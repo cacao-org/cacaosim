@@ -1,0 +1,545 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Olivier Guyon et al
+# SPDX-License-Identifier: LGPL-3.0-or-later
+#
+# cacaosim-bench — Turnkey launcher for single- and multi-stage cacaosim AO benches
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PREFIX_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+export PATH="${SCRIPT_DIR}:${PREFIX_DIR}/bin:${PATH}"
+
+MODE="fused"
+BENCH_CFG=""
+NWF=128
+NACT=20
+WFS_NCAM=64
+FP_NCAM=128
+RATE_HZ=2000
+RATE_SET=0
+MOD_RAD=3.0
+BACKEND=0
+WITH_ATMTURB=0
+SEEING=0.7
+SHOW_VIEW=1
+
+usage() {
+    cat <<EOF
+Usage: cacaosim-bench [command] [options]
+
+Commands:
+  view        Render milk-styled ANSI/UTF-8 graphical optical bench schematic
+  edit        Edit a .bench text file in \$EDITOR (creates template if new) & visualize
+  tui         Launch interactive edit / theme / deploy / stop TUI (cacaosim-bench-view -i)
+  start       Launch AO hardware simulator in current MILK_SHM_DIR (default)
+  stop        Stop running cacaosim / atmturb FPS units cleanly
+  status      Show active optical bench schematic and live SHM streams
+
+Options:
+  --config <file.bench>   Declarative multi-stage optical bench (.bench) file
+  --mode <fused|modular>  Fused zero-hop htsim (default) or separate FPS units
+  --nwf <int>             Pupil wavefront grid size [pixels] (default: ${NWF})
+  --nact <int>            Linear DM actuator count (default: ${NACT})
+  --wfs-ncam <int>        WFS camera size [pixels] (default: ${WFS_NCAM})
+  --fp-ncam <int>         Focal plane camera size [pixels] (default: ${FP_NCAM})
+  --rate <float>          Hardware master frame rate [Hz] (default: ${RATE_HZ})
+  --mod-rad <float>       Pyramid modulation radius [lambda/D] (default: ${MOD_RAD})
+  --backend <0|1|2>       0=auto (default), 1=CPU, 2=CUDA
+  --atmturb               Also launch milk-fpsexec-atmturb-mkwfs phase stream
+  --seeing <float>        Seeing [arcsec] when --atmturb is active (default: ${SEEING})
+  --no-view               Suppress automatic graphical schematic on start/status
+  -h, --help              Show this help message
+EOF
+}
+
+CMD="start"
+if [[ $# -gt 0 && "$1" != -* ]]; then
+    CMD="$1"
+    shift
+fi
+
+case "${CMD}" in
+    view|show)
+        exec cacaosim-bench-view "$@"
+        ;;
+    tui)
+        exec cacaosim-bench-view -i "$@"
+        ;;
+    edit)
+        EDIT_TARGET=""
+        for ((idx = 1; idx <= $#; idx++)); do
+            arg="${!idx}"
+            if [[ "${arg}" == "--config" || "${arg}" == "-c" ]]; then
+                nxt=$((idx + 1))
+                EDIT_TARGET="${!nxt:-}"
+                break
+            elif [[ "${arg}" != -* ]]; then
+                EDIT_TARGET="${arg}"
+                break
+            fi
+        done
+        if [[ -z "${EDIT_TARGET}" ]]; then
+            echo "[cacaosim-bench] Usage: cacaosim-bench edit <file.bench>" >&2
+            exit 1
+        fi
+        if [[ ! -f "${EDIT_TARGET}" ]]; then
+            cacaosim-bench-view --init "${EDIT_TARGET}" --no-footer >/dev/null
+            echo "[cacaosim-bench] Created starter configuration '${EDIT_TARGET}'"
+        fi
+        "${VISUAL:-${EDITOR:-vi}}" "${EDIT_TARGET}"
+        exec cacaosim-bench-view "${EDIT_TARGET}"
+        ;;
+esac
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --config)    BENCH_CFG="$2"; shift 2 ;;
+        --mode)      MODE="$2"; shift 2 ;;
+        --nwf)       NWF="$2"; shift 2 ;;
+        --nact)      NACT="$2"; shift 2 ;;
+        --wfs-ncam)  WFS_NCAM="$2"; shift 2 ;;
+        --fp-ncam)   FP_NCAM="$2"; shift 2 ;;
+        --rate)      RATE_HZ="$2"; RATE_SET=1; shift 2 ;;
+        --mod-rad)   MOD_RAD="$2"; shift 2 ;;
+        --backend)   BACKEND="$2"; shift 2 ;;
+        --atmturb)   WITH_ATMTURB=1; shift ;;
+        --seeing)    SEEING="$2"; shift 2 ;;
+        --no-view)   SHOW_VIEW=0; shift ;;
+        -h|--help)   usage; exit 0 ;;
+        *)           echo "Unknown option: $1" >&2; usage; exit 1 ;;
+    esac
+done
+
+SHM_DIR="${MILK_SHM_DIR:-/milk/shm}"
+mkdir -p "${SHM_DIR}"
+PID_FILE="${SHM_DIR}/cacaosim_bench.pids"
+UNIT_FILE="${SHM_DIR}/cacaosim_bench.units"
+
+case "${CMD}" in
+    stop)
+        if [[ -f "${UNIT_FILE}" ]]; then
+            while IFS=: read -r ubin ufps; do
+                if [[ -n "${ubin}" && -n "${ufps}" ]]; then
+                    "${ubin}" -n "${ufps}" runstop >/dev/null 2>&1 || true
+                fi
+            done < "${UNIT_FILE}"
+            rm -f "${UNIT_FILE}"
+        fi
+        milk-fpsexec-cacaosim-htsim runstop >/dev/null 2>&1 || true
+        milk-fpsexec-cacaosim-mkbeam runstop >/dev/null 2>&1 || true
+        milk-fpsexec-cacaosim-fpcam runstop >/dev/null 2>&1 || true
+        milk-fpsexec-cacaosim-pyrwfs runstop >/dev/null 2>&1 || true
+        milk-fpsexec-cacaosim-shwfs runstop >/dev/null 2>&1 || true
+        milk-fpsexec-cacaosim-zwfs runstop >/dev/null 2>&1 || true
+        milk-fpsexec-cacaosim-coro runstop >/dev/null 2>&1 || true
+        milk-fpsexec-cacaosim-beamsplit runstop >/dev/null 2>&1 || true
+        milk-fpsexec-cacaosim-dmsim runstop >/dev/null 2>&1 || true
+        milk-fpsexec-atmturb-mkwfs runstop >/dev/null 2>&1 || true
+        if [[ -f "${PID_FILE}" ]]; then
+            while read -r pid; do
+                if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+                    kill -INT "${pid}" 2>/dev/null || true
+                fi
+            done < "${PID_FILE}"
+            rm -f "${PID_FILE}"
+        fi
+        echo "[cacaosim-bench] Stopped cacaosim bench units in ${SHM_DIR}"
+        exit 0
+        ;;
+    status)
+        if [[ "${SHOW_VIEW}" -eq 1 && -f "${SHM_DIR}/csim_active.bench" ]] &&
+           command -v cacaosim-bench-view >/dev/null 2>&1; then
+            cacaosim-bench-view "${SHM_DIR}/csim_active.bench" --no-footer || true
+        fi
+        echo "=== MILK_SHM_DIR: ${SHM_DIR} ==="
+        ls -lh "${SHM_DIR}"/*.im.shm 2>/dev/null || echo "(no active .im.shm streams)"
+        exit 0
+        ;;
+    start)
+        ;;
+    *)
+        echo "Unknown command: ${CMD}" >&2
+        usage
+        exit 1
+        ;;
+esac
+
+rm -f "${PID_FILE}" "${UNIT_FILE}"
+
+start_atmturb() {
+    local wf_sz="$1"
+    local rate="$2"
+    if [[ "${WITH_ATMTURB}" -eq 1 ]]; then
+        if command -v milk-fpsexec-atmturb-mkwfs >/dev/null 2>&1; then
+            local dt_s
+            dt_s="$(awk -v r="${rate}" 'BEGIN { printf "%.6f", (r > 0 ? 1.0/r : 0.0005) }')"
+            echo "[cacaosim-bench] Starting milkatmturb (seeing=${SEEING}\", dt=${dt_s}s)..."
+            milk-fpsexec-atmturb-mkwfs --no-procinfo exec \
+                .wfsize="${wf_sz}" \
+                .seeing="${SEEING}" \
+                .time_step="${dt_s}" \
+                .stream_mode=1 \
+                .save_fits=0 > "${SHM_DIR}/cacaosim_atmturb.log" 2>&1 &
+            echo "$!" >> "${PID_FILE}"
+            sleep 0.3
+        else
+            echo "[cacaosim-bench] WARNING: milk-fpsexec-atmturb-mkwfs not found in PATH" >&2
+        fi
+    fi
+}
+
+# ── Declarative Multi-Stage .bench Mode ──────────────────────────────────────
+if [[ -n "${BENCH_CFG}" ]]; then
+    if [[ ! -f "${BENCH_CFG}" ]]; then
+        if [[ -f "${PREFIX_DIR}/share/cacaosim/examples/${BENCH_CFG}" ]]; then
+            BENCH_CFG="${PREFIX_DIR}/share/cacaosim/examples/${BENCH_CFG}"
+        elif [[ -f "${SCRIPT_DIR}/../examples/${BENCH_CFG}" ]]; then
+            BENCH_CFG="${SCRIPT_DIR}/../examples/${BENCH_CFG}"
+        else
+            echo "[cacaosim-bench] ERROR: config file '${BENCH_CFG}' not found" >&2
+            exit 1
+        fi
+    fi
+    BENCH_ABS="$(cd "$(dirname "${BENCH_CFG}")" && pwd)/$(basename "${BENCH_CFG}")"
+    cp -f "${BENCH_ABS}" "${SHM_DIR}/csim_active.bench"
+
+    eval "$(awk '
+        function trim(s) {
+            sub(/^[ \t\r\n]+/, "", s)
+            sub(/[ \t\r\n]+$/, "", s)
+            if ((substr(s,1,1)=="\"" && substr(s,length(s),1)=="\"") ||
+                (substr(s,1,1)=="\x27" && substr(s,length(s),1)=="\x27")) {
+                s = substr(s, 2, length(s)-2)
+            }
+            return s
+        }
+        BEGIN {
+            sec = ""; nwf = 128; pup_d = 0.9375; cobs = 0.30; nsp = 4; spw = 0.012;
+            spd = 45.0; mhz = 2000.0; pup = "csim_pup";
+        }
+        {
+            sub(/[ \t]*[#;].*$/, "")
+            line = trim($0)
+            if (line == "") next
+            if (substr(line,1,1) == "[") {
+                rb = index(line, "]")
+                sec = tolower(trim(substr(line, 2, rb - 2)))
+                next
+            }
+            eq = index(line, "=")
+            if (eq > 0 && sec == "bench") {
+                k = tolower(trim(substr(line, 1, eq - 1)))
+                v = trim(substr(line, eq + 1))
+                if (k == "nwf") nwf = v
+                else if (k == "pup_diam") pup_d = v
+                else if (k == "cobs" || k == "obs_frac") cobs = v
+                else if (k == "nspider" || k == "n_spiders") nsp = v
+                else if (k == "spider_w") spw = v
+                else if (k == "spider_deg") spd = v
+                else if (k == "master_hz" || k == "frame_rate") mhz = v
+                else if (k == "in_pup") pup = v
+            }
+        }
+        END {
+            printf "B_NWF=%s\nB_PUPD=%s\nB_COBS=%s\nB_NSP=%s\n", nwf, pup_d, cobs, nsp
+            printf "B_SPW=%s\nB_SPD=%s\nB_MHZ=%s\nB_PUP=\"%s\"\n", spw, spd, mhz, pup
+        }
+    ' "${BENCH_ABS}")"
+
+    EFF_RATE="${B_MHZ}"
+    if [[ "${RATE_SET}" -eq 1 ]]; then
+        EFF_RATE="${RATE_HZ}"
+    fi
+
+    if [[ -n "${B_PUP}" ]]; then
+        echo "[cacaosim-bench] Generating ${B_NWF}x${B_NWF} pupil (${B_PUP})..."
+        milk-fpsexec-cacaosim-mkpupil --no-procinfo exec \
+            .nwf="${B_NWF}" \
+            .pup_diam="${B_PUPD}" \
+            .cobs="${B_COBS}" \
+            .nspider="${B_NSP}" \
+            .spider_w="${B_SPW}" \
+            .spider_deg="${B_SPD}" \
+            .out_pup="${B_PUP}"
+    fi
+
+    start_atmturb "${B_NWF}" "${EFF_RATE}"
+
+    if [[ "${MODE}" == "fused" ]]; then
+        echo "[cacaosim-bench] Starting fused .bench DAG (${BENCH_ABS}, ${EFF_RATE} Hz)..."
+        export CACAOSIM_BENCH_FILE="${BENCH_ABS}"
+        milk-fpsexec-cacaosim-htsim -n csim_htsim fpsinit \
+            .bench_file=csim_active.bench \
+            .frame_rate="${EFF_RATE}" \
+            .backend="${BACKEND}"
+        milk-fps-set csim_htsim.procinfo.triggermode 0
+        milk-fps-set csim_htsim.procinfo.loopcntMax -1
+        milk-fpsexec-cacaosim-htsim -n csim_htsim runstart
+        echo "milk-fpsexec-cacaosim-htsim:csim_htsim" >> "${UNIT_FILE}"
+    elif [[ "${MODE}" == "modular" ]]; then
+        echo "[cacaosim-bench] Starting modular FPS pipeline from ${BENCH_ABS}..."
+        MOD_SH="${SHM_DIR}/cacaosim_modular_launch.sh"
+        awk -v eff_rate="${EFF_RATE}" -v backend="${BACKEND}" -v ufile="${UNIT_FILE}" '
+        function trim(s) {
+            sub(/^[ \t\r\n]+/, "", s)
+            sub(/[ \t\r\n]+$/, "", s)
+            if ((substr(s,1,1)=="\"" && substr(s,length(s),1)=="\"") ||
+                (substr(s,1,1)=="\x27" && substr(s,length(s),1)=="\x27")) {
+                s = substr(s, 2, length(s)-2)
+            }
+            return s
+        }
+        function bval(v,   lv) {
+            lv = tolower(v)
+            return (lv=="1" || lv=="true" || lv=="on" || lv=="yes") ? "ON" : "OFF"
+        }
+        function smode(v,   lv) {
+            lv = tolower(v)
+            if (lv=="gray") return 0
+            if (lv=="dichroic_lp" || lv=="lp" || lv=="longpass") return 1
+            if (lv=="dichroic_sp" || lv=="sp" || lv=="shortpass") return 2
+            if (lv=="dichroic_bp" || lv=="bp" || lv=="band_reflect") return 3
+            return v + 0
+        }
+        function cmode(v,   lv) {
+            lv = tolower(v)
+            if (lv=="lyot_spot" || lv=="lyot") return 0
+            if (lv=="phase_dimple" || lv=="roddier") return 1
+            if (lv=="vortex") return 2
+            if (lv=="4qpm") return 3
+            return v + 0
+        }
+        function dtype(v,   lv) {
+            lv = tolower(v)
+            if (lv=="float32" || lv=="f32" || lv=="float") return 1
+            if (lv=="uint16" || lv=="u16") return 0
+            return v + 0
+        }
+        function pmode(v,   lv) {
+            lv = tolower(v)
+            if (lv=="fft") return 1
+            if (lv=="mft") return 0
+            return v + 0
+        }
+        BEGIN {
+            nn = 0; cur = 0
+            b["nwf"] = 128; b["pup_diam"] = 0.9375; b["cobs"] = 0.30; b["nspider"] = 4
+            b["spider_w"] = 0.012; b["tel_diam_m"] = 8.2; b["star_mag"] = 8.0
+            b["star_teff"] = 5778.0; b["tput_tel"] = 0.75; b["in_wf"] = "outarraypha"
+            b["in_pup"] = "csim_pup"; b["out_beam"] = "b_pup"; b["wf_unit"] = 1
+            b["ref_lambda"] = 0.50; b["turb_gain"] = 1.0
+        }
+        {
+            sub(/[ \t]*[#;].*$/, "")
+            line = trim($0)
+            if (line == "") next
+            if (substr(line,1,1) == "[") {
+                rb = index(line, "]")
+                sec = trim(substr(line, 2, rb - 2))
+                if (tolower(sec) == "bench") { cur = -1; next }
+                dot = index(sec, ".")
+                nn++; cur = nn
+                ntype[nn] = tolower(trim(substr(sec, 1, dot - 1)))
+                nid[nn] = trim(substr(sec, dot + 1))
+                next
+            }
+            eq = index(line, "=")
+            if (eq <= 0) next
+            k = tolower(trim(substr(line, 1, eq - 1)))
+            v = trim(substr(line, eq + 1))
+            if (cur == -1) { b[k] = v }
+            else if (cur > 0) { kv[cur, k] = v; has[cur, k] = 1 }
+        }
+        function get(i, k, def) { return has[i, k] ? kv[i, k] : def }
+        END {
+            dt_s = (eff_rate > 0.1) ? (1.0 / eff_rate) : 0.0005
+            for (i = 1; i <= nn; i++) {
+                t = ntype[i]; id = nid[i]; fps = "csim_" id
+                inb = has[i, "in"] ? kv[i, "in"] : get(i, "in_beam", b["out_beam"])
+                outb = has[i, "out"] ? kv[i, "out"] : get(i, "out_beam", "")
+                if (t == "dm" || t == "ttm") {
+                    ubin = "milk-fpsexec-cacaosim-dmsim"
+                    dmm = (t == "ttm") ? 1 : get(i, "dm_mode", 0)
+                    nx = (dmm == 1) ? 2 : get(i, "nact_x", get(i, "nact", 16))
+                    ny = (dmm == 1) ? 1 : get(i, "nact_y", get(i, "nact", 16))
+                    tau = has[i, "tau_sec"] ? kv[i, "tau_sec"] : (get(i, "tau_us", 150.0) * 1e-6)
+                    cmd = get(i, "in_cmd", id "_cmd")
+                    opd = get(i, "out_opd", "csim_opd_" id)
+                    printf "%s -n %s fpsinit .nwf=%s .dm_mode=%s .nact_x=%s .nact_y=%s ",
+                        ubin, fps, b["nwf"], dmm, nx, ny
+                    printf ".in_cmd=%s .out_opd=%s .in_beam=%s .out_beam=%s ",
+                        cmd, opd, inb, outb
+                    printf ".if_coupling=%s .tput=%s .max_stroke=%s .dac_bits=%s ",
+                        get(i, "if_coupling", 0.20), get(i, "tput", 0.98),
+                        get(i, "max_stroke", 5.0), get(i, "dac_bits", 16)
+                    printf ".dyn_mode=%s .dt_sec=%.7f .tau_sec=%.7f .delay_frames=%s .backend=%s\n",
+                        get(i, "dyn_mode", 1), dt_s, tau, get(i, "delay_frames", 1.0), backend
+                } else if (t == "splitter") {
+                    ubin = "milk-fpsexec-cacaosim-beamsplit"
+                    printf "%s -n %s fpsinit .nwf=%s .in_beam=%s .out_refl=%s .out_trans=%s ",
+                        ubin, fps, b["nwf"], inb, get(i, "out_refl", ""), get(i, "out_trans", "")
+                    printf ".split_mode=%d .r_gray=%s .t_gray=%s .lambda_cut=%s .band_width=%s ",
+                        smode(get(i, "mode", get(i, "split_mode", "lp"))),
+                        get(i, "r_gray", 0.5), get(i, "t_gray", 0.5),
+                        get(i, "lambda_cut", 0.95), get(i, "band_width", 0.25)
+                    printf ".roll_um=%s .eff_refl=%s .eff_trans=%s\n",
+                        get(i, "roll_um", 0.03), get(i, "eff_refl", 0.95), get(i, "eff_trans", 0.95)
+                } else if (t == "coro") {
+                    ubin = "milk-fpsexec-cacaosim-coro"
+                    printf "%s -n %s fpsinit .nwf=%s .pup_diam=%s .in_beam=%s .out_beam=%s ",
+                        ubin, fps, b["nwf"], b["pup_diam"], inb, outb
+                    printf ".out_lowfs=%s .coro_mode=%d .lambda_um=%s .fpm_rad_ld=%s ",
+                        get(i, "out_lowfs", ""), cmode(get(i, "mode", "lyot_spot")),
+                        get(i, "lambda_um", 1.65), get(i, "fpm_rad_ld", 3.0)
+                    printf ".lowfs_refl=%s .tput=%s .lyot_outer=%s .lyot_obs=%s .backend=%s\n",
+                        get(i, "lowfs_refl", 0.95), get(i, "tput", 0.92),
+                        get(i, "lyot_outer", 0.85), get(i, "lyot_obs", 0.36), backend
+                } else {
+                    navg = get(i, "navg", 1)
+                    if (has[i, "rate_hz"] && kv[i, "rate_hz"] + 0 > 0 && eff_rate > 0) {
+                        navg = int(eff_rate / kv[i, "rate_hz"] + 0.5)
+                        if (navg < 1) navg = 1
+                    }
+                    if (t == "pyrwfs") {
+                        ubin = "milk-fpsexec-cacaosim-pyrwfs"
+                        printf "%s -n %s fpsinit .nwf=%s .pup_diam=%s .in_pup=%s .in_beam=%s ",
+                            ubin, fps, b["nwf"], b["pup_diam"], b["in_pup"], inb
+                        printf ".out_cam=%s .ncam=%s .lambda_um=%s .bw_frac=%s .qe=%s ",
+                            get(i, "out_cam", id "_cam"), get(i, "ncam", 64),
+                            get(i, "lambda_um", 0.75), get(i, "bw_frac", 0.20), get(i, "qe", 0.80)
+                        printf ".dt_exp=%.7f .use_beam_flux=%s .navg=%d .mod_rad=%s .mod_npts=%s ",
+                            dt_s, bval(get(i, "use_beam_flux", "1")), navg,
+                            get(i, "mod_rad", 3.0), get(i, "mod_npts", 16)
+                        printf ".ron_e=%s .out_dtype=%d .backend=%s\n",
+                            get(i, "ron_e", 0.5), dtype(get(i, "out_dtype", "0")), backend
+                    } else if (t == "shwfs") {
+                        ubin = "milk-fpsexec-cacaosim-shwfs"
+                        printf "%s -n %s fpsinit .nwf=%s .pup_diam=%s .in_pup=%s .in_beam=%s ",
+                            ubin, fps, b["nwf"], b["pup_diam"], b["in_pup"], inb
+                        printf ".out_cam=%s .n_sub=%s .pix_per_sub=%s .lambda_um=%s ",
+                            get(i, "out_cam", id "_cam"), get(i, "n_sub", 16),
+                            get(i, "pix_per_sub", 8), get(i, "lambda_um", 0.75)
+                        printf ".bw_frac=%s .qe=%s .dt_exp=%.7f .use_beam_flux=%s .navg=%d ",
+                            get(i, "bw_frac", 0.20), get(i, "qe", 0.80), dt_s,
+                            bval(get(i, "use_beam_flux", "1")), navg
+                        printf ".ron_e=%s .out_dtype=%d .backend=%s\n",
+                            get(i, "ron_e", 0.5), dtype(get(i, "out_dtype", "0")), backend
+                    } else if (t == "zwfs") {
+                        ubin = "milk-fpsexec-cacaosim-zwfs"
+                        printf "%s -n %s fpsinit .nwf=%s .pup_diam=%s .in_pup=%s .in_beam=%s ",
+                            ubin, fps, b["nwf"], b["pup_diam"], b["in_pup"], inb
+                        printf ".out_cam=%s .ncam=%s .lambda_um=%s .dimple_ld=%s ",
+                            get(i, "out_cam", id "_cam"), get(i, "ncam", 64),
+                            get(i, "lambda_um", 0.75), get(i, "dimple_ld", 1.06)
+                        printf ".bw_frac=%s .qe=%s .dt_exp=%.7f .use_beam_flux=%s .navg=%d ",
+                            get(i, "bw_frac", 0.20), get(i, "qe", 0.80), dt_s,
+                            bval(get(i, "use_beam_flux", "1")), navg
+                        printf ".ron_e=%s .out_dtype=%d .backend=%s\n",
+                            get(i, "ron_e", 0.5), dtype(get(i, "out_dtype", "0")), backend
+                    } else if (t == "fpcam") {
+                        ubin = "milk-fpsexec-cacaosim-fpcam"
+                        printf "%s -n %s fpsinit .nwf=%s .pup_diam=%s .in_pup=%s .in_beam=%s ",
+                            ubin, fps, b["nwf"], b["pup_diam"], b["in_pup"], inb
+                        printf ".out_cam=%s .out_long=%s .ncam=%s .prop_mode=%d .lambda_um=%s ",
+                            get(i, "out_cam", id "_cam"), get(i, "out_long", ""),
+                            get(i, "ncam", 128), pmode(get(i, "prop_mode", "0")),
+                            get(i, "lambda_um", 1.65)
+                        printf ".bw_frac=%s .qe=%s .pixscale_ld=%s .dt_exp=%.7f .use_beam_flux=%s ",
+                            get(i, "bw_frac", 0.18), get(i, "qe", 0.85),
+                            get(i, "pixscale_ld", 3.0), dt_s, bval(get(i, "use_beam_flux", "1"))
+                        printf ".navg=%d .ron_e=%s .out_dtype=%d .backend=%s\n",
+                            navg, get(i, "ron_e", 1.0), dtype(get(i, "out_dtype", "0")), backend
+                    }
+                }
+                printf "milk-fps-set %s.procinfo.triggermode 3\n", fps
+                printf "milk-fps-set %s.procinfo.triggersname %s\n", fps, inb
+                printf "milk-fps-set %s.procinfo.loopcntMax -1\n", fps
+                printf "%s -n %s runstart\n", ubin, fps
+                printf "echo \"%s:%s\" >> \"%s\"\n", ubin, fps, ufile
+            }
+            printf "milk-fpsexec-cacaosim-mkbeam -n csim_mkbeam fpsinit "
+            printf ".out_beam=%s .in_wf=%s .in_pup=%s .nwf=%s .pup_diam=%s ",
+                b["out_beam"], b["in_wf"], b["in_pup"], b["nwf"], b["pup_diam"]
+            printf ".obs_frac=%s .n_spiders=%s .spider_w=%s .tel_diam_m=%s ",
+                b["cobs"], b["nspider"], b["spider_w"], b["tel_diam_m"]
+            printf ".star_mag=%s .star_teff=%s .tel_tput=%s .wf_unit=%s ",
+                b["star_mag"], b["star_teff"], b["tput_tel"], b["wf_unit"]
+            printf ".ref_lambda=%s .turb_gain=%s .frame_rate=%s\n",
+                b["ref_lambda"], b["turb_gain"], eff_rate
+            printf "milk-fps-set csim_mkbeam.procinfo.triggermode 0\n"
+            printf "milk-fps-set csim_mkbeam.procinfo.loopcntMax -1\n"
+            printf "milk-fpsexec-cacaosim-mkbeam -n csim_mkbeam runstart\n"
+            printf "echo \"milk-fpsexec-cacaosim-mkbeam:csim_mkbeam\" >> \"%s\"\n", ufile
+        }
+        ' "${BENCH_ABS}" > "${MOD_SH}"
+        bash "${MOD_SH}"
+    else
+        echo "Invalid --mode '${MODE}' (expected fused or modular)" >&2
+        exit 1
+    fi
+
+    if [[ "${SHOW_VIEW}" -eq 1 ]] && command -v cacaosim-bench-view >/dev/null 2>&1; then
+        sleep 0.15
+        cacaosim-bench-view "${BENCH_ABS}" --no-footer || true
+    fi
+    echo "[cacaosim-bench] Multi-stage bench active (${MODE}) in MILK_SHM_DIR=${SHM_DIR}"
+    exit 0
+fi
+
+# ── Default Flat Single-Stage Mode ───────────────────────────────────────────
+echo "[cacaosim-bench] Generating ${NWF}x${NWF} anti-aliased pupil (csim_pup)..."
+milk-fpsexec-cacaosim-mkpupil --no-procinfo exec \
+    .nwf="${NWF}" \
+    .out_pup=csim_pup
+
+start_atmturb "${NWF}" "${RATE_HZ}"
+
+if [[ "${MODE}" == "fused" ]]; then
+    echo "[cacaosim-bench] Starting fused HT bench (rate=${RATE_HZ} Hz, backend=${BACKEND})..."
+    milk-fpsexec-cacaosim-htsim fpsinit \
+        .nwf="${NWF}" \
+        .nact_x="${NACT}" \
+        .nact_y="${NACT}" \
+        .wfs_ncam="${WFS_NCAM}" \
+        .fp_ncam="${FP_NCAM}" \
+        .mod_rad="${MOD_RAD}" \
+        .frame_rate="${RATE_HZ}" \
+        .backend="${BACKEND}"
+    milk-fps-set csim_htsim.procinfo.triggermode 0
+    milk-fps-set csim_htsim.procinfo.loopcntMax -1
+    milk-fpsexec-cacaosim-htsim runstart
+elif [[ "${MODE}" == "modular" ]]; then
+    echo "[cacaosim-bench] Starting modular DM + PyWFS + FPcam FPS units..."
+    milk-fpsexec-cacaosim-dmsim -loops fpsinit \
+        .nwf="${NWF}" \
+        .nact_x="${NACT}" \
+        .nact_y="${NACT}" \
+        .backend="${BACKEND}"
+    milk-fpsexec-cacaosim-dmsim runstart
+
+    milk-fpsexec-cacaosim-pyrwfs fpsinit \
+        .nwf="${NWF}" \
+        .ncam="${WFS_NCAM}" \
+        .mod_rad="${MOD_RAD}" \
+        .frame_rate="${RATE_HZ}" \
+        .backend="${BACKEND}"
+    milk-fps-set csim_pyrwfs.procinfo.triggermode 0
+    milk-fps-set csim_pyrwfs.procinfo.loopcntMax -1
+    milk-fpsexec-cacaosim-pyrwfs runstart
+
+    milk-fpsexec-cacaosim-fpcam fpsinit \
+        .nwf="${NWF}" \
+        .ncam="${FP_NCAM}" \
+        .frame_rate=200 \
+        .backend="${BACKEND}"
+    milk-fps-set csim_fpcam.procinfo.triggermode 0
+    milk-fps-set csim_fpcam.procinfo.loopcntMax -1
+    milk-fpsexec-cacaosim-fpcam runstart
+else
+    echo "Invalid --mode '${MODE}' (expected fused or modular)" >&2
+    exit 1
+fi
+
+echo "[cacaosim-bench] Bench active in MILK_SHM_DIR=${SHM_DIR}"
+echo "[cacaosim-bench] Streams: aol0_dmC -> aol0_wfsim, csim_fpcam, csim_fplong"

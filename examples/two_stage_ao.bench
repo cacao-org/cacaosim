@@ -1,0 +1,121 @@
+# SPDX-FileCopyrightText: 2026 Olivier Guyon et al
+# SPDX-License-Identifier: LGPL-3.0-or-later
+#
+# Two-Stage Cascaded Adaptive Optics Bench:
+#   Stage 1: 12x12 Woofer DM (dm01disp) + J-band (1.22 um) Pyramid WFS @ 1 kHz (navg = 3)
+#   Stage 2: 24x24 Tweeter DM (dm02disp) + Visible (0.75 um) Pyramid WFS @ 3 kHz (navg = 1)
+#   Science: H-band (1.65 um) Focal-Plane PSF Camera @ 100 Hz (navg = 30)
+
+[bench]
+name       = "two_stage_cascaded_ao"
+nwf        = 128
+pup_diam   = 0.9375
+cobs       = 0.30
+nspider    = 4
+spider_w   = 0.012
+spider_deg = 45.0
+tel_diam_m = 8.2
+star_mag   = 8.0
+star_teff  = 5778.0
+tput_tel   = 0.75
+master_hz  = 3000.0
+in_wf      = "outarraypha"
+in_pup     = "csim_pup"
+out_beam   = "b_pup"
+wf_unit    = 1
+ref_lambda = 0.50
+
+[dm.woofer]
+in           = "b_pup"
+out          = "b_post_dm1"
+in_cmd       = "dm01disp"
+nact_x       = 12
+nact_y       = 12
+if_coupling  = 0.20
+tput         = 0.98
+max_stroke   = 8.0
+dac_bits     = 16
+dyn_mode     = 1
+tau_us       = 250.0
+delay_frames = 1.0
+
+# Notch / band-reflect dichroic: reflects J-band (1.07..1.37 um) to Stage-1 NIR PyWFS,
+# transmits both Visible (<1.05 um) and H/K-band (>1.40 um) into Stage 2.
+[splitter.dichroic_stg1]
+in         = "b_post_dm1"
+out_refl   = "b_nir_wfs"
+out_trans  = "b_stg2_in"
+mode       = "dichroic_bp"
+lambda_cut = 1.22
+band_width = 0.30
+roll_um    = 0.03
+eff_refl   = 0.95
+eff_trans  = 0.95
+
+[pyrwfs.wfs_nir]
+in            = "b_nir_wfs"
+out_cam       = "aol1_wfsim"
+ncam          = 64
+lambda_um     = 1.22
+bw_frac       = 0.20
+qe            = 0.80
+use_beam_flux = 1
+navg          = 3
+mod_rad       = 3.0
+mod_npts      = 16
+ron_e         = 0.8
+out_dtype     = "uint16"
+
+[dm.tweeter]
+in           = "b_stg2_in"
+out          = "b_post_dm2"
+in_cmd       = "dm02disp"
+nact_x       = 24
+nact_y       = 24
+if_coupling  = 0.15
+tput         = 0.98
+max_stroke   = 3.0
+dac_bits     = 16
+dyn_mode     = 1
+tau_us       = 80.0
+delay_frames = 1.0
+
+# Long-pass dichroic: reflects Visible (<1.00 um) to Stage-2 PyWFS, transmits H-band to science.
+[splitter.dichroic_stg2]
+in         = "b_post_dm2"
+out_refl   = "b_vis_wfs"
+out_trans  = "b_sci"
+mode       = "dichroic_lp"
+lambda_cut = 1.00
+roll_um    = 0.03
+eff_refl   = 0.95
+eff_trans  = 0.95
+
+[pyrwfs.wfs_vis]
+in            = "b_vis_wfs"
+out_cam       = "aol2_wfsim"
+ncam          = 64
+lambda_um     = 0.75
+bw_frac       = 0.22
+qe            = 0.85
+use_beam_flux = 1
+navg          = 1
+mod_rad       = 2.0
+mod_npts      = 16
+ron_e         = 0.3
+out_dtype     = "uint16"
+
+[fpcam.sci_h]
+in            = "b_sci"
+out_cam       = "csim_fpcam"
+out_long      = "csim_fplong"
+ncam          = 128
+prop_mode     = "mft"
+lambda_um     = 1.65
+bw_frac       = 0.18
+qe            = 0.85
+pixscale_ld   = 3.0
+use_beam_flux = 1
+navg          = 30
+ron_e         = 1.0
+out_dtype     = "uint16"

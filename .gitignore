@@ -1,0 +1,14 @@
+_build/
+_build*/
+build/
+*.o
+*.so
+*.a
+*.fits
+*.fps.shm
+*.fps.d/
+fps.*.confdir/
+fps.*.datadir/
+proc.*.shm
+*.im.shm
+milkscriptcmd.log

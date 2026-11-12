@@ -1,0 +1,115 @@
+# SPDX-FileCopyrightText: 2026 Olivier Guyon et al
+# SPDX-License-Identifier: LGPL-3.0-or-later
+#
+# ExAO Coronagraphic Bench with TTM, SHWFS, Lyot Coronagraph, and Zernike LOWFS:
+#   - 2-axis Tip-Tilt mirror (ttm0_cmd) + 16x16 DM (dm00disp)
+#   - Long-pass dichroic (1.00 um): Visible -> 16x16 Shack-Hartmann WFS @ 2 kHz
+#   - H-band -> Lyot-spot Coronagraph (3 lambda/D):
+#       * FPM core reflection -> H-band Zernike LOWFS @ 500 Hz (navg = 4)
+#       * Post-Lyot beam      -> Coronagraphic Science Camera @ 100 Hz (navg = 20)
+
+[bench]
+name       = "exao_coro_lowfs"
+nwf        = 128
+pup_diam   = 0.9375
+cobs       = 0.30
+nspider    = 4
+spider_w   = 0.012
+spider_deg = 45.0
+tel_diam_m = 8.2
+star_mag   = 6.0
+star_teff  = 5778.0
+tput_tel   = 0.78
+master_hz  = 2000.0
+in_wf      = "outarraypha"
+in_pup     = "csim_pup"
+out_beam   = "b_pup"
+
+[ttm.ttm0]
+in           = "b_pup"
+out          = "b_post_ttm"
+in_cmd       = "ttm0_cmd"
+tput         = 0.99
+max_stroke   = 10.0
+dyn_mode     = 1
+tau_us       = 300.0
+delay_frames = 1.0
+
+[dm.dm0]
+in           = "b_post_ttm"
+out          = "b_post_dm"
+in_cmd       = "dm00disp"
+nact_x       = 16
+nact_y       = 16
+if_coupling  = 0.18
+tput         = 0.98
+max_stroke   = 4.0
+dyn_mode     = 1
+tau_us       = 100.0
+delay_frames = 1.0
+
+[splitter.bs_vis_nir]
+in         = "b_post_dm"
+out_refl   = "b_vis"
+out_trans  = "b_nir"
+mode       = "dichroic_lp"
+lambda_cut = 1.00
+eff_refl   = 0.95
+eff_trans  = 0.95
+
+[shwfs.wfs_ho]
+in            = "b_vis"
+out_cam       = "aol0_shwfs"
+n_sub         = 16
+pix_per_sub   = 8
+lambda_um     = 0.75
+bw_frac       = 0.22
+qe            = 0.85
+use_beam_flux = 1
+navg          = 1
+ron_e         = 0.5
+out_dtype     = "uint16"
+
+[coro.coro_h]
+in              = "b_nir"
+out             = "b_coro_lyot"
+out_lowfs       = "b_coro_lowfs"
+mode            = "lyot_spot"
+lambda_um       = 1.65
+fpm_rad_ld      = 3.0
+fpm_amp         = 0.0
+lowfs_refl      = 0.95
+tput            = 0.92
+lyot_outer      = 0.85
+lyot_obs        = 0.36
+lyot_nspider    = 4
+lyot_spider_w   = 0.02
+lyot_spider_deg = 45.0
+
+[zwfs.lowfs_z]
+in            = "b_coro_lowfs"
+out_cam       = "aol0_lowfs"
+ncam          = 64
+lambda_um     = 1.65
+dimple_ld     = 1.06
+bw_frac       = 0.18
+qe            = 0.85
+use_beam_flux = 1
+navg          = 4
+ron_e         = 0.5
+out_dtype     = "uint16"
+
+[fpcam.coro_cam]
+in            = "b_coro_lyot"
+out_cam       = "csim_corocam"
+out_long      = "csim_corolong"
+ncam          = 128
+prop_mode     = "mft"
+lambda_um     = 1.65
+bw_frac       = 0.18
+qe            = 0.85
+pixscale_ld   = 3.0
+use_beam_flux = 1
+navg          = 20
+ron_e         = 0.8
+out_dtype     = "uint16"
