@@ -9,6 +9,7 @@
  * Exposes all cacaosim compute units under the "cacaosim" namespace:
  *   - cacaosim.mkpupil   : Anti-aliased telescope pupil & static NCPA generator
  *   - cacaosim.mkbeam    : Optical [OPD, Amp] beam + 32-bin stellar spectrum synthesizer
+ *   - cacaosim.wfe       : Inline static wavefront error optical element specified in OPD [meter]
  *   - cacaosim.dmsim     : Zonal DM / 2-axis TTM hardware simulator & in-line beam corrector
  *   - cacaosim.beamsplit : Gray & dichroic beamsplitter with per-arm NCPA, masks, & registration
  *   - cacaosim.coro      : Coronagraphic FPM, Lyot stop, and LOWFS core pickoff simulator
@@ -30,6 +31,7 @@ MODULE_DEPS("milkCOREMODmemory", "milkCOREMODarith", "milkCOREMODiofits", "milkC
 static const MILK_RUNNABLE *const runnables[] = {
     &runnable_cacaosim_mkpupil,
     &runnable_cacaosim_mkbeam,
+    &runnable_cacaosim_wfe,
     &runnable_cacaosim_dmsim,
     &runnable_cacaosim_beamsplit,
     &runnable_cacaosim_coro,

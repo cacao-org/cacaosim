@@ -284,6 +284,7 @@ extern "C" float *cacaosim_cuda_alloc_f32(uint64_t nelem)
         return NULL;
     }
     cudaMemset(d_ptr, 0, bytes);
+    cudaStreamSynchronize((cudaStream_t) 0);
     return d_ptr;
 }
 
@@ -598,6 +599,130 @@ extern "C" void cacaosim_cuda_beam_relay(
         float s    = sinf(rad) * invs;
         kernel_beam_relay_warp<<<blocks, threads, 0, st>>>(
             d_in_opd, d_in_amp, d_ncpa_opd, d_pup_mask, c, s, reg->shift_x, reg->shift_y, nwf,
+            d_out_opd, d_out_amp);
+    }
+}
+
+__global__ void kernel_beam_wfe_ident(
+    const float *__restrict__ in_opd,
+    const float *__restrict__ in_amp,
+    const float *__restrict__ wfe_opd,
+    float                     wfe_to_um,
+    uint32_t                  npix,
+    float *__restrict__       out_opd,
+    float *__restrict__       out_amp)
+{
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= npix)
+    {
+        return;
+    }
+    float o      = (in_opd != NULL) ? in_opd[idx] : 0.0f;
+    float a      = (in_amp != NULL) ? in_amp[idx] : 1.0f;
+    float w      = (wfe_opd != NULL) ? (wfe_to_um * wfe_opd[idx]) : 0.0f;
+    out_opd[idx] = o + w;
+    if (out_amp != NULL)
+    {
+        out_amp[idx] = a;
+    }
+}
+
+__global__ void kernel_beam_wfe_warp(
+    const float *__restrict__ in_opd,
+    const float *__restrict__ in_amp,
+    const float *__restrict__ wfe_opd,
+    float                     wfe_to_um,
+    float                     c,
+    float                     s,
+    float                     dx,
+    float                     dy,
+    uint32_t                  nwf,
+    float *__restrict__       out_opd,
+    float *__restrict__       out_amp)
+{
+    uint32_t idx  = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t npix = nwf * nwf;
+    if (idx >= npix)
+    {
+        return;
+    }
+    uint32_t ix  = idx % nwf;
+    uint32_t iy  = idx / nwf;
+    float    ctr = 0.5f * (float) (nwf - 1u);
+    float    vx  = (float) ix - ctr - dx;
+    float    vy  = (float) iy - ctr - dy;
+    float    sx  = ctr + c * vx - s * vy;
+    float    sy  = ctr + s * vx + c * vy;
+
+    float o = 0.0f;
+    float a = 0.0f;
+    if (sx >= 0.0f && sy >= 0.0f && sx <= (float) (nwf - 1u) && sy <= (float) (nwf - 1u))
+    {
+        uint32_t x0  = (uint32_t) sx;
+        uint32_t y0  = (uint32_t) sy;
+        uint32_t x1  = (x0 + 1u < nwf) ? (x0 + 1u) : x0;
+        uint32_t y1  = (y0 + 1u < nwf) ? (y0 + 1u) : y0;
+        float    fx  = sx - (float) x0;
+        float    fy  = sy - (float) y0;
+        float    w00 = (1.0f - fx) * (1.0f - fy);
+        float    w10 = fx * (1.0f - fy);
+        float    w01 = (1.0f - fx) * fy;
+        float    w11 = fx * fy;
+
+        uint32_t i00 = y0 * nwf + x0;
+        uint32_t i10 = y0 * nwf + x1;
+        uint32_t i01 = y1 * nwf + x0;
+        uint32_t i11 = y1 * nwf + x1;
+
+        if (in_opd != NULL)
+        {
+            o = w00 * in_opd[i00] + w10 * in_opd[i10] + w01 * in_opd[i01] + w11 * in_opd[i11];
+        }
+        a = (in_amp != NULL)
+                ? (w00 * in_amp[i00] + w10 * in_amp[i10] + w01 * in_amp[i01] + w11 * in_amp[i11])
+                : 1.0f;
+    }
+    if (wfe_opd != NULL)
+    {
+        o += wfe_to_um * wfe_opd[idx];
+    }
+    out_opd[idx] = o;
+    if (out_amp != NULL)
+    {
+        out_amp[idx] = a;
+    }
+}
+
+extern "C" void cacaosim_cuda_beam_apply_wfe(
+    const float          *d_in_opd,
+    const float          *d_in_amp,
+    const float          *d_wfe_opd,
+    float                 wfe_to_um,
+    const cacaosim_reg_t *reg,
+    uint32_t              nwf,
+    float                *d_out_opd,
+    float                *d_out_amp,
+    void                 *cuda_stream)
+{
+    uint32_t     npix    = nwf * nwf;
+    uint32_t     threads = 256u;
+    uint32_t     blocks  = (npix + threads - 1u) / threads;
+    cudaStream_t st      = (cudaStream_t) cuda_stream;
+
+    if (cacaosim_reg_is_identity(reg))
+    {
+        kernel_beam_wfe_ident<<<blocks, threads, 0, st>>>(
+            d_in_opd, d_in_amp, d_wfe_opd, wfe_to_um, npix, d_out_opd, d_out_amp);
+    }
+    else
+    {
+        float sc   = (reg->scale > 1e-4f) ? reg->scale : 1.0f;
+        float invs = 1.0f / sc;
+        float rad  = -reg->rot_deg * (CACAOSIM_PI_F / 180.0f);
+        float c    = cosf(rad) * invs;
+        float s    = sinf(rad) * invs;
+        kernel_beam_wfe_warp<<<blocks, threads, 0, st>>>(
+            d_in_opd, d_in_amp, d_wfe_opd, wfe_to_um, c, s, reg->shift_x, reg->shift_y, nwf,
             d_out_opd, d_out_amp);
     }
 }

@@ -19,7 +19,7 @@
 extern "C" {
 #endif
 
-#define CACAOSIM_FPCAM_MAX_LAMBDA 16
+#define CACAOSIM_FPCAM_MAX_LAMBDA 32
 
 /**
  * @brief Focal plane propagation mode.
@@ -42,7 +42,9 @@ typedef struct
     float              pup_diam;    /**< Clear pupil diameter fraction of nwf (default: 0.9375) */
     float              lambda_um;   /**< Central science wavelength [microns] (default: 1.65) */
     float              bw_frac;     /**< Fractional bandpass dlambda / lambda0 [0..0.5] */
-    int32_t            nlambda;     /**< Polychromatic spectral channels (1..16, default: 1) */
+    int32_t            nlambda;     /**< Polychromatic spectral channels (1..32, default: 1) */
+    int32_t            has_ext_lam; /**< 1 to use explicit ext_lam_um[0..nlambda-1] */
+    float              ext_lam_um[CACAOSIM_FPCAM_MAX_LAMBDA]; /**< Explicit channel wavelengths */
     float              pixscale_ld; /**< Focal sampling [pixels per lambda0/D] (MFT mode) */
     int32_t            wf_unit;     /**< Input WF unit: 0 = OPD [um], 1 = phase [rad] */
     float              ref_lambda;  /**< Reference wavelength [um] when wf_unit == 1 */
@@ -143,6 +145,19 @@ void cacaosim_fpcam_accum_beam(
     const float          *d_beam_amp);
 
 /**
+ * cacaosim_fpcam_accum_beam_poly() - Propagate 1 or N_lambda [OPD_c, Amp_c] channels into camera
+ */
+void cacaosim_fpcam_accum_beam_poly(
+    cacaosim_fpcam_ctx_t *ctx,
+    const float          *beam_opd,
+    const float          *beam_amp,
+    uint32_t              beam_nlam,
+    uint64_t              chan_stride,
+    const float          *ncpa_opd,
+    const float          *d_beam_opd,
+    const float          *d_beam_amp);
+
+/**
  * cacaosim_fpcam_readout() - Finalize exposure, update Strehl/long-exp, and run detector readout
  */
 void cacaosim_fpcam_readout(
@@ -185,6 +200,13 @@ void cacaosim_fpcam_cuda_accum(cacaosim_fpcam_ctx_t *ctx,
                                const float          *d_wf_opd_ext,
                                const float          *d_dm_opd_ext,
                                float                 wf_to_opd);
+void cacaosim_fpcam_cuda_accum_poly(cacaosim_fpcam_ctx_t *ctx,
+                                    const float          *beam_opd,
+                                    const float          *beam_amp,
+                                    uint32_t              beam_nlam,
+                                    uint64_t              chan_stride,
+                                    const float          *d_beam_opd,
+                                    const float          *d_beam_amp);
 void cacaosim_fpcam_cuda_readout(cacaosim_fpcam_ctx_t     *ctx,
                                  const cacaosim_det_cfg_t *det_live,
                                  float                    *host_exp_int,

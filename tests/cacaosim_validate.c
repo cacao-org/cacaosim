@@ -2042,6 +2042,861 @@ static void test_bench_configurator_and_tui(void)
     check_cond(tui_ascii_ok, "cacaosim-CTRL 5 views 7-bit ASCII render", detail);
 }
 
+/* 13. Custom 2D & 3D polychromatic pupil/focal/Lyot amplitude & phase masks (CPU + CUDA + FITS) */
+static void test_custom_coro_masks_and_poly_cube(void)
+{
+    printf("\n=== 13. Custom Pupil/Focal Amplitude & Phase Masks + 3D Polychromatic Cubes ===\n");
+    char detail[160];
+    char err[256];
+
+    const uint32_t nwf  = 64u;
+    const uint64_t npix = (uint64_t) nwf * nwf;
+    const float    pdia = 0.875f;
+
+    /* 13a. 3D FITS cube writer/reader round-trip with spectral WCS keywords */
+    const uint32_t nz_test     = 5u;
+    const float    lam_wcs[5]  = { 1.485f, 1.5675f, 1.650f, 1.7325f, 1.815f };
+    const size_t   cube_n      = 32u * 32u * nz_test;
+    float         *cube_src    = (float *) cacaosim_aligned_calloc(cube_n, sizeof(float));
+    const char    *fits_rt_pth = "/tmp/cacaosim_val_3dcube_rt.fits";
+
+    for (size_t i = 0; i < cube_n; i++)
+    {
+        cube_src[i] = 0.5f + 0.4f * sinf(0.13f * (float) i);
+    }
+    int save_ok = (cacaosim_mask_save_fits(fits_rt_pth, cube_src, 32u, 32u, nz_test, lam_wcs) == 0);
+    cacaosim_mask_cube_t loaded = { 0 };
+    int load_ok = save_ok && (cacaosim_mask_load(fits_rt_pth, 0, &loaded, err, sizeof(err)) == 0);
+    double rt_err  = (load_ok && loaded.data) ? rel_l2_f32(cube_src, loaded.data, cube_n) : 1.0;
+    float  lam_err = 0.0f;
+    if (load_ok && loaded.has_wcs_lam && loaded.nz == nz_test)
+    {
+        for (uint32_t c = 0; c < nz_test; c++)
+        {
+            float de = fabsf(loaded.lam_um[c] - lam_wcs[c]);
+            if (de > lam_err)
+            {
+                lam_err = de;
+            }
+        }
+    }
+    else
+    {
+        lam_err = 1.0f;
+    }
+    snprintf(detail, sizeof(detail), "32x32x%u FITS rel_L2=%.2e, max_dlam=%.2e um", loaded.nz,
+             rt_err, lam_err);
+    check_cond(load_ok && loaded.nx == 32u && loaded.ny == 32u && loaded.nz == nz_test &&
+                   loaded.has_wcs_lam && rt_err < 1e-7 && lam_err < 1e-5f,
+               "3D polychromatic FITS mask WCS round-trip", detail);
+    cacaosim_mask_free(&loaded);
+    remove(fits_rt_pth);
+    free(cube_src);
+
+    /* Common entrance pupil and test aberration */
+    float *pup = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+    float *wf  = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+    cacaosim_pupil_cfg_t pcfg = { .nwf = nwf, .pup_diam = pdia, .cobs = 0.0f };
+    cacaosim_make_pupil(&pcfg, pup);
+    cacaosim_make_ncpa(nwf, pdia, pup, 0.06f, 2026ULL, wf);
+
+    /* 13b. Custom 2D focal amp+phase MFT vs analytic PHASE_DIMPLE & custom FFT vs analytic 4QPM */
+    const uint32_t nmft   = 48u;
+    const float    r_ld   = 2.5f;
+    const float    fov    = 2.4f * r_ld;
+    const float    px_ld  = (float) nmft / fov;
+    float         *c_famp = (float *) cacaosim_aligned_calloc((size_t) nmft * nmft, sizeof(float));
+    float         *c_fpha = (float *) cacaosim_aligned_calloc((size_t) nmft * nmft, sizeof(float));
+    const float    du_mft = 1.0f / px_ld;
+    const float    c_mft  = 0.5f * (float) (nmft - 1u);
+
+    for (uint32_t v = 0; v < nmft; v++)
+    {
+        float vc = ((float) v - c_mft) * du_mft;
+        for (uint32_t u = 0; u < nmft; u++)
+        {
+            float uc   = ((float) u - c_mft) * du_mft;
+            int   hits = 0;
+            for (int sy = 0; sy < 8; sy++)
+            {
+                float vs = vc + (((float) sy + 0.5f) / 8.0f - 0.5f) * du_mft;
+                for (int sx = 0; sx < 8; sx++)
+                {
+                    float us = uc + (((float) sx + 0.5f) / 8.0f - 0.5f) * du_mft;
+                    if (us * us + vs * vs <= r_ld * r_ld)
+                    {
+                        hits++;
+                    }
+                }
+            }
+            float w              = (float) hits / 64.0f;
+            float re             = 1.0f + w * (-0.30f - 1.0f);
+            c_famp[v * nmft + u] = fabsf(re);
+            c_fpha[v * nmft + u] = (re < 0.0f) ? CACAOSIM_PI_F : 0.0f;
+        }
+    }
+
+    cacaosim_coro_cfg_t ref_dcfg = {
+        .nwf           = nwf,
+        .mode          = CACAOSIM_CORO_PHASE_DIMPLE,
+        .n_mft         = nmft,
+        .pup_diam      = pdia,
+        .lambda_um     = 1.65f,
+        .fpm_rad_ld    = r_ld,
+        .fpm_amp       = 0.30f,
+        .fpm_phase_rad = CACAOSIM_PI_F,
+        .lowfs_refl    = 0.90f,
+        .lyot_outer    = 0.85f,
+        .backend       = CACAOSIM_BACKEND_CPU,
+    };
+    cacaosim_coro_cfg_t cus_mcfg  = ref_dcfg;
+    cus_mcfg.mode                 = CACAOSIM_CORO_CUSTOM_MFT;
+    cus_mcfg.fpm_pixscale_ld      = px_ld;
+    cacaosim_coro_masks_t m_dimp  = { 0 };
+    m_dimp.fpm_amp                = cacaosim_mask_view_2d(c_famp, nmft, nmft);
+    m_dimp.fpm_pha                = cacaosim_mask_view_2d(c_fpha, nmft, nmft);
+
+    cacaosim_coro_ctx_t ctx_ref_d, ctx_cus_m;
+    cacaosim_coro_init(&ctx_ref_d, &ref_dcfg, NULL, NULL);
+    cacaosim_coro_init_masks(&ctx_cus_m, &cus_mcfg, &m_dimp, NULL);
+
+    float *o_opd1 = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+    float *o_amp1 = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+    float *o_opd2 = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+    float *o_amp2 = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+    cacaosim_coro_step_cpu(&ctx_ref_d, wf, pup, o_opd1, o_amp1, NULL, NULL);
+    cacaosim_coro_step_cpu(&ctx_cus_m, wf, pup, o_opd2, o_amp2, NULL, NULL);
+    double err_mft = rel_l2_f32(o_amp1, o_amp2, npix);
+
+    /* Phase-only custom FFT mask reproducing analytic 4QPM */
+    const uint32_t nfft    = nwf * 4u;
+    float         *qpm_pha = (float *) cacaosim_aligned_calloc((size_t) nfft * nfft, sizeof(float));
+    const float    c_fft   = 0.5f * (float) (nfft - 1u);
+    for (uint32_t v = 0; v < nfft; v++)
+    {
+        float fy = (float) v - c_fft;
+        for (uint32_t u = 0; u < nfft; u++)
+        {
+            float fx              = (float) u - c_fft;
+            qpm_pha[v * nfft + u] = (fx * fy < 0.0f) ? CACAOSIM_PI_F : 0.0f;
+        }
+    }
+    cacaosim_coro_cfg_t ref_qcfg = {
+        .nwf        = nwf,
+        .mode       = CACAOSIM_CORO_4QPM,
+        .pad_factor = 4u,
+        .pup_diam   = pdia,
+        .lambda_um  = 1.65f,
+        .lyot_outer = 0.85f,
+        .backend    = CACAOSIM_BACKEND_CPU,
+    };
+    cacaosim_coro_cfg_t   cus_fcfg = ref_qcfg;
+    cus_fcfg.mode                  = CACAOSIM_CORO_CUSTOM_FFT;
+    cacaosim_coro_masks_t m_qpm    = { 0 };
+    m_qpm.fpm_pha                  = cacaosim_mask_view_2d(qpm_pha, nfft, nfft);
+
+    cacaosim_coro_ctx_t ctx_ref_q, ctx_cus_f;
+    cacaosim_coro_init(&ctx_ref_q, &ref_qcfg, NULL, NULL);
+    cacaosim_coro_init_masks(&ctx_cus_f, &cus_fcfg, &m_qpm, NULL);
+    cacaosim_coro_step_cpu(&ctx_ref_q, wf, pup, o_opd1, o_amp1, NULL, NULL);
+    cacaosim_coro_step_cpu(&ctx_cus_f, wf, pup, o_opd2, o_amp2, NULL, NULL);
+    double err_fft = rel_l2_f32(o_amp1, o_amp2, npix);
+
+    snprintf(detail, sizeof(detail), "MFT vs dimple=%.2e, FFT phase-only vs 4QPM=%.2e", err_mft,
+             err_fft);
+    check_cond(err_mft < 1e-5 && err_fft < 1e-5,
+               "Custom 2D focal amp+phase MFT & FFT exact match", detail);
+
+    cacaosim_coro_free(&ctx_cus_f);
+    cacaosim_coro_free(&ctx_ref_q);
+    cacaosim_coro_free(&ctx_cus_m);
+    cacaosim_coro_free(&ctx_ref_d);
+    free(qpm_pha);
+    free(c_fpha);
+    free(c_famp);
+
+    /* 13c. Custom pupil-plane apodizer (amp + OPD) + Lyot (amp + OPD) in skip_fpm mode */
+    float *p_amp = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+    float *p_opd = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+    float *l_amp = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+    float *l_opd = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+    float  c_wf  = 0.5f * (float) (nwf - 1u);
+    for (uint32_t y = 0; y < nwf; y++)
+    {
+        for (uint32_t x = 0; x < nwf; x++)
+        {
+            float rx            = ((float) x - c_wf) / (0.5f * pdia * (float) nwf);
+            float ry            = ((float) y - c_wf) / (0.5f * pdia * (float) nwf);
+            float r2            = rx * rx + ry * ry;
+            size_t idx          = (size_t) y * nwf + x;
+            p_amp[idx]          = expf(-0.6f * r2);
+            p_opd[idx]          = 0.08f * rx;
+            l_amp[idx]          = (r2 <= 0.75f) ? 0.90f : 0.0f;
+            l_opd[idx]          = -0.05f * ry;
+        }
+    }
+    cacaosim_coro_cfg_t ponly_cfg = {
+        .nwf           = nwf,
+        .mode          = CACAOSIM_CORO_CUSTOM_MFT,
+        .pup_diam      = pdia,
+        .lambda_um     = 1.65f,
+        .mask_pha_unit = 1, /* OPD [um] */
+        .backend       = CACAOSIM_BACKEND_CPU,
+    };
+    cacaosim_coro_masks_t m_ponly = { 0 };
+    m_ponly.pup_amp               = cacaosim_mask_view_2d(p_amp, nwf, nwf);
+    m_ponly.pup_pha               = cacaosim_mask_view_2d(p_opd, nwf, nwf);
+    m_ponly.lyot_amp              = cacaosim_mask_view_2d(l_amp, nwf, nwf);
+    m_ponly.lyot_pha              = cacaosim_mask_view_2d(l_opd, nwf, nwf);
+
+    cacaosim_coro_ctx_t ctx_ponly;
+    cacaosim_coro_init_masks(&ctx_ponly, &ponly_cfg, &m_ponly, NULL);
+    cacaosim_coro_step_cpu(&ctx_ponly, wf, pup, o_opd1, o_amp1, NULL, NULL);
+
+    double err_pamp = 0.0;
+    double err_popd = 0.0;
+    for (uint64_t i = 0; i < npix; i++)
+    {
+        float exp_a = pup[i] * p_amp[i] * l_amp[i];
+        err_pamp += (double) (o_amp1[i] - exp_a) * (double) (o_amp1[i] - exp_a);
+        if (exp_a > 0.1f)
+        {
+            float exp_o = wf[i] + p_opd[i] + l_opd[i];
+            err_popd += (double) (o_opd1[i] - exp_o) * (double) (o_opd1[i] - exp_o);
+        }
+    }
+    err_pamp = sqrt(err_pamp / (double) npix);
+    err_popd = sqrt(err_popd / (double) npix);
+    snprintf(detail, sizeof(detail), "skip_fpm=%d, rmse_amp=%.2e, rmse_opd=%.2e um",
+             ctx_ponly.skip_fpm, err_pamp, err_popd);
+    check_cond(ctx_ponly.skip_fpm == 1 && err_pamp < 1e-6 && err_popd < 1e-6,
+               "Custom pupil & Lyot amp+OPD apodizer (skip_fpm)", detail);
+    cacaosim_coro_free(&ctx_ponly);
+
+    /* 13d. Polychromatic 3D [Nx, Ny, Nlambda] pupil + focal cubes in .bench DAG (CPU & CUDA) */
+    const uint32_t nl3          = 5u;
+    const uint32_t nfft3        = nwf * 2u;
+    const float    lam3[5]      = { 1.485f, 1.5675f, 1.650f, 1.7325f, 1.815f };
+    float         *pup3_amp     = (float *) cacaosim_aligned_calloc(npix * nl3, sizeof(float));
+    float         *fpm3_achrom  = (float *) cacaosim_aligned_calloc(
+        (size_t) nfft3 * nfft3 * nl3, sizeof(float));
+    float         *fpm2_chrom   = (float *) cacaosim_aligned_calloc(
+        (size_t) nfft3 * nfft3, sizeof(float));
+    float         *fpm3_mft_amp = (float *) cacaosim_aligned_calloc(32u * 32u * nl3, sizeof(float));
+    float         *fpm3_mft_pha = (float *) cacaosim_aligned_calloc(32u * 32u * nl3, sizeof(float));
+
+    const float c_f3 = 0.5f * (float) (nfft3 - 1u);
+    for (uint32_t v = 0; v < nfft3; v++)
+    {
+        float fy = (float) v - c_f3;
+        for (uint32_t u = 0; u < nfft3; u++)
+        {
+            float fx = (float) u - c_f3;
+            /* Chromatic 2D half-wave plate OPD: 0.5 * lambda0 -> phase = pi * (lambda0 / lambda) */
+            fpm2_chrom[v * nfft3 + u] = (fx * fy < 0.0f) ? (0.5f * 1.65f) : 0.0f;
+            for (uint32_t c = 0; c < nl3; c++)
+            {
+                /* Achromatic 3D cube: exact half-wave OPD 0.5 * lambda_c in every slice! */
+                fpm3_achrom[((size_t) c * nfft3 + v) * nfft3 + u] =
+                    (fx * fy < 0.0f) ? (0.5f * lam3[c]) : 0.0f;
+            }
+        }
+    }
+    for (uint32_t c = 0; c < nl3; c++)
+    {
+        /* Wavelength-dependent pupil apodization cube across 3rd axis */
+        float alpha = 0.15f + 0.03f * (float) c;
+        for (uint32_t y = 0; y < nwf; y++)
+        {
+            for (uint32_t x = 0; x < nwf; x++)
+            {
+                float rx = ((float) x - c_wf) / (0.5f * pdia * (float) nwf);
+                float ry = ((float) y - c_wf) / (0.5f * pdia * (float) nwf);
+                pup3_amp[(size_t) c * npix + (size_t) y * nwf + x] =
+                    1.0f - alpha * 0.2f * (rx * rx + ry * ry);
+            }
+        }
+        /* 3D MFT focal mask cube for CPU/CUDA parity test */
+        for (uint32_t v = 0; v < 32u; v++)
+        {
+            float vy = ((float) v - 15.5f) / 6.0f;
+            for (uint32_t u = 0; u < 32u; u++)
+            {
+                float ux = ((float) u - 15.5f) / 6.0f;
+                float r  = hypotf(ux, vy);
+                size_t idx = ((size_t) c * 32u + v) * 32u + u;
+                fpm3_mft_amp[idx] = (r < 2.2f) ? (0.15f + 0.04f * (float) c) : 1.0f;
+                fpm3_mft_pha[idx] = (r < 2.2f) ? (0.5f * lam3[c]) : 0.0f;
+            }
+        }
+    }
+
+    const char *pth_p3   = "/tmp/cacaosim_val_pup3d.fits";
+    const char *pth_f3   = "/tmp/cacaosim_val_fpm3d_achrom.fits";
+    const char *pth_f2   = "/tmp/cacaosim_val_fpm2d_chrom.fits";
+    const char *pth_m3a  = "/tmp/cacaosim_val_mft3d_amp.fits";
+    const char *pth_m3p  = "/tmp/cacaosim_val_mft3d_pha.fits";
+    cacaosim_mask_save_fits(pth_p3, pup3_amp, nwf, nwf, nl3, lam3);
+    cacaosim_mask_save_fits(pth_f3, fpm3_achrom, nfft3, nfft3, nl3, lam3);
+    cacaosim_mask_save_fits(pth_f2, fpm2_chrom, nfft3, nfft3, 1u, NULL);
+    cacaosim_mask_save_fits(pth_m3a, fpm3_mft_amp, 32u, 32u, nl3, lam3);
+    cacaosim_mask_save_fits(pth_m3p, fpm3_mft_pha, 32u, 32u, nl3, lam3);
+
+    char bench_achrom[2048];
+    char bench_chrom[2048];
+    snprintf(bench_achrom, sizeof(bench_achrom),
+             "[bench]\nname = \"poly_3d_coro\"\nnwf = %u\npup_diam = %.4f\ncobs = 0.0\n"
+             "nspider = 0\nbackend = \"cpu\"\nout_beam = \"b0\"\n"
+             "[coro.c0]\nin = \"b0\"\nout = \"b1\"\nmode = \"custom_fft\"\npad_factor = 2\n"
+             "lambda_um = 1.65\nbw_frac = 0.20\npha_unit = \"um\"\n"
+             "in_pup_amp = \"%s\"\nin_fpm_pha = \"%s\"\nlyot_outer = 0.82\nlyot_obs = 0.0\n"
+             "lyot_nspider = 0\n"
+             "[fpcam.sci]\nin = \"b1\"\nout_cam = \"sci_cam\"\nncam = 64\nlambda_um = 1.65\n"
+             "bw_frac = 0.20\npixscale_ld = 3.0\nphoton_noise = 0\nron_e = 0.0\nbias_adu = 0.0\n"
+             "out_dtype = \"float32\"\n",
+             nwf, pdia, pth_p3, pth_f3);
+
+    snprintf(bench_chrom, sizeof(bench_chrom),
+             "[bench]\nname = \"poly_2d_chrom\"\nnwf = %u\npup_diam = %.4f\ncobs = 0.0\n"
+             "nspider = 0\nbackend = \"cpu\"\nout_beam = \"b0\"\n"
+             "[coro.c0]\nin = \"b0\"\nout = \"b1\"\nmode = \"custom_fft\"\npad_factor = 2\n"
+             "lambda_um = 1.65\nbw_frac = 0.20\nnlambda = 5\npha_unit = \"um\"\n"
+             "in_pup_amp = \"%s\"\nin_fpm_pha = \"%s\"\nlyot_outer = 0.82\nlyot_obs = 0.0\n"
+             "lyot_nspider = 0\n"
+             "[fpcam.sci]\nin = \"b1\"\nout_cam = \"sci_cam\"\nncam = 64\nlambda_um = 1.65\n"
+             "bw_frac = 0.20\npixscale_ld = 3.0\nphoton_noise = 0\nron_e = 0.0\nbias_adu = 0.0\n"
+             "out_dtype = \"float32\"\n",
+             nwf, pdia, pth_p3, pth_f2);
+
+    cacaosim_bench_cfg_t cfg_3d, cfg_2d;
+    cacaosim_bench_ctx_t ctx_3d, ctx_2d;
+    cacaosim_bench_parse_str(bench_achrom, &cfg_3d, err, sizeof(err));
+    cacaosim_bench_parse_str(bench_chrom, &cfg_2d, err, sizeof(err));
+
+    int ok_3d = (cacaosim_bench_init(&ctx_3d, &cfg_3d, NULL, 0, err, sizeof(err)) == 0);
+    int ok_2d = (cacaosim_bench_init(&ctx_2d, &cfg_2d, NULL, 0, err, sizeof(err)) == 0);
+
+    double core_3d = 1.0, core_2d = 0.0;
+    if (ok_3d && ok_2d)
+    {
+        cacaosim_bench_step(&ctx_3d, NULL, NULL, 0.0f, NULL);
+        cacaosim_bench_step(&ctx_2d, NULL, NULL, 0.0f, NULL);
+        const float *psf_3d = cacaosim_bench_sensor_f32(&ctx_3d, 0);
+        const float *psf_2d = cacaosim_bench_sensor_f32(&ctx_2d, 0);
+        core_3d             = 0.0;
+        core_2d             = 0.0;
+        /* Integrate inner 2x2 central PSF core around optical axis (31..32, 31..32) */
+        for (int yy = 30; yy <= 33; yy++)
+        {
+            for (int xx = 30; xx <= 33; xx++)
+            {
+                core_3d += (double) psf_3d[yy * 64 + xx];
+                core_2d += (double) psf_2d[yy * 64 + xx];
+            }
+        }
+    }
+    double gain_achrom = (core_3d > 0.0) ? (core_2d / core_3d) : 0.0;
+    snprintf(detail, sizeof(detail), "eff_nlam=%d, broadband core leakage ratio 2D/3D=%.1fx",
+             ok_3d ? ctx_3d.nodes[0].coro_ctx.eff_nlam : 0, gain_achrom);
+    check_cond(ok_3d && ok_2d && ctx_3d.nodes[0].coro_ctx.eff_nlam == 5 &&
+                   ctx_3d.nodes[1].fpcam_ctx.cfg.nlambda == 5 && gain_achrom > 25.0,
+               "3D polychromatic FITS mask broadband suppression", detail);
+
+    /* 13e. 3D polychromatic CPU vs CUDA parity for both CUSTOM_FFT and CUSTOM_MFT */
+    if (cacaosim_cuda_available() && ok_3d)
+    {
+        cacaosim_bench_cfg_t cfg_3d_gpu = cfg_3d;
+        cfg_3d_gpu.backend              = CACAOSIM_BACKEND_CUDA;
+        cacaosim_bench_ctx_t ctx_3d_gpu;
+        int ok_g1 = (cacaosim_bench_init(&ctx_3d_gpu, &cfg_3d_gpu, NULL, 0, err, sizeof(err)) == 0);
+        if (ok_g1)
+        {
+            cacaosim_bench_step(&ctx_3d, wf, NULL, 1.0f, NULL);
+            cacaosim_bench_step(&ctx_3d_gpu, wf, NULL, 1.0f, NULL);
+            double err_psf_fft = rel_l2_f32(cacaosim_bench_sensor_f32(&ctx_3d, 0),
+                                            cacaosim_bench_sensor_f32(&ctx_3d_gpu, 0), 64u * 64u);
+            cacaosim_bench_free(&ctx_3d_gpu);
+
+            /* Also test 3D CUSTOM_MFT (3D pupil amp + 3D focal amp + 3D focal phase) CPU vs GPU */
+            cacaosim_bench_cfg_t cfg_m3_cpu = cfg_3d;
+            cfg_m3_cpu.nodes[0].coro.mode            = CACAOSIM_CORO_CUSTOM_MFT;
+            cfg_m3_cpu.nodes[0].coro.fpm_pixscale_ld = 6.0f;
+            snprintf(cfg_m3_cpu.nodes[0].in_fpm_amp, sizeof(cfg_m3_cpu.nodes[0].in_fpm_amp), "%s",
+                     pth_m3a);
+            snprintf(cfg_m3_cpu.nodes[0].in_fpm_pha, sizeof(cfg_m3_cpu.nodes[0].in_fpm_pha), "%s",
+                     pth_m3p);
+            cacaosim_bench_cfg_t cfg_m3_gpu = cfg_m3_cpu;
+            cfg_m3_gpu.backend              = CACAOSIM_BACKEND_CUDA;
+
+            cacaosim_bench_ctx_t ctx_mc, ctx_mg;
+            cacaosim_bench_init(&ctx_mc, &cfg_m3_cpu, NULL, 0, err, sizeof(err));
+            cacaosim_bench_init(&ctx_mg, &cfg_m3_gpu, NULL, 0, err, sizeof(err));
+            cacaosim_bench_step(&ctx_mc, wf, NULL, 1.0f, NULL);
+            cacaosim_bench_step(&ctx_mg, wf, NULL, 1.0f, NULL);
+            double err_psf_mft = rel_l2_f32(cacaosim_bench_sensor_f32(&ctx_mc, 0),
+                                            cacaosim_bench_sensor_f32(&ctx_mg, 0), 64u * 64u);
+            cacaosim_bench_free(&ctx_mg);
+            cacaosim_bench_free(&ctx_mc);
+
+            snprintf(detail, sizeof(detail), "3D PSF rel_L2: FFT=%.2e, MFT=%.2e", err_psf_fft,
+                     err_psf_mft);
+            check_cond(err_psf_fft < 5e-5 && err_psf_mft < 5e-5,
+                       "3D polychromatic coro+fpcam CPU vs CUDA parity", detail);
+        }
+    }
+
+    if (ok_3d)
+    {
+        cacaosim_bench_free(&ctx_3d);
+    }
+    if (ok_2d)
+    {
+        cacaosim_bench_free(&ctx_2d);
+    }
+    remove(pth_p3);
+    remove(pth_f3);
+    remove(pth_f2);
+    remove(pth_m3a);
+    remove(pth_m3p);
+    free(fpm3_mft_pha);
+    free(fpm3_mft_amp);
+    free(fpm2_chrom);
+    free(fpm3_achrom);
+    free(pup3_amp);
+    free(l_opd);
+    free(l_amp);
+    free(p_opd);
+    free(p_amp);
+    free(o_amp2);
+    free(o_opd2);
+    free(o_amp1);
+    free(o_opd1);
+    free(wf);
+    free(pup);
+}
+
+/* 14. CORO+LOWFS dual pickoff options, static WFE [OPD m] & cacaosim-CTRL optical scale panel */
+static void test_coro_lowfs_wfe_and_scales(void)
+{
+    printf("\n=== 14. CORO+LOWFS Dual Pickoff, Static WFE [OPD m] & TUI Pixel Scales ===\n");
+    char detail[160];
+    char err[256];
+
+    const uint32_t nwf  = 64u;
+    const uint64_t npix = (uint64_t) nwf * nwf;
+    const float    pdia = 0.875f;
+
+    float *pup    = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+    float *wf     = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+    float *sc_opd = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+    float *sc_amp = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+    float *lo_opd = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+    float *lo_amp = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+
+    cacaosim_pupil_cfg_t pcfg = { .nwf = nwf, .pup_diam = pdia, .cobs = 0.0f };
+    cacaosim_make_pupil(&pcfg, pup);
+    cacaosim_make_ncpa(nwf, pdia, pup, 0.05f, 4040ULL, wf);
+
+    /* 14a. Option (1): Reflective Lyot stop (lyot_refl) vs Option (2) on phase-only Vortex */
+    cacaosim_coro_cfg_t vcfg_fpm = {
+        .nwf            = nwf,
+        .mode           = CACAOSIM_CORO_VORTEX,
+        .pad_factor     = 4u,
+        .pup_diam       = pdia,
+        .lambda_um      = 1.65f,
+        .vortex_charge  = 2,
+        .lowfs_mode     = CACAOSIM_LOWFS_FPM_REFL,
+        .lowfs_pup_diam = 1.0f,
+        .lowfs_refl     = 0.90f,
+        .lyot_outer     = 0.82f,
+        .backend        = CACAOSIM_BACKEND_CPU,
+    };
+    cacaosim_coro_cfg_t vcfg_lyot = vcfg_fpm;
+    vcfg_lyot.lowfs_mode          = CACAOSIM_LOWFS_LYOT_REFL;
+
+    cacaosim_coro_ctx_t vctx_fpm, vctx_lyot;
+    cacaosim_coro_init(&vctx_fpm, &vcfg_fpm, NULL, NULL);
+    cacaosim_coro_init(&vctx_lyot, &vcfg_lyot, NULL, NULL);
+
+    memset(wf, 0, npix * sizeof(float));
+    cacaosim_coro_step_cpu(&vctx_fpm, wf, pup, sc_opd, sc_amp, lo_opd, lo_amp);
+    double e_vortex_fpm = 0.0;
+    for (uint64_t p = 0; p < npix; p++)
+    {
+        e_vortex_fpm += (double) lo_amp[p] * (double) lo_amp[p];
+    }
+
+    cacaosim_coro_step_cpu(&vctx_lyot, wf, pup, sc_opd, sc_amp, lo_opd, lo_amp);
+    double e_vortex_lyot = 0.0;
+    double e_pup_in      = 0.0;
+    for (uint64_t p = 0; p < npix; p++)
+    {
+        e_vortex_lyot += (double) lo_amp[p] * (double) lo_amp[p];
+        e_pup_in += (double) pup[p] * (double) pup[p];
+    }
+    cacaosim_coro_free(&vctx_fpm);
+    cacaosim_coro_free(&vctx_lyot);
+
+    /* Also verify exact Lyot power partition |L|^2 + (1 - |L|^2) == 1 in skip_fpm mode */
+    float               *p_apod     = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+    cacaosim_coro_cfg_t  sk_cfg     = vcfg_lyot;
+    sk_cfg.mode                     = CACAOSIM_CORO_CUSTOM_MFT;
+    sk_cfg.lowfs_refl               = 1.0f;
+    for (uint64_t p = 0; p < npix; p++)
+    {
+        p_apod[p] = 1.0f;
+    }
+    cacaosim_coro_masks_t sk_m = { 0 };
+    sk_m.pup_amp               = cacaosim_mask_view_2d(p_apod, nwf, nwf);
+    cacaosim_coro_ctx_t sk_ctx;
+    cacaosim_coro_init_masks(&sk_ctx, &sk_cfg, &sk_m, NULL);
+    cacaosim_make_ncpa(nwf, pdia, pup, 0.05f, 4040ULL, wf);
+    cacaosim_coro_step_cpu(&sk_ctx, wf, pup, sc_opd, sc_amp, lo_opd, lo_amp);
+    double lyot_part_err = 0.0;
+    for (uint64_t p = 0; p < npix; p++)
+    {
+        double ein  = (double) pup[p] * (double) pup[p];
+        double esum = (double) sc_amp[p] * (double) sc_amp[p] +
+                      (double) lo_amp[p] * (double) lo_amp[p];
+        lyot_part_err += (esum - ein) * (esum - ein);
+    }
+    lyot_part_err = sqrt(lyot_part_err / (double) npix);
+    cacaosim_coro_free(&sk_ctx);
+    free(p_apod);
+
+    snprintf(detail, sizeof(detail),
+             "Vortex fpm/Ein=%.1e, lyot_refl/Ein=%.3f, part_rmse=%.2e",
+             e_vortex_fpm / e_pup_in, e_vortex_lyot / e_pup_in, lyot_part_err);
+    check_cond((e_vortex_fpm / e_pup_in) < 1e-8 && (e_vortex_lyot / e_pup_in) > 0.25 &&
+                   lyot_part_err < 1e-6,
+               "CORO Option 1: Reflective Lyot stop LOWFS", detail);
+
+    /* 14b. Option (2): Reflective FPM (absorbed light reflected) + lowfs_pup_diam stop */
+    cacaosim_coro_cfg_t lcfg_full = {
+        .nwf            = nwf,
+        .mode           = CACAOSIM_CORO_LYOT_SPOT,
+        .n_mft          = 40u,
+        .pup_diam       = pdia,
+        .lambda_um      = 1.65f,
+        .fpm_rad_ld     = 3.0f,
+        .fpm_amp        = 0.20f,
+        .lowfs_mode     = CACAOSIM_LOWFS_FPM_REFL,
+        .lowfs_pup_diam = 1.00f,
+        .lowfs_refl     = 1.00f,
+        .lyot_outer     = 0.85f,
+        .backend        = CACAOSIM_BACKEND_CPU,
+    };
+    cacaosim_coro_cfg_t lcfg_mid  = lcfg_full;
+    lcfg_mid.lowfs_pup_diam       = 0.75f;
+    cacaosim_coro_cfg_t lcfg_stop = lcfg_full;
+    lcfg_stop.lowfs_pup_diam      = 0.45f;
+
+    cacaosim_coro_ctx_t lctx_full, lctx_mid, lctx_stop;
+    cacaosim_coro_init(&lctx_full, &lcfg_full, NULL, NULL);
+    cacaosim_coro_init(&lctx_mid, &lcfg_mid, NULL, NULL);
+    cacaosim_coro_init(&lctx_stop, &lcfg_stop, NULL, NULL);
+
+    cacaosim_coro_step_cpu(&lctx_full, wf, pup, sc_opd, sc_amp, lo_opd, lo_amp);
+    double e_lo_100 = 0.0;
+    for (uint64_t p = 0; p < npix; p++)
+    {
+        e_lo_100 += (double) lo_amp[p] * (double) lo_amp[p];
+    }
+
+    cacaosim_coro_step_cpu(&lctx_mid, wf, pup, sc_opd, sc_amp, lo_opd, lo_amp);
+    double e_lo_075 = 0.0;
+    for (uint64_t p = 0; p < npix; p++)
+    {
+        e_lo_075 += (double) lo_amp[p] * (double) lo_amp[p];
+    }
+
+    cacaosim_coro_step_cpu(&lctx_stop, wf, pup, sc_opd, sc_amp, lo_opd, lo_amp);
+    double e_lo_045    = 0.0;
+    double leak_outside = 0.0;
+    float  c_wf        = 0.5f * (float) (nwf - 1u);
+    float  r_stop_px   = 0.5f * pdia * 0.45f * (float) nwf + 1.5f;
+    for (uint32_t y = 0; y < nwf; y++)
+    {
+        for (uint32_t x = 0; x < nwf; x++)
+        {
+            uint64_t p = (uint64_t) y * nwf + x;
+            double   e = (double) lo_amp[p] * (double) lo_amp[p];
+            e_lo_045 += e;
+            if (hypotf((float) x - c_wf, (float) y - c_wf) > r_stop_px)
+            {
+                leak_outside += e;
+            }
+        }
+    }
+    cacaosim_coro_free(&lctx_stop);
+    cacaosim_coro_free(&lctx_mid);
+    cacaosim_coro_free(&lctx_full);
+
+    snprintf(detail, sizeof(detail), "E(1.00D)=%.1f > E(0.75D)=%.1f > E(0.45D)=%.1f, leak=%.1e",
+             e_lo_100, e_lo_075, e_lo_045, leak_outside);
+    check_cond(e_lo_100 > e_lo_075 && e_lo_075 > e_lo_045 && e_lo_045 > 10.0 &&
+                   leak_outside < 1e-12,
+               "CORO Option 2: FPM-refl + lowfs_pup_diam stop", detail);
+
+    /* 14c. CPU vs CUDA parity on both LOWFS modes (MFT fpm_refl, FFT fpm_refl, FFT lyot_refl) */
+    if (cacaosim_cuda_available())
+    {
+        float *g_sc_opd = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+        float *g_sc_amp = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+        float *g_lo_opd = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+        float *g_lo_amp = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+
+        /* 1) MFT Lyot spot + fpm_refl + lowfs_pup_diam=0.72 */
+        cacaosim_coro_cfg_t c1_cpu = lcfg_mid;
+        c1_cpu.lowfs_pup_diam      = 0.72f;
+        cacaosim_coro_cfg_t c1_gpu = c1_cpu;
+        c1_gpu.backend             = CACAOSIM_BACKEND_CUDA;
+        cacaosim_coro_ctx_t x1_c, x1_g;
+        cacaosim_coro_init(&x1_c, &c1_cpu, NULL, NULL);
+        cacaosim_coro_init(&x1_g, &c1_gpu, NULL, NULL);
+        cacaosim_coro_step_cpu(&x1_c, wf, pup, sc_opd, sc_amp, lo_opd, lo_amp);
+        cacaosim_coro_step_beam(&x1_g, wf, pup, g_sc_opd, g_sc_amp, g_lo_opd, g_lo_amp, NULL, NULL,
+                                NULL, NULL, NULL, NULL);
+        double err_mft_fpm = rel_l2_f32(lo_amp, g_lo_amp, npix);
+        cacaosim_coro_free(&x1_g);
+        cacaosim_coro_free(&x1_c);
+
+        /* 2) Custom FFT focal amplitude spot + fpm_refl + lowfs_pup_diam=0.75 */
+        const uint32_t nfft2 = nwf * 2u;
+        float         *fft_a = (float *) cacaosim_aligned_calloc(
+            (size_t) nfft2 * nfft2, sizeof(float));
+        float cf2 = 0.5f * (float) (nfft2 - 1u);
+        for (uint32_t v = 0; v < nfft2; v++)
+        {
+            for (uint32_t u = 0; u < nfft2; u++)
+            {
+                float r               = hypotf((float) u - cf2, (float) v - cf2);
+                fft_a[v * nfft2 + u]  = (r <= 5.5f) ? 0.15f : 1.0f;
+            }
+        }
+        cacaosim_coro_cfg_t c2_cpu = {
+            .nwf            = nwf,
+            .mode           = CACAOSIM_CORO_CUSTOM_FFT,
+            .pad_factor     = 2u,
+            .pup_diam       = pdia,
+            .lambda_um      = 1.65f,
+            .lowfs_mode     = CACAOSIM_LOWFS_FPM_REFL,
+            .lowfs_pup_diam = 0.75f,
+            .lowfs_refl     = 0.95f,
+            .lyot_outer     = 0.84f,
+            .backend        = CACAOSIM_BACKEND_CPU,
+        };
+        cacaosim_coro_cfg_t   c2_gpu = c2_cpu;
+        c2_gpu.backend               = CACAOSIM_BACKEND_CUDA;
+        cacaosim_coro_masks_t m2     = { 0 };
+        m2.fpm_amp                   = cacaosim_mask_view_2d(fft_a, nfft2, nfft2);
+        cacaosim_coro_ctx_t x2_c, x2_g;
+        cacaosim_coro_init_masks(&x2_c, &c2_cpu, &m2, NULL);
+        cacaosim_coro_init_masks(&x2_g, &c2_gpu, &m2, NULL);
+        cacaosim_coro_step_cpu(&x2_c, wf, pup, sc_opd, sc_amp, lo_opd, lo_amp);
+        cacaosim_coro_step_beam(&x2_g, wf, pup, g_sc_opd, g_sc_amp, g_lo_opd, g_lo_amp, NULL, NULL,
+                                NULL, NULL, NULL, NULL);
+        double err_fft_fpm = rel_l2_f32(lo_amp, g_lo_amp, npix);
+        cacaosim_coro_free(&x2_g);
+        cacaosim_coro_free(&x2_c);
+        free(fft_a);
+
+        /* 3) Vortex FFT + lyot_refl */
+        cacaosim_coro_cfg_t c3_cpu = vcfg_lyot;
+        cacaosim_coro_cfg_t c3_gpu = c3_cpu;
+        c3_gpu.backend             = CACAOSIM_BACKEND_CUDA;
+        cacaosim_coro_ctx_t x3_c, x3_g;
+        cacaosim_coro_init(&x3_c, &c3_cpu, NULL, NULL);
+        cacaosim_coro_init(&x3_g, &c3_gpu, NULL, NULL);
+        cacaosim_coro_step_cpu(&x3_c, wf, pup, sc_opd, sc_amp, lo_opd, lo_amp);
+        cacaosim_coro_step_beam(&x3_g, wf, pup, g_sc_opd, g_sc_amp, g_lo_opd, g_lo_amp, NULL, NULL,
+                                NULL, NULL, NULL, NULL);
+        double err_fft_lyot = rel_l2_f32(lo_amp, g_lo_amp, npix);
+        cacaosim_coro_free(&x3_g);
+        cacaosim_coro_free(&x3_c);
+
+        snprintf(detail, sizeof(detail), "MFT_fpm=%.2e, FFT_fpm=%.2e, FFT_lyot=%.2e",
+                 err_mft_fpm, err_fft_fpm, err_fft_lyot);
+        check_cond(err_mft_fpm < 5e-5 && err_fft_fpm < 5e-5 && err_fft_lyot < 5e-5,
+                   "CORO+LOWFS dual modes CPU vs CUDA parity", detail);
+
+        free(g_lo_amp);
+        free(g_lo_opd);
+        free(g_sc_amp);
+        free(g_sc_opd);
+    }
+
+    /* 14d. Static Wavefront Error [OPD m]: synthesis, Maréchal Strehl, .bench round-trip & CUDA */
+    float *wfe_m = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+    const float target_rms_m = 80.0e-9f;
+    cacaosim_make_wfe_m(nwf, pdia, pup, target_rms_m, 1.6f, 2026ULL, wfe_m);
+
+    double w_sum = 0.0, w_mean = 0.0, w_var = 0.0;
+    for (uint64_t p = 0; p < npix; p++)
+    {
+        double w = (double) pup[p];
+        w_sum += w;
+        w_mean += w * (double) wfe_m[p];
+    }
+    w_mean /= w_sum;
+    for (uint64_t p = 0; p < npix; p++)
+    {
+        double w = (double) pup[p];
+        double d = (double) wfe_m[p] - w_mean;
+        w_var += w * d * d;
+    }
+    double meas_rms_m = sqrt(w_var / w_sum);
+    double rms_rel    = fabs(meas_rms_m - (double) target_rms_m) / (double) target_rms_m;
+    snprintf(detail, sizeof(detail), "target=%.2e m, measured=%.2e m, rel_err=%.2e",
+             (double) target_rms_m, meas_rms_m, rms_rel);
+    check_cond(rms_rel < 1e-5 && fabs(w_mean) < 1e-12,
+               "cacaosim_make_wfe_m pupil RMS in [meter]", detail);
+
+    const char *wfe_bench_txt =
+        "[bench]\n"
+        "name = \"wfe_opd_meter_test\"\n"
+        "nwf = 64\n"
+        "pup_diam = 0.875\n"
+        "cobs = 0.0\n"
+        "nspider = 0\n"
+        "backend = \"cpu\"\n"
+        "out_beam = \"b_in\"\n"
+        "[wfe.stat0]\n"
+        "in = \"b_in\"\n"
+        "out = \"b_wfe\"\n"
+        "in_wfe = \"csim_val_wfe_m\"\n"
+        "rms_nm = 80.0\n"
+        "psd_alpha = 1.6\n"
+        "wfe_gain = 1.0\n"
+        "wfe_seed = 2026\n"
+        "[coro.c0]\n"
+        "in = \"b_wfe\"\n"
+        "out = \"b_sci\"\n"
+        "out_lowfs = \"b_lo\"\n"
+        "mode = \"lyot_spot\"\n"
+        "lowfs_mode = \"lyot_refl\"\n"
+        "lowfs_pup_diam = 0.80\n"
+        "[zwfs.lo]\n"
+        "in = \"b_lo\"\n"
+        "out_cam = \"lo_cam\"\n"
+        "ncam = 32\n"
+        "photon_noise = 0\n"
+        "ron_e = 0.0\n"
+        "out_dtype = \"float32\"\n"
+        "[fpcam.sci]\n"
+        "in = \"b_wfe\"\n"
+        "out_cam = \"sci_cam\"\n"
+        "ncam = 64\n"
+        "lambda_um = 1.65\n"
+        "bw_frac = 0.01\n"
+        "nlambda = 1\n"
+        "pixscale_ld = 3.0\n"
+        "photon_noise = 0\n"
+        "ron_e = 0.0\n"
+        "bias_adu = 0.0\n"
+        "out_dtype = \"float32\"\n";
+
+    cacaosim_bench_cfg_t wcfg0, wcfg1;
+    char                 wfmt[8192];
+    int wp_ok = (cacaosim_bench_parse_str(wfe_bench_txt, &wcfg0, err, sizeof(err)) == 0);
+    int wf_ln = wp_ok ? cacaosim_bench_format_str(&wcfg0, wfmt, sizeof(wfmt)) : -1;
+    int wr_ok = (wf_ln > 0 && cacaosim_bench_parse_str(wfmt, &wcfg1, err, sizeof(err)) == 0 &&
+                 wcfg1.nodes[0].kind == CACAOSIM_NODE_WFE &&
+                 fabsf(wcfg1.nodes[0].wfe_rms_nm - 80.0f) < 1e-4f &&
+                 wcfg1.nodes[1].coro.lowfs_mode == CACAOSIM_LOWFS_LYOT_REFL &&
+                 fabsf(wcfg1.nodes[1].coro.lowfs_pup_diam - 0.80f) < 1e-4f);
+
+    cacaosim_bench_ctx_t wctx;
+    int wi_ok = wr_ok && (cacaosim_bench_init(&wctx, &wcfg1, NULL, 0, err, sizeof(err)) == 0);
+    float sr_80nm = 0.0f;
+    float sr_zero = 0.0f;
+    double sr_mar = exp(-pow(2.0 * M_PI * 0.080 / 1.65, 2.0));
+    double wfe_gpu_err = 0.0;
+
+    if (wi_ok)
+    {
+        cacaosim_bench_step(&wctx, NULL, NULL, 0.0f, NULL);
+        sr_80nm = wctx.last_strehl_inst;
+
+        wctx.nodes[0].cfg.wfe_gain = 0.0f;
+        cacaosim_bench_step(&wctx, NULL, NULL, 0.0f, NULL);
+        sr_zero = wctx.last_strehl_inst;
+        wctx.nodes[0].cfg.wfe_gain = 1.0f;
+        cacaosim_bench_step(&wctx, NULL, NULL, 0.0f, NULL);
+
+        if (cacaosim_cuda_available())
+        {
+            cacaosim_bench_cfg_t wcfg_gpu = wcfg1;
+            wcfg_gpu.backend              = CACAOSIM_BACKEND_CUDA;
+            cacaosim_bench_ctx_t wctx_gpu;
+            if (cacaosim_bench_init(&wctx_gpu, &wcfg_gpu, NULL, 0, err, sizeof(err)) == 0)
+            {
+                cacaosim_bench_step(&wctx_gpu, NULL, NULL, 0.0f, NULL);
+                int s_sci = cacaosim_bench_find_sensor(&wctx, "sci");
+                wfe_gpu_err = rel_l2_f32(cacaosim_bench_sensor_f32(&wctx, s_sci),
+                                         cacaosim_bench_sensor_f32(&wctx_gpu, s_sci), 64u * 64u);
+                cacaosim_bench_free(&wctx_gpu);
+            }
+        }
+        cacaosim_bench_free(&wctx);
+    }
+
+    /* Also test topological add/move/clone/remove of CACAOSIM_NODE_WFE */
+    cacaosim_bench_cfg_t ecfg;
+    cacaosim_bench_ctx_t ectx;
+    cacaosim_bench_preset(&ecfg, CACAOSIM_PRESET_SINGLE_PYRWFS);
+    int iw   = cacaosim_bench_add_node(&ecfg, CACAOSIM_NODE_WFE, 0, 0, NULL);
+    int ic   = (iw >= 0) ? cacaosim_bench_clone_node(&ecfg, (uint32_t) iw) : -1;
+    int im   = (iw >= 0) ? cacaosim_bench_move_node(&ecfg, (uint32_t) iw, -1) : -1;
+    int ed_ok = (iw >= 0 && ic >= 0 && im == 0 &&
+                 cacaosim_bench_analyze(&ectx, &ecfg, err, sizeof(err)) == 0 &&
+                 cacaosim_bench_remove_node(&ecfg, 0u) == 0 &&
+                 cacaosim_bench_analyze(&ectx, &ecfg, err, sizeof(err)) == 0);
+
+    snprintf(detail, sizeof(detail), "SR(0)=%.3f, SR(80nm)=%.3f (Mar=%.3f), gpu_err=%.2e, ed=%d",
+             sr_zero, sr_80nm, sr_mar, wfe_gpu_err, ed_ok);
+    check_cond(wi_ok && ed_ok && fabsf(sr_zero - 1.0f) < 1e-4f &&
+                   fabs((double) sr_80nm - sr_mar) < 0.015 && wfe_gpu_err < 5e-5,
+               "Static WFE [wfe.<id>] OPD [m] DAG, CUDA & edit", detail);
+
+    /* 14e. cacaosim-CTRL lower-left pupil panel: Array, Beam [pix], [m/pix], [l/D/pix], ["/pix] */
+    cacaosim_bench_cfg_t scfg;
+    cacaosim_bench_preset(&scfg, CACAOSIM_PRESET_TWO_STAGE);
+    /* TWO_STAGE: nwf=128, pup_diam=0.9375 (120.0 pix), tel_diam_m=8.2 (0.0683 m/pix),
+     * sci_h: lambda_um=1.65, pixscale_ld=3.0 -> 0.333 l/D/pix, 0.0138 arcsec/pix @1.65um */
+    char *sbuf = (char *) malloc(65536u);
+    int   sc_ok = 0;
+    if (sbuf != NULL)
+    {
+        int n_b = cacaosim_tui_render_headless(&scfg, CACAOSIM_TUI_VIEW_BUILDER, 128, 38, 1, sbuf,
+                                               65536u);
+        int ok_b = (n_b > 1500 && strstr(sbuf, "128x128 pix") != NULL &&
+                    strstr(sbuf, "120.0 pix") != NULL && strstr(sbuf, "0.0683 m/pix") != NULL &&
+                    strstr(sbuf, "0.333 l/D/pix") != NULL &&
+                    strstr(sbuf, "0.0138 arcsec/pix @1.65um") != NULL);
+
+        int n_s = cacaosim_tui_render_headless(&scfg, CACAOSIM_TUI_VIEW_SCHEMATIC, 128, 38, 1, sbuf,
+                                               65536u);
+        int ok_s = (n_s > 1500 && strstr(sbuf, "128x128 pix") != NULL &&
+                    strstr(sbuf, "120.0 pix") != NULL && strstr(sbuf, "0.0683 m/pix") != NULL &&
+                    strstr(sbuf, "0.333 l/D/pix") != NULL &&
+                    strstr(sbuf, "0.0138 arcsec/pix @1.65um") != NULL);
+        sc_ok = ok_b && ok_s;
+        snprintf(detail, sizeof(detail),
+                 "128x128 pix, 120.0 pix, 0.0683 m/pix, 0.333 l/D/pix, 0.0138 arcsec/pix");
+        free(sbuf);
+    }
+    check_cond(sc_ok, "cacaosim-CTRL pupil & focal pixel scale panel", detail);
+
+    free(wfe_m);
+    free(lo_amp);
+    free(lo_opd);
+    free(sc_amp);
+    free(sc_opd);
+    free(wf);
+    free(pup);
+}
+
 int main(void)
 {
     printf("======================================================================\n");
@@ -2060,6 +2915,8 @@ int main(void)
     test_zwfs_and_coro_physics();
     test_multistage_bench_dag();
     test_bench_configurator_and_tui();
+    test_custom_coro_masks_and_poly_cube();
+    test_coro_lowfs_wfe_and_scales();
 
     printf("\n======================================================================\n");
     printf("  Summary: %d passed, %d failed\n", g_pass, g_fail);

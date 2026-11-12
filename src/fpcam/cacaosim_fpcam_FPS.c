@@ -71,7 +71,7 @@ static float    param_strehl_ave                             = 0.0f;
       FPFLAG_DEFAULT_INPUT | FPFLAG_TRIGGER_STREAM,                                     \
       "Input 2D DM OPD stream [um] (optional trigger)")                                 \
     X(".in_beam", param_in_beam, FPTYPE_STRING, 0, FPFLAG_DEFAULT_INPUT,                \
-      "Optional 3D [nwf x nwf x 2] input optical beam stream (e.g. post-coronagraph)")  \
+      "Optional 3D [nwf x nwf x 2*N] input optical beam stream (e.g. post-coronagraph)")\
     X(".in_wf", param_in_wf, FPTYPE_STRING, 0, FPFLAG_DEFAULT_INPUT,                    \
       "Optional atmospheric WF stream (e.g. outarraypha from milkatmturb)")             \
     X(".in_amp", param_in_amp, FPTYPE_STRING, 0, FPFLAG_DEFAULT_INPUT,                  \
@@ -95,7 +95,7 @@ static float    param_strehl_ave                             = 0.0f;
     X(".bw_frac", &param_bw_frac, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,              \
       "Fractional bandpass dlambda/lambda0 (default: 0.0)")                             \
     X(".nlambda", &param_nlambda, FPTYPE_INT32, 0, FPFLAG_DEFAULT_INPUT,                \
-      "Polychromatic spectral channels (1..16, default: 1)")                            \
+      "Polychromatic spectral channels (1..32, default: 1)")                            \
     X(".pixscale_ld", &param_pixscale_ld, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,      \
       "Focal sampling [pixels per lambda0/D] in MFT mode (default: 3.0)")               \
     X(".qe", &param_qe, FPTYPE_FLOAT32, 0,                                              \
@@ -319,6 +319,33 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
         },
     };
 
+    if (img_beam.ID != -1 && cfg.nlambda <= 1)
+    {
+        uint32_t b_nwl = 1u;
+        float    b_wl0 = 0.0f;
+        float    b_wl1 = 0.0f;
+        if (cacaosim_beam_shm_read_poly_kw(img_beam.im, &b_nwl, &b_wl0, &b_wl1) && b_nwl > 1u)
+        {
+            if (b_nwl > CACAOSIM_FPCAM_MAX_LAMBDA)
+            {
+                b_nwl = CACAOSIM_FPCAM_MAX_LAMBDA;
+            }
+            cfg.nlambda     = (int32_t) b_nwl;
+            cfg.has_ext_lam = 1;
+            for (uint32_t c = 0; c < b_nwl; c++)
+            {
+                float t = (b_nwl > 1u) ? ((float) c / (float) (b_nwl - 1u)) : 0.0f;
+                cfg.ext_lam_um[c] =
+                    (b_wl0 > 0.05f && b_wl1 > 0.05f) ? (b_wl0 + (b_wl1 - b_wl0) * t)
+                                                     : param_lambda_um;
+            }
+            if (cfg.lambda_um <= 0.05f && b_wl0 > 0.05f && b_wl1 > 0.05f)
+            {
+                cfg.lambda_um = 0.5f * (b_wl0 + b_wl1);
+            }
+        }
+    }
+
     cacaosim_fpcam_ctx_t fp_ctx;
     if (cacaosim_fpcam_init(&fp_ctx, &cfg, pup_ptr, ncpa_ptr, NULL) != 0)
     {
@@ -340,7 +367,8 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
     float *reg_buf = NULL;
     if (!cacaosim_reg_is_identity(&reg))
     {
-        reg_buf = (float *) cacaosim_aligned_calloc(npix * 2u, sizeof(float));
+        reg_buf = (float *) cacaosim_aligned_calloc(
+            (size_t) CACAOSIM_FPCAM_MAX_LAMBDA * npix * 2u, sizeof(float));
     }
 
     struct timespec deadline;
@@ -378,16 +406,28 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
         float eff_flux = param_flux_ph;
         if (img_beam.ID != -1 && cacaosim_beam_shm_is_valid(img_beam.im, nwf))
         {
-            const float *b_opd = img_beam.im->array.F;
-            const float *b_amp = img_beam.im->array.F + npix;
+            uint32_t b_nwl = (img_beam.md->size[2] >= 4u) ? (img_beam.md->size[2] / 2u) : 1u;
+            if (b_nwl > CACAOSIM_FPCAM_MAX_LAMBDA)
+            {
+                b_nwl = CACAOSIM_FPCAM_MAX_LAMBDA;
+            }
+            const float *b_opd    = img_beam.im->array.F;
+            const float *b_amp    = img_beam.im->array.F + npix;
+            uint64_t     b_stride = npix * 2u;
             if (reg_buf != NULL)
             {
-                cacaosim_beam_relay_cpu(b_opd, b_amp, NULL, NULL, &reg, nwf, reg_buf,
-                                        reg_buf + npix);
+                for (uint32_t c = 0; c < b_nwl; c++)
+                {
+                    cacaosim_beam_relay_cpu(b_opd + (uint64_t) c * b_stride,
+                                            b_amp + (uint64_t) c * b_stride, NULL, NULL, &reg, nwf,
+                                            reg_buf + (uint64_t) c * b_stride,
+                                            reg_buf + (uint64_t) c * b_stride + npix);
+                }
                 b_opd = reg_buf;
                 b_amp = reg_buf + npix;
             }
-            cacaosim_fpcam_accum_beam(&fp_ctx, b_opd, b_amp, ncpa_ptr, NULL, NULL);
+            cacaosim_fpcam_accum_beam_poly(&fp_ctx, b_opd, b_amp, b_nwl, b_stride, ncpa_ptr, NULL,
+                                           NULL);
 
             cacaosim_spec_t b_spec;
             if (param_use_beam_flux && param_flux_ph >= 0.0f &&

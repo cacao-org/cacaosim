@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include "bench/cacaosim_tui_internal.h"
+#include "common/cacaosim_mask.h"
 
 static void shm_dir_path(char *out, size_t cap)
 {
@@ -255,12 +256,26 @@ static void probe_fps_file(cs_shm_mon_t *mon, const char *shm_dir, const char *f
     munmap(addr, map_len);
 }
 
+static void register_mask_shm(
+    cs_shm_mon_t *mon,
+    const char   *spec,
+    const char   *role,
+    const char   *owner)
+{
+    if (spec != NULL && spec[0] != '\0' && !cacaosim_mask_is_fits_path(spec))
+    {
+        register_stream(mon, spec, role, owner, 1);
+    }
+}
+
 static int is_relevant_extra_shm(const char *stem)
 {
     return (strncmp(stem, "csim_", 5) == 0 || strncmp(stem, "aol", 3) == 0 ||
             strncmp(stem, "dm", 2) == 0 || strncmp(stem, "ttm", 3) == 0 ||
             strncmp(stem, "lowfs", 5) == 0 || strncmp(stem, "b_", 2) == 0 ||
-            strcmp(stem, "outarraypha") == 0);
+            strncmp(stem, "wfe", 3) == 0 || strstr(stem, "_wfe") != NULL ||
+            strncmp(stem, "apod", 4) == 0 || strncmp(stem, "fpm", 3) == 0 ||
+            strncmp(stem, "lyot", 4) == 0 || strcmp(stem, "outarraypha") == 0);
 }
 
 static int is_relevant_fps(const char *stem)
@@ -323,6 +338,19 @@ void cs_shm_scan(cs_shm_mon_t *mon, const cacaosim_bench_cfg_t *cfg, int force)
                      nd->kind == CACAOSIM_NODE_ZWFS)
             {
                 register_stream(mon, nd->out_cam, "wfs_cam", nd->id, 1);
+            }
+            else if (nd->kind == CACAOSIM_NODE_CORO)
+            {
+                register_mask_shm(mon, nd->in_pup_amp, "pup_amp", nd->id);
+                register_mask_shm(mon, nd->in_pup_pha, "pup_pha", nd->id);
+                register_mask_shm(mon, nd->in_fpm_amp, "fpm_amp", nd->id);
+                register_mask_shm(mon, nd->in_fpm_pha, "fpm_pha", nd->id);
+                register_mask_shm(mon, nd->in_lyot, "lyot_amp", nd->id);
+                register_mask_shm(mon, nd->in_lyot_pha, "lyot_pha", nd->id);
+            }
+            else if (nd->kind == CACAOSIM_NODE_WFE)
+            {
+                register_stream(mon, nd->in_wfe, "wfe_opd_m", nd->id, 1);
             }
         }
     }
@@ -543,12 +571,46 @@ int cs_tui_exec_mkpupil(cs_tui_app_t *app)
              app->cfg.spider_w, app->cfg.spider_deg, pup_name);
 
     char last[200];
-    int  rc = run_logged_cmd(app, cmd, last, sizeof(last));
+    int  rc    = run_logged_cmd(app, cmd, last, sizeof(last));
+    int  n_wfe = 0;
+
+    if (rc == 0)
+    {
+        char wfe_bin[512];
+        locate_tool(app->opts.exe_dir, "milk-fpsexec-cacaosim-wfe", wfe_bin, sizeof(wfe_bin));
+        for (uint32_t i = 0; i < app->cfg.n_nodes; i++)
+        {
+            const cacaosim_node_cfg_t *nd = &app->cfg.nodes[i];
+            if (nd->kind == CACAOSIM_NODE_WFE && nd->in_wfe[0] != '\0')
+            {
+                char wcmd[1024];
+                snprintf(wcmd, sizeof(wcmd),
+                         "\"%.420s\" --no-procinfo exec .init_only=ON .nwf=%u .pup_diam=%.6g"
+                         " .in_pup=\"%.60s\" .in_wfe=\"%.60s\" .rms_nm=%.4g .psd_alpha=%.4g"
+                         " .wfe_seed=%llu 2>&1",
+                         wfe_bin, app->cfg.nwf, app->cfg.pup_diam, pup_name, nd->in_wfe,
+                         nd->wfe_rms_nm, nd->wfe_alpha, (unsigned long long) nd->wfe_seed);
+                if (run_logged_cmd(app, wcmd, last, sizeof(last)) == 0)
+                {
+                    n_wfe++;
+                }
+            }
+        }
+    }
+
     cs_shm_scan(&app->shm, &app->cfg, 1);
     if (rc == 0)
     {
-        cs_tui_log(app, 1, "Generated %ux%u anti-aliased pupil stream '%s'", app->cfg.nwf,
-                   app->cfg.nwf, pup_name);
+        if (n_wfe > 0)
+        {
+            cs_tui_log(app, 1, "Generated %ux%u pupil '%s' + %d static WFE [m] stream(s)",
+                       app->cfg.nwf, app->cfg.nwf, pup_name, n_wfe);
+        }
+        else
+        {
+            cs_tui_log(app, 1, "Generated %ux%u anti-aliased pupil stream '%s'", app->cfg.nwf,
+                       app->cfg.nwf, pup_name);
+        }
     }
     else
     {

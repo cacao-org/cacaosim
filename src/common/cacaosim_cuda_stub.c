@@ -304,6 +304,24 @@ void cacaosim_fpcam_cuda_accum(
     (void) wf_to_opd;
 }
 
+void cacaosim_fpcam_cuda_accum_poly(
+    cacaosim_fpcam_ctx_t *ctx,
+    const float          *beam_opd,
+    const float          *beam_amp,
+    uint32_t              beam_nlam,
+    uint64_t              chan_stride,
+    const float          *d_beam_opd,
+    const float          *d_beam_amp)
+{
+    (void) ctx;
+    (void) beam_opd;
+    (void) beam_amp;
+    (void) beam_nlam;
+    (void) chan_stride;
+    (void) d_beam_opd;
+    (void) d_beam_amp;
+}
+
 void cacaosim_fpcam_cuda_readout(
     cacaosim_fpcam_ctx_t     *ctx,
     const cacaosim_det_cfg_t *det_live,
@@ -434,12 +452,15 @@ void cacaosim_coro_cuda_free(cacaosim_coro_ctx_t *ctx)
     (void) ctx;
 }
 
-void cacaosim_coro_cuda_step(
+void cacaosim_coro_cuda_step_poly(
     cacaosim_coro_ctx_t *ctx,
     const float         *h_in_opd,
     const float         *h_in_amp,
+    uint32_t             in_nlam,
+    uint64_t             in_stride,
     float               *h_out_opd,
     float               *h_out_amp,
+    uint64_t             out_stride,
     float               *h_lowfs_opd,
     float               *h_lowfs_amp,
     const float         *d_in_opd,
@@ -452,8 +473,11 @@ void cacaosim_coro_cuda_step(
     (void) ctx;
     (void) h_in_opd;
     (void) h_in_amp;
+    (void) in_nlam;
+    (void) in_stride;
     (void) h_out_opd;
     (void) h_out_amp;
+    (void) out_stride;
     (void) h_lowfs_opd;
     (void) h_lowfs_amp;
     (void) d_in_opd;
@@ -462,6 +486,28 @@ void cacaosim_coro_cuda_step(
     (void) d_out_amp;
     (void) d_lowfs_opd;
     (void) d_lowfs_amp;
+}
+
+void cacaosim_cuda_beam_apply_wfe(
+    const float          *d_in_opd,
+    const float          *d_in_amp,
+    const float          *d_wfe_opd,
+    float                 wfe_to_um,
+    const cacaosim_reg_t *reg,
+    uint32_t              nwf,
+    float                *d_out_opd,
+    float                *d_out_amp,
+    void                 *cuda_stream)
+{
+    (void) d_in_opd;
+    (void) d_in_amp;
+    (void) d_wfe_opd;
+    (void) wfe_to_um;
+    (void) reg;
+    (void) nwf;
+    (void) d_out_opd;
+    (void) d_out_amp;
+    (void) cuda_stream;
 }
 
 #endif /* !HAVE_CUDA */

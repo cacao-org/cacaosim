@@ -184,6 +184,27 @@ void cacaosim_beam_relay_cpu(
     float                *out_amp);
 
 /**
+ * cacaosim_beam_apply_wfe_cpu() - Add scaled static WFE OPD map (+ optional registration) on CPU
+ * @in_opd:    Input pupil OPD [um]
+ * @in_amp:    Input pupil amplitude
+ * @wfe_opd:   Static wavefront error map (e.g. in [meter])
+ * @wfe_to_um: Conversion & gain scale to microns (1.0e6f * wfe_gain for [meter] -> [um])
+ * @reg:       Optional 2D affine pupil registration (NULL = identity)
+ * @nwf:       Grid size [pixels]
+ * @out_opd:   Output pupil OPD [um]
+ * @out_amp:   Output pupil amplitude
+ */
+void cacaosim_beam_apply_wfe_cpu(
+    const float          *in_opd,
+    const float          *in_amp,
+    const float          *wfe_opd,
+    float                 wfe_to_um,
+    const cacaosim_reg_t *reg,
+    uint32_t              nwf,
+    float                *out_opd,
+    float                *out_amp);
+
+/**
  * cacaosim_beam_shm_init_kw() - Initialize fixed-slot CSIM_BM/S00..S31 keywords on a 3D SHM image
  */
 void cacaosim_beam_shm_init_kw(IMAGE *im);
@@ -205,11 +226,31 @@ int cacaosim_beam_shm_read_spec(
     cacaosim_spec_t *spec);
 
 /**
- * cacaosim_beam_shm_is_valid() - Return 1 if @im is a valid [nwf x nwf x 2] FLOAT32 beam stream
+ * cacaosim_beam_shm_is_valid() - Return 1 if @im is a valid [nwf x nwf x 2*N] FLOAT32 beam stream
  */
 int cacaosim_beam_shm_is_valid(
     const IMAGE *im,
     uint32_t     nwf);
+
+/**
+ * cacaosim_beam_shm_write_poly_kw() - Record multi-wavelength [OPD_c, Amp_c] cube metadata in SHM
+ */
+void cacaosim_beam_shm_write_poly_kw(
+    IMAGE   *im,
+    uint32_t nwl,
+    float    wl0_um,
+    float    wl1_um);
+
+/**
+ * cacaosim_beam_shm_read_poly_kw() - Query multi-wavelength channel count & endpoints from SHM
+ *
+ * Return: 1 if @im carries >1 coherent wavelength channels, 0 if monochromatic.
+ */
+int cacaosim_beam_shm_read_poly_kw(
+    const IMAGE *im,
+    uint32_t    *nwl_out,
+    float       *wl0_out,
+    float       *wl1_out);
 
 #ifdef __cplusplus
 }

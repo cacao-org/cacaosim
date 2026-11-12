@@ -54,6 +54,8 @@ __global__ static void k_fpcam_build_epup_batch(
     const float *__restrict__ pup_amp,
     const float *__restrict__ atm_amp,
     const float *__restrict__ wf_in,
+    uint32_t                  beam_nlam,
+    uint64_t                  chan_stride,
     const float *__restrict__ dm_opd,
     const float *__restrict__ ncpa_opd,
     const float *__restrict__ lam_um,
@@ -69,7 +71,14 @@ __global__ static void k_fpcam_build_epup_batch(
         return;
     }
 
-    float amp = (pup_amp != NULL) ? pup_amp[p] : 1.0f;
+    uint32_t bc = (beam_nlam <= 1u)
+                      ? 0u
+                      : ((beam_nlam == (uint32_t) nlam)
+                             ? (uint32_t) c
+                             : (((uint32_t) c * beam_nlam) / (uint32_t) nlam));
+    uint64_t b_idx = (uint64_t) bc * chan_stride + p;
+
+    float amp = (pup_amp != NULL) ? pup_amp[b_idx] : 1.0f;
     if (atm_amp != NULL)
     {
         amp *= atm_amp[p];
@@ -84,7 +93,7 @@ __global__ static void k_fpcam_build_epup_batch(
     float opd = 0.0f;
     if (wf_in != NULL)
     {
-        opd += wf_to_opd * wf_in[p];
+        opd += wf_to_opd * wf_in[b_idx];
     }
     if (dm_opd != NULL)
     {
@@ -191,9 +200,11 @@ extern "C" int cacaosim_fpcam_cuda_init(
     const int32_t  nlam     = ctx->eff_nlam;
 
     if (cudaMalloc((void **) &p->d_pup_amp, npix_wf * sizeof(float)) != cudaSuccess ||
-        cudaMalloc((void **) &p->d_dyn_pup, npix_wf * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void **) &p->d_dyn_pup, (size_t) nlam * npix_wf * sizeof(float)) !=
+            cudaSuccess ||
         cudaMalloc((void **) &p->d_atm_amp, npix_wf * sizeof(float)) != cudaSuccess ||
-        cudaMalloc((void **) &p->d_wf_in, npix_wf * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void **) &p->d_wf_in, (size_t) nlam * npix_wf * sizeof(float)) !=
+            cudaSuccess ||
         cudaMalloc((void **) &p->d_dm_opd, npix_wf * sizeof(float)) != cudaSuccess ||
         cudaMalloc((void **) &p->d_lam_um, (size_t) nlam * sizeof(float)) != cudaSuccess ||
         cudaMalloc((void **) &p->d_accum_int, npix_cam * sizeof(float)) != cudaSuccess ||
@@ -320,6 +331,79 @@ extern "C" void cacaosim_fpcam_cuda_reset_accum(cacaosim_fpcam_ctx_t *ctx)
     cudaMemsetAsync(p->d_accum_int, 0, ctx->npix_cam * sizeof(float), p->stream);
 }
 
+static void fpcam_cuda_run_prop(
+    cacaosim_fpcam_ctx_t *ctx,
+    const float          *d_pup,
+    const float          *d_amp,
+    const float          *d_wf,
+    uint32_t              dev_nlam,
+    uint64_t              dev_stride,
+    const float          *d_dm,
+    float                 wf_to_opd)
+{
+    fpcam_cuda_priv_t *p        = (fpcam_cuda_priv_t *) ctx->cuda_priv;
+    const uint64_t     npix_wf  = ctx->npix_wf;
+    const uint64_t     npix_cam = ctx->npix_cam;
+    const uint32_t     nwf      = ctx->cfg.nwf;
+    const uint32_t     ncam     = ctx->cfg.ncam;
+    const int32_t      nlam     = ctx->eff_nlam;
+
+    if (ctx->cfg.prop_mode == CACAOSIM_FPCAM_PROP_MFT)
+    {
+        dim3 blk(256, 1, 1);
+        dim3 grd((unsigned int) ((npix_wf + 255u) / 256u), (unsigned int) nlam, 1);
+        k_fpcam_build_epup_batch<<<grd, blk, 0, p->stream>>>(
+            d_pup, d_amp, d_wf, dev_nlam, dev_stride, d_dm, p->d_ncpa_opd, p->d_lam_um, wf_to_opd,
+            npix_wf, nlam, p->d_epup_batch);
+
+        const cuComplex one       = make_cuComplex(1.0f, 0.0f);
+        const cuComplex zero      = make_cuComplex(0.0f, 0.0f);
+        long long int   stride_ep = (long long int) npix_wf;
+        long long int   stride_uv = (long long int) ncam * nwf;
+        long long int   stride_ef = (long long int) npix_cam;
+
+        /* Row-major T[ncam x nwf] = U * Epup -> col-major T^T = Epup^T * U^T */
+        cublasCgemmStridedBatched(p->cublas, CUBLAS_OP_N, CUBLAS_OP_N, (int) nwf, (int) ncam,
+                                  (int) nwf, &one, p->d_epup_batch, (int) nwf, stride_ep,
+                                  p->d_mft_U, (int) nwf, stride_uv, &zero, p->d_mft_tmp, (int) nwf,
+                                  stride_uv, nlam);
+
+        /* Row-major Efoc[ncam x ncam] = T * V -> col-major Efoc^T = V^T * T^T */
+        cublasCgemmStridedBatched(p->cublas, CUBLAS_OP_N, CUBLAS_OP_N, (int) ncam, (int) ncam,
+                                  (int) nwf, &one, p->d_mft_V, (int) ncam, stride_uv, p->d_mft_tmp,
+                                  (int) nwf, stride_uv, &zero, p->d_efoc_batch, (int) ncam,
+                                  stride_ef, nlam);
+
+        uint32_t g1d = (uint32_t) ((npix_cam + 255u) / 256u);
+        k_fpcam_accum_mft_batch<<<g1d, 256, 0, p->stream>>>(p->d_efoc_batch, npix_cam, nlam,
+                                                            1.0f / (float) nlam, p->d_accum_int);
+    }
+    else
+    {
+        const float scale_i = 1.0f / ((float) nlam * ctx->pup_sum_amp * ctx->pup_sum_amp);
+        dim3        b2d(16, 16);
+        dim3        g2d((ncam + 15u) / 16u, (ncam + 15u) / 16u);
+
+        for (int32_t c = 0; c < nlam; c++)
+        {
+            uint32_t bc = (dev_nlam <= 1u)
+                              ? 0u
+                              : ((dev_nlam == (uint32_t) nlam)
+                                     ? (uint32_t) c
+                                     : (((uint32_t) c * dev_nlam) / (uint32_t) nlam));
+            const float *d_pup_c = (d_pup != NULL) ? (d_pup + (uint64_t) bc * dev_stride) : NULL;
+            const float *d_wf_c  = (d_wf != NULL) ? (d_wf + (uint64_t) bc * dev_stride) : NULL;
+            float        opd_to_rad = CACAOSIM_TWO_PI_F / ctx->lam_um[c];
+            cacaosim_cuda_build_pupil_padded(d_pup_c, d_amp, d_wf_c, d_dm, p->d_ncpa_opd,
+                                             wf_to_opd, opd_to_rad, nwf, ctx->nfft, p->d_fft_in,
+                                             p->stream);
+            cufftExecC2C(p->fft_fwd, p->d_fft_in, p->d_fft_out, CUFFT_FORWARD);
+            k_fpcam_accum_fft_crop<<<g2d, b2d, 0, p->stream>>>(p->d_fft_out, ctx->nfft, ncam,
+                                                               scale_i, p->d_accum_int);
+        }
+    }
+}
+
 extern "C" void cacaosim_fpcam_cuda_accum(
     cacaosim_fpcam_ctx_t *ctx,
     const float          *dyn_pup_amp,
@@ -331,12 +415,8 @@ extern "C" void cacaosim_fpcam_cuda_accum(
     const float          *d_dm_opd_ext,
     float                 wf_to_opd)
 {
-    fpcam_cuda_priv_t *p        = (fpcam_cuda_priv_t *) ctx->cuda_priv;
-    const uint64_t     npix_wf  = ctx->npix_wf;
-    const uint64_t     npix_cam = ctx->npix_cam;
-    const uint32_t     nwf      = ctx->cfg.nwf;
-    const uint32_t     ncam     = ctx->cfg.ncam;
-    const int32_t      nlam     = ctx->eff_nlam;
+    fpcam_cuda_priv_t *p       = (fpcam_cuda_priv_t *) ctx->cuda_priv;
+    const uint64_t     npix_wf = ctx->npix_wf;
 
     const float *d_pup = p->d_pup_amp;
     const float *d_amp = NULL;
@@ -381,53 +461,96 @@ extern "C" void cacaosim_fpcam_cuda_accum(
         d_dm = p->d_dm_opd;
     }
 
-    if (ctx->cfg.prop_mode == CACAOSIM_FPCAM_PROP_MFT)
+    fpcam_cuda_run_prop(ctx, d_pup, d_amp, d_wf, 1u, npix_wf, d_dm, wf_to_opd);
+}
+
+extern "C" void cacaosim_fpcam_cuda_accum_poly(
+    cacaosim_fpcam_ctx_t *ctx,
+    const float          *beam_opd,
+    const float          *beam_amp,
+    uint32_t              beam_nlam,
+    uint64_t              chan_stride,
+    const float          *d_beam_opd,
+    const float          *d_beam_amp)
+{
+    fpcam_cuda_priv_t *p        = (fpcam_cuda_priv_t *) ctx->cuda_priv;
+    const uint64_t     npix_wf  = ctx->npix_wf;
+    const size_t       wf_bytes = (size_t) npix_wf * sizeof(float);
+    const int32_t      nlam     = ctx->eff_nlam;
+
+    if (d_beam_opd != NULL || d_beam_amp != NULL)
     {
-        dim3 blk(256, 1, 1);
-        dim3 grd((unsigned int) ((npix_wf + 255u) / 256u), (unsigned int) nlam, 1);
-        k_fpcam_build_epup_batch<<<grd, blk, 0, p->stream>>>(
-            d_pup, d_amp, d_wf, d_dm, p->d_ncpa_opd, p->d_lam_um, wf_to_opd, npix_wf, nlam,
-            p->d_epup_batch);
-
-        const cuComplex one       = make_cuComplex(1.0f, 0.0f);
-        const cuComplex zero      = make_cuComplex(0.0f, 0.0f);
-        long long int   stride_ep = (long long int) npix_wf;
-        long long int   stride_uv = (long long int) ncam * nwf;
-        long long int   stride_ef = (long long int) npix_cam;
-
-        /* Row-major T[ncam x nwf] = U * Epup -> col-major T^T = Epup^T * U^T */
-        cublasCgemmStridedBatched(p->cublas, CUBLAS_OP_N, CUBLAS_OP_N, (int) nwf, (int) ncam,
-                                  (int) nwf, &one, p->d_epup_batch, (int) nwf, stride_ep,
-                                  p->d_mft_U, (int) nwf, stride_uv, &zero, p->d_mft_tmp, (int) nwf,
-                                  stride_uv, nlam);
-
-        /* Row-major Efoc[ncam x ncam] = T * V -> col-major Efoc^T = V^T * T^T */
-        cublasCgemmStridedBatched(p->cublas, CUBLAS_OP_N, CUBLAS_OP_N, (int) ncam, (int) ncam,
-                                  (int) nwf, &one, p->d_mft_V, (int) ncam, stride_uv, p->d_mft_tmp,
-                                  (int) nwf, stride_uv, &zero, p->d_efoc_batch, (int) ncam,
-                                  stride_ef, nlam);
-
-        uint32_t g1d = (uint32_t) ((npix_cam + 255u) / 256u);
-        k_fpcam_accum_mft_batch<<<g1d, 256, 0, p->stream>>>(p->d_efoc_batch, npix_cam, nlam,
-                                                            1.0f / (float) nlam, p->d_accum_int);
+        const float *d_pup = (d_beam_amp != NULL) ? d_beam_amp : p->d_pup_amp;
+        uint32_t     dn    = (beam_nlam >= 1u) ? beam_nlam : 1u;
+        fpcam_cuda_run_prop(ctx, d_pup, NULL, d_beam_opd, dn, chan_stride, NULL, 1.0f);
+        return;
     }
-    else
-    {
-        const float scale_i = 1.0f / ((float) nlam * ctx->pup_sum_amp * ctx->pup_sum_amp);
-        dim3        b2d(16, 16);
-        dim3        g2d((ncam + 15u) / 16u, (ncam + 15u) / 16u);
 
-        for (int32_t c = 0; c < nlam; c++)
+    const float *d_pup    = p->d_pup_amp;
+    const float *d_wf     = NULL;
+    uint32_t     dev_nlam = (beam_nlam <= 1u) ? 1u : (uint32_t) nlam;
+
+    if (beam_amp != NULL)
+    {
+        if (beam_nlam <= 1u)
         {
-            float opd_to_rad = CACAOSIM_TWO_PI_F / ctx->lam_um[c];
-            cacaosim_cuda_build_pupil_padded(d_pup, d_amp, d_wf, d_dm, p->d_ncpa_opd,
-                                             wf_to_opd, opd_to_rad, nwf, ctx->nfft, p->d_fft_in,
-                                             p->stream);
-            cufftExecC2C(p->fft_fwd, p->d_fft_in, p->d_fft_out, CUFFT_FORWARD);
-            k_fpcam_accum_fft_crop<<<g2d, b2d, 0, p->stream>>>(p->d_fft_out, ctx->nfft, ncam,
-                                                               scale_i, p->d_accum_int);
+            cudaMemcpyAsync(p->d_dyn_pup, beam_amp, wf_bytes, cudaMemcpyHostToDevice, p->stream);
         }
+        else if (beam_nlam == (uint32_t) nlam && chan_stride == npix_wf)
+        {
+            cudaMemcpyAsync(p->d_dyn_pup, beam_amp, (size_t) nlam * wf_bytes,
+                            cudaMemcpyHostToDevice, p->stream);
+        }
+        else if (beam_nlam == (uint32_t) nlam)
+        {
+            cudaMemcpy2DAsync(p->d_dyn_pup, wf_bytes, beam_amp,
+                              (size_t) chan_stride * sizeof(float), wf_bytes, (size_t) nlam,
+                              cudaMemcpyHostToDevice, p->stream);
+        }
+        else
+        {
+            for (int32_t c = 0; c < nlam; c++)
+            {
+                uint32_t bc = ((uint32_t) c * beam_nlam) / (uint32_t) nlam;
+                cudaMemcpyAsync(p->d_dyn_pup + (size_t) c * npix_wf,
+                                beam_amp + (uint64_t) bc * chan_stride, wf_bytes,
+                                cudaMemcpyHostToDevice, p->stream);
+            }
+        }
+        d_pup = p->d_dyn_pup;
     }
+
+    if (beam_opd != NULL)
+    {
+        if (beam_nlam <= 1u)
+        {
+            cudaMemcpyAsync(p->d_wf_in, beam_opd, wf_bytes, cudaMemcpyHostToDevice, p->stream);
+        }
+        else if (beam_nlam == (uint32_t) nlam && chan_stride == npix_wf)
+        {
+            cudaMemcpyAsync(p->d_wf_in, beam_opd, (size_t) nlam * wf_bytes, cudaMemcpyHostToDevice,
+                            p->stream);
+        }
+        else if (beam_nlam == (uint32_t) nlam)
+        {
+            cudaMemcpy2DAsync(p->d_wf_in, wf_bytes, beam_opd,
+                              (size_t) chan_stride * sizeof(float), wf_bytes, (size_t) nlam,
+                              cudaMemcpyHostToDevice, p->stream);
+        }
+        else
+        {
+            for (int32_t c = 0; c < nlam; c++)
+            {
+                uint32_t bc = ((uint32_t) c * beam_nlam) / (uint32_t) nlam;
+                cudaMemcpyAsync(p->d_wf_in + (size_t) c * npix_wf,
+                                beam_opd + (uint64_t) bc * chan_stride, wf_bytes,
+                                cudaMemcpyHostToDevice, p->stream);
+            }
+        }
+        d_wf = p->d_wf_in;
+    }
+
+    fpcam_cuda_run_prop(ctx, d_pup, NULL, d_wf, dev_nlam, npix_wf, NULL, 1.0f);
 }
 
 extern "C" void cacaosim_fpcam_cuda_readout(

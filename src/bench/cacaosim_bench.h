@@ -33,6 +33,7 @@ extern "C" {
 #define CACAOSIM_BENCH_MAX_DMS     16
 #define CACAOSIM_BENCH_MAX_SENSORS 16
 #define CACAOSIM_BENCH_NAME_LEN    64
+#define CACAOSIM_BENCH_PATH_LEN    256
 
 /**
  * @brief Optical node type in a declarative .bench DAG.
@@ -45,7 +46,8 @@ typedef enum
     CACAOSIM_NODE_PYRWFS   = 3, /**< 4-sided Pyramid WFS + camera ([pyrwfs.<id>]) */
     CACAOSIM_NODE_SHWFS    = 4, /**< Diffractive Shack-Hartmann WFS + camera ([shwfs.<id>]) */
     CACAOSIM_NODE_ZWFS     = 5, /**< Babinet MFT Zernike WFS + camera ([zwfs.<id>]) */
-    CACAOSIM_NODE_FPCAM    = 6  /**< Focal-plane science PSF camera ([fpcam.<id>]) */
+    CACAOSIM_NODE_FPCAM    = 6, /**< Focal-plane science PSF camera ([fpcam.<id>]) */
+    CACAOSIM_NODE_WFE      = 7  /**< Static wavefront error map in OPD [m] ([wfe.<id>]) */
 } cacaosim_node_kind_t;
 
 /**
@@ -63,26 +65,36 @@ typedef struct
     char                 out_trans[CACAOSIM_BENCH_NAME_LEN];
     char                 out_lowfs[CACAOSIM_BENCH_NAME_LEN];
 
-    /* Optional SHM stream names */
+    /* Optional SHM stream names and custom FITS/SHM mask specifiers */
     char                 in_cmd[CACAOSIM_BENCH_NAME_LEN];
     char                 out_opd[CACAOSIM_BENCH_NAME_LEN];
     char                 in_flat[CACAOSIM_BENCH_NAME_LEN];
+    char                 in_wfe[CACAOSIM_BENCH_NAME_LEN];
     char                 out_cam[CACAOSIM_BENCH_NAME_LEN];
     char                 out_long[CACAOSIM_BENCH_NAME_LEN];
     char                 in_ncpa[CACAOSIM_BENCH_NAME_LEN];
-    char                 in_lyot[CACAOSIM_BENCH_NAME_LEN];
+    char                 in_pup_amp[CACAOSIM_BENCH_PATH_LEN];
+    char                 in_pup_pha[CACAOSIM_BENCH_PATH_LEN];
+    char                 in_fpm_amp[CACAOSIM_BENCH_PATH_LEN];
+    char                 in_fpm_pha[CACAOSIM_BENCH_PATH_LEN];
+    char                 in_lyot[CACAOSIM_BENCH_PATH_LEN];
+    char                 in_lyot_pha[CACAOSIM_BENCH_PATH_LEN];
     char                 ncpa_refl[CACAOSIM_BENCH_NAME_LEN];
     char                 ncpa_trans[CACAOSIM_BENCH_NAME_LEN];
     char                 pup_refl[CACAOSIM_BENCH_NAME_LEN];
     char                 pup_trans[CACAOSIM_BENCH_NAME_LEN];
 
-    /* Throughput, cadence, photometry, and 2D registration */
+    /* Throughput, cadence, photometry, static WFE synthesis, and 2D registration */
     float                tput;
     uint32_t             navg;
     float                rate_hz;
     float                bw_frac;
     float                qe;
     int32_t              use_beam_flux;
+    float                wfe_rms_nm;
+    float                wfe_alpha;
+    float                wfe_gain;
+    uint64_t             wfe_seed;
     cacaosim_reg_t       reg;
     cacaosim_reg_t       reg_refl;
     cacaosim_reg_t       reg_trans;
@@ -135,6 +147,8 @@ typedef struct
 {
     char            name[CACAOSIM_BENCH_NAME_LEN];
     cacaosim_spec_t spec;
+    uint32_t        nlam;
+    float           lam_um[CACAOSIM_CORO_MAX_LAMBDA];
     float          *opd;
     float          *amp;
     float          *d_opd;
@@ -180,9 +194,12 @@ typedef struct
     float              *d_pup_refl;
     float              *d_pup_trans;
 
-    /* Host buffers when running in pure C mode (connect_shm == 0) */
+    /* Host buffers when running in pure C mode (connect_shm == 0) + device WFE map */
     float              *cmd_buf;
     float              *dm_opd_buf;
+    float              *wfe_m_buf;
+    float              *d_wfe_m;
+    uint64_t            wfe_cnt0;
     uint16_t           *cam_u16;
     float              *cam_f32;
     float              *long_f32;
@@ -191,6 +208,7 @@ typedef struct
     IMGID               img_cmd;
     IMGID               img_opd;
     IMGID               img_flat;
+    IMGID               img_wfe;
     IMGID               img_cam;
     IMGID               img_long;
     IMGID               img_ncpa;

@@ -159,6 +159,20 @@ void cacaosim_cuda_beam_relay(
     float                *d_out_amp,
     void                 *cuda_stream);
 
+/**
+ * cacaosim_cuda_beam_apply_wfe() - Add scaled static WFE OPD map (+ optional registration) on GPU
+ */
+void cacaosim_cuda_beam_apply_wfe(
+    const float          *d_in_opd,
+    const float          *d_in_amp,
+    const float          *d_wfe_opd,
+    float                 wfe_to_um,
+    const cacaosim_reg_t *reg,
+    uint32_t              nwf,
+    float                *d_out_opd,
+    float                *d_out_amp,
+    void                 *cuda_stream);
+
 #ifdef __cplusplus
 }
 #endif

@@ -349,7 +349,7 @@ typedef struct
     /* Inline parameter value editor */
     int                  editing;
     int                  edit_cursor;
-    char                 edit_buf[128];
+    char                 edit_buf[256];
     cs_param_desc_t      params[CS_MAX_PARAMS];
     int                  n_params;
 
@@ -533,6 +533,21 @@ void cs_tui_add_hit(
 
 void cs_tui_log(cs_tui_app_t *app, int level, const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));
+
+typedef struct
+{
+    float d_beam_px;
+    float pup_m_pix;
+    float foc_ld_pix;
+    float foc_arcsec_pix;
+    float ref_lam_um;
+    char  foc_src[24];
+} cs_optical_scales_t;
+
+void cs_tui_compute_scales(
+    const cacaosim_bench_cfg_t *cfg,
+    int                         sel_item,
+    cs_optical_scales_t        *out);
 
 void cs_tui_refresh_analysis(cs_tui_app_t *app);
 void cs_tui_render_frame(cs_tui_app_t *app);

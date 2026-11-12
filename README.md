@@ -16,16 +16,17 @@ simulator for `cacao`. It natively consumes live 2D phase and amplitude streams 
 
 ## Compute Units
 
-All 10 compute units use the `MILK_RUNNABLE` / `EXPORT_FPSEXEC` architecture on `milk`'s
+All 11 compute units use the `MILK_RUNNABLE` / `EXPORT_FPSEXEC` architecture on `milk`'s
 `feat/bash-engine` branch with zero `libCLIcore` dependency in standalone `milk-fpsexec-*` binaries:
 
 | Command | `fpsexec` Binary | Role & Optical Ports |
 | :--- | :--- | :--- |
 | `cacaosim.mkpupil` | `milk-fpsexec-cacaosim-mkpupil` | Pupil + NCPA (`-> csim_pup, csim_ncpa`) |
 | `cacaosim.mkbeam` | `milk-fpsexec-cacaosim-mkbeam` | `[OPD, Amp]` beam + 32-bin Vega spectrum |
+| `cacaosim.wfe` | `milk-fpsexec-cacaosim-wfe` | Static wavefront error SHM (`OPD [m]`) |
 | `cacaosim.dmsim` | `milk-fpsexec-cacaosim-dmsim` | Zonal DM / 2-axis TTM (`in_beam->out_beam`) |
 | `cacaosim.beamsplit` | `milk-fpsexec-cacaosim-beamsplit` | Gray / LP / SP / BP dichroic splitter |
-| `cacaosim.coro` | `milk-fpsexec-cacaosim-coro` | Lyot, phase, Vortex, 4QPM + `out_lowfs` |
+| `cacaosim.coro` | `milk-fpsexec-cacaosim-coro` | Analytic/custom 2D/3D coro + FPM/Lyot LOWFS |
 | `cacaosim.pyrwfs` | `milk-fpsexec-cacaosim-pyrwfs` | 4-sided Pyramid WFS (`navg`, CUDA Graph) |
 | `cacaosim.shwfs` | `milk-fpsexec-cacaosim-shwfs` | Diffractive lenslet Shack-Hartmann WFS |
 | `cacaosim.zwfs` | `milk-fpsexec-cacaosim-zwfs` | Babinet MFT Zernike phase-contrast WFS |
@@ -69,10 +70,11 @@ flicker-free terminal hardware builder and live `MILK_SHM_DIR` status monitor mo
 mouse + draggable splitters + hover tooltips, 5 `milk` themes, and `--ascii` 7-bit mode):
 
 - **`F2:BUILDER`**: 3-pane workspace with **Elements & Arranger** (`[a]` add DM/TTM/Splitter/Coro/
-  PyWFS/SHWFS/ZWFS/FPCAM, `[c]` clone, `[K]`/`[J]` optical-splicing reorder, `[x]` branch swap,
-  `[w]` upstream beam picker, `[d]` beam-bridging delete, `[u]`/`Ctrl+R` 24-step undo/redo, live
-  `16x16` pupil dock), **clickable 2D Optical Schematic**, and **Parameter Inspector** (`1:OPTICS`,
-  `2:DYN/DET`, `3:SHM/WIRING`).
+  PyWFS/SHWFS/ZWFS/FPCAM/WFE, `[g]` InitSHM pupil+WFE maps, `[c]` clone, `[K]`/`[J]` optical
+  splicing reorder, `[x]` branch swap, `[w]` upstream beam picker, `[d]` beam-bridging delete,
+  `[u]`/`Ctrl+R` 24-step undo/redo, live `16x16` pupil dock with array/beam pix & `[m/pix]`,
+  `[l/D/pix]`, `[arcsec/pix]` scales), **clickable 2D Optical Schematic**, and **Parameter
+  Inspector** (`1:OPTICS`, `2:DYN/DET`, `3:SHM/WIRING`).
 - **`F3:SCHEMATIC` / `F4:TABLES` / `F5:STATUS` / `F6:SOURCE`**: Full-screen optical diagram &
   32-bin (`0.40..2.40 um`) spectral deck, hardware summary tables, live `.im.shm` / `.fps.shm`
   rates + Strehl + one-key `fused`/`modular` deployment, and `.bench` INI/TOML preview.
@@ -117,11 +119,12 @@ Pass `-DCACAOSIM_ENABLE_CUDA=OFF` to force a CPU-only build (`FFTW3f` + `OpenBLA
 
 ## Validation & Measured Runtime Performance
 
-`cacaosim-validate` executes **45** quantitative optical physics, spectral photon-conservation,
-CPU-vs-CUDA numerical parity (`rel_L2 < 1e-5`), coronagraphic suppression, optical causality,
-topological hardware splicing, `cacaosim-CTRL` headless TUI snapshots, and multi-stage closed-loop
-AO tests (`H-band Strehl: open=0.153 -> Stage-1=0.815 -> 2-Stage=0.998`).
-`tests/test_closed_loop.sh` verifies zero `libCLIcore` linkage across all 10 `fpsexec` binaries,
+`cacaosim-validate` executes **56** quantitative optical physics, spectral photon-conservation,
+CPU-vs-CUDA numerical parity (`rel_L2 < 1e-5`), analytic & custom 2D/3D polychromatic coronagraphic
+mask suppression, dual-mode LOWFS (`fpm_refl` + `lowfs_pup_diam` & `lyot_refl`), static WFE `[m]`
+synthesis, topological hardware splicing, `cacaosim-CTRL` headless TUI snapshots, and multi-stage
+closed-loop AO tests (`H-band Strehl: open=0.153 -> Stage-1=0.815 -> 2-Stage=0.998`).
+`tests/test_closed_loop.sh` verifies zero `libCLIcore` linkage across all 11 `fpsexec` binaries,
 `cacaosim-CTRL`, and `cacaosim-bench-view`, modular 3D beam SHM pipelines, fused/modular `.bench`
 runs, interactive `cacaosim-CTRL` PTY workflows, and `milk-cli` loading.
 

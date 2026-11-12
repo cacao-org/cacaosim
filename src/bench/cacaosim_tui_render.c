@@ -59,6 +59,8 @@ static const char *node_badge(const cacaosim_node_cfg_t *nd)
         return "ZWFS";
     case CACAOSIM_NODE_FPCAM:
         return "CAM";
+    case CACAOSIM_NODE_WFE:
+        return "WFE";
     }
     return "NODE";
 }
@@ -72,6 +74,7 @@ static cs_tui_rgb_t node_color(const cacaosim_node_cfg_t *nd, const cs_tui_pal_t
     case CACAOSIM_NODE_SPLITTER:
         return pal->fg_proc;
     case CACAOSIM_NODE_CORO:
+    case CACAOSIM_NODE_WFE:
         return pal->fg_warn;
     case CACAOSIM_NODE_PYRWFS:
     case CACAOSIM_NODE_SHWFS:
@@ -120,19 +123,50 @@ static void node_short_spec(
         }
         break;
     case CACAOSIM_NODE_CORO:
-        if (nd->coro.mode == CACAOSIM_CORO_VORTEX)
+    {
+        int has_cmask = (nd->in_pup_amp[0] != '\0' || nd->in_pup_pha[0] != '\0' ||
+                         nd->in_fpm_amp[0] != '\0' || nd->in_fpm_pha[0] != '\0' ||
+                         nd->in_lyot[0] != '\0' || nd->in_lyot_pha[0] != '\0');
+        if (nd->coro.mode == CACAOSIM_CORO_CUSTOM_MFT)
         {
-            snprintf(out, cap, "Vortex l=%d", nd->coro.vortex_charge);
+            if (nd->coro.nlambda > 1)
+            {
+                snprintf(out, cap, "CustMFT %dch %.2fu", nd->coro.nlambda, nd->coro.lambda_um);
+            }
+            else
+            {
+                snprintf(out, cap, "CustMFT %.2fu", nd->coro.lambda_um);
+            }
+        }
+        else if (nd->coro.mode == CACAOSIM_CORO_CUSTOM_FFT)
+        {
+            if (nd->coro.nlambda > 1)
+            {
+                snprintf(out, cap, "CustFFT %dch %.2fu", nd->coro.nlambda, nd->coro.lambda_um);
+            }
+            else
+            {
+                snprintf(out, cap, "CustFFT %.2fu", nd->coro.lambda_um);
+            }
+        }
+        else if (nd->coro.mode == CACAOSIM_CORO_VORTEX)
+        {
+            snprintf(out, cap, "Vortex l=%d%s", nd->coro.vortex_charge, has_cmask ? "+M" : "");
         }
         else if (nd->coro.mode == CACAOSIM_CORO_4QPM)
         {
-            snprintf(out, cap, "4QPM %.2fu", nd->coro.lambda_um);
+            snprintf(out, cap, "4QPM %.2fu%s", nd->coro.lambda_um, has_cmask ? "+M" : "");
+        }
+        else if (nd->coro.mode == CACAOSIM_CORO_PHASE_DIMPLE)
+        {
+            snprintf(out, cap, "Dimple %.1fl/D%s", nd->coro.fpm_rad_ld, has_cmask ? "+M" : "");
         }
         else
         {
-            snprintf(out, cap, "Lyot %.1fl/D", nd->coro.fpm_rad_ld);
+            snprintf(out, cap, "Lyot %.1fl/D%s", nd->coro.fpm_rad_ld, has_cmask ? "+M" : "");
         }
         break;
+    }
     case CACAOSIM_NODE_PYRWFS:
     {
         float hz = (nd->rate_hz > 0.0f) ? nd->rate_hz : (mhz / (float) (nd->navg ? nd->navg : 1u));
@@ -158,7 +192,140 @@ static void node_short_spec(
         snprintf(out, cap, "%upx %.2fu %.0fHz", nd->fpcam.ncam, nd->fpcam.lambda_um, hz);
         break;
     }
+    case CACAOSIM_NODE_WFE:
+        snprintf(out, cap, "%.0fnm [OPD m]", nd->wfe_rms_nm * fabsf(nd->wfe_gain));
+        break;
     }
+}
+
+static int node_focal_scale(
+    const cacaosim_bench_cfg_t *cfg,
+    const cacaosim_node_cfg_t  *nd,
+    float                      *out_ld_pix,
+    float                      *out_lam_um)
+{
+    float pdia = (cfg->pup_diam > 0.05f) ? cfg->pup_diam : 1.0f;
+    switch (nd->kind)
+    {
+    case CACAOSIM_NODE_FPCAM:
+        *out_lam_um = (nd->fpcam.lambda_um > 0.1f) ? nd->fpcam.lambda_um : 1.65f;
+        if (nd->fpcam.prop_mode == CACAOSIM_FPCAM_PROP_FFT)
+        {
+            float pad   = (nd->fpcam.pad_factor >= 2u) ? (float) nd->fpcam.pad_factor : 2.0f;
+            *out_ld_pix = 1.0f / (pdia * pad);
+        }
+        else
+        {
+            float px    = (nd->fpcam.pixscale_ld > 0.05f) ? nd->fpcam.pixscale_ld : 3.0f;
+            *out_ld_pix = 1.0f / px;
+        }
+        return 1;
+    case CACAOSIM_NODE_CORO:
+        *out_lam_um = (nd->coro.lambda_um > 0.1f) ? nd->coro.lambda_um : 1.65f;
+        if (nd->coro.mode == CACAOSIM_CORO_CUSTOM_MFT)
+        {
+            float px    = (nd->coro.fpm_pixscale_ld > 0.05f) ? nd->coro.fpm_pixscale_ld : 8.0f;
+            *out_ld_pix = 1.0f / px;
+        }
+        else if (nd->coro.mode == CACAOSIM_CORO_VORTEX || nd->coro.mode == CACAOSIM_CORO_4QPM ||
+                 nd->coro.mode == CACAOSIM_CORO_CUSTOM_FFT)
+        {
+            float pad   = (nd->coro.pad_factor >= 2u) ? (float) nd->coro.pad_factor : 4.0f;
+            *out_ld_pix = 1.0f / (pdia * pad);
+        }
+        else
+        {
+            float r_ld  = (nd->coro.fpm_rad_ld > 0.1f) ? nd->coro.fpm_rad_ld : 2.5f;
+            float nmft  = (nd->coro.n_mft >= 8u) ? (float) nd->coro.n_mft : 32.0f;
+            *out_ld_pix = (2.4f * r_ld) / nmft;
+        }
+        return 1;
+    case CACAOSIM_NODE_SHWFS:
+    {
+        float nsub  = (nd->shwfs.n_sub >= 1u) ? (float) nd->shwfs.n_sub : 16.0f;
+        float pad   = (nd->shwfs.pad_factor >= 1u) ? (float) nd->shwfs.pad_factor : 2.0f;
+        *out_lam_um = (nd->shwfs.lambda_um > 0.1f) ? nd->shwfs.lambda_um : 0.75f;
+        *out_ld_pix = nsub / pad;
+        return 1;
+    }
+    case CACAOSIM_NODE_PYRWFS:
+    {
+        float pad   = (nd->pyrwfs.pad_factor >= 2u) ? (float) nd->pyrwfs.pad_factor : 2.0f;
+        *out_lam_um = (nd->pyrwfs.lambda_um > 0.1f) ? nd->pyrwfs.lambda_um : 0.75f;
+        *out_ld_pix = 1.0f / (pdia * pad);
+        return 1;
+    }
+    case CACAOSIM_NODE_ZWFS:
+    {
+        float d_ld  = (nd->zwfs.dimple_ld > 0.1f) ? nd->zwfs.dimple_ld : 1.06f;
+        float nmft  = (nd->zwfs.n_mft >= 8u) ? (float) nd->zwfs.n_mft : 32.0f;
+        *out_lam_um = (nd->zwfs.lambda_um > 0.1f) ? nd->zwfs.lambda_um : 0.85f;
+        *out_ld_pix = (1.2f * d_ld) / nmft;
+        return 1;
+    }
+    default:
+        return 0;
+    }
+}
+
+void cs_tui_compute_scales(
+    const cacaosim_bench_cfg_t *cfg,
+    int                         sel_item,
+    cs_optical_scales_t        *out)
+{
+    if (out == NULL)
+    {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    if (cfg == NULL)
+    {
+        return;
+    }
+
+    float nwf_f     = (cfg->nwf > 0u) ? (float) cfg->nwf : 128.0f;
+    float pdia      = (cfg->pup_diam > 0.05f) ? cfg->pup_diam : 1.0f;
+    float tel_d     = (cfg->tel_diam_m > 0.05f) ? cfg->tel_diam_m : 8.2f;
+    out->d_beam_px  = pdia * nwf_f;
+    out->pup_m_pix  = tel_d / out->d_beam_px;
+    out->foc_ld_pix = 1.0f / (pdia * 2.0f);
+    out->ref_lam_um = (cfg->ref_lambda > 0.1f) ? cfg->ref_lambda : 1.65f;
+    snprintf(out->foc_src, sizeof(out->foc_src), "2xFFT");
+
+    int found = 0;
+    if (sel_item > 0 && (uint32_t) (sel_item - 1) < cfg->n_nodes)
+    {
+        const cacaosim_node_cfg_t *nd = &cfg->nodes[sel_item - 1];
+        if (node_focal_scale(cfg, nd, &out->foc_ld_pix, &out->ref_lam_um))
+        {
+            snprintf(out->foc_src, sizeof(out->foc_src), "%s", nd->id);
+            found = 1;
+        }
+    }
+
+    if (!found)
+    {
+        static const cacaosim_node_kind_t prio[5] = {
+            CACAOSIM_NODE_FPCAM, CACAOSIM_NODE_CORO,   CACAOSIM_NODE_SHWFS,
+            CACAOSIM_NODE_PYRWFS, CACAOSIM_NODE_ZWFS
+        };
+        for (int p = 0; p < 5 && !found; p++)
+        {
+            for (uint32_t i = 0; i < cfg->n_nodes; i++)
+            {
+                if (cfg->nodes[i].kind == prio[p] &&
+                    node_focal_scale(cfg, &cfg->nodes[i], &out->foc_ld_pix, &out->ref_lam_um))
+                {
+                    snprintf(out->foc_src, sizeof(out->foc_src), "%s", cfg->nodes[i].id);
+                    found = 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    float ld_arcsec     = (out->ref_lam_um * 1.0e-6f / tel_d) * 206264.8062f;
+    out->foc_arcsec_pix = out->foc_ld_pix * ld_arcsec;
 }
 
 static const cacaosim_bench_node_t *find_analyzed_node(
@@ -202,6 +369,10 @@ static int node_primary_shm_live(const cs_tui_app_t *app, const cacaosim_node_cf
     {
         s = nd->in_cmd;
     }
+    else if (nd->kind == CACAOSIM_NODE_WFE)
+    {
+        s = nd->in_wfe;
+    }
     else if (nd->kind == CACAOSIM_NODE_PYRWFS || nd->kind == CACAOSIM_NODE_SHWFS ||
              nd->kind == CACAOSIM_NODE_ZWFS || nd->kind == CACAOSIM_NODE_FPCAM)
     {
@@ -230,6 +401,11 @@ typedef struct
     int                 vw;
     int                 vh;
     int                 wide_spec;
+    int                 measure_only;
+    int                 sel_found;
+    int                 sel_lx;
+    int                 sel_ly;
+    int                 sel_bw;
     uint8_t             visited[CACAOSIM_BENCH_MAX_NODES];
     int                 next_row;
 } dag_draw_t;
@@ -243,6 +419,10 @@ static void dc_put(
     cs_tui_rgb_t bg,
     uint8_t      attrs)
 {
+    if (d->measure_only)
+    {
+        return;
+    }
     int sy = d->vy + (ly - d->app->schem_scroll_y);
     if (sy < d->vy || sy >= d->vy + d->vh)
     {
@@ -308,6 +488,17 @@ static int dc_draw_node_chip(
         inner = 24;
     }
     int bw = inner + 4;
+    if (sel)
+    {
+        d->sel_found = 1;
+        d->sel_lx    = lx;
+        d->sel_ly    = ly;
+        d->sel_bw    = bw;
+    }
+    if (d->measure_only)
+    {
+        return bw;
+    }
 
     const char *tl = d->app->scr.ascii_only ? "+" : (sel ? "\xe2\x95\x94" : "\xe2\x95\xad");
     const char *tr = d->app->scr.ascii_only ? "+" : (sel ? "\xe2\x95\x97" : "\xe2\x95\xae");
@@ -390,7 +581,8 @@ static void dc_draw_vbranch(dag_draw_t *d, int lx, int ly0, int ly1, const char 
     dc_put(d, lx + 3, ly1 + 1, arr, d->pal->fg_conn, d->pal->bg_panel, CS_ATTR_BOLD);
     if (arm_lbl != NULL && arm_lbl[0] != '\0')
     {
-        dc_put(d, lx + 2, ly1, arm_lbl, d->pal->fg_dim, d->pal->bg_panel, 0u);
+        dc_put(d, lx + 2, (ly1 > 0) ? (ly1 - 1) : ly1, arm_lbl, d->pal->fg_dim, d->pal->bg_panel,
+               0u);
     }
 }
 
@@ -450,7 +642,7 @@ static void dc_trace_beam(dag_draw_t *d, const char *beam, int lx, int row_slot,
                                    node_color(nd, d->pal), tip);
         int nx = cur_x + bw;
 
-        if (nd->kind == CACAOSIM_NODE_DM)
+        if (nd->kind == CACAOSIM_NODE_DM || nd->kind == CACAOSIM_NODE_WFE)
         {
             dc_draw_harrow(d, nx, ly, nd->out_beam, d->pal->fg_conn);
             dc_trace_beam(d, nd->out_beam, nx + 6, use_row, depth + 1);
@@ -461,8 +653,18 @@ static void dc_trace_beam(dag_draw_t *d, const char *beam, int lx, int row_slot,
             dc_trace_beam(d, nd->out_beam, nx + 6, use_row, depth + 1);
             if (nd->out_lowfs[0] != '\0')
             {
-                int lrow = d->next_row++;
-                dc_draw_vbranch(d, cur_x + bw / 2, ly + 4, lrow * 5, "lowfs");
+                int  lrow = d->next_row++;
+                char llbl[24];
+                if (nd->coro.lowfs_mode == CACAOSIM_LOWFS_LYOT_REFL)
+                {
+                    snprintf(llbl, sizeof(llbl), "lowfs:Lyot");
+                }
+                else
+                {
+                    float ap = (nd->coro.lowfs_pup_diam > 0.0f) ? nd->coro.lowfs_pup_diam : 1.0f;
+                    snprintf(llbl, sizeof(llbl), "FPM(%.2fD)", ap);
+                }
+                dc_draw_vbranch(d, cur_x + bw / 2, ly + 4, lrow * 5, llbl);
                 dc_trace_beam(d, nd->out_lowfs, cur_x + bw / 2 + 4, lrow, depth + 1);
             }
         }
@@ -489,8 +691,8 @@ static void dc_trace_beam(dag_draw_t *d, const char *beam, int lx, int row_slot,
             int                          spx = d->vx + (nx + 1 - d->app->schem_scroll_x);
             int                          spy = d->vy + (ly + 1 - d->app->schem_scroll_y);
 
-            if (sp != NULL && spy >= d->vy && spy < d->vy + d->vh && spx >= d->vx &&
-                spx + sw <= d->vx + d->vw)
+            if (!d->measure_only && sp != NULL && spy >= d->vy && spy < d->vy + d->vh &&
+                spx >= d->vx && spx + sw <= d->vx + d->vw)
             {
                 cs_draw_spectrum32(&d->app->scr, spx, spy, sw, sp, d->app->opts.theme,
                                    d->pal->bg_panel);
@@ -532,6 +734,66 @@ void cs_render_dag_canvas(
         ch--;
     }
 
+    char tel_sub[40];
+    snprintf(tel_sub, sizeof(tel_sub), "%.1fm mV=%.1f %.0fHz", app->cfg.tel_diam_m,
+             app->cfg.star_mag, app->cfg.master_hz);
+    const char *root_beam = app->cfg.out_beam[0] ? app->cfg.out_beam : "b_pup";
+
+    /* Auto-follow selected element when schematic pane is not being manually scrolled */
+    if (app->focus != CS_FOCUS_SCHEM)
+    {
+        dag_draw_t md;
+        memset(&md, 0, sizeof(md));
+        md.app          = app;
+        md.pal          = pal;
+        md.vw           = w;
+        md.vh           = ch;
+        md.measure_only = 1;
+        md.next_row     = 1;
+        int mbw = dc_draw_node_chip(&md, 1, 0, 0, "TEL", app->cfg.name[0] ? app->cfg.name : "bench",
+                                    tel_sub, pal->fg_title, "");
+        dc_trace_beam(&md, root_beam, 1 + mbw + 6, 0, 0);
+        for (uint32_t i = 0; i < app->cfg.n_nodes; i++)
+        {
+            if (!md.visited[i])
+            {
+                int                        urow = md.next_row++;
+                const cacaosim_node_cfg_t *nd   = &app->cfg.nodes[i];
+                dc_draw_node_chip(&md, 2, urow * 5, (int) i + 1, node_badge(nd), nd->id, "",
+                                  pal->fg_error, "");
+            }
+        }
+        if (md.sel_found)
+        {
+            int rx_need = md.sel_lx + md.sel_bw + 28;
+            if (md.sel_lx < app->schem_scroll_x)
+            {
+                app->schem_scroll_x = (md.sel_lx > 2) ? (md.sel_lx - 2) : 0;
+            }
+            else if (rx_need > app->schem_scroll_x + w)
+            {
+                app->schem_scroll_x = rx_need - w;
+                if (app->schem_scroll_x > md.sel_lx)
+                {
+                    app->schem_scroll_x = (md.sel_lx > 1) ? (md.sel_lx - 1) : 0;
+                }
+            }
+            int ry_need = md.sel_ly + 9;
+            if (md.sel_ly < app->schem_scroll_y)
+            {
+                app->schem_scroll_y = md.sel_ly;
+            }
+            else if (ry_need > app->schem_scroll_y + ch)
+            {
+                app->schem_scroll_y = ry_need - ch;
+                if (app->schem_scroll_y > md.sel_ly)
+                {
+                    app->schem_scroll_y = md.sel_ly;
+                }
+            }
+        }
+    }
+
     dag_draw_t d;
     memset(&d, 0, sizeof(d));
     d.app       = app;
@@ -543,10 +805,6 @@ void cs_render_dag_canvas(
     d.wide_spec = wide_spectra;
     d.next_row  = 1;
 
-    char tel_sub[40];
-    snprintf(tel_sub, sizeof(tel_sub), "%.1fm mV=%.1f %.0fHz", app->cfg.tel_diam_m,
-             app->cfg.star_mag, app->cfg.master_hz);
-    const char *root_beam = app->cfg.out_beam[0] ? app->cfg.out_beam : "b_pup";
     int         bw        = dc_draw_node_chip(
         &d, 1, 0, 0, "TEL", app->cfg.name[0] ? app->cfg.name : "bench", tel_sub, pal->fg_title,
         "Click to inspect [bench] telescope, pupil & guide star");
@@ -654,8 +912,10 @@ static void render_view_builder(cs_tui_app_t *app, int x, int y, int w, int h)
     }
 
     int show_pup_dock = (h >= 24 && lw >= 30);
+    int tall_pup_dock = (h >= 28 && lw >= 30);
+    int dock_rows     = tall_pup_dock ? 15 : 10;
     int list_top      = y + 3;
-    int list_bot      = show_pup_dock ? (y + h - 10) : (y + h - 1);
+    int list_bot      = show_pup_dock ? (y + h - dock_rows) : (y + h - 1);
     int list_rows     = list_bot - list_top;
     int total_items   = 1 + (int) app->cfg.n_nodes;
 
@@ -724,7 +984,10 @@ static void render_view_builder(cs_tui_app_t *app, int x, int y, int w, int h)
 
     if (show_pup_dock)
     {
-        int py = y + h - 9;
+        cs_optical_scales_t sc;
+        cs_tui_compute_scales(&app->cfg, app->sel_item, &sc);
+
+        int py = y + h - (tall_pup_dock ? 14 : 9);
         for (int cx = x + 1; cx < x + lw - 1; cx++)
         {
             cs_put_cell(&app->scr, cx, py - 1, app->scr.ascii_only ? "-" : "\xe2\x94\x80",
@@ -735,23 +998,59 @@ static void render_view_builder(cs_tui_app_t *app, int x, int y, int w, int h)
         int tw = lw - 20;
         if (tw > 6)
         {
-            cs_printf_at(&app->scr, tx, py, tw, pal->fg_title, pal->bg_panel, CS_ATTR_BOLD, 1,
-                         "PUPIL %ux%u", app->cfg.nwf, app->cfg.nwf);
-            cs_printf_at(&app->scr, tx, py + 1, tw, pal->fg_text, pal->bg_panel, 0u, 1,
-                         "D=%.1fm obs=%.0f%%", app->cfg.tel_diam_m, app->cfg.cobs * 100.0f);
-            cs_printf_at(&app->scr, tx, py + 2, tw, pal->fg_muted, pal->bg_panel, 0u, 1,
-                         "%d spiders", app->cfg.nspider);
-            cs_printf_at(&app->scr, tx, py + 4, tw, pal->fg_accent, pal->bg_panel, 0u, 1,
-                         "mV=%.1f %.0fK", app->cfg.star_mag, app->cfg.star_teff);
-            if (app->dag_valid && app->ctx.n_beams > 0u)
+            if (tall_pup_dock)
             {
-                char f0[24];
-                fmt_flux_compact(cacaosim_spec_total(&app->ctx.beams[0].spec), f0, sizeof(f0));
-                cs_printf_at(&app->scr, tx, py + 5, tw, pal->fg_stream, pal->bg_panel, 0u, 1,
-                             "%s ph/s", f0);
+                cs_printf_at(&app->scr, tx, py, tw, pal->fg_title, pal->bg_panel, CS_ATTR_BOLD, 1,
+                             "PUPIL %ux%u", app->cfg.nwf, app->cfg.nwf);
+                cs_printf_at(&app->scr, tx, py + 1, tw, pal->fg_text, pal->bg_panel, 0u, 1,
+                             "D=%.1fm obs=%.0f%%", app->cfg.tel_diam_m, app->cfg.cobs * 100.0f);
+                cs_printf_at(&app->scr, tx, py + 2, tw, pal->fg_muted, pal->bg_panel, 0u, 1,
+                             "%d spiders", app->cfg.nspider);
+                cs_printf_at(&app->scr, tx, py + 4, tw, pal->fg_accent, pal->bg_panel, 0u, 1,
+                             "mV=%.1f %.0fK", app->cfg.star_mag, app->cfg.star_teff);
+                if (app->dag_valid && app->ctx.n_beams > 0u)
+                {
+                    char f0[24];
+                    fmt_flux_compact(cacaosim_spec_total(&app->ctx.beams[0].spec), f0, sizeof(f0));
+                    cs_printf_at(&app->scr, tx, py + 5, tw, pal->fg_stream, pal->bg_panel, 0u, 1,
+                                 "%s ph/s", f0);
+                }
+                draw_btn(app, tx, py + 7, "[g:InitSHM]", CS_HIT_ACT_MKPUP, 0, pal->fg_stream,
+                         pal->bg_panel_alt,
+                         "Generate pupil & static WFE streams in MILK_SHM_DIR [g]");
             }
-            draw_btn(app, tx, py + 7, "[g:MkPupil]", CS_HIT_ACT_MKPUP, 0, pal->fg_stream,
-                     pal->bg_panel_alt, "Generate anti-aliased pupil in MILK_SHM_DIR [g]");
+            else
+            {
+                cs_printf_at(&app->scr, tx, py, tw, pal->fg_title, pal->bg_panel, CS_ATTR_BOLD, 1,
+                             "%ux%u pix", app->cfg.nwf, app->cfg.nwf);
+                cs_printf_at(&app->scr, tx, py + 1, tw, pal->fg_text, pal->bg_panel, 0u, 1,
+                             "Beam %.1f pix", sc.d_beam_px);
+                cs_printf_at(&app->scr, tx, py + 2, tw, pal->fg_stream, pal->bg_panel, 0u, 1,
+                             "%.4f m/pix", sc.pup_m_pix);
+                cs_printf_at(&app->scr, tx, py + 3, tw, pal->fg_accent, pal->bg_panel, 0u, 1,
+                             "%.3f l/D/pix", sc.foc_ld_pix);
+                cs_printf_at(&app->scr, tx, py + 4, tw, pal->fg_muted, pal->bg_panel, 0u, 1,
+                             "%.4f arcsec/pix", sc.foc_arcsec_pix);
+                cs_printf_at(&app->scr, tx, py + 5, tw, pal->fg_dim, pal->bg_panel, 0u, 1,
+                             "@%.2fum D=%.1fm", sc.ref_lam_um, app->cfg.tel_diam_m);
+                draw_btn(app, tx, py + 7, "[g:InitSHM]", CS_HIT_ACT_MKPUP, 0, pal->fg_stream,
+                         pal->bg_panel_alt,
+                         "Generate pupil & static WFE streams in MILK_SHM_DIR [g]");
+            }
+        }
+        if (tall_pup_dock)
+        {
+            int fw = lw - 4;
+            cs_printf_at(&app->scr, x + 2, py + 8, fw, pal->fg_text, pal->bg_panel, 0u, 1,
+                         "Array: %ux%u pix", app->cfg.nwf, app->cfg.nwf);
+            cs_printf_at(&app->scr, x + 2, py + 9, fw, pal->fg_text, pal->bg_panel, 0u, 1,
+                         "Beam : %.1f pix (%.1f%%)", sc.d_beam_px, app->cfg.pup_diam * 100.0f);
+            cs_printf_at(&app->scr, x + 2, py + 10, fw, pal->fg_stream, pal->bg_panel, 0u, 1,
+                         "Pupil: %.4f m/pix", sc.pup_m_pix);
+            cs_printf_at(&app->scr, x + 2, py + 11, fw, pal->fg_accent, pal->bg_panel, 0u, 1,
+                         "Focal: %.3f l/D/pix (%.8s)", sc.foc_ld_pix, sc.foc_src);
+            cs_printf_at(&app->scr, x + 2, py + 12, fw, pal->fg_muted, pal->bg_panel, 0u, 1,
+                         "Sky  : %.4f arcsec/pix @%.2fum", sc.foc_arcsec_pix, sc.ref_lam_um);
         }
     }
 
@@ -773,24 +1072,37 @@ static void render_view_builder(cs_tui_app_t *app, int x, int y, int w, int h)
     }
     else
     {
-        const cacaosim_node_cfg_t *nd = &app->cfg.nodes[app->sel_item - 1];
-        snprintf(ititle, sizeof(ititle), "INSPECTOR: [%s.%s]",
-                 (nd->kind == CACAOSIM_NODE_DM && nd->dm.dm_mode == 1)
-                     ? "ttm"
-                     : (nd->kind == CACAOSIM_NODE_DM
-                            ? "dm"
-                            : (nd->kind == CACAOSIM_NODE_SPLITTER
-                                   ? "splitter"
-                                   : (nd->kind == CACAOSIM_NODE_CORO
-                                          ? "coro"
-                                          : (nd->kind == CACAOSIM_NODE_PYRWFS
-                                                 ? "pyrwfs"
-                                                 : (nd->kind == CACAOSIM_NODE_SHWFS
-                                                        ? "shwfs"
-                                                        : (nd->kind == CACAOSIM_NODE_ZWFS
-                                                               ? "zwfs"
-                                                               : "fpcam")))))),
-                 nd->id);
+        const cacaosim_node_cfg_t *nd    = &app->cfg.nodes[app->sel_item - 1];
+        const char                *kname = "fpcam";
+        if (nd->kind == CACAOSIM_NODE_DM)
+        {
+            kname = (nd->dm.dm_mode == 1) ? "ttm" : "dm";
+        }
+        else if (nd->kind == CACAOSIM_NODE_SPLITTER)
+        {
+            kname = "splitter";
+        }
+        else if (nd->kind == CACAOSIM_NODE_CORO)
+        {
+            kname = "coro";
+        }
+        else if (nd->kind == CACAOSIM_NODE_PYRWFS)
+        {
+            kname = "pyrwfs";
+        }
+        else if (nd->kind == CACAOSIM_NODE_SHWFS)
+        {
+            kname = "shwfs";
+        }
+        else if (nd->kind == CACAOSIM_NODE_ZWFS)
+        {
+            kname = "zwfs";
+        }
+        else if (nd->kind == CACAOSIM_NODE_WFE)
+        {
+            kname = "wfe";
+        }
+        snprintf(ititle, sizeof(ititle), "INSPECTOR: [%s.%s]", kname, nd->id);
     }
     cs_draw_box(&app->scr, rx, iy, rw, ih, f_pa, ititle, "Enter:Edit  <-/->:Step",
                 f_pa ? pal->fg_border_focus : pal->fg_border, pal->fg_title, pal->fg_muted,
@@ -878,8 +1190,16 @@ static void render_view_builder(cs_tui_app_t *app, int x, int y, int w, int h)
         }
         else
         {
+            char        pdisp[32];
+            const char *vshow = vbuf[0] ? vbuf : "\"\"";
+            if (strlen(vbuf) > 18u && strchr(vbuf, '/') != NULL)
+            {
+                const char *bn = strrchr(vbuf, '/');
+                snprintf(pdisp, sizeof(pdisp), ".../%.14s", (bn != NULL) ? (bn + 1) : vbuf);
+                vshow = pdisp;
+            }
             cs_printf_at(&app->scr, rx + 36, py, 18, sel ? pal->fg_bright : pal->fg_stream, rbg,
-                         sel ? CS_ATTR_BOLD : 0u, 1, "%-18.18s", vbuf[0] ? vbuf : "\"\"");
+                         sel ? CS_ATTR_BOLD : 0u, 1, "%-18.18s", vshow);
         }
 
         cs_printf_at(&app->scr, rx + 55, py, 6, pal->fg_muted, rbg, 0u, 1, "%-6.6s", pd->unit);
@@ -1072,7 +1392,7 @@ static void render_modal(cs_tui_app_t *app)
 
     if (app->modal == CS_MODAL_ADD)
     {
-        static const char *const names[8] = {
+        static const char *const names[9] = {
             "1. [dm]       Zonal Deformable Mirror",
             "2. [ttm]      2-Axis Tip-Tilt Mirror",
             "3. [splitter] Dichroic / Gray Beamsplitter",
@@ -1081,27 +1401,29 @@ static void render_modal(cs_tui_app_t *app)
             "6. [shwfs]    Shack-Hartmann Lenslet WFS",
             "7. [zwfs]     Zernike Phase-Contrast WFS",
             "8. [fpcam]    Focal-Plane Science Camera",
+            "9. [wfe]      Static Wavefront Error [OPD m]",
         };
-        static const char *const descs[8] = {
+        static const char *const descs[9] = {
             "Actuator grid with ZOH servo dynamics, stroke clip & DAC bits",
             "Fast steering tip-tilt mirror (dm_mode=1) with servo latency",
             "Splits beam into out_refl + out_trans (gray, LP, SP, or BP)",
-            "Lyot spot, phase dimple, Vortex or 4QPM + out_lowfs core pickoff",
+            "Analytic/custom FPM & pupil masks + reflective FPM or Lyot LOWFS",
             "Modulated/unmodulated diffractive 4-quadrant Pyramid WFS",
             "Diffractive lenslet array Shack-Hartmann wavefront sensor",
             "Babinet Matrix-DFT Zernike phase-contrast wavefront sensor",
             "Polychromatic MFT/FFT science PSF camera + Strehl telemetry",
+            "Inline static wavefront error SHM stream in unit of OPD [meter]",
         };
 
         char     beams[CACAOSIM_BENCH_MAX_BEAMS][CACAOSIM_BENCH_NAME_LEN];
         uint32_t nb = cacaosim_bench_list_beams(&app->cfg, beams, CACAOSIM_BENCH_MAX_BEAMS);
         int      mw = (W > 80) ? 76 : (W - 4);
-        int      mh = 15;
+        int      mh = 16;
         int      mx = (W - mw) / 2;
         int      my = (H - mh) / 2;
 
         cs_draw_shadow(&app->scr, mx, my, mw, mh, pal);
-        cs_draw_box(&app->scr, mx, my, mw, mh, 1, "ADD OPTICAL ELEMENT", "1..8 / Enter  Esc:Cancel",
+        cs_draw_box(&app->scr, mx, my, mw, mh, 1, "ADD OPTICAL ELEMENT", "1..9 / Enter  Esc:Cancel",
                     pal->fg_border_focus, pal->fg_title, pal->fg_muted, pal->bg_popup);
 
         const char *b_lbl = (app->modal_beam_idx >= 0 && (uint32_t) app->modal_beam_idx < nb)
@@ -1112,21 +1434,21 @@ static void render_modal(cs_tui_app_t *app)
         cs_tui_add_hit(app, CS_HIT_MODAL_EXTRA, 0, mx + 2, my + 1, mw - 4, 1,
                        "Click or press Tab to cycle target input beam");
 
-        for (int i = 0; i < 8; i++)
+        for (int i = 0; i < 9; i++)
         {
             int          sel = (app->modal_sel == i);
             cs_tui_rgb_t bg  = sel ? pal->bg_selected : pal->bg_popup;
             cs_fill_rect(&app->scr, mx + 1, my + 3 + i, mw - 2, 1, pal->fg_text, bg);
             cs_printf_at(&app->scr, mx + 2, my + 3 + i, mw - 4,
                          sel ? pal->fg_bright : pal->fg_text, bg, sel ? CS_ATTR_BOLD : 0u, 1,
-                         "%-40s", names[i]);
+                         "%-44s", names[i]);
             cs_tui_add_hit(app, CS_HIT_MODAL_ROW, i, mx + 1, my + 3 + i, mw - 2, 1, descs[i]);
         }
-        cs_printf_at(&app->scr, mx + 2, my + 12, mw - 4, pal->fg_muted, pal->bg_popup, 0u, 1, "%s",
-                     descs[(app->modal_sel >= 0 && app->modal_sel < 8) ? app->modal_sel : 0]);
-        draw_btn(app, mx + mw - 22, my + 13, "[Enter:Insert]", CS_HIT_MODAL_OK, 0, pal->fg_active,
+        cs_printf_at(&app->scr, mx + 2, my + 13, mw - 4, pal->fg_muted, pal->bg_popup, 0u, 1, "%s",
+                     descs[(app->modal_sel >= 0 && app->modal_sel < 9) ? app->modal_sel : 0]);
+        draw_btn(app, mx + mw - 22, my + 14, "[Enter:Insert]", CS_HIT_MODAL_OK, 0, pal->fg_active,
                  pal->bg_panel_alt, "Insert selected optical element");
-        draw_btn(app, mx + mw - 7, my + 13, "[Esc]", CS_HIT_MODAL_CANCEL, 0, pal->fg_error,
+        draw_btn(app, mx + mw - 7, my + 14, "[Esc]", CS_HIT_MODAL_CANCEL, 0, pal->fg_error,
                  pal->bg_panel_alt, "Cancel");
         return;
     }
@@ -1287,7 +1609,7 @@ static void render_modal(cs_tui_app_t *app)
             "  Tab / Shift+Tab   Cycle focus between Elements, Schematic & Inspector",
             "  Up / Down / Click Select element, parameter, or click any 2D schematic box",
             "HARDWARE ARRANGER",
-            "  a / +             Add optical element (DM, TTM, BS, Coro, PyWFS, SH, ZWFS, Cam)",
+            "  a / +             Add element (DM, TTM, BS, Coro, PyWFS, SH, ZWFS, Cam, WFE)",
             "  c                 Duplicate (clone) selected element with auto-wiring",
             "  K / J (Shift+U/D) Move element upstream / downstream (optically splices chain!)",
             "  x                 Swap downstream arms on Beamsplitter (R/T) or Coro (Sci/LOWFS)",
@@ -1299,7 +1621,7 @@ static void render_modal(cs_tui_app_t *app)
             "  Enter / Space     Edit parameter inline or cycle enum/boolean value",
             "  Left / Right      Step numeric/enum value ([ / ] for 5x coarse step)",
             "  P / s / A / o / e Presets / Save / Save As / Open / Edit in $EDITOR",
-            "  f / M / S / g / t Deploy Fused / Deploy Modular / Stop / MkPupil / AtmTurb",
+            "  f / M / S / g / t Deploy Fused / Deploy Modular / Stop / InitSHM / AtmTurb",
             "  T / m / q         Theme selector / Toggle hover tooltips / Quit",
         };
         int n_hl = (int) (sizeof(hlines) / sizeof(hlines[0]));

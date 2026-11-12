@@ -40,11 +40,13 @@ set(SOURCEFILES
     src/common/cacaosim_rng.c
     src/common/cacaosim_detector.c
     src/common/cacaosim_beam.c
+    src/common/cacaosim_mask.c
     src/common/cacaosim_cuda_stub.c
     src/pupil/cacaosim_pupil.c
     src/pupil/cacaosim_mkpupil_FPS.c
     src/beam/cacaosim_mkbeam_FPS.c
     src/beam/cacaosim_beamsplit_FPS.c
+    src/beam/cacaosim_wfe_FPS.c
     src/dm/cacaosim_dm_engine.c
     src/dm/cacaosim_dmsim_FPS.c
     src/coro/cacaosim_coro_engine.c
@@ -77,11 +79,13 @@ set(INCLUDEFILES
     src/common/cacaosim_rng.h
     src/common/cacaosim_detector.h
     src/common/cacaosim_beam.h
+    src/common/cacaosim_mask.h
     src/common/cacaosim_cuda.h
     src/pupil/cacaosim_pupil.h
     src/pupil/cacaosim_mkpupil_FPS.h
     src/beam/cacaosim_mkbeam_FPS.h
     src/beam/cacaosim_beamsplit_FPS.h
+    src/beam/cacaosim_wfe_FPS.h
     src/dm/cacaosim_dm.h
     src/dm/cacaosim_dmsim_FPS.h
     src/coro/cacaosim_coro.h

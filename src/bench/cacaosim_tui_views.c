@@ -96,25 +96,33 @@ void cs_render_view_schematic(cs_tui_app_t *app, int x, int y, int w, int h)
 
     int dy = y + schem_h;
     cs_draw_box(&app->scr, x, dy, w, deck_h, 0,
-                "ENTRANCE PUPIL & 32-BIN POLYCHROMATIC BEAM SPECTRA (0.40 .. 2.40 um)", NULL,
-                pal->fg_border, pal->fg_title, pal->fg_muted, pal->bg_panel);
+                "ENTRANCE PUPIL, PIXEL SCALES & 32-BIN POLYCHROMATIC SPECTRA (0.40 .. 2.40 um)",
+                NULL, pal->fg_border, pal->fg_title, pal->fg_muted, pal->bg_panel);
+
+    cs_optical_scales_t sc;
+    cs_tui_compute_scales(&app->cfg, app->sel_item, &sc);
 
     cs_draw_pupil16(&app->scr, x + 2, dy + 1, app->pup16, pal);
-    cs_printf_at(&app->scr, x + 20, dy + 1, 26, pal->fg_bright, pal->bg_panel, CS_ATTR_BOLD, 1,
-                 "Telescope %.2f m", app->cfg.tel_diam_m);
-    cs_printf_at(&app->scr, x + 20, dy + 2, 26, pal->fg_text, pal->bg_panel, 0u, 1,
-                 "Grid %ux%u (obs %.0f%%)", app->cfg.nwf, app->cfg.nwf, app->cfg.cobs * 100.0f);
-    cs_printf_at(&app->scr, x + 20, dy + 3, 26, pal->fg_accent, pal->bg_panel, 0u, 1,
-                 "Star mV=%.1f  %.0f K", app->cfg.star_mag, app->cfg.star_teff);
-    cs_printf_at(&app->scr, x + 20, dy + 4, 26, pal->fg_stream, pal->bg_panel, 0u, 1,
-                 "Master %.0f Hz", app->cfg.master_hz);
-    cs_printf_at(&app->scr, x + 20, dy + 6, 26, pal->fg_muted, pal->bg_panel, 0u, 1,
-                 "wf:  %s", app->cfg.in_wf);
-    cs_printf_at(&app->scr, x + 20, dy + 7, 26, pal->fg_muted, pal->bg_panel, 0u, 1,
-                 "pup: %s", app->cfg.in_pup);
+    cs_printf_at(&app->scr, x + 20, dy + 1, 33, pal->fg_bright, pal->bg_panel, CS_ATTR_BOLD, 1,
+                 "Telescope %.2f m (obs %.0f%%)", app->cfg.tel_diam_m, app->cfg.cobs * 100.0f);
+    cs_printf_at(&app->scr, x + 20, dy + 2, 33, pal->fg_text, pal->bg_panel, 0u, 1,
+                 "Array: %ux%u pix", app->cfg.nwf, app->cfg.nwf);
+    cs_printf_at(&app->scr, x + 20, dy + 3, 33, pal->fg_text, pal->bg_panel, 0u, 1,
+                 "Beam : %.1f pix (%.1f%%)", sc.d_beam_px, app->cfg.pup_diam * 100.0f);
+    cs_printf_at(&app->scr, x + 20, dy + 4, 33, pal->fg_stream, pal->bg_panel, 0u, 1,
+                 "Pupil: %.4f m/pix", sc.pup_m_pix);
+    cs_printf_at(&app->scr, x + 20, dy + 5, 33, pal->fg_accent, pal->bg_panel, 0u, 1,
+                 "Focal: %.3f l/D/pix (%.8s)", sc.foc_ld_pix, sc.foc_src);
+    cs_printf_at(&app->scr, x + 20, dy + 6, 33, pal->fg_muted, pal->bg_panel, 0u, 1,
+                 "Sky  : %.4f arcsec/pix @%.2fum", sc.foc_arcsec_pix, sc.ref_lam_um);
+    cs_printf_at(&app->scr, x + 20, dy + 7, 33, pal->fg_accent, pal->bg_panel, 0u, 1,
+                 "Star : mV=%.1f  %.0fK  %.0fHz", app->cfg.star_mag, app->cfg.star_teff,
+                 app->cfg.master_hz);
+    cs_printf_at(&app->scr, x + 20, dy + 8, 33, pal->fg_dim, pal->bg_panel, 0u, 1,
+                 "SHM  : wf=%s pup=%s", app->cfg.in_wf, app->cfg.in_pup);
 
-    int sx = x + 48;
-    int sw = w - 50;
+    int sx = x + 55;
+    int sw = w - 57;
     if (sw > 36 && app->dag_valid)
     {
         cs_printf_at(&app->scr, sx, dy + 1, sw, pal->fg_dim, pal->bg_panel, 0u, 1,
@@ -286,20 +294,21 @@ void cs_render_view_tables(cs_tui_app_t *app, int x, int y, int w, int h)
     }
 
     ry++;
-    /* Section 3: Beamsplitters & Coronagraphs */
+    /* Section 3: Beamsplitters, Coronagraphs & Static WFE */
     if (ry + 2 < bot)
     {
         cs_printf_at(&app->scr, x + 2, ry++, w - 4, pal->fg_proc, pal->bg_panel, CS_ATTR_BOLD, 1,
-                     "BEAMSPLITTERS & CORONAGRAPHS");
+                     "BEAMSPLITTERS, CORONAGRAPHS & STATIC WFE");
         cs_printf_at(&app->scr, x + 2, ry++, w - 4, pal->fg_dim, pal->bg_panel, 0u, 1,
-                     "%-12s %-10s %-22s %-16s %s", "ID", "KIND", "MODE / CUTOFF", "IN BEAM",
-                     "OUTPUT ARMS");
+                     "%-12s %-10s %-24s %-16s %s", "ID", "KIND", "MODE / SPEC", "IN BEAM",
+                     "OUTPUT ARMS / SHM");
     }
 
     for (uint32_t i = 0; i < app->cfg.n_nodes && ry < bot; i++)
     {
         const cacaosim_node_cfg_t *nd = &app->cfg.nodes[i];
-        if (nd->kind != CACAOSIM_NODE_SPLITTER && nd->kind != CACAOSIM_NODE_CORO)
+        if (nd->kind != CACAOSIM_NODE_SPLITTER && nd->kind != CACAOSIM_NODE_CORO &&
+            nd->kind != CACAOSIM_NODE_WFE)
         {
             continue;
         }
@@ -307,7 +316,10 @@ void cs_render_view_tables(cs_tui_app_t *app, int x, int y, int w, int h)
         cs_tui_rgb_t bg  = sel ? pal->bg_selected : pal->bg_panel;
         cs_fill_rect(&app->scr, x + 1, ry, w - 2, 1, pal->fg_text, bg);
 
-        char mstr[28], arms[64];
+        const char *kstr = (nd->kind == CACAOSIM_NODE_SPLITTER)
+                               ? "SPLITTER"
+                               : (nd->kind == CACAOSIM_NODE_CORO ? "CORO" : "WFE");
+        char mstr[36], arms[112];
         if (nd->kind == CACAOSIM_NODE_SPLITTER)
         {
             if (nd->split.mode == CACAOSIM_SPLIT_GRAY)
@@ -321,19 +333,68 @@ void cs_render_view_tables(cs_tui_app_t *app, int x, int y, int w, int h)
             }
             snprintf(arms, sizeof(arms), "R:%s  T:%s", nd->out_refl, nd->out_trans);
         }
+        else if (nd->kind == CACAOSIM_NODE_CORO)
+        {
+            static const char *const cm_names[6] = {
+                "lyot_spot", "dimple", "vortex", "4qpm", "custom_mft", "custom_fft"
+            };
+            const char *cm = (nd->coro.mode >= 0 && nd->coro.mode < 6) ? cm_names[nd->coro.mode]
+                                                                       : "coro";
+            if (nd->coro.nlambda > 1)
+            {
+                snprintf(mstr, sizeof(mstr), "%s %dch %.2fu", cm, nd->coro.nlambda,
+                         nd->coro.lambda_um);
+            }
+            else
+            {
+                snprintf(mstr, sizeof(mstr), "%s %.2fu", cm, nd->coro.lambda_um);
+            }
+            int n_masks = (nd->in_pup_amp[0] != '\0') + (nd->in_pup_pha[0] != '\0') +
+                          (nd->in_fpm_amp[0] != '\0') + (nd->in_fpm_pha[0] != '\0') +
+                          (nd->in_lyot[0] != '\0') + (nd->in_lyot_pha[0] != '\0');
+            char ldesc[40] = "";
+            if (nd->out_lowfs[0] != '\0')
+            {
+                if (nd->coro.lowfs_mode == CACAOSIM_LOWFS_LYOT_REFL)
+                {
+                    snprintf(ldesc, sizeof(ldesc), "lyot_refl");
+                }
+                else
+                {
+                    float ap = (nd->coro.lowfs_pup_diam > 0.0f) ? nd->coro.lowfs_pup_diam : 1.0f;
+                    snprintf(ldesc, sizeof(ldesc), "fpm_refl ap=%.2fD", ap);
+                }
+            }
+            if (n_masks > 0 && nd->out_lowfs[0] != '\0')
+            {
+                snprintf(arms, sizeof(arms), "Sci:%s  LOWFS:%s (%s)  +%d masks", nd->out_beam,
+                         nd->out_lowfs, ldesc, n_masks);
+            }
+            else if (nd->out_lowfs[0] != '\0')
+            {
+                snprintf(arms, sizeof(arms), "Sci:%s  LOWFS:%s (%s)", nd->out_beam, nd->out_lowfs,
+                         ldesc);
+            }
+            else if (n_masks > 0)
+            {
+                snprintf(arms, sizeof(arms), "Sci:%s  (+%d custom masks)", nd->out_beam, n_masks);
+            }
+            else
+            {
+                snprintf(arms, sizeof(arms), "Sci:%s", nd->out_beam);
+            }
+        }
         else
         {
-            snprintf(mstr, sizeof(mstr), "coro %.2fu r=%.1fl/D", nd->coro.lambda_um,
-                     nd->coro.fpm_rad_ld);
-            snprintf(arms, sizeof(arms), "Sci:%s  LOWFS:%s", nd->out_beam, nd->out_lowfs);
+            snprintf(mstr, sizeof(mstr), "%.0fnm x%.2f [OPD m]", nd->wfe_rms_nm, nd->wfe_gain);
+            snprintf(arms, sizeof(arms), "Out:%s  SHM:%s", nd->out_beam, nd->in_wfe);
         }
 
         cs_printf_at(&app->scr, x + 2, ry, w - 4, sel ? pal->fg_bright : pal->fg_text, bg,
-                     sel ? CS_ATTR_BOLD : 0u, 1, "%-12.12s %-10s %-22s %-16.16s %s", nd->id,
-                     (nd->kind == CACAOSIM_NODE_SPLITTER) ? "SPLITTER" : "CORO", mstr, nd->in_beam,
-                     arms);
+                     sel ? CS_ATTR_BOLD : 0u, 1, "%-12.12s %-10s %-24s %-16.16s %s", nd->id, kstr,
+                     mstr, nd->in_beam, arms);
         cs_tui_add_hit(app, CS_HIT_ELEM_ROW, (int) i + 1, x + 1, ry, w - 2, 1,
-                       "Click to select splitter / coronagraph");
+                       "Click to select splitter / coronagraph / static WFE");
         ry++;
     }
 }
@@ -371,8 +432,9 @@ void cs_render_view_status(cs_tui_app_t *app, int x, int y, int w, int h)
     bx += view_btn(app, bx, by, "[S:Stop Bench]", CS_HIT_ACT_STOP, 0, pal->fg_error,
                    pal->bg_panel_alt, "Stop running cacaosim / atmturb processes [S]") +
           1;
-    bx += view_btn(app, bx, by, "[g:Regen Pupil]", CS_HIT_ACT_MKPUP, 0, pal->fg_fps,
-                   pal->bg_panel_alt, "Generate entrance pupil stream via mkpupil [g]") +
+    bx += view_btn(app, bx, by, "[g:Init Pupil+WFE]", CS_HIT_ACT_MKPUP, 0, pal->fg_fps,
+                   pal->bg_panel_alt,
+                   "Initialize entrance pupil & static WFE [m] SHM maps [g]") +
           1;
     {
         char at_lbl[32];

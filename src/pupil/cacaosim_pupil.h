@@ -57,6 +57,25 @@ void cacaosim_make_ncpa(
     uint64_t     seed,
     float       *ncpa_out);
 
+/**
+ * cacaosim_make_wfe_m() - Generate static optical wavefront error map in OPD [meter]
+ * @nwf:       Grid dimension [pixels]
+ * @pup_diam:  Outer pupil diameter fraction of nwf
+ * @pup_amp:   Optional pupil amplitude weights [nwf * nwf] (NULL uses circular pup_diam)
+ * @rms_m:     Target pupil-weighted RMS OPD [meter] (e.g. 5.0e-8f for 50 nm; <=0 -> zero map)
+ * @psd_alpha: Mid-spatial-frequency amplitude slope k^-alpha (<=0 -> 1.6)
+ * @seed:      Deterministic PRNG seed
+ * @wfe_out_m: Destination float OPD buffer [nwf * nwf] in meters
+ */
+void cacaosim_make_wfe_m(
+    uint32_t     nwf,
+    float        pup_diam,
+    const float *pup_amp,
+    float        rms_m,
+    float        psd_alpha,
+    uint64_t     seed,
+    float       *wfe_out_m);
+
 #ifdef __cplusplus
 }
 #endif

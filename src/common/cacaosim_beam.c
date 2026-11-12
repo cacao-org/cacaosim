@@ -412,6 +412,98 @@ void MILK_HOT cacaosim_beam_relay_cpu(
     }
 }
 
+void MILK_HOT cacaosim_beam_apply_wfe_cpu(
+    const float          *in_opd,
+    const float          *in_amp,
+    const float          *wfe_opd,
+    float                 wfe_to_um,
+    const cacaosim_reg_t *reg,
+    uint32_t              nwf,
+    float                *out_opd,
+    float                *out_amp)
+{
+    const uint64_t npix = (uint64_t) nwf * nwf;
+
+    if (cacaosim_reg_is_identity(reg))
+    {
+#pragma omp parallel for simd schedule(static) if (npix >= 8192)
+        for (uint64_t p = 0; p < npix; p++)
+        {
+            float o    = (in_opd != NULL) ? in_opd[p] : 0.0f;
+            float a    = (in_amp != NULL) ? in_amp[p] : 1.0f;
+            float w    = (wfe_opd != NULL) ? (wfe_to_um * wfe_opd[p]) : 0.0f;
+            out_opd[p] = o + w;
+            if (out_amp != NULL && out_amp != in_amp)
+            {
+                out_amp[p] = a;
+            }
+        }
+        return;
+    }
+
+    float sc   = (reg->scale > 1e-4f) ? reg->scale : 1.0f;
+    float invs = 1.0f / sc;
+    float rad  = -reg->rot_deg * (CACAOSIM_PI_F / 180.0f);
+    float c    = cosf(rad) * invs;
+    float s    = sinf(rad) * invs;
+    float ctr  = 0.5f * (float) (nwf - 1u);
+    float dx   = reg->shift_x;
+    float dy   = reg->shift_y;
+
+#pragma omp parallel for schedule(static) if (npix >= 4096)
+    for (uint32_t iy = 0; iy < nwf; iy++)
+    {
+        float vy = (float) iy - ctr - dy;
+        for (uint32_t ix = 0; ix < nwf; ix++)
+        {
+            float    vx = (float) ix - ctr - dx;
+            float    sx = ctr + c * vx - s * vy;
+            float    sy = ctr + s * vx + c * vy;
+            uint64_t p  = (uint64_t) iy * nwf + ix;
+
+            float o = 0.0f;
+            float a = 0.0f;
+            if (sx >= 0.0f && sy >= 0.0f && sx <= (float) (nwf - 1u) && sy <= (float) (nwf - 1u))
+            {
+                uint32_t x0  = (uint32_t) sx;
+                uint32_t y0  = (uint32_t) sy;
+                uint32_t x1  = (x0 + 1u < nwf) ? (x0 + 1u) : x0;
+                uint32_t y1  = (y0 + 1u < nwf) ? (y0 + 1u) : y0;
+                float    fx  = sx - (float) x0;
+                float    fy  = sy - (float) y0;
+                float    w00 = (1.0f - fx) * (1.0f - fy);
+                float    w10 = fx * (1.0f - fy);
+                float    w01 = (1.0f - fx) * fy;
+                float    w11 = fx * fy;
+
+                uint64_t i00 = (uint64_t) y0 * nwf + x0;
+                uint64_t i10 = (uint64_t) y0 * nwf + x1;
+                uint64_t i01 = (uint64_t) y1 * nwf + x0;
+                uint64_t i11 = (uint64_t) y1 * nwf + x1;
+
+                if (in_opd != NULL)
+                {
+                    o = w00 * in_opd[i00] + w10 * in_opd[i10] + w01 * in_opd[i01] +
+                        w11 * in_opd[i11];
+                }
+                a = (in_amp != NULL)
+                        ? (w00 * in_amp[i00] + w10 * in_amp[i10] + w01 * in_amp[i01] +
+                           w11 * in_amp[i11])
+                        : 1.0f;
+            }
+            if (wfe_opd != NULL)
+            {
+                o += wfe_to_um * wfe_opd[p];
+            }
+            out_opd[p] = o;
+            if (out_amp != NULL)
+            {
+                out_amp[p] = a;
+            }
+        }
+    }
+}
+
 void MILK_COLD cacaosim_beam_shm_init_kw(IMAGE *im)
 {
     if (im == NULL || im->md == NULL || im->kw == NULL || im->md->NBkw < 4 + CACAOSIM_NSPEC)
@@ -504,4 +596,87 @@ int cacaosim_beam_shm_is_valid(
             im->md->size[0] == nwf && im->md->size[1] == nwf && im->md->size[2] >= 2)
                ? 1
                : 0;
+}
+
+void cacaosim_beam_shm_write_poly_kw(
+    IMAGE   *im,
+    uint32_t nwl,
+    float    wl0_um,
+    float    wl1_um)
+{
+    const int base = 4 + CACAOSIM_NSPEC;
+    if (im == NULL || im->md == NULL || im->kw == NULL || im->md->NBkw < base + 3)
+    {
+        return;
+    }
+    snprintf(im->kw[base].name, KEYWORD_MAX_STRING, "CSIM_NWL");
+    im->kw[base].type       = 'L';
+    im->kw[base].value.numl = (int64_t) ((nwl >= 1u) ? nwl : 1u);
+    snprintf(im->kw[base].comment, KEYWORD_MAX_COMMENT, "Number of [OPD, Amp] spectral channels");
+
+    snprintf(im->kw[base + 1].name, KEYWORD_MAX_STRING, "CSIM_WL0");
+    im->kw[base + 1].type       = 'D';
+    im->kw[base + 1].value.numf = (double) wl0_um;
+    snprintf(im->kw[base + 1].comment, KEYWORD_MAX_COMMENT, "First channel wavelength [um]");
+
+    snprintf(im->kw[base + 2].name, KEYWORD_MAX_STRING, "CSIM_WL1");
+    im->kw[base + 2].type       = 'D';
+    im->kw[base + 2].value.numf = (double) wl1_um;
+    snprintf(im->kw[base + 2].comment, KEYWORD_MAX_COMMENT, "Last channel wavelength [um]");
+}
+
+int cacaosim_beam_shm_read_poly_kw(
+    const IMAGE *im,
+    uint32_t    *nwl_out,
+    float       *wl0_out,
+    float       *wl1_out)
+{
+    if (nwl_out != NULL)
+    {
+        *nwl_out = 1u;
+    }
+    if (wl0_out != NULL)
+    {
+        *wl0_out = 0.0f;
+    }
+    if (wl1_out != NULL)
+    {
+        *wl1_out = 0.0f;
+    }
+    if (im == NULL || im->md == NULL || im->md->naxis != 3 || im->md->size[2] < 4u)
+    {
+        return 0;
+    }
+
+    uint32_t z_nwl = im->md->size[2] / 2u;
+    uint32_t kw_n  = z_nwl;
+    float    l0    = 0.0f;
+    float    l1    = 0.0f;
+
+    const int base = 4 + CACAOSIM_NSPEC;
+    if (im->kw != NULL && im->md->NBkw >= base + 3 && im->kw[base].type == 'L' &&
+        strcmp(im->kw[base].name, "CSIM_NWL") == 0 && im->kw[base].value.numl >= 1)
+    {
+        uint32_t kn = (uint32_t) im->kw[base].value.numl;
+        if (kn <= z_nwl)
+        {
+            kw_n = kn;
+        }
+        l0 = (float) im->kw[base + 1].value.numf;
+        l1 = (float) im->kw[base + 2].value.numf;
+    }
+
+    if (nwl_out != NULL)
+    {
+        *nwl_out = kw_n;
+    }
+    if (wl0_out != NULL)
+    {
+        *wl0_out = l0;
+    }
+    if (wl1_out != NULL)
+    {
+        *wl1_out = l1;
+    }
+    return (kw_n > 1u) ? 1 : 0;
 }

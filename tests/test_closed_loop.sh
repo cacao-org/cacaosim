@@ -18,7 +18,7 @@ export LD_LIBRARY_PATH="${BUILD_DIR}:${INSTALL_DIR}/lib:${LD_LIBRARY_PATH:-}"
 
 cleanup() {
     cacaosim-bench stop >/dev/null 2>&1 || true
-    for unit in htsim mkbeam fpcam pyrwfs shwfs zwfs coro beamsplit dmsim; do
+    for unit in htsim mkbeam fpcam pyrwfs shwfs zwfs coro beamsplit dmsim wfe; do
         "milk-fpsexec-cacaosim-${unit}" runstop >/dev/null 2>&1 || true
     done
     pkill -INT -P $$ 2>/dev/null || true
@@ -30,7 +30,7 @@ trap cleanup EXIT
 cd "${TEST_WORK}"
 
 echo "=== [1/8] Checking fpsexec & visualizer -h1 help & zero CLIcore linkage ==="
-ALL_UNITS=(mkpupil mkbeam dmsim beamsplit coro pyrwfs shwfs zwfs fpcam htsim)
+ALL_UNITS=(mkpupil mkbeam wfe dmsim beamsplit coro pyrwfs shwfs zwfs fpcam htsim)
 for unit in "${ALL_UNITS[@]}"; do
     exe="milk-fpsexec-cacaosim-${unit}"
     "${exe}" -h1 >/dev/null
@@ -58,26 +58,48 @@ if ldd "$(command -v cacaosim-CTRL)" | grep -q "libCLIcore"; then
 fi
 echo "  [PASS] cacaosim-CTRL (-h1/-h2/-hm OK, no libCLIcore)"
 
-echo "=== [2/7] Testing oneshot pupil + NCPA stream creation ==="
+echo "=== [2/8] Testing oneshot pupil + NCPA + static WFE [meter] stream creation ==="
 milk-fpsexec-cacaosim-mkpupil --no-procinfo exec \
     .nwf=128 \
     .out_pup=csim_pup \
     .out_ncpa=csim_ncpa \
     .ncpa_rms=0.05
 
+milk-fpsexec-cacaosim-wfe -n csim_wfe_init --no-procinfo exec \
+    .init_only=ON \
+    .nwf=128 \
+    .in_pup=csim_pup \
+    .in_wfe=csim_wfe_m \
+    .rms_nm=65.0
+
 test -f "${TEST_SHM}/csim_pup.im.shm"
 test -f "${TEST_SHM}/csim_ncpa.im.shm"
-echo "  [PASS] csim_pup.im.shm and csim_ncpa.im.shm created in ${TEST_SHM}"
+test -f "${TEST_SHM}/csim_wfe_m.im.shm"
+echo "  [PASS] csim_pup, csim_ncpa, and csim_wfe_m [OPD m] created in ${TEST_SHM}"
 
-echo "=== [3/7] Testing modular beam pipeline (mkbeam -> dm -> split -> shwfs + coro -> zwfs) ==="
+echo "=== [3/8] Testing modular beam pipeline (mkbeam -> wfe -> dm -> split -> shwfs + coro) ==="
 milk-fpsexec-cacaosim-mkbeam fpsinit \
     .nwf=128 \
     .in_pup=csim_pup \
-    .out_beam=b_mod0 \
+    .out_beam=b_mod_raw \
     .star_mag=7.0
 milk-fps-set csim_mkbeam.procinfo.triggermode 0
 milk-fps-set csim_mkbeam.procinfo.loopcntMax 5
 milk-fpsexec-cacaosim-mkbeam run
+
+test -f "${TEST_SHM}/b_mod_raw.im.shm"
+
+milk-fpsexec-cacaosim-wfe fpsinit \
+    .init_only=OFF \
+    .nwf=128 \
+    .in_pup=csim_pup \
+    .in_beam=b_mod_raw \
+    .out_beam=b_mod0 \
+    .in_wfe=csim_wfe_m \
+    .wfe_gain=1.0
+milk-fps-set csim_wfe.procinfo.triggermode 0
+milk-fps-set csim_wfe.procinfo.loopcntMax 5
+milk-fpsexec-cacaosim-wfe run
 
 test -f "${TEST_SHM}/b_mod0.im.shm"
 
@@ -170,7 +192,67 @@ milk-fpsexec-cacaosim-fpcam run
 
 test -f "${TEST_SHM}/csim_fpcam.im.shm"
 test -f "${TEST_SHM}/csim_fplong.im.shm"
-echo "  [PASS] Modular optical beam + SHWFS + Coro + ZWFS + PyWFS + FPcam streams verified"
+
+if command -v python3 >/dev/null 2>&1; then
+    P3_FITS="${TEST_WORK}/pup_apod_3d.fits"
+    F3_FITS="${TEST_WORK}/fpm_pha_3d.fits"
+    python3 - "${P3_FITS}" "${F3_FITS}" <<'PYEOF'
+import math, struct, sys
+
+def write_fits3d(path, nx, ny, nz, crval3, cdelt3, gen_fn):
+    cards = [
+        "SIMPLE  =                    T",
+        "BITPIX  =                  -32",
+        "NAXIS   =                    3",
+        f"NAXIS1  = {nx:20d}",
+        f"NAXIS2  = {ny:20d}",
+        f"NAXIS3  = {nz:20d}",
+        f"CRPIX3  =                  1.0",
+        f"CRVAL3  = {crval3:20.8f}",
+        f"CDELT3  = {cdelt3:20.8f}",
+        "CUNIT3  = 'um      '",
+        "END",
+    ]
+    hdr = b"".join(c.ljust(80).encode("ascii") for c in cards)
+    hdr += b" " * ((2880 - len(hdr) % 2880) % 2880)
+    vals = [gen_fn(x, y, z) for z in range(nz) for y in range(ny) for x in range(nx)]
+    raw = struct.pack(f">{len(vals)}f", *vals)
+    raw += b"\x00" * ((2880 - len(raw) % 2880) % 2880)
+    with open(path, "wb") as f:
+        f.write(hdr + raw)
+
+write_fits3d(sys.argv[1], 128, 128, 4, 1.50, 0.10,
+             lambda x, y, z: 0.92 - 0.02 * z)
+write_fits3d(sys.argv[2], 48, 48, 4, 1.50, 0.10,
+             lambda x, y, z: math.pi if (x - 23.5)**2 + (y - 23.5)**2 < 64.0 else 0.0)
+PYEOF
+    milk-fpsexec-cacaosim-coro -n csim_coro3d fpsinit \
+        .nwf=128 \
+        .in_beam=b_nir_arm \
+        .out_beam=b_coro_poly3d \
+        .coro_mode=4 \
+        .fpm_pixscale=6.0 \
+        .lambda_um=1.65 \
+        .bw_frac=0.20 \
+        .in_pup_amp="${P3_FITS}" \
+        .in_fpm_pha="${F3_FITS}"
+    milk-fps-set csim_coro3d.procinfo.triggermode 0
+    milk-fps-set csim_coro3d.procinfo.loopcntMax 4
+    milk-fpsexec-cacaosim-coro -n csim_coro3d run
+    test -f "${TEST_SHM}/b_coro_poly3d.im.shm"
+
+    milk-fpsexec-cacaosim-fpcam -n csim_fpcam3d fpsinit \
+        .nwf=128 \
+        .in_pup=csim_pup \
+        .in_beam=b_coro_poly3d \
+        .ncam=64 \
+        .out_cam=csim_fpcam_poly3d
+    milk-fps-set csim_fpcam3d.procinfo.triggermode 0
+    milk-fps-set csim_fpcam3d.procinfo.loopcntMax 4
+    milk-fpsexec-cacaosim-fpcam -n csim_fpcam3d run
+    test -f "${TEST_SHM}/csim_fpcam_poly3d.im.shm"
+fi
+echo "  [PASS] Modular optical beam + 3D custom coronagraph masks + WFS + FPcam verified"
 
 echo "=== [4/7] Testing fused htsim + milkatmturb live stream + default cacaosim-bench ==="
 if command -v milk-fpsexec-atmturb-mkwfs >/dev/null 2>&1; then
@@ -282,9 +364,9 @@ def drain(timeout_s):
                 break
 
 drain(0.20)
-# Load ExAO preset ('P' -> '4' ExAO -> 'y' confirm), add DM ('a' -> '1'),
+# Load ExAO preset ('P' -> '4' ExAO -> 'y' confirm), add DM ('a' -> '1') & WFE ('a' -> '9'),
 # cycle F3/F4/F5/F6/F2 tabs, save ('s'), and quit ('q')
-for seq in [b"P", b"4", b"y", b"a", b"1", b"\x1b[13~", b"\x1b[14~",
+for seq in [b"P", b"4", b"y", b"a", b"1", b"a", b"9", b"\x1b[13~", b"\x1b[14~",
             b"\x1b[15~", b"\x1b[17~", b"\x1b[12~", b"s", b"q"]:
     os.write(master_fd, seq)
     drain(0.06)
@@ -298,16 +380,18 @@ PYEOF
     test -f "${PTY_BENCH}"
     PTY_VIEW="$(cacaosim-bench view "${PTY_BENCH}" -t)"
     grep -q "VALID DAG" <<<"${PTY_VIEW}"
-    echo "  [PASS] cacaosim-CTRL interactive PTY (preset -> add DM -> F2..F6 -> save -> quit)"
+    grep -q "wfe" <<<"${PTY_VIEW}"
+    echo "  [PASS] cacaosim-CTRL interactive PTY (preset -> add DM+WFE -> F2..F6 -> save -> quit)"
 fi
 
 echo "=== [8/8] Testing milk-cli dynamic module load (cacaosim) ==="
 if [[ -x "${INSTALL_DIR}/bin/milk-cli" && -f "${INSTALL_DIR}/lib/libmilkcacaosim.so" ]]; then
     CLI_OUT="$("${INSTALL_DIR}/bin/milk-cli" -q -c \
-        "cacaosim.pyrwfs -h; cacaosim.shwfs -h; cacaosim.coro -h" 2>&1)"
+        "cacaosim.pyrwfs -h; cacaosim.shwfs -h; cacaosim.coro -h; cacaosim.wfe -h" 2>&1)"
     if echo "${CLI_OUT}" | grep -q "Pyramid WFS" &&
        echo "${CLI_OUT}" | grep -q "Shack-Hartmann" &&
-       echo "${CLI_OUT}" | grep -q "coronagraph"; then
+       echo "${CLI_OUT}" | grep -q "coronagraph" &&
+       echo "${CLI_OUT}" | grep -q "wavefront error"; then
         "${INSTALL_DIR}/bin/milk-cli" -q -c \
             "cacaosim.mkpupil csim_cli_pup 64" >/dev/null
         test -f "${TEST_SHM}/csim_cli_pup.im.shm"

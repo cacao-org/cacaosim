@@ -122,11 +122,13 @@ static void MILK_HOT fpcam_build_epup_cpu(
     }
 }
 
-static void MILK_HOT fpcam_accum_cpu(
+static void MILK_HOT fpcam_accum_poly_cpu(
     cacaosim_fpcam_ctx_t *ctx,
     const float          *pup_amp,
     const float          *atm_amp,
     const float          *wf_in,
+    uint32_t              beam_nlam,
+    uint64_t              chan_stride,
     const float          *dm_opd,
     const float          *ncpa_opd,
     float                 wf_to_opd)
@@ -144,9 +146,17 @@ static void MILK_HOT fpcam_accum_cpu(
 
         for (int32_t c = 0; c < ctx->eff_nlam; c++)
         {
-            const float opd_to_rad = CACAOSIM_TWO_PI_F / ctx->lam_um[c];
-            fpcam_build_epup_cpu(pup_amp, atm_amp, wf_in, dm_opd, ncpa_opd, wf_to_opd,
-                                 opd_to_rad, ctx->npix_wf, ctx->cpu_epup_cplx);
+            uint32_t bc = (beam_nlam <= 1u)
+                              ? 0u
+                              : ((beam_nlam == (uint32_t) ctx->eff_nlam)
+                                     ? (uint32_t) c
+                                     : (((uint32_t) c * beam_nlam) / (uint32_t) ctx->eff_nlam));
+            const float *pup_c = (pup_amp != NULL) ? (pup_amp + (uint64_t) bc * chan_stride) : NULL;
+            const float *wf_c  = (wf_in != NULL) ? (wf_in + (uint64_t) bc * chan_stride) : NULL;
+            const float  opd_to_rad = CACAOSIM_TWO_PI_F / ctx->lam_um[c];
+
+            fpcam_build_epup_cpu(pup_c, atm_amp, wf_c, dm_opd, ncpa_opd, wf_to_opd, opd_to_rad,
+                                 ctx->npix_wf, ctx->cpu_epup_cplx);
 
             const float *Uc = &ctx->mft_U_cplx[(size_t) c * ncam * nwf * 2u];
             const float *Vc = &ctx->mft_V_cplx[(size_t) c * nwf * ncam * 2u];
@@ -180,9 +190,17 @@ static void MILK_HOT fpcam_accum_cpu(
 
         for (int32_t c = 0; c < ctx->eff_nlam; c++)
         {
-            const float opd_to_rad = CACAOSIM_TWO_PI_F / ctx->lam_um[c];
-            fpcam_build_epup_cpu(pup_amp, atm_amp, wf_in, dm_opd, ncpa_opd, wf_to_opd,
-                                 opd_to_rad, ctx->npix_wf, ctx->cpu_epup_cplx);
+            uint32_t bc = (beam_nlam <= 1u)
+                              ? 0u
+                              : ((beam_nlam == (uint32_t) ctx->eff_nlam)
+                                     ? (uint32_t) c
+                                     : (((uint32_t) c * beam_nlam) / (uint32_t) ctx->eff_nlam));
+            const float *pup_c = (pup_amp != NULL) ? (pup_amp + (uint64_t) bc * chan_stride) : NULL;
+            const float *wf_c  = (wf_in != NULL) ? (wf_in + (uint64_t) bc * chan_stride) : NULL;
+            const float  opd_to_rad = CACAOSIM_TWO_PI_F / ctx->lam_um[c];
+
+            fpcam_build_epup_cpu(pup_c, atm_amp, wf_c, dm_opd, ncpa_opd, wf_to_opd, opd_to_rad,
+                                 ctx->npix_wf, ctx->cpu_epup_cplx);
 
             __builtin_memset(ctx->cpu_fft_in_cplx, 0, ctx->npix_fft * 2u * sizeof(float));
             for (uint32_t yp = 0; yp < nwf; yp++)
@@ -212,6 +230,19 @@ static void MILK_HOT fpcam_accum_cpu(
             }
         }
     }
+}
+
+static void MILK_HOT fpcam_accum_cpu(
+    cacaosim_fpcam_ctx_t *ctx,
+    const float          *pup_amp,
+    const float          *atm_amp,
+    const float          *wf_in,
+    const float          *dm_opd,
+    const float          *ncpa_opd,
+    float                 wf_to_opd)
+{
+    fpcam_accum_poly_cpu(ctx, pup_amp, atm_amp, wf_in, 1u, ctx->npix_wf, dm_opd, ncpa_opd,
+                         wf_to_opd);
 }
 
 int MILK_COLD cacaosim_fpcam_init(
@@ -252,20 +283,35 @@ int MILK_COLD cacaosim_fpcam_init(
     float   lam0 = (cfg->lambda_um > 0.05f) ? cfg->lambda_um : 1.65f;
     float   bw   = (cfg->bw_frac > 0.0f) ? cfg->bw_frac : 0.0f;
     int32_t nlam = cfg->nlambda;
-    if (nlam < 1 || bw <= 1e-6f)
+    if (cfg->has_ext_lam && nlam >= 1)
     {
-        nlam = 1;
+        if (nlam > CACAOSIM_FPCAM_MAX_LAMBDA)
+        {
+            nlam = CACAOSIM_FPCAM_MAX_LAMBDA;
+        }
+        ctx->eff_nlam = nlam;
+        for (int32_t c = 0; c < nlam; c++)
+        {
+            ctx->lam_um[c] = (cfg->ext_lam_um[c] > 0.05f) ? cfg->ext_lam_um[c] : lam0;
+        }
     }
-    if (nlam > CACAOSIM_FPCAM_MAX_LAMBDA)
+    else
     {
-        nlam = CACAOSIM_FPCAM_MAX_LAMBDA;
-    }
-    ctx->eff_nlam = nlam;
+        if (nlam < 1 || bw <= 1e-6f)
+        {
+            nlam = 1;
+        }
+        if (nlam > CACAOSIM_FPCAM_MAX_LAMBDA)
+        {
+            nlam = CACAOSIM_FPCAM_MAX_LAMBDA;
+        }
+        ctx->eff_nlam = nlam;
 
-    for (int32_t c = 0; c < nlam; c++)
-    {
-        float u        = (nlam > 1) ? (((float) c + 0.5f) / (float) nlam - 0.5f) : 0.0f;
-        ctx->lam_um[c] = lam0 * (1.0f + bw * u);
+        for (int32_t c = 0; c < nlam; c++)
+        {
+            float u        = (nlam > 1) ? (((float) c + 0.5f) / (float) nlam - 0.5f) : 0.0f;
+            ctx->lam_um[c] = lam0 * (1.0f + bw * u);
+        }
     }
 
     float dpix = cfg->pup_diam * (float) cfg->nwf;
@@ -433,10 +479,12 @@ void MILK_HOT cacaosim_fpcam_accum_subframe(
     ctx->subframe_cnt++;
 }
 
-void MILK_HOT cacaosim_fpcam_accum_beam(
+void MILK_HOT cacaosim_fpcam_accum_beam_poly(
     cacaosim_fpcam_ctx_t *ctx,
     const float          *beam_opd,
     const float          *beam_amp,
+    uint32_t              beam_nlam,
+    uint64_t              chan_stride,
     const float          *ncpa_opd,
     const float          *d_beam_opd,
     const float          *d_beam_amp)
@@ -447,8 +495,8 @@ void MILK_HOT cacaosim_fpcam_accum_beam(
         {
             cacaosim_fpcam_cuda_reset_accum(ctx);
         }
-        cacaosim_fpcam_cuda_accum(ctx, beam_amp, NULL, beam_opd, NULL, d_beam_amp, d_beam_opd,
-                                  NULL, 1.0f);
+        cacaosim_fpcam_cuda_accum_poly(ctx, beam_opd, beam_amp, beam_nlam, chan_stride, d_beam_opd,
+                                       d_beam_amp);
     }
     else
     {
@@ -456,9 +504,22 @@ void MILK_HOT cacaosim_fpcam_accum_beam(
         {
             __builtin_memset(ctx->cpu_accum_int, 0, ctx->npix_cam * sizeof(float));
         }
-        fpcam_accum_cpu(ctx, beam_amp, NULL, beam_opd, NULL, ncpa_opd, 1.0f);
+        fpcam_accum_poly_cpu(ctx, beam_amp, NULL, beam_opd, beam_nlam, chan_stride, NULL, ncpa_opd,
+                             1.0f);
     }
     ctx->subframe_cnt++;
+}
+
+void MILK_HOT cacaosim_fpcam_accum_beam(
+    cacaosim_fpcam_ctx_t *ctx,
+    const float          *beam_opd,
+    const float          *beam_amp,
+    const float          *ncpa_opd,
+    const float          *d_beam_opd,
+    const float          *d_beam_amp)
+{
+    cacaosim_fpcam_accum_beam_poly(ctx, beam_opd, beam_amp, 1u, ctx->npix_wf, ncpa_opd, d_beam_opd,
+                                   d_beam_amp);
 }
 
 void MILK_HOT cacaosim_fpcam_readout(

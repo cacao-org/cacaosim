@@ -10,18 +10,23 @@ hardware and optical simulation plugin for the `milk` framework (`feat/bash-engi
 
 - **`src/common/`**: Aligned memory, monotonic `TIMER_ABSTIME` pacing, thread-local `xoshiro128++`
   CPU PRNG, Philox-style CUDA PRNG, 32-bin (`0.40..2.40 um`) spectral photometry & dichroic
-  beamsplitters, 2D affine pupil registration, SHM beam keyword serialization, and detector readout.
+  beamsplitters, 2D affine pupil registration, SHM beam keyword serialization, 2D/3D polychromatic
+  FITS/SHM mask cube I/O (`cacaosim_mask`), and detector readout.
 - **`src/pupil/`**: Anti-aliased telescope pupil and static NCPA generator (`cacaosim.mkpupil`,
   `milk-fpsexec-cacaosim-mkpupil`).
 - **`src/beam/`**: Optical beam `[OPD_um, Amplitude]` source (`cacaosim.mkbeam`,
-  `milk-fpsexec-cacaosim-mkbeam`) and gray / LP / SP / band-reflect dichroic beamsplitter with
-  per-arm NCPA, pupil/Lyot masks, and 2D registration (`cacaosim.beamsplit`,
-  `milk-fpsexec-cacaosim-beamsplit`).
+  `milk-fpsexec-cacaosim-mkbeam`), inline static wavefront error `[meter]` OPD element
+  (`cacaosim.wfe`, `milk-fpsexec-cacaosim-wfe`, `[wfe.<id>]`), and gray / LP / SP / band-reflect
+  dichroic beamsplitter with per-arm NCPA, pupil/Lyot masks, and 2D registration
+  (`cacaosim.beamsplit`, `milk-fpsexec-cacaosim-beamsplit`).
 - **`src/dm/`**: DM & 2-axis Tip-Tilt mirror (`dm_mode = 1`) hardware simulator (`cacaosim.dmsim`,
   `milk-fpsexec-cacaosim-dmsim`) with fractional-frame delay, 1st/2nd-order exact discrete ZOH
   dynamics, DAC quantization, stroke saturation, 2D registration, and in-line `in_beam -> out_beam`.
-- **`src/coro/`**: Coronagraphic focal-plane mask (Lyot spot, phase dimple, Optical Vortex, 4QPM),
-  Lyot stop, and FPM-reflected `out_lowfs` pickoff (`cacaosim.coro`, `milk-fpsexec-cacaosim-coro`).
+- **`src/coro/`**: Coronagraphic focal-plane & pupil-plane unit (`cacaosim.coro`,
+  `milk-fpsexec-cacaosim-coro`) supporting analytic (Lyot spot, phase dimple, Optical Vortex, 4QPM)
+  and custom FITS/SHM amplitude and/or phase masks in pupil, focal (`custom_mft`, `custom_fft`),
+  and Lyot planes, including 3D `[Nx, Ny, Nlambda]` polychromatic cubes and dual `out_lowfs`
+  pickoff modes (`fpm_refl` with `lowfs_pup_diam` aperture stop, or `lyot_refl` reflective Lyot).
 - **`src/pyrwfs/`**: 4-sided Pyramid WFS (`cacaosim.pyrwfs`, `milk-fpsexec-cacaosim-pyrwfs`) using
   precomputed shifted focal masks, `N_mod + 1` FFT reduction, multi-subframe `navg`, and CUDA
   Graphs.

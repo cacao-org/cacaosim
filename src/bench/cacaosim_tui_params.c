@@ -54,6 +54,7 @@ enum
     PID_N_OUT_LONG,
     PID_N_IN_NCPA,
     PID_N_IN_LYOT,
+    PID_N_IN_WFE,
     PID_N_TPUT,
     PID_N_SHIFT_X,
     PID_N_SHIFT_Y,
@@ -90,15 +91,27 @@ enum
     /* Coronagraph */
     PID_CO_MODE = 400,
     PID_CO_LAMBDA,
+    PID_CO_BW_FRAC,
+    PID_CO_NLAMBDA,
+    PID_CO_PHA_UNIT,
     PID_CO_FPM_RAD,
     PID_CO_FPM_AMP,
     PID_CO_FPM_PHASE,
+    PID_CO_FPM_PIXSCALE,
+    PID_CO_PAD_FACTOR,
     PID_CO_VORTEX_Q,
+    PID_CO_LOWFS_MODE,
+    PID_CO_LOWFS_PUP,
     PID_CO_LOWFS_REFL,
     PID_CO_LYOT_OUTER,
     PID_CO_LYOT_OBS,
     PID_CO_LYOT_NSP,
     PID_CO_LYOT_SPW,
+    PID_CO_IN_PUP_AMP,
+    PID_CO_IN_PUP_PHA,
+    PID_CO_IN_FPM_AMP,
+    PID_CO_IN_FPM_PHA,
+    PID_CO_IN_LYOT_PHA,
 
     /* Sensors (PyWFS / SHWFS / ZWFS / FPCAM) */
     PID_S_NCAM = 500,
@@ -124,7 +137,13 @@ enum
     PID_ZW_NMFT,
     PID_FP_PROP_MODE,
     PID_FP_PIXSCALE,
-    PID_FP_NLAMBDA
+    PID_FP_NLAMBDA,
+
+    /* Static Wavefront Error */
+    PID_WFE_RMS_NM = 600,
+    PID_WFE_ALPHA,
+    PID_WFE_GAIN,
+    PID_WFE_SEED
 };
 
 static void add_pd(
@@ -192,6 +211,29 @@ static void add_enum_pd(
     p->enum_names[1] = e1;
     p->enum_names[2] = e2;
     p->enum_names[3] = e3;
+}
+
+static void add_enum6_pd(
+    cs_param_desc_t *arr,
+    int             *n,
+    int              max_n,
+    int              id,
+    const char      *key,
+    const char      *label,
+    const char      *e0,
+    const char      *e1,
+    const char      *e2,
+    const char      *e3,
+    const char      *e4,
+    const char      *e5,
+    const char      *tip)
+{
+    add_enum_pd(arr, n, max_n, id, key, label, 6, e0, e1, e2, e3, tip);
+    if (*n > 0)
+    {
+        arr[*n - 1].enum_names[4] = e4;
+        arr[*n - 1].enum_names[5] = e5;
+    }
 }
 
 int cs_params_build(
@@ -301,9 +343,26 @@ int cs_params_build(
             add_pd(out, &n, max_out, PID_N_OUT_BEAM, "out", "Post-Lyot Beam", "beam", CS_PTYPE_STR,
                    0, 0, 0, "Post-Lyot coronagraphic output beam");
             add_pd(out, &n, max_out, PID_N_OUT_LOWFS, "out_lowfs", "LOWFS Pickoff", "beam",
-                   CS_PTYPE_STR, 0, 0, 0, "FPM-reflected inner core beam for LOWFS");
-            add_pd(out, &n, max_out, PID_N_IN_LYOT, "in_lyot", "Lyot Mask SHM", "shm", CS_PTYPE_STR,
-                   0, 0, 0, "Optional custom 2D Lyot stop amplitude stream");
+                   CS_PTYPE_STR, 0, 0, 0, "Reflected FPM or Lyot stop pickoff beam for LOWFS");
+            add_pd(out, &n, max_out, PID_CO_IN_PUP_AMP, "in_pup_amp", "Pupil Amp Mask", "mask",
+                   CS_PTYPE_STR, 0, 0, 0, "Custom 2D/3D pupil apodizer amplitude (FITS or SHM)");
+            add_pd(out, &n, max_out, PID_CO_IN_PUP_PHA, "in_pup_pha", "Pupil Pha Mask", "mask",
+                   CS_PTYPE_STR, 0, 0, 0, "Custom 2D/3D pupil apodizer phase/OPD (FITS or SHM)");
+            add_pd(out, &n, max_out, PID_CO_IN_FPM_AMP, "in_fpm_amp", "Focal Amp Mask", "mask",
+                   CS_PTYPE_STR, 0, 0, 0, "Custom 2D/3D focal mask amplitude (FITS or SHM)");
+            add_pd(out, &n, max_out, PID_CO_IN_FPM_PHA, "in_fpm_pha", "Focal Pha Mask", "mask",
+                   CS_PTYPE_STR, 0, 0, 0, "Custom 2D/3D focal mask phase/OPD (FITS or SHM)");
+            add_pd(out, &n, max_out, PID_N_IN_LYOT, "in_lyot", "Lyot Amp Mask", "mask",
+                   CS_PTYPE_STR, 0, 0, 0, "Custom 2D/3D Lyot stop amplitude (FITS or SHM)");
+            add_pd(out, &n, max_out, PID_CO_IN_LYOT_PHA, "in_lyot_pha", "Lyot Pha Mask", "mask",
+                   CS_PTYPE_STR, 0, 0, 0, "Custom 2D/3D Lyot stop phase/OPD (FITS or SHM)");
+        }
+        else if (nd->kind == CACAOSIM_NODE_WFE)
+        {
+            add_pd(out, &n, max_out, PID_N_OUT_BEAM, "out", "Output Beam", "beam", CS_PTYPE_STR, 0,
+                   0, 0, "Downstream optical beam with static WFE applied");
+            add_pd(out, &n, max_out, PID_N_IN_WFE, "in_wfe", "Static WFE SHM", "m", CS_PTYPE_STR, 0,
+                   0, 0, "Input 2D static wavefront error OPD stream [meter]");
         }
         else
         {
@@ -417,10 +476,17 @@ int cs_params_build(
     {
         if (subtab == 0)
         {
-            add_enum_pd(out, &n, max_out, PID_CO_MODE, "mode", "FPM Architecture", 4, "lyot_spot",
-                        "phase_dimple", "vortex", "4qpm", "Coronagraphic focal-plane mask type");
+            add_enum6_pd(out, &n, max_out, PID_CO_MODE, "mode", "FPM Architecture", "lyot_spot",
+                         "phase_dimple", "vortex", "4qpm", "custom_mft", "custom_fft",
+                         "Analytic or custom FITS/SHM focal/pupil mask propagation");
             add_pd(out, &n, max_out, PID_CO_LAMBDA, "lambda_um", "Design Lambda", "um",
-                   CS_PTYPE_FLOAT, 0.45, 2.40, 0.05, "Coronagraph design wavelength [um]");
+                   CS_PTYPE_FLOAT, 0.40, 2.40, 0.05, "Coronagraph reference wavelength [um]");
+            add_pd(out, &n, max_out, PID_CO_BW_FRAC, "bw_frac", "Bandwidth dL/L", "",
+                   CS_PTYPE_FLOAT, 0.0, 0.60, 0.02, "Polychromatic fractional bandwidth dLambda/L");
+            add_pd(out, &n, max_out, PID_CO_NLAMBDA, "nlambda", "Spectral Slices", "ch",
+                   CS_PTYPE_INT, 1, 32, 1, "Polychromatic slices (auto-adopted from 3D mask cube)");
+            add_enum_pd(out, &n, max_out, PID_CO_PHA_UNIT, "pha_unit", "Mask Phase Unit", 2, "rad",
+                        "um", NULL, NULL, "Unit of custom phase masks: 0 = radians, 1 = OPD [um]");
             if (nd->coro.mode <= CACAOSIM_CORO_PHASE_DIMPLE)
             {
                 add_pd(out, &n, max_out, PID_CO_FPM_RAD, "fpm_rad_ld", "FPM Radius", "l/D",
@@ -437,6 +503,19 @@ int cs_params_build(
             {
                 add_pd(out, &n, max_out, PID_CO_VORTEX_Q, "vortex_charge", "Vortex Charge", "l",
                        CS_PTYPE_INT, 2, 8, 2, "Topological charge l (even integer: 2, 4, 6)");
+                add_pd(out, &n, max_out, PID_CO_PAD_FACTOR, "pad_factor", "FFT Pad Factor", "x",
+                       CS_PTYPE_UINT, 2, 8, 1, "Zero-padded focal FFT oversampling factor");
+            }
+            else if (nd->coro.mode == CACAOSIM_CORO_CUSTOM_MFT)
+            {
+                add_pd(out, &n, max_out, PID_CO_FPM_PIXSCALE, "fpm_pixscale", "FPM Sampling",
+                       "px/(l/D)", CS_PTYPE_FLOAT, 0.5, 64.0, 0.5,
+                       "Custom MFT focal mask pixels per lambda_0/D");
+            }
+            else
+            {
+                add_pd(out, &n, max_out, PID_CO_PAD_FACTOR, "pad_factor", "FFT Pad Factor", "x",
+                       CS_PTYPE_UINT, 2, 8, 1, "Zero-padded focal FFT oversampling factor");
             }
         }
         else
@@ -449,10 +528,54 @@ int cs_params_build(
                    CS_PTYPE_INT, 0, 12, 1, "Lyot spider mask vane count");
             add_pd(out, &n, max_out, PID_CO_LYOT_SPW, "lyot_spider_w", "Lyot Spider W", "D",
                    CS_PTYPE_FLOAT, 0.0, 0.15, 0.005, "Lyot spider vane width fraction");
+            add_enum_pd(out, &n, max_out, PID_CO_LOWFS_MODE, "lowfs_mode", "LOWFS Pickoff", 2,
+                        "fpm_refl", "lyot_refl", NULL, NULL,
+                        "0 = FPM-absorbed light reflected, 1 = Reflective Lyot stop");
+            if (nd->coro.lowfs_mode == CACAOSIM_LOWFS_FPM_REFL)
+            {
+                add_pd(out, &n, max_out, PID_CO_LOWFS_PUP, "lowfs_pup_diam", "LOWFS Pupil Ap",
+                       "D_pup", CS_PTYPE_FLOAT, 0.05, 2.0, 0.05,
+                       "Pupil-plane aperture diameter on FPM->LOWFS path [D_pup]");
+            }
             add_pd(out, &n, max_out, PID_CO_LOWFS_REFL, "lowfs_refl", "LOWFS Pickoff R", "",
-                   CS_PTYPE_FLOAT, 0.0, 1.0, 0.05, "Reflectivity of rejected FPM core to LOWFS");
+                   CS_PTYPE_FLOAT, 0.0, 1.0, 0.05,
+                   "Amplitude reflectivity into LOWFS pickoff arm");
             add_pd(out, &n, max_out, PID_N_TPUT, "tput", "Relay Tput", "", CS_PTYPE_FLOAT, 0.05,
                    1.0, 0.02, "Coronagraph relay optical throughput");
+        }
+        return n;
+    }
+
+    if (nd->kind == CACAOSIM_NODE_WFE)
+    {
+        if (subtab == 0)
+        {
+            add_pd(out, &n, max_out, PID_N_IN_WFE, "in_wfe", "Static WFE SHM", "m", CS_PTYPE_STR, 0,
+                   0, 0, "2D static wavefront error stream in unit of OPD [meter]");
+            add_pd(out, &n, max_out, PID_WFE_RMS_NM, "rms_nm", "Init Pupil RMS", "nm",
+                   CS_PTYPE_FLOAT, 0.0, 5000.0, 5.0,
+                   "Target pupil-weighted RMS OPD when initializing map [nm]");
+            add_pd(out, &n, max_out, PID_WFE_ALPHA, "psd_alpha", "PSD Slope Alpha", "",
+                   CS_PTYPE_FLOAT, 0.5, 4.0, 0.1,
+                   "Spatial amplitude power-law exponent k^-alpha");
+            add_pd(out, &n, max_out, PID_WFE_GAIN, "wfe_gain", "OPD Scale Gain", "x",
+                   CS_PTYPE_FLOAT, -10.0, 10.0, 0.05,
+                   "Dimensionless multiplier on input [meter] OPD map");
+            add_pd(out, &n, max_out, PID_WFE_SEED, "wfe_seed", "Random Seed", "", CS_PTYPE_UINT, 1,
+                   9999999, 1, "Deterministic seed for map synthesis");
+            add_pd(out, &n, max_out, PID_N_TPUT, "tput", "Throughput", "", CS_PTYPE_FLOAT, 0.05,
+                   1.0, 0.01, "Optical intensity transmission factor [0..1]");
+        }
+        else
+        {
+            add_pd(out, &n, max_out, PID_N_SHIFT_X, "shift_x", "Pupil Shift X", "px",
+                   CS_PTYPE_FLOAT, -32.0, 32.0, 0.25, "Lateral X misregistration [pupil pixels]");
+            add_pd(out, &n, max_out, PID_N_SHIFT_Y, "shift_y", "Pupil Shift Y", "px",
+                   CS_PTYPE_FLOAT, -32.0, 32.0, 0.25, "Lateral Y misregistration [pupil pixels]");
+            add_pd(out, &n, max_out, PID_N_ROT_DEG, "rot_deg", "Pupil Rotation", "deg",
+                   CS_PTYPE_FLOAT, -180.0, 180.0, 1.0, "In-plane pupil clocking angle [degrees]");
+            add_pd(out, &n, max_out, PID_N_MAG_SCALE, "mag_scale", "Magnification", "x",
+                   CS_PTYPE_FLOAT, 0.50, 1.50, 0.01, "Radial pupil magnification factor");
         }
         return n;
     }
@@ -712,6 +835,9 @@ void cs_param_format_val(
     case PID_N_IN_LYOT:
         snprintf(buf, cap, "%s", nd->in_lyot);
         break;
+    case PID_N_IN_WFE:
+        snprintf(buf, cap, "%s", nd->in_wfe);
+        break;
     case PID_N_TPUT:
         snprintf(buf, cap, "%.3f", nd->tput);
         break;
@@ -803,10 +929,19 @@ void cs_param_format_val(
 
     case PID_CO_MODE:
         snprintf(buf, cap, "%s",
-                 pd->enum_names[(nd->coro.mode >= 0 && nd->coro.mode < 4) ? nd->coro.mode : 0]);
+                 pd->enum_names[(nd->coro.mode >= 0 && nd->coro.mode < 6) ? nd->coro.mode : 0]);
         break;
     case PID_CO_LAMBDA:
         snprintf(buf, cap, "%.3f", nd->coro.lambda_um);
+        break;
+    case PID_CO_BW_FRAC:
+        snprintf(buf, cap, "%.3f", nd->coro.bw_frac);
+        break;
+    case PID_CO_NLAMBDA:
+        snprintf(buf, cap, "%d", (nd->coro.nlambda > 0) ? nd->coro.nlambda : 1);
+        break;
+    case PID_CO_PHA_UNIT:
+        snprintf(buf, cap, "%s", (nd->coro.mask_pha_unit == 1) ? "um" : "rad");
         break;
     case PID_CO_FPM_RAD:
         snprintf(buf, cap, "%.2f", nd->coro.fpm_rad_ld);
@@ -817,8 +952,23 @@ void cs_param_format_val(
     case PID_CO_FPM_PHASE:
         snprintf(buf, cap, "%.3f", nd->coro.fpm_phase_rad);
         break;
+    case PID_CO_FPM_PIXSCALE:
+        snprintf(buf, cap, "%.2f",
+                 (nd->coro.fpm_pixscale_ld > 0.0f) ? nd->coro.fpm_pixscale_ld : 8.0f);
+        break;
+    case PID_CO_PAD_FACTOR:
+        snprintf(buf, cap, "%u", (nd->coro.pad_factor >= 2u) ? nd->coro.pad_factor : 4u);
+        break;
     case PID_CO_VORTEX_Q:
         snprintf(buf, cap, "%d", nd->coro.vortex_charge);
+        break;
+    case PID_CO_LOWFS_MODE:
+        snprintf(buf, cap, "%s",
+                 (nd->coro.lowfs_mode == CACAOSIM_LOWFS_LYOT_REFL) ? "lyot_refl" : "fpm_refl");
+        break;
+    case PID_CO_LOWFS_PUP:
+        snprintf(buf, cap, "%.3f",
+                 (nd->coro.lowfs_pup_diam > 0.0f) ? nd->coro.lowfs_pup_diam : 1.0f);
         break;
     case PID_CO_LOWFS_REFL:
         snprintf(buf, cap, "%.3f", nd->coro.lowfs_refl);
@@ -834,6 +984,21 @@ void cs_param_format_val(
         break;
     case PID_CO_LYOT_SPW:
         snprintf(buf, cap, "%.4f", nd->coro.lyot_spider_w);
+        break;
+    case PID_CO_IN_PUP_AMP:
+        snprintf(buf, cap, "%s", nd->in_pup_amp);
+        break;
+    case PID_CO_IN_PUP_PHA:
+        snprintf(buf, cap, "%s", nd->in_pup_pha);
+        break;
+    case PID_CO_IN_FPM_AMP:
+        snprintf(buf, cap, "%s", nd->in_fpm_amp);
+        break;
+    case PID_CO_IN_FPM_PHA:
+        snprintf(buf, cap, "%s", nd->in_fpm_pha);
+        break;
+    case PID_CO_IN_LYOT_PHA:
+        snprintf(buf, cap, "%s", nd->in_lyot_pha);
         break;
 
     case PID_S_NCAM:
@@ -916,6 +1081,18 @@ void cs_param_format_val(
         break;
     case PID_FP_NLAMBDA:
         snprintf(buf, cap, "%d", nd->fpcam.nlambda);
+        break;
+    case PID_WFE_RMS_NM:
+        snprintf(buf, cap, "%.1f", nd->wfe_rms_nm);
+        break;
+    case PID_WFE_ALPHA:
+        snprintf(buf, cap, "%.2f", nd->wfe_alpha);
+        break;
+    case PID_WFE_GAIN:
+        snprintf(buf, cap, "%.3f", nd->wfe_gain);
+        break;
+    case PID_WFE_SEED:
+        snprintf(buf, cap, "%llu", (unsigned long long) nd->wfe_seed);
         break;
     default:
         break;
@@ -1150,6 +1327,9 @@ int cs_param_set_str(
     case PID_N_IN_LYOT:
         snprintf(nd->in_lyot, sizeof(nd->in_lyot), "%s", val_str);
         break;
+    case PID_N_IN_WFE:
+        snprintf(nd->in_wfe, sizeof(nd->in_wfe), "%s", val_str);
+        break;
     case PID_N_TPUT:
         nd->tput = (float) dv;
         break;
@@ -1257,6 +1437,16 @@ int cs_param_set_str(
     case PID_CO_LAMBDA:
         nd->coro.lambda_um = (float) dv;
         break;
+    case PID_CO_BW_FRAC:
+        nd->coro.bw_frac = (float) dv;
+        nd->bw_frac      = nd->coro.bw_frac;
+        break;
+    case PID_CO_NLAMBDA:
+        nd->coro.nlambda = iv;
+        break;
+    case PID_CO_PHA_UNIT:
+        nd->coro.mask_pha_unit = iv;
+        break;
     case PID_CO_FPM_RAD:
         nd->coro.fpm_rad_ld = (float) dv;
         break;
@@ -1266,8 +1456,21 @@ int cs_param_set_str(
     case PID_CO_FPM_PHASE:
         nd->coro.fpm_phase_rad = (float) dv;
         break;
+    case PID_CO_FPM_PIXSCALE:
+        nd->coro.fpm_pixscale_ld = (float) dv;
+        break;
+    case PID_CO_PAD_FACTOR:
+        nd->coro.pad_factor = (uint32_t) iv;
+        break;
     case PID_CO_VORTEX_Q:
         nd->coro.vortex_charge = (iv + 1) & ~1;
+        break;
+    case PID_CO_LOWFS_MODE:
+        nd->coro.lowfs_mode =
+            (iv == 1) ? CACAOSIM_LOWFS_LYOT_REFL : CACAOSIM_LOWFS_FPM_REFL;
+        break;
+    case PID_CO_LOWFS_PUP:
+        nd->coro.lowfs_pup_diam = (float) dv;
         break;
     case PID_CO_LOWFS_REFL:
         nd->coro.lowfs_refl = (float) dv;
@@ -1283,6 +1486,21 @@ int cs_param_set_str(
         break;
     case PID_CO_LYOT_SPW:
         nd->coro.lyot_spider_w = (float) dv;
+        break;
+    case PID_CO_IN_PUP_AMP:
+        snprintf(nd->in_pup_amp, sizeof(nd->in_pup_amp), "%s", val_str);
+        break;
+    case PID_CO_IN_PUP_PHA:
+        snprintf(nd->in_pup_pha, sizeof(nd->in_pup_pha), "%s", val_str);
+        break;
+    case PID_CO_IN_FPM_AMP:
+        snprintf(nd->in_fpm_amp, sizeof(nd->in_fpm_amp), "%s", val_str);
+        break;
+    case PID_CO_IN_FPM_PHA:
+        snprintf(nd->in_fpm_pha, sizeof(nd->in_fpm_pha), "%s", val_str);
+        break;
+    case PID_CO_IN_LYOT_PHA:
+        snprintf(nd->in_lyot_pha, sizeof(nd->in_lyot_pha), "%s", val_str);
         break;
 
     case PID_S_NCAM:
@@ -1383,6 +1601,18 @@ int cs_param_set_str(
         break;
     case PID_FP_NLAMBDA:
         nd->fpcam.nlambda = iv;
+        break;
+    case PID_WFE_RMS_NM:
+        nd->wfe_rms_nm = (float) dv;
+        break;
+    case PID_WFE_ALPHA:
+        nd->wfe_alpha = (float) dv;
+        break;
+    case PID_WFE_GAIN:
+        nd->wfe_gain = (float) dv;
+        break;
+    case PID_WFE_SEED:
+        nd->wfe_seed = (uint64_t) llround(dv);
         break;
     default:
         break;

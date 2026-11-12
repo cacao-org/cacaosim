@@ -136,6 +136,7 @@ case "${CMD}" in
         milk-fpsexec-cacaosim-zwfs runstop >/dev/null 2>&1 || true
         milk-fpsexec-cacaosim-coro runstop >/dev/null 2>&1 || true
         milk-fpsexec-cacaosim-beamsplit runstop >/dev/null 2>&1 || true
+        milk-fpsexec-cacaosim-wfe runstop >/dev/null 2>&1 || true
         milk-fpsexec-cacaosim-dmsim runstop >/dev/null 2>&1 || true
         milk-fpsexec-atmturb-mkwfs runstop >/dev/null 2>&1 || true
         if [[ -f "${PID_FILE}" ]]; then
@@ -310,7 +311,20 @@ if [[ -n "${BENCH_CFG}" ]]; then
             if (lv=="phase_dimple" || lv=="roddier") return 1
             if (lv=="vortex") return 2
             if (lv=="4qpm") return 3
+            if (lv=="custom_mft" || lv=="custom") return 4
+            if (lv=="custom_fft") return 5
             return v + 0
+        }
+        function punit(v,   lv) {
+            lv = tolower(v)
+            if (lv=="opd" || lv=="um") return 1
+            if (lv=="rad" || lv=="phase") return 0
+            return v + 0
+        }
+        function lmode(v,   lv) {
+            lv = tolower(v)
+            if (lv=="lyot_refl" || lv=="lyot" || lv=="1") return 1
+            return 0
         }
         function dtype(v,   lv) {
             lv = tolower(v)
@@ -394,9 +408,31 @@ if [[ -n "${BENCH_CFG}" ]]; then
                     printf ".out_lowfs=%s .coro_mode=%d .lambda_um=%s .fpm_rad_ld=%s ",
                         get(i, "out_lowfs", ""), cmode(get(i, "mode", "lyot_spot")),
                         get(i, "lambda_um", 1.65), get(i, "fpm_rad_ld", 3.0)
+                    printf ".fpm_pixscale=%s .bw_frac=%s .nlambda=%s .pha_unit=%d ",
+                        get(i, "fpm_pixscale", get(i, "fpm_pixscale_ld", 8.0)),
+                        get(i, "bw_frac", 0.0), get(i, "nlambda", 1),
+                        punit(get(i, "pha_unit", get(i, "mask_pha_unit", "0")))
+                    printf ".in_pup_amp=\"%s\" .in_pup_pha=\"%s\" .in_fpm_amp=\"%s\" ",
+                        get(i, "in_pup_amp", ""), get(i, "in_pup_pha", ""), get(i, "in_fpm_amp", "")
+                    printf ".in_fpm_pha=\"%s\" .in_lyot=\"%s\" .in_lyot_pha=\"%s\" ",
+                        get(i, "in_fpm_pha", ""), get(i, "in_lyot", ""), get(i, "in_lyot_pha", "")
+                    printf ".lowfs_mode=%d .lowfs_pup_diam=%s ",
+                        lmode(get(i, "lowfs_mode", "fpm_refl")),
+                        get(i, "lowfs_pup_diam", get(i, "lowfs_pup", 1.0))
                     printf ".lowfs_refl=%s .tput=%s .lyot_outer=%s .lyot_obs=%s .backend=%s\n",
                         get(i, "lowfs_refl", 0.95), get(i, "tput", 0.92),
                         get(i, "lyot_outer", 0.85), get(i, "lyot_obs", 0.36), backend
+                } else if (t == "wfe" || t == "static_wfe") {
+                    ubin = "milk-fpsexec-cacaosim-wfe"
+                    rms_nm = has[i, "rms_m"] ? (kv[i, "rms_m"] * 1e9) : get(i, "rms_nm", 50.0)
+                    printf "%s -n %s fpsinit .init_only=OFF .nwf=%s .pup_diam=%s .in_pup=%s ",
+                        ubin, fps, b["nwf"], b["pup_diam"], b["in_pup"]
+                    printf ".in_beam=%s .out_beam=%s .in_wfe=%s ",
+                        inb, outb, get(i, "in_wfe", get(i, "stream", id "_wfe"))
+                    printf ".rms_nm=%s .psd_alpha=%s .wfe_gain=%s .wfe_seed=%s .tput=%s\n",
+                        rms_nm, get(i, "psd_alpha", get(i, "alpha", 1.6)),
+                        get(i, "wfe_gain", get(i, "gain", 1.0)),
+                        get(i, "wfe_seed", get(i, "seed", 101)), get(i, "tput", 0.98)
                 } else {
                     navg = get(i, "navg", 1)
                     if (has[i, "rate_hz"] && kv[i, "rate_hz"] + 0 > 0 && eff_rate > 0) {
@@ -447,11 +483,12 @@ if [[ -n "${BENCH_CFG}" ]]; then
                             get(i, "out_cam", id "_cam"), get(i, "out_long", ""),
                             get(i, "ncam", 128), pmode(get(i, "prop_mode", "0")),
                             get(i, "lambda_um", 1.65)
-                        printf ".bw_frac=%s .qe=%s .pixscale_ld=%s .dt_exp=%.7f .use_beam_flux=%s ",
-                            get(i, "bw_frac", 0.18), get(i, "qe", 0.85),
-                            get(i, "pixscale_ld", 3.0), dt_s, bval(get(i, "use_beam_flux", "1"))
-                        printf ".navg=%d .ron_e=%s .out_dtype=%d .backend=%s\n",
-                            navg, get(i, "ron_e", 1.0), dtype(get(i, "out_dtype", "0")), backend
+                        printf ".bw_frac=%s .nlambda=%s .qe=%s .pixscale_ld=%s .dt_exp=%.7f ",
+                            get(i, "bw_frac", 0.18), get(i, "nlambda", 1), get(i, "qe", 0.85),
+                            get(i, "pixscale_ld", 3.0), dt_s
+                        printf ".use_beam_flux=%s .navg=%d .ron_e=%s .out_dtype=%d .backend=%s\n",
+                            bval(get(i, "use_beam_flux", "1")), navg, get(i, "ron_e", 1.0),
+                            dtype(get(i, "out_dtype", "0")), backend
                     }
                 }
                 printf "milk-fps-set %s.procinfo.triggermode 3\n", fps

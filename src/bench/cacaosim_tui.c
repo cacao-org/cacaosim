@@ -301,11 +301,12 @@ static void action_open_add_modal(cs_tui_app_t *app)
 
 static void action_commit_add(cs_tui_app_t *app, int choice)
 {
-    static const cacaosim_node_kind_t kinds[8] = {
-        CACAOSIM_NODE_DM,     CACAOSIM_NODE_DM,     CACAOSIM_NODE_SPLITTER, CACAOSIM_NODE_CORO,
-        CACAOSIM_NODE_PYRWFS, CACAOSIM_NODE_SHWFS,  CACAOSIM_NODE_ZWFS,     CACAOSIM_NODE_FPCAM,
+    static const cacaosim_node_kind_t kinds[9] = {
+        CACAOSIM_NODE_DM,     CACAOSIM_NODE_DM,     CACAOSIM_NODE_SPLITTER,
+        CACAOSIM_NODE_CORO,   CACAOSIM_NODE_PYRWFS, CACAOSIM_NODE_SHWFS,
+        CACAOSIM_NODE_ZWFS,   CACAOSIM_NODE_FPCAM,  CACAOSIM_NODE_WFE,
     };
-    if (choice < 0 || choice >= 8)
+    if (choice < 0 || choice >= 9)
     {
         return;
     }
@@ -578,7 +579,7 @@ static void handle_modal_event(cs_tui_app_t *app, const cs_input_ev_t *ev)
     int max_items = 1;
     if (app->modal == CS_MODAL_ADD)
     {
-        max_items = 8;
+        max_items = 9;
     }
     else if (app->modal == CS_MODAL_PRESET)
     {
@@ -617,7 +618,7 @@ static void handle_modal_event(cs_tui_app_t *app, const cs_input_ev_t *ev)
         app->scr.ascii_only = !app->scr.ascii_only;
         app->scr.force_full = 1;
     }
-    else if (ev->key >= '1' && ev->key <= '8' && (ev->key - '1') < max_items)
+    else if (ev->key >= '1' && ev->key <= '9' && (ev->key - '1') < max_items)
     {
         app->modal_sel = ev->key - '1';
         cs_input_ev_t enter_ev;

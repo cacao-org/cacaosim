@@ -167,7 +167,28 @@ static int parse_coro_mode(const char *v)
     {
         return CACAOSIM_CORO_4QPM;
     }
+    if (strcasecmp(v, "custom_mft") == 0 || strcasecmp(v, "custom") == 0)
+    {
+        return CACAOSIM_CORO_CUSTOM_MFT;
+    }
+    if (strcasecmp(v, "custom_fft") == 0)
+    {
+        return CACAOSIM_CORO_CUSTOM_FFT;
+    }
     return atoi(v);
+}
+
+static int parse_lowfs_mode(const char *v)
+{
+    if (strcasecmp(v, "fpm_refl") == 0 || strcasecmp(v, "fpm") == 0)
+    {
+        return CACAOSIM_LOWFS_FPM_REFL;
+    }
+    if (strcasecmp(v, "lyot_refl") == 0 || strcasecmp(v, "lyot") == 0)
+    {
+        return CACAOSIM_LOWFS_LYOT_REFL;
+    }
+    return atoi(v) ? CACAOSIM_LOWFS_LYOT_REFL : CACAOSIM_LOWFS_FPM_REFL;
 }
 
 static void init_det_defaults(cacaosim_det_cfg_t *det, float flux, float ron)
@@ -240,6 +261,8 @@ static void init_node_defaults(
     {
         nd->tput                 = 0.92f;
         nd->coro.mode            = CACAOSIM_CORO_LYOT_SPOT;
+        nd->coro.lowfs_mode      = CACAOSIM_LOWFS_FPM_REFL;
+        nd->coro.lowfs_pup_diam  = 1.0f;
         nd->coro.n_mft           = 48u;
         nd->coro.pad_factor      = 4u;
         nd->coro.lambda_um       = 1.65f;
@@ -253,6 +276,19 @@ static void init_node_defaults(
         nd->coro.lyot_nspider    = 4;
         nd->coro.lyot_spider_w   = 0.02f;
         nd->coro.lyot_spider_deg = 45.0f;
+        nd->coro.fpm_pixscale_ld = 8.0f;
+        nd->coro.bw_frac         = 0.0f;
+        nd->coro.nlambda         = 1;
+        nd->coro.mask_pha_unit   = 0;
+    }
+    else if (kind == CACAOSIM_NODE_WFE)
+    {
+        snprintf(nd->in_wfe, sizeof(nd->in_wfe), "%s_wfe", id);
+        nd->tput       = 0.98f;
+        nd->wfe_rms_nm = 50.0f;
+        nd->wfe_alpha  = 1.6f;
+        nd->wfe_gain   = 1.0f;
+        nd->wfe_seed   = seed_base;
     }
     else if (kind == CACAOSIM_NODE_PYRWFS)
     {
@@ -743,9 +779,29 @@ static int apply_node_kv(cacaosim_node_cfg_t *nd, const char *k, const char *v)
         {
             copy_str(nd->out_lowfs, sizeof(nd->out_lowfs), v);
         }
-        else if (strcmp(k, "in_lyot") == 0)
+        else if (strcmp(k, "in_pup_amp") == 0)
+        {
+            copy_str(nd->in_pup_amp, sizeof(nd->in_pup_amp), v);
+        }
+        else if (strcmp(k, "in_pup_pha") == 0)
+        {
+            copy_str(nd->in_pup_pha, sizeof(nd->in_pup_pha), v);
+        }
+        else if (strcmp(k, "in_fpm_amp") == 0)
+        {
+            copy_str(nd->in_fpm_amp, sizeof(nd->in_fpm_amp), v);
+        }
+        else if (strcmp(k, "in_fpm_pha") == 0)
+        {
+            copy_str(nd->in_fpm_pha, sizeof(nd->in_fpm_pha), v);
+        }
+        else if (strcmp(k, "in_lyot") == 0 || strcmp(k, "in_lyot_amp") == 0)
         {
             copy_str(nd->in_lyot, sizeof(nd->in_lyot), v);
+        }
+        else if (strcmp(k, "in_lyot_pha") == 0)
+        {
+            copy_str(nd->in_lyot_pha, sizeof(nd->in_lyot_pha), v);
         }
         else if (strcmp(k, "mode") == 0 || strcmp(k, "coro_mode") == 0)
         {
@@ -762,6 +818,34 @@ static int apply_node_kv(cacaosim_node_cfg_t *nd, const char *k, const char *v)
         else if (strcmp(k, "lambda_um") == 0)
         {
             nd->coro.lambda_um = strtof(v, NULL);
+        }
+        else if (strcmp(k, "bw_frac") == 0)
+        {
+            nd->coro.bw_frac = strtof(v, NULL);
+            nd->bw_frac      = nd->coro.bw_frac;
+        }
+        else if (strcmp(k, "nlambda") == 0)
+        {
+            nd->coro.nlambda = atoi(v);
+        }
+        else if (strcmp(k, "fpm_pixscale") == 0 || strcmp(k, "fpm_pixscale_ld") == 0)
+        {
+            nd->coro.fpm_pixscale_ld = strtof(v, NULL);
+        }
+        else if (strcmp(k, "pha_unit") == 0 || strcmp(k, "mask_pha_unit") == 0)
+        {
+            if (strcasecmp(v, "opd") == 0 || strcasecmp(v, "um") == 0)
+            {
+                nd->coro.mask_pha_unit = 1;
+            }
+            else if (strcasecmp(v, "rad") == 0 || strcasecmp(v, "phase") == 0)
+            {
+                nd->coro.mask_pha_unit = 0;
+            }
+            else
+            {
+                nd->coro.mask_pha_unit = atoi(v);
+            }
         }
         else if (strcmp(k, "fpm_rad_ld") == 0)
         {
@@ -783,6 +867,14 @@ static int apply_node_kv(cacaosim_node_cfg_t *nd, const char *k, const char *v)
         {
             nd->coro.lowfs_refl = strtof(v, NULL);
         }
+        else if (strcmp(k, "lowfs_mode") == 0)
+        {
+            nd->coro.lowfs_mode = parse_lowfs_mode(v);
+        }
+        else if (strcmp(k, "lowfs_pup_diam") == 0 || strcmp(k, "lowfs_pup") == 0)
+        {
+            nd->coro.lowfs_pup_diam = strtof(v, NULL);
+        }
         else if (strcmp(k, "lyot_outer") == 0)
         {
             nd->coro.lyot_outer = strtof(v, NULL);
@@ -802,6 +894,39 @@ static int apply_node_kv(cacaosim_node_cfg_t *nd, const char *k, const char *v)
         else if (strcmp(k, "lyot_spider_deg") == 0)
         {
             nd->coro.lyot_spider_deg = strtof(v, NULL);
+        }
+        else
+        {
+            return -1;
+        }
+        return 0;
+    }
+
+    if (nd->kind == CACAOSIM_NODE_WFE)
+    {
+        if (strcmp(k, "in_wfe") == 0 || strcmp(k, "stream") == 0)
+        {
+            copy_str(nd->in_wfe, sizeof(nd->in_wfe), v);
+        }
+        else if (strcmp(k, "rms_nm") == 0)
+        {
+            nd->wfe_rms_nm = strtof(v, NULL);
+        }
+        else if (strcmp(k, "rms_m") == 0)
+        {
+            nd->wfe_rms_nm = strtof(v, NULL) * 1.0e9f;
+        }
+        else if (strcmp(k, "psd_alpha") == 0 || strcmp(k, "alpha") == 0)
+        {
+            nd->wfe_alpha = strtof(v, NULL);
+        }
+        else if (strcmp(k, "wfe_gain") == 0 || strcmp(k, "gain") == 0)
+        {
+            nd->wfe_gain = strtof(v, NULL);
+        }
+        else if (strcmp(k, "wfe_seed") == 0 || strcmp(k, "seed") == 0)
+        {
+            nd->wfe_seed = (uint64_t) strtoull(v, NULL, 10);
         }
         else
         {
@@ -1121,6 +1246,10 @@ int cacaosim_bench_parse_str(
             {
                 kind = CACAOSIM_NODE_FPCAM;
             }
+            else if (strcasecmp(type_str, "wfe") == 0 || strcasecmp(type_str, "static_wfe") == 0)
+            {
+                kind = CACAOSIM_NODE_WFE;
+            }
             else
             {
                 set_err(err_buf, err_cap, "Line %u: unknown node type '%s'", line_no, type_str);
@@ -1291,6 +1420,10 @@ static const char *coro_mode_str(int32_t m)
         return "vortex";
     case CACAOSIM_CORO_4QPM:
         return "4qpm";
+    case CACAOSIM_CORO_CUSTOM_MFT:
+        return "custom_mft";
+    case CACAOSIM_CORO_CUSTOM_FFT:
+        return "custom_fft";
     default:
         return "lyot_spot";
     }
@@ -1572,12 +1705,44 @@ int cacaosim_bench_format_str(
             {
                 cw_printf(&w, "out_lowfs     = \"%s\"\n", nd->out_lowfs);
             }
+            if (nd->in_pup_amp[0] != '\0')
+            {
+                cw_printf(&w, "in_pup_amp    = \"%s\"\n", nd->in_pup_amp);
+            }
+            if (nd->in_pup_pha[0] != '\0')
+            {
+                cw_printf(&w, "in_pup_pha    = \"%s\"\n", nd->in_pup_pha);
+            }
+            if (nd->in_fpm_amp[0] != '\0')
+            {
+                cw_printf(&w, "in_fpm_amp    = \"%s\"\n", nd->in_fpm_amp);
+            }
+            if (nd->in_fpm_pha[0] != '\0')
+            {
+                cw_printf(&w, "in_fpm_pha    = \"%s\"\n", nd->in_fpm_pha);
+            }
             if (nd->in_lyot[0] != '\0')
             {
                 cw_printf(&w, "in_lyot       = \"%s\"\n", nd->in_lyot);
             }
+            if (nd->in_lyot_pha[0] != '\0')
+            {
+                cw_printf(&w, "in_lyot_pha   = \"%s\"\n", nd->in_lyot_pha);
+            }
             cw_printf(&w, "mode          = \"%s\"\n", coro_mode_str(nd->coro.mode));
             cw_printf(&w, "lambda_um     = %.4g\n", nd->coro.lambda_um);
+            if (nd->coro.bw_frac > 1e-6f)
+            {
+                cw_printf(&w, "bw_frac       = %.4g\n", nd->coro.bw_frac);
+            }
+            if (nd->coro.nlambda > 1)
+            {
+                cw_printf(&w, "nlambda       = %d\n", nd->coro.nlambda);
+            }
+            if (nd->coro.mask_pha_unit != 0)
+            {
+                cw_printf(&w, "pha_unit      = \"um\"\n");
+            }
             if (nd->coro.mode <= CACAOSIM_CORO_PHASE_DIMPLE)
             {
                 cw_printf(&w, "fpm_rad_ld    = %.4g\n", nd->coro.fpm_rad_ld);
@@ -1591,6 +1756,10 @@ int cacaosim_bench_format_str(
                     cw_printf(&w, "n_mft         = %u\n", nd->coro.n_mft);
                 }
             }
+            else if (nd->coro.mode == CACAOSIM_CORO_CUSTOM_MFT)
+            {
+                cw_printf(&w, "fpm_pixscale  = %.4g\n", nd->coro.fpm_pixscale_ld);
+            }
             else
             {
                 if (nd->coro.mode == CACAOSIM_CORO_VORTEX)
@@ -1603,6 +1772,18 @@ int cacaosim_bench_format_str(
                 }
             }
             cw_printf(&w, "lowfs_refl    = %.4g\n", nd->coro.lowfs_refl);
+            if (nd->out_lowfs[0] != '\0' || nd->coro.lowfs_mode != CACAOSIM_LOWFS_FPM_REFL)
+            {
+                cw_printf(&w, "lowfs_mode    = \"%s\"\n",
+                          (nd->coro.lowfs_mode == CACAOSIM_LOWFS_LYOT_REFL) ? "lyot_refl"
+                                                                            : "fpm_refl");
+            }
+            if (nd->coro.lowfs_pup_diam > 0.0f &&
+                ((nd->coro.lowfs_mode == CACAOSIM_LOWFS_FPM_REFL && nd->out_lowfs[0] != '\0') ||
+                 fabsf(nd->coro.lowfs_pup_diam - 1.0f) > 1e-4f))
+            {
+                cw_printf(&w, "lowfs_pup_diam = %.4g\n", nd->coro.lowfs_pup_diam);
+            }
             cw_printf(&w, "tput          = %.4g\n", nd->tput);
             cw_printf(&w, "lyot_outer    = %.4g\n", nd->coro.lyot_outer);
             cw_printf(&w, "lyot_obs      = %.4g\n", nd->coro.lyot_obs);
@@ -1612,6 +1793,22 @@ int cacaosim_bench_format_str(
             {
                 cw_printf(&w, "lyot_spider_deg = %.4g\n", nd->coro.lyot_spider_deg);
             }
+            cw_write_reg(&w, &nd->reg);
+        }
+        else if (nd->kind == CACAOSIM_NODE_WFE)
+        {
+            cw_printf(&w, "[wfe.%s]\n", nd->id);
+            cw_printf(&w, "in            = \"%s\"\n", nd->in_beam);
+            cw_printf(&w, "out           = \"%s\"\n", nd->out_beam);
+            cw_printf(&w, "in_wfe        = \"%s\"\n", nd->in_wfe);
+            cw_printf(&w, "rms_nm        = %.4g\n", nd->wfe_rms_nm);
+            if (fabsf(nd->wfe_alpha - 1.6f) > 1e-4f)
+            {
+                cw_printf(&w, "psd_alpha     = %.4g\n", nd->wfe_alpha);
+            }
+            cw_printf(&w, "wfe_gain      = %.4g\n", nd->wfe_gain);
+            cw_printf(&w, "wfe_seed      = %llu\n", (unsigned long long) nd->wfe_seed);
+            cw_printf(&w, "tput          = %.4g\n", nd->tput);
             cw_write_reg(&w, &nd->reg);
         }
         else if (nd->kind == CACAOSIM_NODE_PYRWFS)

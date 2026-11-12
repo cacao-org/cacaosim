@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "bench/cacaosim_bench_view.h"
+#include "common/cacaosim_mask.h"
 #include "pupil/cacaosim_pupil.h"
 
 typedef struct
@@ -1020,6 +1021,38 @@ static void format_splitter_desc(const cacaosim_split_cfg_t *sp, int ascii, char
     }
 }
 
+static int sb_mask_spec_tag(
+    sbuf_t           *sb,
+    const view_env_t *ev,
+    const char       *key,
+    const char       *spec,
+    int               need_sp)
+{
+    if (spec == NULL || spec[0] == '\0')
+    {
+        return 0;
+    }
+    if (need_sp)
+    {
+        sb_puts(sb, "  ");
+    }
+    sb_fg(sb, ev->lvl, ev->pal->fg_dim);
+    sb_printf(sb, "%s=", key);
+    if (cacaosim_mask_is_fits_path(spec))
+    {
+        const char *bn = strrchr(spec, '/');
+        sb_bold(sb, ev->lvl);
+        sb_fg(sb, ev->lvl, ev->pal->fg_bright);
+        sb_puts(sb, (bn != NULL) ? (bn + 1) : spec);
+        sb_rst(sb, ev->lvl);
+    }
+    else
+    {
+        sb_stream_tag(sb, ev, spec);
+    }
+    return 1;
+}
+
 static const char *coro_mode_label(int mode)
 {
     switch (mode)
@@ -1032,6 +1065,10 @@ static const char *coro_mode_label(int mode)
         return "VORTEX";
     case 3:
         return "4QPM";
+    case 4:
+        return "CUSTOM MFT";
+    case 5:
+        return "CUSTOM FFT";
     default:
         return "CORO";
     }
@@ -1247,6 +1284,74 @@ static void render_beam_subtree(
         return;
     }
 
+    /* Case 1b: Single inline Static Wavefront Error [OPD m] -> keep vertical axis unindented */
+    if (n_cons == 1 && ctx->nodes[consumers[0]].cfg.kind == CACAOSIM_NODE_WFE)
+    {
+        const cacaosim_bench_node_t *nd  = &ctx->nodes[consumers[0]];
+        const char                  *sep = ev->ascii ? " | " : " │ ";
+
+        sbuf_t c1;
+        sb_init(&c1);
+        sb_fg(&c1, ev->lvl, ev->pal->fg_conn);
+        sb_puts(&c1, prefix);
+        sb_puts(&c1, vbar);
+        panel_row(ev, ev->pal->fg_conn, c1.data);
+
+        sbuf_t line;
+        sb_init(&line);
+        sb_fg(&line, ev->lvl, ev->pal->fg_conn);
+        sb_puts(&line, prefix);
+        sb_puts(&line, darr);
+        sb_puts(&line, " ");
+        sb_soft_pill(&line, ev->lvl, ev->pal->bg_panel, ev->pal->fg_warn, "WFE");
+        sb_puts(&line, " ");
+        sb_bold(&line, ev->lvl);
+        sb_fg(&line, ev->lvl, ev->pal->fg_bright);
+        sb_printf(&line, "%-11s", nd->cfg.id);
+        sb_rst(&line, ev->lvl);
+
+        sb_fg(&line, ev->lvl, ev->pal->fg_text);
+        sb_printf(&line, " static OPD [m]");
+        sb_fg(&line, ev->lvl, ev->pal->fg_dim);
+        sb_puts(&line, sep);
+        sb_fg(&line, ev->lvl, ev->pal->fg_text);
+        sb_printf(&line, "rms=%.0fnm", nd->cfg.wfe_rms_nm);
+        sb_fg(&line, ev->lvl, ev->pal->fg_dim);
+        sb_puts(&line, sep);
+        sb_fg(&line, ev->lvl, ev->pal->fg_muted);
+        sb_printf(&line, "gain=%.2f T=%.0f%%", nd->cfg.wfe_gain, 100.0f * nd->cfg.tput);
+
+        sb_puts(&line, "  ");
+        sb_fg(&line, ev->lvl, ev->pal->fg_conn);
+        sb_puts(&line, larr);
+        sb_stream_tag(&line, ev, nd->cfg.in_wfe);
+        sb_reg_badge(&line, ev, &nd->cfg.reg);
+        panel_row(ev, ev->pal->fg_conn, line.data);
+
+        if (nd->out_idx >= 0)
+        {
+            float bt = cacaosim_spec_total(&ctx->beams[nd->out_idx].spec);
+            float pc = (src_tot > 0.0f) ? (100.0f * bt / src_tot) : 0.0f;
+
+            sbuf_t bl;
+            sb_init(&bl);
+            sb_fg(&bl, ev->lvl, ev->pal->fg_conn);
+            sb_puts(&bl, prefix);
+            sb_puts(&bl, vbar);
+            sb_fg(&bl, ev->lvl, ev->pal->fg_dim);
+            sb_printf(&bl, "   beam ");
+            sb_fg(&bl, ev->lvl, ev->pal->fg_accent);
+            sb_puts(&bl, ctx->beams[nd->out_idx].name);
+            sb_fg(&bl, ev->lvl, ev->pal->fg_dim);
+            sb_printf(&bl, " (%.1f%%, %.2e ph/s)", pc, bt);
+            panel_row(ev, ev->pal->fg_conn, bl.data);
+
+            render_beam_subtree(ev, ctx, nd->out_idx, prefix, src_tot, src_peak, visited_beam,
+                                depth + 1);
+        }
+        return;
+    }
+
     /* Case 2: Single Dichroic or Gray Beamsplitter -> branch into refl and trans arms */
     if (n_cons == 1 && ctx->nodes[consumers[0]].cfg.kind == CACAOSIM_NODE_SPLITTER)
     {
@@ -1366,26 +1471,81 @@ static void render_beam_subtree(
         sb_puts(&hdr, nd->cfg.id);
         sb_rst(&hdr, ev->lvl);
         sb_fg(&hdr, ev->lvl, ev->pal->fg_muted);
-        sb_printf(&hdr, "  %s (r=%.2f l/D @ %.2fum, Lyot %.0f%%/%.0f%%)",
-                  coro_mode_label(nd->cfg.coro.mode), nd->cfg.coro.fpm_rad_ld,
-                  nd->cfg.coro.lambda_um, 100.0f * nd->cfg.coro.lyot_outer,
-                  100.0f * nd->cfg.coro.lyot_obs);
+        if (nd->cfg.coro.mode == CACAOSIM_CORO_CUSTOM_MFT)
+        {
+            sb_printf(&hdr, "  %s (px=%.1f px/[l/D] @ %.2fum, Lyot %.0f%%/%.0f%%)",
+                      coro_mode_label(nd->cfg.coro.mode), nd->cfg.coro.fpm_pixscale_ld,
+                      nd->cfg.coro.lambda_um, 100.0f * nd->cfg.coro.lyot_outer,
+                      100.0f * nd->cfg.coro.lyot_obs);
+        }
+        else if (nd->cfg.coro.mode >= CACAOSIM_CORO_VORTEX)
+        {
+            sb_printf(&hdr, "  %s (pad=%ux @ %.2fum, Lyot %.0f%%/%.0f%%)",
+                      coro_mode_label(nd->cfg.coro.mode), nd->cfg.coro.pad_factor,
+                      nd->cfg.coro.lambda_um, 100.0f * nd->cfg.coro.lyot_outer,
+                      100.0f * nd->cfg.coro.lyot_obs);
+        }
+        else
+        {
+            sb_printf(&hdr, "  %s (r=%.2f l/D @ %.2fum, Lyot %.0f%%/%.0f%%)",
+                      coro_mode_label(nd->cfg.coro.mode), nd->cfg.coro.fpm_rad_ld,
+                      nd->cfg.coro.lambda_um, 100.0f * nd->cfg.coro.lyot_outer,
+                      100.0f * nd->cfg.coro.lyot_obs);
+        }
+        if (nd->cfg.coro.nlambda > 1)
+        {
+            sb_fg(&hdr, ev->lvl, ev->pal->fg_accent);
+            sb_printf(&hdr, " [%dch, dL/L=%.0f%%]", nd->cfg.coro.nlambda,
+                      100.0f * nd->cfg.coro.bw_frac);
+        }
         panel_row(ev, ev->pal->fg_conn, hdr.data);
 
-        int         arms[2]   = { -1, -1 };
-        const char *alabel[2] = { NULL, NULL };
-        int         n_arms    = 0;
+        if (nd->cfg.in_pup_amp[0] != '\0' || nd->cfg.in_pup_pha[0] != '\0' ||
+            nd->cfg.in_fpm_amp[0] != '\0' || nd->cfg.in_fpm_pha[0] != '\0' ||
+            nd->cfg.in_lyot[0] != '\0' || nd->cfg.in_lyot_pha[0] != '\0')
+        {
+            sbuf_t mk;
+            sb_init(&mk);
+            sb_fg(&mk, ev->lvl, ev->pal->fg_conn);
+            sb_puts(&mk, prefix);
+            sb_puts(&mk, vbar);
+            sb_fg(&mk, ev->lvl, ev->pal->fg_proc);
+            sb_puts(&mk, "   masks: ");
+            int n_m = 0;
+            n_m += sb_mask_spec_tag(&mk, ev, "pup_amp", nd->cfg.in_pup_amp, n_m > 0);
+            n_m += sb_mask_spec_tag(&mk, ev, "pup_pha", nd->cfg.in_pup_pha, n_m > 0);
+            n_m += sb_mask_spec_tag(&mk, ev, "fpm_amp", nd->cfg.in_fpm_amp, n_m > 0);
+            n_m += sb_mask_spec_tag(&mk, ev, "fpm_pha", nd->cfg.in_fpm_pha, n_m > 0);
+            n_m += sb_mask_spec_tag(&mk, ev, "lyot_amp", nd->cfg.in_lyot, n_m > 0);
+            n_m += sb_mask_spec_tag(&mk, ev, "lyot_pha", nd->cfg.in_lyot_pha, n_m > 0);
+            if (nd->cfg.in_pup_pha[0] != '\0' || nd->cfg.in_fpm_pha[0] != '\0' ||
+                nd->cfg.in_lyot_pha[0] != '\0')
+            {
+                sb_fg(&mk, ev->lvl, ev->pal->fg_muted);
+                sb_printf(&mk, " [%s]",
+                          (nd->cfg.coro.mask_pha_unit == 1) ? "OPD um" : "rad");
+            }
+            panel_row(ev, ev->pal->fg_conn, mk.data);
+        }
+
+        int         arms[2]     = { -1, -1 };
+        const char *alabel[2]   = { NULL, NULL };
+        int         is_lowfs[2] = { 0, 0 };
+        int         n_arms      = 0;
 
         if (nd->lowfs_idx >= 0)
         {
-            arms[n_arms]   = nd->lowfs_idx;
-            alabel[n_arms] = "lowfs";
+            arms[n_arms]     = nd->lowfs_idx;
+            alabel[n_arms]   = (nd->cfg.coro.lowfs_mode == CACAOSIM_LOWFS_LYOT_REFL)
+                                   ? "lowfs(Lyot)"
+                                   : "lowfs(FPM) ";
+            is_lowfs[n_arms] = 1;
             n_arms++;
         }
         if (nd->out_idx >= 0)
         {
             arms[n_arms]   = nd->out_idx;
-            alabel[n_arms] = "lyot ";
+            alabel[n_arms] = (nd->lowfs_idx >= 0) ? "lyot       " : "lyot ";
             n_arms++;
         }
 
@@ -1413,6 +1573,13 @@ static void render_beam_subtree(
             sb_fg(&arm, ev->lvl, ev->pal->fg_muted);
             sb_printf(&arm, " (%5.1f%%) ", pc);
             sb_spectrum_bar(&arm, ev, &ctx->beams[bi].spec, src_peak, 24);
+            if (is_lowfs[a] && nd->cfg.coro.lowfs_mode == CACAOSIM_LOWFS_FPM_REFL)
+            {
+                float ap = (nd->cfg.coro.lowfs_pup_diam > 0.0f) ? nd->cfg.coro.lowfs_pup_diam
+                                                                : 1.0f;
+                sb_fg(&arm, ev->lvl, ev->pal->fg_warn);
+                sb_printf(&arm, " [ap=%.2fD]", ap);
+            }
             panel_row(ev, ev->pal->fg_conn, arm.data);
 
             char child_pfx[256];
@@ -1446,7 +1613,7 @@ static void render_beam_subtree(
         sb_puts(&line, is_last ? (ev->ascii ? "`--> " : "└──▶ ")
                                : (ev->ascii ? "|--> " : "├──▶ "));
 
-        if (nd->cfg.kind >= CACAOSIM_NODE_PYRWFS)
+        if (nd->cfg.kind >= CACAOSIM_NODE_PYRWFS && nd->cfg.kind <= CACAOSIM_NODE_FPCAM)
         {
             render_sensor_inline(&line, ev, ctx, nd);
             panel_row(ev, ev->pal->fg_conn, line.data);
@@ -1490,7 +1657,28 @@ static void count_shm_streams(
             total++;
             live += shm_stream_exists(ev, nd->cfg.in_cmd);
         }
-        else if (nd->cfg.kind >= CACAOSIM_NODE_PYRWFS && nd->cfg.out_cam[0] != '\0')
+        else if (nd->cfg.kind == CACAOSIM_NODE_WFE && nd->cfg.in_wfe[0] != '\0')
+        {
+            total++;
+            live += shm_stream_exists(ev, nd->cfg.in_wfe);
+        }
+        else if (nd->cfg.kind == CACAOSIM_NODE_CORO)
+        {
+            const char *ms[6] = {
+                nd->cfg.in_pup_amp, nd->cfg.in_pup_pha, nd->cfg.in_fpm_amp,
+                nd->cfg.in_fpm_pha, nd->cfg.in_lyot,    nd->cfg.in_lyot_pha
+            };
+            for (int m = 0; m < 6; m++)
+            {
+                if (ms[m][0] != '\0' && !cacaosim_mask_is_fits_path(ms[m]))
+                {
+                    total++;
+                    live += shm_stream_exists(ev, ms[m]);
+                }
+            }
+        }
+        else if (nd->cfg.kind >= CACAOSIM_NODE_PYRWFS &&
+                 nd->cfg.kind <= CACAOSIM_NODE_FPCAM && nd->cfg.out_cam[0] != '\0')
         {
             total++;
             live += shm_stream_exists(ev, nd->cfg.out_cam);
@@ -1528,6 +1716,115 @@ static void init_view_env(
     const char *sd = getenv("MILK_SHM_DIR");
     snprintf(ev->shm_dir, sizeof(ev->shm_dir), "%s",
              (sd != NULL && sd[0] != '\0') ? sd : "/milk/shm");
+}
+
+static void compute_bench_scales(
+    const cacaosim_bench_ctx_t *ctx,
+    float                      *out_beam_px,
+    float                      *out_pup_m_pix,
+    float                      *out_foc_ld_pix,
+    float                      *out_foc_arcsec_pix,
+    float                      *out_ref_lam_um,
+    char                       *out_src,
+    size_t                      src_cap)
+{
+    float nwf_f     = (ctx->nwf > 0u) ? (float) ctx->nwf : 128.0f;
+    float pdia      = (ctx->cfg.pup_diam > 0.05f) ? ctx->cfg.pup_diam : 1.0f;
+    float tel_d     = (ctx->cfg.tel_diam_m > 0.05f) ? ctx->cfg.tel_diam_m : 8.2f;
+    *out_beam_px    = pdia * nwf_f;
+    *out_pup_m_pix  = tel_d / *out_beam_px;
+    *out_foc_ld_pix = 1.0f / (pdia * 2.0f);
+    *out_ref_lam_um = (ctx->cfg.ref_lambda > 0.1f) ? ctx->cfg.ref_lambda : 1.65f;
+    snprintf(out_src, src_cap, "2xFFT");
+
+    static const cacaosim_node_kind_t prio[5] = {
+        CACAOSIM_NODE_FPCAM, CACAOSIM_NODE_CORO,   CACAOSIM_NODE_SHWFS,
+        CACAOSIM_NODE_PYRWFS, CACAOSIM_NODE_ZWFS
+    };
+    int found = 0;
+    for (int p = 0; p < 5 && !found; p++)
+    {
+        for (uint32_t i = 0; i < ctx->n_nodes; i++)
+        {
+            const cacaosim_node_cfg_t *nd = &ctx->nodes[i].cfg;
+            if (nd->kind != prio[p])
+            {
+                continue;
+            }
+            if (nd->kind == CACAOSIM_NODE_FPCAM)
+            {
+                *out_ref_lam_um = (nd->fpcam.lambda_um > 0.1f) ? nd->fpcam.lambda_um : 1.65f;
+                if (nd->fpcam.prop_mode == CACAOSIM_FPCAM_PROP_FFT)
+                {
+                    float pad = (nd->fpcam.pad_factor >= 2u) ? (float) nd->fpcam.pad_factor : 2.0f;
+                    *out_foc_ld_pix = 1.0f / (pdia * pad);
+                }
+                else
+                {
+                    float px = (nd->fpcam.pixscale_ld > 0.05f) ? nd->fpcam.pixscale_ld : 3.0f;
+                    *out_foc_ld_pix = 1.0f / px;
+                }
+                snprintf(out_src, src_cap, "%s", nd->id);
+                found = 1;
+                break;
+            }
+            if (nd->kind == CACAOSIM_NODE_CORO)
+            {
+                *out_ref_lam_um = (nd->coro.lambda_um > 0.1f) ? nd->coro.lambda_um : 1.65f;
+                if (nd->coro.mode == CACAOSIM_CORO_CUSTOM_MFT)
+                {
+                    float px = (nd->coro.fpm_pixscale_ld > 0.05f) ? nd->coro.fpm_pixscale_ld : 8.0f;
+                    *out_foc_ld_pix = 1.0f / px;
+                }
+                else if (nd->coro.mode >= CACAOSIM_CORO_VORTEX)
+                {
+                    float pad = (nd->coro.pad_factor >= 2u) ? (float) nd->coro.pad_factor : 4.0f;
+                    *out_foc_ld_pix = 1.0f / (pdia * pad);
+                }
+                else
+                {
+                    float r_ld = (nd->coro.fpm_rad_ld > 0.1f) ? nd->coro.fpm_rad_ld : 2.5f;
+                    float nmft = (nd->coro.n_mft >= 8u) ? (float) nd->coro.n_mft : 32.0f;
+                    *out_foc_ld_pix = (2.4f * r_ld) / nmft;
+                }
+                snprintf(out_src, src_cap, "%s", nd->id);
+                found = 1;
+                break;
+            }
+            if (nd->kind == CACAOSIM_NODE_SHWFS)
+            {
+                float nsub      = (nd->shwfs.n_sub >= 1u) ? (float) nd->shwfs.n_sub : 16.0f;
+                float pad       = (nd->shwfs.pad_factor >= 1u) ? (float) nd->shwfs.pad_factor
+                                                               : 2.0f;
+                *out_ref_lam_um = (nd->shwfs.lambda_um > 0.1f) ? nd->shwfs.lambda_um : 0.75f;
+                *out_foc_ld_pix = nsub / pad;
+                snprintf(out_src, src_cap, "%s", nd->id);
+                found = 1;
+                break;
+            }
+            if (nd->kind == CACAOSIM_NODE_PYRWFS)
+            {
+                float pad       = (nd->pyrwfs.pad_factor >= 2u) ? (float) nd->pyrwfs.pad_factor
+                                                                : 2.0f;
+                *out_ref_lam_um = (nd->pyrwfs.lambda_um > 0.1f) ? nd->pyrwfs.lambda_um : 0.75f;
+                *out_foc_ld_pix = 1.0f / (pdia * pad);
+                snprintf(out_src, src_cap, "%s", nd->id);
+                found = 1;
+                break;
+            }
+            if (nd->kind == CACAOSIM_NODE_ZWFS)
+            {
+                float d_ld      = (nd->zwfs.dimple_ld > 0.1f) ? nd->zwfs.dimple_ld : 1.06f;
+                float nmft      = (nd->zwfs.n_mft >= 8u) ? (float) nd->zwfs.n_mft : 32.0f;
+                *out_ref_lam_um = (nd->zwfs.lambda_um > 0.1f) ? nd->zwfs.lambda_um : 0.85f;
+                *out_foc_ld_pix = (1.2f * d_ld) / nmft;
+                snprintf(out_src, src_cap, "%s", nd->id);
+                found = 1;
+                break;
+            }
+        }
+    }
+    *out_foc_arcsec_pix = *out_foc_ld_pix * (*out_ref_lam_um * 1.0e-6f / tel_d) * 206264.8062f;
 }
 
 void cacaosim_bench_render(
@@ -1579,18 +1876,41 @@ void cacaosim_bench_render(
     int shm_total = 0;
     count_shm_streams(&ev, ctx, &shm_live, &shm_total);
 
+    float beam_px = 0.0f, pup_m_pix = 0.0f, foc_ld_pix = 0.0f;
+    float foc_arcsec_pix = 0.0f, foc_lam_um = 1.65f;
+    char  foc_src[32] = "";
+    compute_bench_scales(ctx, &beam_px, &pup_m_pix, &foc_ld_pix, &foc_arcsec_pix, &foc_lam_um,
+                         foc_src, sizeof(foc_src));
+
     /* ── Panel 1: Optical Bench Overview + 2D Pupil Preview + Star Spectrum ── */
     char hdr_title[128];
     snprintf(hdr_title, sizeof(hdr_title), "CACAOSIM OPTICAL BENCH : %s", ctx->cfg.name);
     panel_top(&ev, hdr_title, ev.pal->fg_title, ev.pal->fg_title);
 
     const char *sep = ev.ascii ? " | " : " │ ";
-    for (int r = 0; r < 8; r++)
+    for (int r = 0; r < 10; r++)
     {
         sbuf_t ln;
         sb_init(&ln);
         sb_puts(&ln, " ");
-        sb_pupil_mini_row(&ln, &ev, pup16, r);
+        if (r < 8)
+        {
+            sb_pupil_mini_row(&ln, &ev, pup16, r);
+        }
+        else if (r == 8)
+        {
+            char ptag[20];
+            snprintf(ptag, sizeof(ptag), "%ux%u pix", ctx->nwf, ctx->nwf);
+            sb_fg(&ln, ev.lvl, ev.pal->fg_stream);
+            sb_printf(&ln, "%-16.16s", ptag);
+        }
+        else
+        {
+            char btag[20];
+            snprintf(btag, sizeof(btag), "Beam %.1f pix", beam_px);
+            sb_fg(&ln, ev.lvl, ev.pal->fg_muted);
+            sb_printf(&ln, "%-16.16s", btag);
+        }
         sb_fg(&ln, ev.lvl, ev.pal->fg_dim);
         sb_puts(&ln, ev.ascii ? " | " : " │ ");
         sb_rst(&ln, ev.lvl);
@@ -1632,11 +1952,38 @@ void cacaosim_bench_render(
             sb_fg(&ln, ev.lvl, ev.pal->fg_muted);
             sb_puts(&ln, "Telescope: ");
             sb_fg(&ln, ev.lvl, ev.pal->fg_text);
-            sb_printf(&ln, "D=%.2f m%scobs=%.0f%%%s%d spiders (%.0f%s)%sgrid %ux%u",
+            sb_printf(&ln, "D=%.2f m%scobs=%.0f%%%s%d spiders (%.0f%s)%sgrid %ux%u pix",
                       ctx->cfg.tel_diam_m, sep, 100.0f * ctx->cfg.cobs, sep, ctx->cfg.nspider,
                       ctx->cfg.spider_deg, ev.ascii ? "deg" : "°", sep, ctx->nwf, ctx->nwf);
         }
         else if (r == 3)
+        {
+            sb_fg(&ln, ev.lvl, ev.pal->fg_muted);
+            sb_puts(&ln, "Pupil Sc : ");
+            sb_fg(&ln, ev.lvl, ev.pal->fg_text);
+            sb_printf(&ln, "Array %ux%u pix%sBeam %.1f pix (%.1f%%)%s", ctx->nwf, ctx->nwf, sep,
+                      beam_px, 100.0f * ctx->cfg.pup_diam, sep);
+            sb_bold(&ln, ev.lvl);
+            sb_fg(&ln, ev.lvl, ev.pal->fg_stream);
+            sb_printf(&ln, "%.4f m/pix", pup_m_pix);
+            sb_rst(&ln, ev.lvl);
+        }
+        else if (r == 4)
+        {
+            sb_fg(&ln, ev.lvl, ev.pal->fg_muted);
+            sb_puts(&ln, "Focal Sc : ");
+            sb_bold(&ln, ev.lvl);
+            sb_fg(&ln, ev.lvl, ev.pal->fg_accent);
+            sb_printf(&ln, "%.3f l/D per pix", foc_ld_pix);
+            sb_rst(&ln, ev.lvl);
+            sb_fg(&ln, ev.lvl, ev.pal->fg_muted);
+            sb_printf(&ln, " (%s)%sSky ", foc_src, sep);
+            sb_fg(&ln, ev.lvl, ev.pal->fg_text);
+            sb_printf(&ln, "%.4f arcsec/pix", foc_arcsec_pix);
+            sb_fg(&ln, ev.lvl, ev.pal->fg_dim);
+            sb_printf(&ln, " @ %.2f um", foc_lam_um);
+        }
+        else if (r == 5)
         {
             sb_fg(&ln, ev.lvl, ev.pal->fg_muted);
             sb_puts(&ln, "Clock/In : ");
@@ -1651,7 +1998,7 @@ void cacaosim_bench_render(
             sb_puts(&ln, "  pup=");
             sb_stream_tag(&ln, &ev, ctx->cfg.in_pup);
         }
-        else if (r == 4)
+        else if (r == 6)
         {
             sb_fg(&ln, ev.lvl, ev.pal->fg_muted);
             sb_puts(&ln, "Star     : ");
@@ -1660,7 +2007,7 @@ void cacaosim_bench_render(
                       ctx->cfg.star_mag, sep, ctx->cfg.star_teff,
                       spectral_type_hint(ctx->cfg.star_teff), sep, 100.0f * ctx->cfg.tput_tel);
         }
-        else if (r == 5)
+        else if (r == 7)
         {
             sb_fg(&ln, ev.lvl, ev.pal->fg_muted);
             sb_puts(&ln, "Photons  : ");
@@ -1672,7 +2019,7 @@ void cacaosim_bench_render(
             sb_printf(&ln, "  (%u DMs/TTMs, %u sensors, %u beams)", ctx->n_dms, ctx->n_sensors,
                       ctx->n_beams);
         }
-        else if (r == 6)
+        else if (r == 8)
         {
             sb_fg(&ln, ev.lvl, ev.pal->fg_muted);
             sb_puts(&ln, "Spectrum : ");
@@ -1923,6 +2270,144 @@ void cacaosim_bench_render(
                 sb_fg(&rline, ev.lvl,
                       (strcmp(reg_lbl, "Shot") == 0) ? ev.pal->fg_active : ev.pal->fg_warn);
                 sb_puts(&rline, rn_s);
+                panel_row(&ev, ev.pal->fg_conn, rline.data);
+            }
+            panel_bot(&ev, ev.pal->fg_conn);
+        }
+
+        uint32_t n_aux = 0;
+        for (uint32_t i = 0; i < ctx->n_nodes; i++)
+        {
+            cacaosim_node_kind_t k = ctx->nodes[i].cfg.kind;
+            if (k == CACAOSIM_NODE_SPLITTER || k == CACAOSIM_NODE_CORO || k == CACAOSIM_NODE_WFE)
+            {
+                n_aux++;
+            }
+        }
+        if (n_aux > 0)
+        {
+            panel_top(&ev, "BEAMSPLITTERS, CORONAGRAPHS & STATIC WFE", ev.pal->fg_conn,
+                      ev.pal->fg_proc);
+
+            sbuf_t th;
+            sb_init(&th);
+            sb_bold(&th, ev.lvl);
+            sb_fg(&th, ev.lvl, ev.pal->fg_muted);
+            sb_printf(&th, " %-2s %-11s %-8s %-25s %-12s %s", "#", "ID", "Kind",
+                      "Mode / Optical Spec", "In Beam", "Output Arms / SHM / Masks");
+            sb_rst(&th, ev.lvl);
+            panel_row(&ev, ev.pal->fg_conn, th.data);
+            panel_sep(&ev, ev.pal->fg_dim);
+
+            uint32_t aidx = 0;
+            for (uint32_t i = 0; i < ctx->n_nodes; i++)
+            {
+                const cacaosim_bench_node_t *nd = &ctx->nodes[i];
+                if (nd->cfg.kind != CACAOSIM_NODE_SPLITTER &&
+                    nd->cfg.kind != CACAOSIM_NODE_CORO && nd->cfg.kind != CACAOSIM_NODE_WFE)
+                {
+                    continue;
+                }
+
+                sbuf_t rline;
+                sb_init(&rline);
+                sb_fg(&rline, ev.lvl, ev.pal->fg_dim);
+                sb_printf(&rline, " %-2u ", aidx++);
+                sb_bold(&rline, ev.lvl);
+                sb_fg(&rline, ev.lvl, ev.pal->fg_bright);
+                sb_pad_col(&rline, nd->cfg.id, 12);
+                sb_rst(&rline, ev.lvl);
+
+                char mspec[32] = "";
+                if (nd->cfg.kind == CACAOSIM_NODE_SPLITTER)
+                {
+                    sb_fg(&rline, ev.lvl, ev.pal->fg_warn);
+                    sb_pad_col(&rline, "SPLITTER", 9);
+                    if (nd->cfg.split.mode == CACAOSIM_SPLIT_GRAY)
+                    {
+                        snprintf(mspec, sizeof(mspec), "gray R=%.0f%% T=%.0f%%",
+                                 100.0f * nd->cfg.split.r_gray, 100.0f * nd->cfg.split.t_gray);
+                    }
+                    else
+                    {
+                        const char *sm = (nd->cfg.split.mode == CACAOSIM_SPLIT_DICHROIC_BP)
+                                             ? "BP"
+                                             : ((nd->cfg.split.mode == CACAOSIM_SPLIT_DICHROIC_SP)
+                                                    ? "SP"
+                                                    : "LP");
+                        snprintf(mspec, sizeof(mspec), "dichroic %s %.2fum", sm,
+                                 nd->cfg.split.lambda_cut);
+                    }
+                    sb_fg(&rline, ev.lvl, ev.pal->fg_text);
+                    sb_pad_col(&rline, mspec, 26);
+                    sb_fg(&rline, ev.lvl, ev.pal->fg_accent);
+                    sb_pad_col(&rline, nd->cfg.in_beam, 13);
+                    sb_fg(&rline, ev.lvl, ev.pal->fg_muted);
+                    sb_printf(&rline, "R:%s  T:%s", nd->cfg.out_refl, nd->cfg.out_trans);
+                }
+                else if (nd->cfg.kind == CACAOSIM_NODE_CORO)
+                {
+                    sb_fg(&rline, ev.lvl, ev.pal->fg_proc);
+                    sb_pad_col(&rline, "CORO", 9);
+                    if (nd->cfg.coro.nlambda > 1)
+                    {
+                        snprintf(mspec, sizeof(mspec), "%s %dch %.2fu",
+                                 coro_mode_label(nd->cfg.coro.mode), nd->cfg.coro.nlambda,
+                                 nd->cfg.coro.lambda_um);
+                    }
+                    else
+                    {
+                        snprintf(mspec, sizeof(mspec), "%s %.2fum",
+                                 coro_mode_label(nd->cfg.coro.mode), nd->cfg.coro.lambda_um);
+                    }
+                    sb_fg(&rline, ev.lvl, ev.pal->fg_text);
+                    sb_pad_col(&rline, mspec, 26);
+                    sb_fg(&rline, ev.lvl, ev.pal->fg_accent);
+                    sb_pad_col(&rline, nd->cfg.in_beam, 13);
+                    sb_fg(&rline, ev.lvl, ev.pal->fg_muted);
+                    int n_m = (nd->cfg.in_pup_amp[0] != '\0') + (nd->cfg.in_pup_pha[0] != '\0') +
+                              (nd->cfg.in_fpm_amp[0] != '\0') + (nd->cfg.in_fpm_pha[0] != '\0') +
+                              (nd->cfg.in_lyot[0] != '\0') + (nd->cfg.in_lyot_pha[0] != '\0');
+                    if (nd->cfg.out_lowfs[0] != '\0')
+                    {
+                        if (nd->cfg.coro.lowfs_mode == CACAOSIM_LOWFS_LYOT_REFL)
+                        {
+                            sb_printf(&rline, "Sci:%s  LOWFS:%s (lyot_refl)", nd->cfg.out_beam,
+                                      nd->cfg.out_lowfs);
+                        }
+                        else
+                        {
+                            float ap = (nd->cfg.coro.lowfs_pup_diam > 0.0f)
+                                           ? nd->cfg.coro.lowfs_pup_diam
+                                           : 1.0f;
+                            sb_printf(&rline, "Sci:%s  LOWFS:%s (fpm_refl, %.2fD)",
+                                      nd->cfg.out_beam, nd->cfg.out_lowfs, ap);
+                        }
+                    }
+                    else
+                    {
+                        sb_printf(&rline, "Sci:%s", nd->cfg.out_beam);
+                    }
+                    if (n_m > 0)
+                    {
+                        sb_fg(&rline, ev.lvl, ev.pal->fg_stream);
+                        sb_printf(&rline, " +%dM", n_m);
+                    }
+                }
+                else
+                {
+                    sb_fg(&rline, ev.lvl, ev.pal->fg_warn);
+                    sb_pad_col(&rline, "WFE", 9);
+                    snprintf(mspec, sizeof(mspec), "OPD [m] %.0fnm x%.2f", nd->cfg.wfe_rms_nm,
+                             nd->cfg.wfe_gain);
+                    sb_fg(&rline, ev.lvl, ev.pal->fg_text);
+                    sb_pad_col(&rline, mspec, 26);
+                    sb_fg(&rline, ev.lvl, ev.pal->fg_accent);
+                    sb_pad_col(&rline, nd->cfg.in_beam, 13);
+                    sb_fg(&rline, ev.lvl, ev.pal->fg_muted);
+                    sb_printf(&rline, "Out:%s  SHM:", nd->cfg.out_beam);
+                    sb_stream_tag(&rline, &ev, nd->cfg.in_wfe);
+                }
                 panel_row(&ev, ev.pal->fg_conn, rline.data);
             }
             panel_bot(&ev, ev.pal->fg_conn);

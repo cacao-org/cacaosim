@@ -89,7 +89,8 @@ static int shm_name_exists(const cacaosim_bench_cfg_t *cfg, const char *shm)
     {
         const cacaosim_node_cfg_t *nd = &cfg->nodes[i];
         if (strcmp(nd->in_cmd, shm) == 0 || strcmp(nd->out_opd, shm) == 0 ||
-            strcmp(nd->out_cam, shm) == 0 || strcmp(nd->out_long, shm) == 0)
+            strcmp(nd->in_wfe, shm) == 0 || strcmp(nd->out_cam, shm) == 0 ||
+            strcmp(nd->out_long, shm) == 0)
         {
             return 1;
         }
@@ -211,7 +212,7 @@ static int is_wfs_kind(cacaosim_node_kind_t k)
 
 static int is_inline_single_kind(cacaosim_node_kind_t k)
 {
-    return (k == CACAOSIM_NODE_DM || k == CACAOSIM_NODE_CORO);
+    return (k == CACAOSIM_NODE_DM || k == CACAOSIM_NODE_CORO || k == CACAOSIM_NODE_WFE);
 }
 
 /* Suggest a sensible sensor wavelength based on upstream dichroic arm if applicable */
@@ -708,7 +709,7 @@ static void derive_auto_target_beam(
     }
 
     const cacaosim_node_cfg_t *prev = &cfg->nodes[after_node_idx];
-    if (prev->kind == CACAOSIM_NODE_DM)
+    if (prev->kind == CACAOSIM_NODE_DM || prev->kind == CACAOSIM_NODE_WFE)
     {
         edit_copy_str(out_beam, cap, prev->out_beam[0] ? prev->out_beam : root);
         return;
@@ -798,6 +799,9 @@ int cacaosim_bench_add_node(
     case CACAOSIM_NODE_FPCAM:
         prefix = "sci";
         break;
+    case CACAOSIM_NODE_WFE:
+        prefix = "wfe";
+        break;
     }
 
     char id[CACAOSIM_BENCH_NAME_LEN];
@@ -824,6 +828,14 @@ int cacaosim_bench_add_node(
         make_unique_beam(cfg, base_buf, nd.out_beam, sizeof(nd.out_beam));
         snprintf(base_buf, sizeof(base_buf), "%.48s_cmd", id);
         make_unique_shm(cfg, base_buf, nd.in_cmd, sizeof(nd.in_cmd));
+        rewire_consumers_except(cfg, in_beam, nd.out_beam, -1, -1);
+    }
+    else if (kind == CACAOSIM_NODE_WFE)
+    {
+        snprintf(base_buf, sizeof(base_buf), "b_%.48s", id);
+        make_unique_beam(cfg, base_buf, nd.out_beam, sizeof(nd.out_beam));
+        snprintf(base_buf, sizeof(base_buf), "%.48s_wfe", id);
+        make_unique_shm(cfg, base_buf, nd.in_wfe, sizeof(nd.in_wfe));
         rewire_consumers_except(cfg, in_beam, nd.out_beam, -1, -1);
     }
     else if (kind == CACAOSIM_NODE_CORO)
@@ -902,6 +914,7 @@ int cacaosim_bench_clone_node(cacaosim_bench_cfg_t *cfg, uint32_t src_idx)
     char                 saved_trans[CACAOSIM_BENCH_NAME_LEN];
     char                 saved_lowfs[CACAOSIM_BENCH_NAME_LEN];
     char                 saved_cmd[CACAOSIM_BENCH_NAME_LEN];
+    char                 saved_wfe[CACAOSIM_BENCH_NAME_LEN];
     char                 saved_cam[CACAOSIM_BENCH_NAME_LEN];
     char                 saved_long[CACAOSIM_BENCH_NAME_LEN];
 
@@ -912,6 +925,7 @@ int cacaosim_bench_clone_node(cacaosim_bench_cfg_t *cfg, uint32_t src_idx)
     edit_copy_str(saved_trans, sizeof(saved_trans), dst->out_trans);
     edit_copy_str(saved_lowfs, sizeof(saved_lowfs), dst->out_lowfs);
     edit_copy_str(saved_cmd, sizeof(saved_cmd), dst->in_cmd);
+    edit_copy_str(saved_wfe, sizeof(saved_wfe), dst->in_wfe);
     edit_copy_str(saved_cam, sizeof(saved_cam), dst->out_cam);
     edit_copy_str(saved_long, sizeof(saved_long), dst->out_long);
 
@@ -923,9 +937,14 @@ int cacaosim_bench_clone_node(cacaosim_bench_cfg_t *cfg, uint32_t src_idx)
     edit_copy_str(dst->out_trans, sizeof(dst->out_trans), saved_trans);
     edit_copy_str(dst->out_lowfs, sizeof(dst->out_lowfs), saved_lowfs);
     edit_copy_str(dst->in_cmd, sizeof(dst->in_cmd), saved_cmd);
+    edit_copy_str(dst->in_wfe, sizeof(dst->in_wfe), saved_wfe);
     edit_copy_str(dst->out_cam, sizeof(dst->out_cam), saved_cam);
     edit_copy_str(dst->out_long, sizeof(dst->out_long), saved_long);
     dst->out_opd[0] = '\0';
+    if (dst->kind == CACAOSIM_NODE_WFE)
+    {
+        dst->wfe_seed += 101ULL;
+    }
     return idx;
 }
 
