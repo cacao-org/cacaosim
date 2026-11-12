@@ -58,8 +58,15 @@ set(SOURCEFILES
     src/fpcam/cacaosim_fpcam_engine.c
     src/fpcam/cacaosim_fpcam_FPS.c
     src/bench/cacaosim_bench_cfg.c
+    src/bench/cacaosim_bench_edit.c
     src/bench/cacaosim_bench_dag.c
     src/bench/cacaosim_bench_view.c
+    src/bench/cacaosim_tui_ansi.c
+    src/bench/cacaosim_tui_shm.c
+    src/bench/cacaosim_tui_params.c
+    src/bench/cacaosim_tui_render.c
+    src/bench/cacaosim_tui_views.c
+    src/bench/cacaosim_tui.c
     src/fused/cacaosim_htsim_FPS.c
 )
 
@@ -89,6 +96,7 @@ set(INCLUDEFILES
     src/fpcam/cacaosim_fpcam_FPS.h
     src/bench/cacaosim_bench.h
     src/bench/cacaosim_bench_view.h
+    src/bench/cacaosim_tui.h
     src/fused/cacaosim_htsim_FPS.h
 )
 
@@ -172,6 +180,13 @@ if(COMMAND milk_add_runnable_module)
     target_include_directories(cacaosim-bench-view PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(cacaosim-bench-view PRIVATE ${LIBNAME} milkfps m)
     install(TARGETS cacaosim-bench-view DESTINATION bin)
+
+    add_executable(cacaosim-CTRL src/bench/cacaosim_ctrl_main.c)
+    target_compile_definitions(cacaosim-CTRL PRIVATE MILK_NO_CLI)
+    target_compile_options(cacaosim-CTRL PRIVATE ${CACAOSIM_C_OPT_FLAGS})
+    target_include_directories(cacaosim-CTRL PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(cacaosim-CTRL PRIVATE ${LIBNAME} milkfps m)
+    install(TARGETS cacaosim-CTRL DESTINATION bin)
 
     install(DIRECTORY src/ DESTINATION include/${SRCNAME} FILES_MATCHING PATTERN "*.h")
     install(
@@ -410,6 +425,22 @@ int main(int argc, char *argv[])
         INSTALL_RPATH "$ORIGIN/../lib;${CMAKE_INSTALL_RPATH}"
     )
     install(TARGETS cacaosim-bench-view DESTINATION bin)
+
+    add_executable(cacaosim-CTRL src/bench/cacaosim_ctrl_main.c)
+    target_compile_definitions(cacaosim-CTRL PRIVATE MILK_NO_CLI)
+    target_compile_options(cacaosim-CTRL PRIVATE ${CACAOSIM_C_OPT_FLAGS})
+    target_include_directories(cacaosim-CTRL PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_include_directories(cacaosim-CTRL SYSTEM PRIVATE ${MILK_STANDALONE_INCLUDES})
+    target_link_libraries(cacaosim-CTRL PRIVATE
+        ${LIBNAME}
+        ${MILK_LIBRARIES}
+        ${CACAOSIM_MATH_LIBS}
+    )
+    set_target_properties(cacaosim-CTRL PROPERTIES
+        BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR};${CMAKE_INSTALL_RPATH}"
+        INSTALL_RPATH "$ORIGIN/../lib;${CMAKE_INSTALL_RPATH}"
+    )
+    install(TARGETS cacaosim-CTRL DESTINATION bin)
 
     enable_testing()
 

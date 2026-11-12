@@ -15,6 +15,7 @@
 #include "beam/cacaosim_mkbeam_FPS.h"
 #include "bench/cacaosim_bench.h"
 #include "bench/cacaosim_bench_view.h"
+#include "bench/cacaosim_tui.h"
 #include "common/cacaosim_beam.h"
 #include "common/cacaosim_cuda.h"
 #include "common/cacaosim_detector.h"

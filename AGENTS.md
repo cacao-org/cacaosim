@@ -32,10 +32,11 @@ hardware and optical simulation plugin for the `milk` framework (`feat/bash-engi
 - **`src/fpcam/`**: Focal-plane science camera (`cacaosim.fpcam`, `milk-fpsexec-cacaosim-fpcam`)
   supporting Soummer Matrix-DFT and padded FFT across polychromatic channels, dynamic `in_beam`
   amplitude/OPD, subframe integration, and Strehl telemetry.
-- **`src/bench/` & `src/fused/`**: Declarative `.bench` INI/TOML parser, topological DAG sorter,
-  zero-FFT spectral analyzer, `milk`-styled TrueColor/256/mono ANSI optical schematic visualizer &
-  interactive TUI (`cacaosim-bench-view`), and multi-rate optical bench engine (`cacaosim.htsim`,
-  `milk-fpsexec-cacaosim-htsim`, `scripts/cacaosim-bench`).
+- **`src/bench/` & `src/fused/`**: Declarative `.bench` INI/TOML parser/serializer, presets &
+  topological optical-splicing editor, zero-FFT spectral analyzer, `milk-CTRL`-style flicker-free
+  hardware configurator & live SHM status GUI (`cacaosim-CTRL`, `cacaosim-bench gui`), one-shot CLI
+  schematic visualizer (`cacaosim-bench-view`), and multi-rate optical bench engine
+  (`cacaosim.htsim`, `milk-fpsexec-cacaosim-htsim`, `scripts/cacaosim-bench`).
 
 ---
 

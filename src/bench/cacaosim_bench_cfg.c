@@ -8,6 +8,8 @@
  */
 
 #include <ctype.h>
+#include <errno.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -303,6 +305,20 @@ static void init_node_defaults(
         nd->fpcam.rng_seed    = seed_base;
         init_det_defaults(&nd->fpcam.det, 1000000.0f, 1.0f);
     }
+}
+
+void cacaosim_bench_node_defaults(
+    cacaosim_node_cfg_t *nd,
+    cacaosim_node_kind_t kind,
+    const char          *id,
+    int                  is_ttm,
+    uint32_t             idx)
+{
+    if (nd == NULL)
+    {
+        return;
+    }
+    init_node_defaults(nd, kind, (id != NULL) ? id : "node", is_ttm, idx);
 }
 
 void cacaosim_bench_cfg_defaults(cacaosim_bench_cfg_t *cfg)
@@ -1220,4 +1236,595 @@ int cacaosim_bench_load_file(
     int rc = cacaosim_bench_parse_str(buf, cfg, err_buf, err_cap);
     free(buf);
     return rc;
+}
+
+typedef struct
+{
+    char  *buf;
+    size_t cap;
+    size_t len;
+} cfg_writer_t;
+
+static void cw_printf(cfg_writer_t *w, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
+static void cw_printf(cfg_writer_t *w, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    char   *dst = (w->buf != NULL && w->len < w->cap) ? (w->buf + w->len) : NULL;
+    size_t  rem = (w->buf != NULL && w->len < w->cap) ? (w->cap - w->len) : 0u;
+    int     n   = vsnprintf(dst, rem, fmt, ap);
+    va_end(ap);
+    if (n > 0)
+    {
+        w->len += (size_t) n;
+    }
+}
+
+static const char *split_mode_str(int32_t m)
+{
+    switch (m)
+    {
+    case CACAOSIM_SPLIT_GRAY:
+        return "gray";
+    case CACAOSIM_SPLIT_DICHROIC_LP:
+        return "dichroic_lp";
+    case CACAOSIM_SPLIT_DICHROIC_SP:
+        return "dichroic_sp";
+    case CACAOSIM_SPLIT_DICHROIC_BP:
+        return "dichroic_bp";
+    default:
+        return "dichroic_lp";
+    }
+}
+
+static const char *coro_mode_str(int32_t m)
+{
+    switch (m)
+    {
+    case CACAOSIM_CORO_LYOT_SPOT:
+        return "lyot_spot";
+    case CACAOSIM_CORO_PHASE_DIMPLE:
+        return "phase_dimple";
+    case CACAOSIM_CORO_VORTEX:
+        return "vortex";
+    case CACAOSIM_CORO_4QPM:
+        return "4qpm";
+    default:
+        return "lyot_spot";
+    }
+}
+
+static const char *dyn_mode_str(int32_t m)
+{
+    switch (m)
+    {
+    case 0:
+        return "instant";
+    case 1:
+        return "rc";
+    case 2:
+        return "osc";
+    default:
+        return "rc";
+    }
+}
+
+static void cw_write_reg(cfg_writer_t *w, const cacaosim_reg_t *reg)
+{
+    if (fabsf(reg->shift_x) > 1e-6f)
+    {
+        cw_printf(w, "shift_x       = %.4g\n", reg->shift_x);
+    }
+    if (fabsf(reg->shift_y) > 1e-6f)
+    {
+        cw_printf(w, "shift_y       = %.4g\n", reg->shift_y);
+    }
+    if (fabsf(reg->rot_deg) > 1e-6f)
+    {
+        cw_printf(w, "rot_deg       = %.4g\n", reg->rot_deg);
+    }
+    if (reg->scale > 0.0f && fabsf(reg->scale - 1.0f) > 1e-5f)
+    {
+        cw_printf(w, "mag_scale     = %.5g\n", reg->scale);
+    }
+}
+
+static void cw_write_det(
+    cfg_writer_t             *w,
+    const cacaosim_det_cfg_t *det,
+    int32_t                   use_beam_flux)
+{
+    if (!use_beam_flux)
+    {
+        cw_printf(w, "flux_ph       = %.6g\n", det->flux_ph);
+    }
+    cw_printf(w, "ron_e         = %.4g\n", det->ron_e);
+    if (fabsf(det->dark_e) > 1e-6f)
+    {
+        cw_printf(w, "dark_e        = %.4g\n", det->dark_e);
+    }
+    if (fabsf(det->gain_eadu - 1.0f) > 1e-5f)
+    {
+        cw_printf(w, "gain_eadu     = %.4g\n", det->gain_eadu);
+    }
+    if (fabsf(det->bias_adu - 100.0f) > 1e-4f)
+    {
+        cw_printf(w, "bias_adu      = %.5g\n", det->bias_adu);
+    }
+    if (fabsf(det->sat_adu - 65535.0f) > 1e-2f)
+    {
+        cw_printf(w, "sat_adu       = %.6g\n", det->sat_adu);
+    }
+    if (det->shutter == 0)
+    {
+        cw_printf(w, "shutter       = 0\n");
+    }
+    cw_printf(w, "photon_noise  = %d\n", det->photon_noise ? 1 : 0);
+    cw_printf(w, "out_dtype     = \"%s\"\n",
+              (det->out_dtype == CACAOSIM_DTYPE_F32) ? "float32" : "uint16");
+}
+
+int cacaosim_bench_format_str(
+    const cacaosim_bench_cfg_t *cfg,
+    char                       *buf,
+    size_t                      cap)
+{
+    if (cfg == NULL)
+    {
+        return -1;
+    }
+
+    cfg_writer_t w = { .buf = buf, .cap = cap, .len = 0u };
+
+    cw_printf(&w,
+              "# Declarative cacaosim Multi-Stage Optical Bench Configuration (.bench)\n"
+              "# Interactive builder/status GUI: cacaosim-CTRL <file.bench>\n"
+              "# Deploy & run:                   cacaosim-bench start --config <file.bench>\n\n");
+
+    cw_printf(&w, "[bench]\n");
+    cw_printf(&w, "name       = \"%s\"\n", cfg->name[0] ? cfg->name : "ao_bench");
+    cw_printf(&w, "nwf        = %u\n", cfg->nwf);
+    cw_printf(&w, "pup_diam   = %.6g\n", cfg->pup_diam);
+    cw_printf(&w, "cobs       = %.4g\n", cfg->cobs);
+    cw_printf(&w, "nspider    = %d\n", cfg->nspider);
+    cw_printf(&w, "spider_w   = %.4g\n", cfg->spider_w);
+    cw_printf(&w, "spider_deg = %.4g\n", cfg->spider_deg);
+    cw_printf(&w, "tel_diam_m = %.4g\n", cfg->tel_diam_m);
+    cw_printf(&w, "star_mag   = %.4g\n", cfg->star_mag);
+    cw_printf(&w, "star_teff  = %.5g\n", cfg->star_teff);
+    cw_printf(&w, "tput_tel   = %.4g\n", cfg->tput_tel);
+    cw_printf(&w, "master_hz  = %.6g\n", cfg->master_hz);
+    cw_printf(&w, "in_wf      = \"%s\"\n", cfg->in_wf);
+    if (cfg->in_amp[0] != '\0')
+    {
+        cw_printf(&w, "in_amp     = \"%s\"\n", cfg->in_amp);
+    }
+    cw_printf(&w, "in_pup     = \"%s\"\n", cfg->in_pup);
+    if (cfg->in_ncpa[0] != '\0')
+    {
+        cw_printf(&w, "in_ncpa    = \"%s\"\n", cfg->in_ncpa);
+    }
+    cw_printf(&w, "out_beam   = \"%s\"\n", cfg->out_beam[0] ? cfg->out_beam : "b_pup");
+    if (cfg->wf_unit != CACAOSIM_WFUNIT_PHASE_RAD)
+    {
+        cw_printf(&w, "wf_unit    = \"um\"\n");
+    }
+    if (fabsf(cfg->ref_lambda - 0.50f) > 1e-5f)
+    {
+        cw_printf(&w, "ref_lambda = %.4g\n", cfg->ref_lambda);
+    }
+    if (fabsf(cfg->turb_gain - 1.0f) > 1e-5f)
+    {
+        cw_printf(&w, "turb_gain  = %.4g\n", cfg->turb_gain);
+    }
+    if (cfg->backend == CACAOSIM_BACKEND_CPU)
+    {
+        cw_printf(&w, "backend    = \"cpu\"\n");
+    }
+    else if (cfg->backend == CACAOSIM_BACKEND_CUDA)
+    {
+        cw_printf(&w, "backend    = \"cuda\"\n");
+    }
+
+    for (uint32_t i = 0; i < cfg->n_nodes; i++)
+    {
+        const cacaosim_node_cfg_t *nd = &cfg->nodes[i];
+        cw_printf(&w, "\n");
+
+        if (nd->kind == CACAOSIM_NODE_DM)
+        {
+            int is_ttm = (nd->dm.dm_mode == 1);
+            cw_printf(&w, "[%s.%s]\n", is_ttm ? "ttm" : "dm", nd->id);
+            cw_printf(&w, "in            = \"%s\"\n", nd->in_beam);
+            cw_printf(&w, "out           = \"%s\"\n", nd->out_beam);
+            cw_printf(&w, "in_cmd        = \"%s\"\n", nd->in_cmd);
+            if (nd->out_opd[0] != '\0')
+            {
+                cw_printf(&w, "out_opd       = \"%s\"\n", nd->out_opd);
+            }
+            if (nd->in_flat[0] != '\0')
+            {
+                cw_printf(&w, "in_flat       = \"%s\"\n", nd->in_flat);
+            }
+            if (!is_ttm)
+            {
+                cw_printf(&w, "nact_x        = %u\n", nd->dm.nact_x);
+                cw_printf(&w, "nact_y        = %u\n", nd->dm.nact_y);
+                cw_printf(&w, "if_coupling   = %.4g\n", nd->dm.if_coupling);
+                if (nd->dm.dm_diam > 0.0f)
+                {
+                    cw_printf(&w, "dm_diam       = %.5g\n", nd->dm.dm_diam);
+                }
+            }
+            cw_printf(&w, "tput          = %.4g\n", nd->tput);
+            if (fabsf(nd->dm.refl_scale - 2.0f) > 1e-5f)
+            {
+                cw_printf(&w, "refl_scale    = %.4g\n", nd->dm.refl_scale);
+            }
+            cw_printf(&w, "max_stroke    = %.4g\n", nd->dm.max_stroke);
+            cw_printf(&w, "dac_bits      = %d\n", nd->dm.dac_bits);
+            if (fabsf(nd->dm.nonlin_quad) > 1e-6f)
+            {
+                cw_printf(&w, "nonlin_quad   = %.4g\n", nd->dm.nonlin_quad);
+            }
+            cw_printf(&w, "dyn_mode      = \"%s\"\n", dyn_mode_str(nd->dm.dyn_mode));
+            if (nd->dm.dyn_mode == 1)
+            {
+                cw_printf(&w, "tau_us        = %.5g\n", nd->dm.tau_sec * 1.0e6f);
+            }
+            else if (nd->dm.dyn_mode == 2)
+            {
+                cw_printf(&w, "f0_hz         = %.5g\n", nd->dm.f0_hz);
+                cw_printf(&w, "zeta          = %.4g\n", nd->dm.zeta);
+            }
+            cw_printf(&w, "delay_frames  = %.4g\n", nd->dm.delay_frames);
+            cw_write_reg(&w, &nd->reg);
+        }
+        else if (nd->kind == CACAOSIM_NODE_SPLITTER)
+        {
+            cw_printf(&w, "[splitter.%s]\n", nd->id);
+            cw_printf(&w, "in            = \"%s\"\n", nd->in_beam);
+            if (nd->out_refl[0] != '\0')
+            {
+                cw_printf(&w, "out_refl      = \"%s\"\n", nd->out_refl);
+            }
+            if (nd->out_trans[0] != '\0')
+            {
+                cw_printf(&w, "out_trans     = \"%s\"\n", nd->out_trans);
+            }
+            cw_printf(&w, "mode          = \"%s\"\n", split_mode_str(nd->split.mode));
+            if (nd->split.mode == CACAOSIM_SPLIT_GRAY)
+            {
+                cw_printf(&w, "r_gray        = %.4g\n", nd->split.r_gray);
+                cw_printf(&w, "t_gray        = %.4g\n", nd->split.t_gray);
+            }
+            else
+            {
+                cw_printf(&w, "lambda_cut    = %.4g\n", nd->split.lambda_cut);
+                if (nd->split.mode == CACAOSIM_SPLIT_DICHROIC_BP)
+                {
+                    cw_printf(&w, "band_width    = %.4g\n", nd->split.band_width);
+                }
+                if (fabsf(nd->split.roll_um - 0.03f) > 1e-5f)
+                {
+                    cw_printf(&w, "roll_um       = %.4g\n", nd->split.roll_um);
+                }
+                cw_printf(&w, "eff_refl      = %.4g\n", nd->split.eff_refl);
+                cw_printf(&w, "eff_trans     = %.4g\n", nd->split.eff_trans);
+            }
+            if (fabsf(nd->reg_refl.shift_x) > 1e-6f)
+            {
+                cw_printf(&w, "refl_dx       = %.4g\n", nd->reg_refl.shift_x);
+            }
+            if (fabsf(nd->reg_refl.shift_y) > 1e-6f)
+            {
+                cw_printf(&w, "refl_dy       = %.4g\n", nd->reg_refl.shift_y);
+            }
+            if (fabsf(nd->reg_refl.rot_deg) > 1e-6f)
+            {
+                cw_printf(&w, "refl_rot      = %.4g\n", nd->reg_refl.rot_deg);
+            }
+            if (nd->reg_refl.scale > 0.0f && fabsf(nd->reg_refl.scale - 1.0f) > 1e-5f)
+            {
+                cw_printf(&w, "refl_scale    = %.5g\n", nd->reg_refl.scale);
+            }
+            if (fabsf(nd->reg_trans.shift_x) > 1e-6f)
+            {
+                cw_printf(&w, "trans_dx      = %.4g\n", nd->reg_trans.shift_x);
+            }
+            if (fabsf(nd->reg_trans.shift_y) > 1e-6f)
+            {
+                cw_printf(&w, "trans_dy      = %.4g\n", nd->reg_trans.shift_y);
+            }
+            if (fabsf(nd->reg_trans.rot_deg) > 1e-6f)
+            {
+                cw_printf(&w, "trans_rot     = %.4g\n", nd->reg_trans.rot_deg);
+            }
+            if (nd->reg_trans.scale > 0.0f && fabsf(nd->reg_trans.scale - 1.0f) > 1e-5f)
+            {
+                cw_printf(&w, "trans_scale   = %.5g\n", nd->reg_trans.scale);
+            }
+            if (nd->ncpa_refl[0] != '\0')
+            {
+                cw_printf(&w, "ncpa_refl     = \"%s\"\n", nd->ncpa_refl);
+            }
+            if (nd->ncpa_trans[0] != '\0')
+            {
+                cw_printf(&w, "ncpa_trans    = \"%s\"\n", nd->ncpa_trans);
+            }
+            if (nd->pup_refl[0] != '\0')
+            {
+                cw_printf(&w, "pup_refl      = \"%s\"\n", nd->pup_refl);
+            }
+            if (nd->pup_trans[0] != '\0')
+            {
+                cw_printf(&w, "pup_trans     = \"%s\"\n", nd->pup_trans);
+            }
+        }
+        else if (nd->kind == CACAOSIM_NODE_CORO)
+        {
+            cw_printf(&w, "[coro.%s]\n", nd->id);
+            cw_printf(&w, "in            = \"%s\"\n", nd->in_beam);
+            cw_printf(&w, "out           = \"%s\"\n", nd->out_beam);
+            if (nd->out_lowfs[0] != '\0')
+            {
+                cw_printf(&w, "out_lowfs     = \"%s\"\n", nd->out_lowfs);
+            }
+            if (nd->in_lyot[0] != '\0')
+            {
+                cw_printf(&w, "in_lyot       = \"%s\"\n", nd->in_lyot);
+            }
+            cw_printf(&w, "mode          = \"%s\"\n", coro_mode_str(nd->coro.mode));
+            cw_printf(&w, "lambda_um     = %.4g\n", nd->coro.lambda_um);
+            if (nd->coro.mode <= CACAOSIM_CORO_PHASE_DIMPLE)
+            {
+                cw_printf(&w, "fpm_rad_ld    = %.4g\n", nd->coro.fpm_rad_ld);
+                cw_printf(&w, "fpm_amp       = %.4g\n", nd->coro.fpm_amp);
+                if (nd->coro.mode == CACAOSIM_CORO_PHASE_DIMPLE)
+                {
+                    cw_printf(&w, "fpm_phase     = %.5g\n", nd->coro.fpm_phase_rad);
+                }
+                if (nd->coro.n_mft != 48u)
+                {
+                    cw_printf(&w, "n_mft         = %u\n", nd->coro.n_mft);
+                }
+            }
+            else
+            {
+                if (nd->coro.mode == CACAOSIM_CORO_VORTEX)
+                {
+                    cw_printf(&w, "vortex_charge = %d\n", nd->coro.vortex_charge);
+                }
+                if (nd->coro.pad_factor != 4u)
+                {
+                    cw_printf(&w, "pad_factor    = %u\n", nd->coro.pad_factor);
+                }
+            }
+            cw_printf(&w, "lowfs_refl    = %.4g\n", nd->coro.lowfs_refl);
+            cw_printf(&w, "tput          = %.4g\n", nd->tput);
+            cw_printf(&w, "lyot_outer    = %.4g\n", nd->coro.lyot_outer);
+            cw_printf(&w, "lyot_obs      = %.4g\n", nd->coro.lyot_obs);
+            cw_printf(&w, "lyot_nspider  = %d\n", nd->coro.lyot_nspider);
+            cw_printf(&w, "lyot_spider_w = %.4g\n", nd->coro.lyot_spider_w);
+            if (fabsf(nd->coro.lyot_spider_deg - 45.0f) > 1e-4f)
+            {
+                cw_printf(&w, "lyot_spider_deg = %.4g\n", nd->coro.lyot_spider_deg);
+            }
+            cw_write_reg(&w, &nd->reg);
+        }
+        else if (nd->kind == CACAOSIM_NODE_PYRWFS)
+        {
+            cw_printf(&w, "[pyrwfs.%s]\n", nd->id);
+            cw_printf(&w, "in            = \"%s\"\n", nd->in_beam);
+            cw_printf(&w, "out_cam       = \"%s\"\n", nd->out_cam);
+            if (nd->in_ncpa[0] != '\0')
+            {
+                cw_printf(&w, "in_ncpa       = \"%s\"\n", nd->in_ncpa);
+            }
+            cw_printf(&w, "ncam          = %u\n", nd->pyrwfs.ncam);
+            if (nd->pyrwfs.pad_factor != 2u)
+            {
+                cw_printf(&w, "pad_factor    = %u\n", nd->pyrwfs.pad_factor);
+            }
+            cw_printf(&w, "lambda_um     = %.4g\n", nd->pyrwfs.lambda_um);
+            cw_printf(&w, "mod_rad       = %.4g\n", nd->pyrwfs.mod_rad_ld);
+            cw_printf(&w, "mod_npts      = %d\n", nd->pyrwfs.mod_npts);
+            if (fabsf(nd->pyrwfs.pup_sep - 0.50f) > 1e-5f)
+            {
+                cw_printf(&w, "pup_sep       = %.4g\n", nd->pyrwfs.pup_sep);
+            }
+            if (fabsf(nd->pyrwfs.roof_ld) > 1e-5f)
+            {
+                cw_printf(&w, "roof_ld       = %.4g\n", nd->pyrwfs.roof_ld);
+            }
+            if (fabsf(nd->pyrwfs.fstop_frac - 0.45f) > 1e-5f)
+            {
+                cw_printf(&w, "fstop_frac    = %.4g\n", nd->pyrwfs.fstop_frac);
+            }
+            cw_printf(&w, "bw_frac       = %.4g\n", nd->bw_frac);
+            cw_printf(&w, "qe            = %.4g\n", nd->qe);
+            cw_printf(&w, "use_beam_flux = %d\n", nd->use_beam_flux ? 1 : 0);
+            if (nd->rate_hz > 0.0f)
+            {
+                cw_printf(&w, "rate_hz       = %.6g\n", nd->rate_hz);
+            }
+            else
+            {
+                cw_printf(&w, "navg          = %u\n", nd->navg);
+            }
+            if (fabsf(nd->tput - 1.0f) > 1e-5f)
+            {
+                cw_printf(&w, "tput          = %.4g\n", nd->tput);
+            }
+            cw_write_det(&w, &nd->pyrwfs.det, nd->use_beam_flux);
+            cw_write_reg(&w, &nd->reg);
+        }
+        else if (nd->kind == CACAOSIM_NODE_SHWFS)
+        {
+            cw_printf(&w, "[shwfs.%s]\n", nd->id);
+            cw_printf(&w, "in            = \"%s\"\n", nd->in_beam);
+            cw_printf(&w, "out_cam       = \"%s\"\n", nd->out_cam);
+            if (nd->in_ncpa[0] != '\0')
+            {
+                cw_printf(&w, "in_ncpa       = \"%s\"\n", nd->in_ncpa);
+            }
+            cw_printf(&w, "n_sub         = %u\n", nd->shwfs.n_sub);
+            cw_printf(&w, "pix_per_sub   = %u\n", nd->shwfs.pix_per_sub);
+            if (nd->shwfs.pad_factor != 2u)
+            {
+                cw_printf(&w, "pad_factor    = %u\n", nd->shwfs.pad_factor);
+            }
+            cw_printf(&w, "lambda_um     = %.4g\n", nd->shwfs.lambda_um);
+            cw_printf(&w, "bw_frac       = %.4g\n", nd->bw_frac);
+            cw_printf(&w, "qe            = %.4g\n", nd->qe);
+            cw_printf(&w, "use_beam_flux = %d\n", nd->use_beam_flux ? 1 : 0);
+            if (nd->rate_hz > 0.0f)
+            {
+                cw_printf(&w, "rate_hz       = %.6g\n", nd->rate_hz);
+            }
+            else
+            {
+                cw_printf(&w, "navg          = %u\n", nd->navg);
+            }
+            if (fabsf(nd->tput - 1.0f) > 1e-5f)
+            {
+                cw_printf(&w, "tput          = %.4g\n", nd->tput);
+            }
+            cw_write_det(&w, &nd->shwfs.det, nd->use_beam_flux);
+            cw_write_reg(&w, &nd->reg);
+        }
+        else if (nd->kind == CACAOSIM_NODE_ZWFS)
+        {
+            cw_printf(&w, "[zwfs.%s]\n", nd->id);
+            cw_printf(&w, "in            = \"%s\"\n", nd->in_beam);
+            cw_printf(&w, "out_cam       = \"%s\"\n", nd->out_cam);
+            if (nd->in_ncpa[0] != '\0')
+            {
+                cw_printf(&w, "in_ncpa       = \"%s\"\n", nd->in_ncpa);
+            }
+            cw_printf(&w, "ncam          = %u\n", nd->zwfs.ncam);
+            if (nd->zwfs.n_mft != 32u)
+            {
+                cw_printf(&w, "n_mft         = %u\n", nd->zwfs.n_mft);
+            }
+            cw_printf(&w, "lambda_um     = %.4g\n", nd->zwfs.lambda_um);
+            cw_printf(&w, "dimple_ld     = %.4g\n", nd->zwfs.dimple_ld);
+            if (fabsf(nd->zwfs.dimple_rad - 0.5f * CACAOSIM_PI_F) > 1e-4f)
+            {
+                cw_printf(&w, "dimple_rad    = %.5g\n", nd->zwfs.dimple_rad);
+            }
+            if (fabsf(nd->zwfs.dimple_amp - 1.0f) > 1e-5f)
+            {
+                cw_printf(&w, "dimple_amp    = %.4g\n", nd->zwfs.dimple_amp);
+            }
+            cw_printf(&w, "bw_frac       = %.4g\n", nd->bw_frac);
+            cw_printf(&w, "qe            = %.4g\n", nd->qe);
+            cw_printf(&w, "use_beam_flux = %d\n", nd->use_beam_flux ? 1 : 0);
+            if (nd->rate_hz > 0.0f)
+            {
+                cw_printf(&w, "rate_hz       = %.6g\n", nd->rate_hz);
+            }
+            else
+            {
+                cw_printf(&w, "navg          = %u\n", nd->navg);
+            }
+            if (fabsf(nd->tput - 1.0f) > 1e-5f)
+            {
+                cw_printf(&w, "tput          = %.4g\n", nd->tput);
+            }
+            cw_write_det(&w, &nd->zwfs.det, nd->use_beam_flux);
+            cw_write_reg(&w, &nd->reg);
+        }
+        else if (nd->kind == CACAOSIM_NODE_FPCAM)
+        {
+            cw_printf(&w, "[fpcam.%s]\n", nd->id);
+            cw_printf(&w, "in            = \"%s\"\n", nd->in_beam);
+            cw_printf(&w, "out_cam       = \"%s\"\n", nd->out_cam);
+            if (nd->out_long[0] != '\0')
+            {
+                cw_printf(&w, "out_long      = \"%s\"\n", nd->out_long);
+            }
+            if (nd->in_ncpa[0] != '\0')
+            {
+                cw_printf(&w, "in_ncpa       = \"%s\"\n", nd->in_ncpa);
+            }
+            cw_printf(&w, "ncam          = %u\n", nd->fpcam.ncam);
+            cw_printf(&w, "prop_mode     = \"%s\"\n",
+                      (nd->fpcam.prop_mode == CACAOSIM_FPCAM_PROP_FFT) ? "fft" : "mft");
+            if (nd->fpcam.prop_mode == CACAOSIM_FPCAM_PROP_FFT && nd->fpcam.pad_factor != 2u)
+            {
+                cw_printf(&w, "pad_factor    = %u\n", nd->fpcam.pad_factor);
+            }
+            cw_printf(&w, "lambda_um     = %.4g\n", nd->fpcam.lambda_um);
+            if (nd->fpcam.nlambda > 1)
+            {
+                cw_printf(&w, "nlambda       = %d\n", nd->fpcam.nlambda);
+            }
+            cw_printf(&w, "pixscale_ld   = %.4g\n", nd->fpcam.pixscale_ld);
+            cw_printf(&w, "bw_frac       = %.4g\n", nd->bw_frac);
+            cw_printf(&w, "qe            = %.4g\n", nd->qe);
+            cw_printf(&w, "use_beam_flux = %d\n", nd->use_beam_flux ? 1 : 0);
+            if (nd->rate_hz > 0.0f)
+            {
+                cw_printf(&w, "rate_hz       = %.6g\n", nd->rate_hz);
+            }
+            else
+            {
+                cw_printf(&w, "navg          = %u\n", nd->navg);
+            }
+            if (fabsf(nd->tput - 1.0f) > 1e-5f)
+            {
+                cw_printf(&w, "tput          = %.4g\n", nd->tput);
+            }
+            cw_write_det(&w, &nd->fpcam.det, nd->use_beam_flux);
+            cw_write_reg(&w, &nd->reg);
+        }
+    }
+
+    return (int) w.len;
+}
+
+int cacaosim_bench_save_file(
+    const char                 *path,
+    const cacaosim_bench_cfg_t *cfg,
+    char                       *err_buf,
+    size_t                      err_cap)
+{
+    if (path == NULL || path[0] == '\0' || cfg == NULL)
+    {
+        set_err(err_buf, err_cap, "Invalid path or configuration pointer");
+        return -1;
+    }
+    int need = cacaosim_bench_format_str(cfg, NULL, 0u);
+    if (need <= 0)
+    {
+        set_err(err_buf, err_cap, "Failed to format .bench configuration");
+        return -1;
+    }
+    char *buf = (char *) malloc((size_t) need + 2u);
+    if (buf == NULL)
+    {
+        set_err(err_buf, err_cap, "Out of memory formatting '%s'", path);
+        return -1;
+    }
+    cacaosim_bench_format_str(cfg, buf, (size_t) need + 2u);
+
+    FILE *fp = fopen(path, "wb");
+    if (fp == NULL)
+    {
+        set_err(err_buf, err_cap, "Cannot write '%s': %s", path, strerror(errno));
+        free(buf);
+        return -1;
+    }
+    size_t nw = fwrite(buf, 1u, (size_t) need, fp);
+    int    rc = fclose(fp);
+    free(buf);
+    if (nw != (size_t) need || rc != 0)
+    {
+        set_err(err_buf, err_cap, "Short write saving '%s'", path);
+        return -1;
+    }
+    return 0;
 }

@@ -257,9 +257,38 @@ typedef struct
 } cacaosim_bench_ctx_t;
 
 /**
+ * @brief Built-in optical bench hardware templates for rapid setup.
+ */
+typedef enum
+{
+    CACAOSIM_PRESET_SINGLE_PYRWFS  = 0, /**< Single-stage DM + Dichroic + PyWFS + Sci Cam */
+    CACAOSIM_PRESET_SINGLE_SHWFS   = 1, /**< Single-stage TTM + DM + Dichroic + SHWFS + Sci Cam */
+    CACAOSIM_PRESET_TWO_STAGE      = 2, /**< Cascaded Woofer + J-PyWFS + Tweeter + Vis-PyWFS */
+    CACAOSIM_PRESET_EXAO_CORO      = 3, /**< TTM + DM + SHWFS + Lyot Coro + ZWFS LOWFS + Cam */
+    CACAOSIM_PRESET_TRUTH_DUAL_WFS = 4, /**< DM + Dichroic + Gray BS -> PyWFS + Truth SHWFS */
+    CACAOSIM_PRESET_MINIMAL        = 5, /**< Minimal Telescope -> Focal-Plane Science Camera */
+    CACAOSIM_PRESET_COUNT          = 6
+} cacaosim_preset_t;
+
+/**
  * cacaosim_bench_cfg_defaults() - Initialize a .bench configuration struct with defaults
  */
 void cacaosim_bench_cfg_defaults(cacaosim_bench_cfg_t *cfg);
+
+/**
+ * cacaosim_bench_node_defaults() - Initialize a single optical node configuration with defaults
+ * @nd:     Destination node configuration
+ * @kind:   Optical node type
+ * @id:     Unique node section identifier
+ * @is_ttm: Non-zero when initializing a 2-axis Tip-Tilt mirror (CACAOSIM_NODE_DM, dm_mode=1)
+ * @idx:    Node slot index (used to derive deterministic distinct PRNG seeds)
+ */
+void cacaosim_bench_node_defaults(
+    cacaosim_node_cfg_t *nd,
+    cacaosim_node_kind_t kind,
+    const char          *id,
+    int                  is_ttm,
+    uint32_t             idx);
 
 /**
  * cacaosim_bench_parse_str() - Parse an INI/TOML-style .bench configuration from a string
@@ -282,6 +311,143 @@ int cacaosim_bench_load_file(
     cacaosim_bench_cfg_t *cfg,
     char                 *err_buf,
     size_t                err_cap);
+
+/**
+ * cacaosim_bench_format_str() - Serialize a .bench configuration into INI/TOML text
+ * @cfg: Source bench configuration
+ * @buf: Destination text buffer (may be NULL when @cap == 0 to query required length)
+ * @cap: Capacity of @buf in bytes
+ *
+ * Return: Number of characters formatted (excluding NUL), or -1 on invalid input.
+ */
+int cacaosim_bench_format_str(
+    const cacaosim_bench_cfg_t *cfg,
+    char                       *buf,
+    size_t                      cap);
+
+/**
+ * cacaosim_bench_save_file() - Write a .bench configuration cleanly to disk
+ * @path:    Destination file path
+ * @cfg:     Source bench configuration
+ * @err_buf: Optional error diagnostic buffer
+ * @err_cap: Capacity of @err_buf in bytes
+ *
+ * Return: 0 on success, -1 on I/O or validation error.
+ */
+int cacaosim_bench_save_file(
+    const char                 *path,
+    const cacaosim_bench_cfg_t *cfg,
+    char                       *err_buf,
+    size_t                      err_cap);
+
+/**
+ * cacaosim_bench_preset_name() - Short title for built-in hardware template @preset_id
+ */
+const char *cacaosim_bench_preset_name(int preset_id);
+
+/**
+ * cacaosim_bench_preset_desc() - One-line summary for built-in hardware template @preset_id
+ */
+const char *cacaosim_bench_preset_desc(int preset_id);
+
+/**
+ * cacaosim_bench_preset() - Populate @cfg with a complete built-in optical bench template
+ *
+ * Return: 0 on success, -1 if @preset_id is out of range.
+ */
+int cacaosim_bench_preset(
+    cacaosim_bench_cfg_t *cfg,
+    int                   preset_id);
+
+/**
+ * cacaosim_bench_list_beams() - Enumerate all optical beam names produced in @cfg
+ * @cfg:       Source bench configuration
+ * @beams:     Output array of beam name strings
+ * @max_beams: Capacity of @beams array
+ *
+ * Return: Total number of produced beams written to @beams.
+ */
+uint32_t cacaosim_bench_list_beams(
+    const cacaosim_bench_cfg_t *cfg,
+    char                        beams[][CACAOSIM_BENCH_NAME_LEN],
+    uint32_t                    max_beams);
+
+/**
+ * cacaosim_bench_add_node() - Insert a new optical element and auto-wire its optical beams
+ * @cfg:            Active bench configuration to modify
+ * @kind:           Optical element kind to insert
+ * @is_ttm:         1 for 2-axis Tip-Tilt mirror when @kind == CACAOSIM_NODE_DM, else 0
+ * @after_node_idx: Node index [0..n_nodes-1] to insert after, or -1 for entrance telescope beam
+ * @target_beam:    Explicit input beam name, or NULL/"" to auto-select & splice downstream
+ *
+ * Return: Index [0..n_nodes-1] of inserted node, or -1 if node capacity is full.
+ */
+int cacaosim_bench_add_node(
+    cacaosim_bench_cfg_t *cfg,
+    cacaosim_node_kind_t  kind,
+    int                   is_ttm,
+    int                   after_node_idx,
+    const char           *target_beam);
+
+/**
+ * cacaosim_bench_clone_node() - Duplicate node @src_idx with unique ID/streams and auto-wiring
+ *
+ * Return: Index of cloned node, or -1 on error.
+ */
+int cacaosim_bench_clone_node(
+    cacaosim_bench_cfg_t *cfg,
+    uint32_t              src_idx);
+
+/**
+ * cacaosim_bench_remove_node() - Remove node @node_idx and bridge its upstream/downstream beams
+ *
+ * Return: 0 on success, -1 if @node_idx is out of range.
+ */
+int cacaosim_bench_remove_node(
+    cacaosim_bench_cfg_t *cfg,
+    uint32_t              node_idx);
+
+/**
+ * cacaosim_bench_move_node() - Reorder node @node_idx by @dir (-1 upstream/up, +1 downstream/down)
+ *
+ * When moving an inline optical element across an adjacent inline element on the same beam chain,
+ * splices their beam connections so physical upstream/downstream optical causality swaps cleanly.
+ *
+ * Return: New index of the moved node, or -1 if move is not possible.
+ */
+int cacaosim_bench_move_node(
+    cacaosim_bench_cfg_t *cfg,
+    uint32_t              node_idx,
+    int                   dir);
+
+/**
+ * cacaosim_bench_swap_branches() - Swap downstream consumers on splitter refl/trans or coro arms
+ *
+ * Return: 0 on success, -1 if node has no dual output arms.
+ */
+int cacaosim_bench_swap_branches(
+    cacaosim_bench_cfg_t *cfg,
+    uint32_t              node_idx);
+
+/**
+ * cacaosim_bench_rename_node() - Rename node @node_idx to a validated unique identifier @new_id
+ *
+ * Return: 0 on success, -1 if invalid or duplicate (writes reason to @err_buf).
+ */
+int cacaosim_bench_rename_node(
+    cacaosim_bench_cfg_t *cfg,
+    uint32_t              node_idx,
+    const char           *new_id,
+    char                 *err_buf,
+    size_t                err_cap);
+
+/**
+ * cacaosim_bench_rewire_beam_out() - Rename a produced optical beam and update all its consumers
+ */
+int cacaosim_bench_rewire_beam_out(
+    cacaosim_bench_cfg_t *cfg,
+    const char           *old_beam,
+    const char           *new_beam);
 
 /**
  * cacaosim_bench_init() - Topologically sort, validate, and allocate a multi-stage bench DAG

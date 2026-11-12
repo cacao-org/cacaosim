@@ -29,9 +29,11 @@ usage() {
 Usage: cacaosim-bench [command] [options]
 
 Commands:
+  gui         Launch milk-CTRL-style hardware configurator & status GUI (cacaosim-CTRL)
+  ctrl        Alias for 'gui' (cacaosim-CTRL)
+  tui         Alias for 'gui' (cacaosim-CTRL)
   view        Render milk-styled ANSI/UTF-8 graphical optical bench schematic
   edit        Edit a .bench text file in \$EDITOR (creates template if new) & visualize
-  tui         Launch interactive edit / theme / deploy / stop TUI (cacaosim-bench-view -i)
   start       Launch AO hardware simulator in current MILK_SHM_DIR (default)
   stop        Stop running cacaosim / atmturb FPS units cleanly
   status      Show active optical bench schematic and live SHM streams
@@ -63,8 +65,8 @@ case "${CMD}" in
     view|show)
         exec cacaosim-bench-view "$@"
         ;;
-    tui)
-        exec cacaosim-bench-view -i "$@"
+    gui|ctrl|config|tui)
+        exec cacaosim-CTRL "$@"
         ;;
     edit)
         EDIT_TARGET=""

@@ -49,6 +49,15 @@ if ldd "$(command -v cacaosim-bench-view)" | grep -q "libCLIcore"; then
 fi
 echo "  [PASS] cacaosim-bench-view (-h1/-h2/-hm OK, no libCLIcore)"
 
+cacaosim-CTRL -h1 >/dev/null
+cacaosim-CTRL -h2 >/dev/null
+cacaosim-CTRL -hm >/dev/null
+if ldd "$(command -v cacaosim-CTRL)" | grep -q "libCLIcore"; then
+    echo "[FAIL] cacaosim-CTRL must NEVER link libCLIcore!" >&2
+    exit 1
+fi
+echo "  [PASS] cacaosim-CTRL (-h1/-h2/-hm OK, no libCLIcore)"
+
 echo "=== [2/7] Testing oneshot pupil + NCPA stream creation ==="
 milk-fpsexec-cacaosim-mkpupil --no-procinfo exec \
     .nwf=128 \
@@ -241,6 +250,56 @@ VIEW_LIVE="$(cacaosim-bench view "${CUSTOM_BENCH}" -t)"
 grep -q "SHM LIVE" <<<"${VIEW_LIVE}"
 cacaosim-bench stop
 echo "  [PASS] Edit .bench -> visualize -> deploy & run -> SHM LIVE indicator verified"
+
+if command -v python3 >/dev/null 2>&1; then
+    PTY_BENCH="${TEST_WORK}/pty_ctrl_built.bench"
+    python3 - "${PTY_BENCH}" <<'PYEOF'
+import fcntl, os, pty, select, struct, subprocess, termios, time, sys
+
+bench_path = sys.argv[1]
+master_fd, slave_fd = pty.openpty()
+winsz = struct.pack("HHHH", 40, 128, 0, 0)
+fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsz)
+
+proc = subprocess.Popen(
+    ["cacaosim-CTRL", "-p", bench_path],
+    stdin=slave_fd, stdout=slave_fd, stderr=slave_fd, close_fds=True
+)
+os.close(slave_fd)
+
+captured = bytearray()
+def drain(timeout_s):
+    end = time.monotonic() + timeout_s
+    while time.monotonic() < end:
+        r, _, _ = select.select([master_fd], [], [], 0.03)
+        if r:
+            try:
+                chunk = os.read(master_fd, 65536)
+                if not chunk:
+                    break
+                captured.extend(chunk)
+            except OSError:
+                break
+
+drain(0.20)
+# Load ExAO preset ('P' -> '4' ExAO -> 'y' confirm), add DM ('a' -> '1'),
+# cycle F3/F4/F5/F6/F2 tabs, save ('s'), and quit ('q')
+for seq in [b"P", b"4", b"y", b"a", b"1", b"\x1b[13~", b"\x1b[14~",
+            b"\x1b[15~", b"\x1b[17~", b"\x1b[12~", b"s", b"q"]:
+    os.write(master_fd, seq)
+    drain(0.06)
+
+rc = proc.wait(timeout=5.0)
+os.close(master_fd)
+assert rc == 0, f"cacaosim-CTRL exited with {rc}"
+assert b"\x1b[?2026h" in captured, "Missing synchronized output sequence"
+assert b"\x1b[?1049l" in captured, "Missing alternate screen restore"
+PYEOF
+    test -f "${PTY_BENCH}"
+    PTY_VIEW="$(cacaosim-bench view "${PTY_BENCH}" -t)"
+    grep -q "VALID DAG" <<<"${PTY_VIEW}"
+    echo "  [PASS] cacaosim-CTRL interactive PTY (preset -> add DM -> F2..F6 -> save -> quit)"
+fi
 
 echo "=== [8/8] Testing milk-cli dynamic module load (cacaosim) ==="
 if [[ -x "${INSTALL_DIR}/bin/milk-cli" && -f "${INSTALL_DIR}/lib/libmilkcacaosim.so" ]]; then

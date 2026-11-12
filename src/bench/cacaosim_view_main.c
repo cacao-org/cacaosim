@@ -24,6 +24,7 @@
 
 #include "milk_help.h"
 #include "bench/cacaosim_bench_view.h"
+#include "bench/cacaosim_tui.h"
 
 static struct termios        g_orig_termios;
 static volatile sig_atomic_t g_raw_active = 0;
@@ -142,7 +143,9 @@ static void print_help_full(const char *prog, int color)
     print_opt_line(color, "(default)", NULL,
                    "Render optical schematic, spectra, and hardware tables once");
     print_opt_line(color, "-i, --interactive", NULL,
-                   "Live TUI: [e] edit in $EDITOR, [f/m] deploy & run, [s] stop, [t] theme");
+                   "Launch milk-CTRL-style builder & status TUI (cacaosim-CTRL)");
+    print_opt_line(color, "-g, --gui", NULL,
+                   "Alias for -i / --interactive hardware configuration GUI");
     print_opt_line(color, "-w, --watch", NULL,
                    "Auto-reload diagram live whenever <config.bench> is saved on disk");
     print_opt_line(color, "--init", "<file.bench>",
@@ -737,7 +740,8 @@ int main(int argc, char **argv)
         {
             watch_mode = 1;
         }
-        else if (strcmp(a, "-i") == 0 || strcmp(a, "--interactive") == 0)
+        else if (strcmp(a, "-i") == 0 || strcmp(a, "--interactive") == 0 ||
+                 strcmp(a, "-g") == 0 || strcmp(a, "--gui") == 0)
         {
             inter_mode = 1;
         }
@@ -805,20 +809,40 @@ int main(int argc, char **argv)
         }
     }
 
+    char exe_dir[PATH_MAX];
+    char resolved[PATH_MAX];
+    get_exe_dir(argv[0], exe_dir, sizeof(exe_dir));
+
+    if (inter_mode)
+    {
+        cacaosim_tui_opts_t topts;
+        cacaosim_tui_opts_defaults(&topts);
+        topts.color_level   = opts.color_level;
+        topts.theme         = opts.theme;
+        topts.ascii_only    = opts.ascii_only;
+        topts.with_atmturb  = with_atmturb;
+        topts.seeing_arcsec = seeing;
+        topts.deploy_mode   = (strcmp(deploy_mode, "modular") == 0) ? 1 : 0;
+        snprintf(topts.exe_dir, sizeof(topts.exe_dir), "%.511s", exe_dir);
+        if (bench_arg != NULL)
+        {
+            resolve_bench_file(bench_arg, exe_dir, resolved, sizeof(resolved));
+            return cacaosim_tui_run(resolved, &topts);
+        }
+        return cacaosim_tui_run(NULL, &topts);
+    }
+
     if (bench_arg == NULL)
     {
         print_help_full(argv[0], isatty(STDOUT_FILENO));
         return 1;
     }
 
-    char exe_dir[PATH_MAX];
-    char resolved[PATH_MAX];
-    get_exe_dir(argv[0], exe_dir, sizeof(exe_dir));
     resolve_bench_file(bench_arg, exe_dir, resolved, sizeof(resolved));
 
-    if (inter_mode || watch_mode)
+    if (watch_mode)
     {
-        run_watch_or_tui(resolved, exe_dir, &opts, inter_mode, with_atmturb, seeing);
+        run_watch_or_tui(resolved, exe_dir, &opts, 0, with_atmturb, seeing);
         return 0;
     }
 

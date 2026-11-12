@@ -61,25 +61,33 @@ All 10 compute units use the `MILK_RUNNABLE` / `EXPORT_FPSEXEC` architecture on 
   long-pass dichroic -> Stage-2 Visible (`0.75 um`) Pyramid WFS (`aol2_wfsim`) at `3 kHz`
   (`navg = 1`) + H-band (`1.65 um`) Science Camera (`csim_fpcam`) at `100 Hz` (`navg = 30`).
 
-### 3. Edit, Visualize & Deploy Workflow (`cacaosim-bench-view`)
+### 3. Hardware Configurator, Status GUI & CLI Visualizer (`cacaosim-CTRL`, `cacaosim-bench-view`)
 
-`cacaosim-bench-view` renders any `.bench` text file in `< 1 ms` using `milk`'s native TrueColor /
-256-color / 16-color / monochrome ANSI theme engine (`dark`, `night` Observatory Red, `accessible`
-Okabe-Ito, `light`, `nordic`, plus `--ascii`), displaying an anti-aliased 2D pupil miniature,
-wavelength-colored 32-bin (`0.40..2.40 um`) spectral bars on every split arm, live `MILK_SHM_DIR`
-stream indicators, and interactive edit/deploy/stop TUI controls:
+`cacaosim-CTRL` (`cacaosim-bench gui` / `cacaosim-bench-view -i`) provides an interactive,
+flicker-free terminal hardware builder and live `MILK_SHM_DIR` status monitor modeled after
+`milk-CTRL` (shadow/front cell-grid delta buffer with `\033[?2026h` synchronized updates, SGR 1006
+mouse + draggable splitters + hover tooltips, 5 `milk` themes, and `--ascii` 7-bit mode):
+
+- **`F2:BUILDER`**: 3-pane workspace with **Elements & Arranger** (`[a]` add DM/TTM/Splitter/Coro/
+  PyWFS/SHWFS/ZWFS/FPCAM, `[c]` clone, `[K]`/`[J]` optical-splicing reorder, `[x]` branch swap,
+  `[w]` upstream beam picker, `[d]` beam-bridging delete, `[u]`/`Ctrl+R` 24-step undo/redo, live
+  `16x16` pupil dock), **clickable 2D Optical Schematic**, and **Parameter Inspector** (`1:OPTICS`,
+  `2:DYN/DET`, `3:SHM/WIRING`).
+- **`F3:SCHEMATIC` / `F4:TABLES` / `F5:STATUS` / `F6:SOURCE`**: Full-screen optical diagram &
+  32-bin (`0.40..2.40 um`) spectral deck, hardware summary tables, live `.im.shm` / `.fps.shm`
+  rates + Strehl + one-key `fused`/`modular` deployment, and `.bench` INI/TOML preview.
 
 ```bash
 export MILK_SHM_DIR=/milk/shm
 
-# 1. Bootstrap or edit a .bench configuration file and visualize immediately:
-cacaosim-bench edit my_two_stage.bench
-cacaosim-bench-view my_two_stage.bench                 # one-shot milk TrueColor schematic
-cacaosim-bench-view --theme night exao_coro_lowfs.bench # Observatory Red palette
-cacaosim-bench-view -w my_two_stage.bench              # live-reload on every file save
+# 1. Launch the milk-CTRL-style interactive hardware configurator & live status GUI:
+cacaosim-CTRL my_two_stage.bench                       # or: cacaosim-bench gui my_two_stage.bench
+cacaosim-CTRL --status                                 # open directly on F5:STATUS SHM monitor
+cacaosim-CTRL --theme night exao_coro_lowfs.bench      # Observatory Red night-vision palette
 
-# 2. Or launch the interactive TUI ([e] edit, [f] deploy fused, [m] modular, [s] stop, [t] theme):
-cacaosim-bench-view -i my_two_stage.bench
+# 2. One-shot or file-watch CLI schematic rendering:
+cacaosim-bench-view my_two_stage.bench                 # one-shot milk TrueColor schematic
+cacaosim-bench-view -w my_two_stage.bench              # live-reload on every file save
 
 # 3. Deploy and run in zero-hop fused GPU/CPU mode or multi-process modular FPS mode:
 cacaosim-bench start --config my_two_stage.bench --mode fused --atmturb --seeing 0.7
@@ -109,13 +117,13 @@ Pass `-DCACAOSIM_ENABLE_CUDA=OFF` to force a CPU-only build (`FFTW3f` + `OpenBLA
 
 ## Validation & Measured Runtime Performance
 
-`cacaosim-validate` executes **40** quantitative optical physics, spectral photon-conservation,
+`cacaosim-validate` executes **45** quantitative optical physics, spectral photon-conservation,
 CPU-vs-CUDA numerical parity (`rel_L2 < 1e-5`), coronagraphic suppression, optical causality,
-visualizer rendering, and multi-stage closed-loop AO tests
-(`H-band Strehl: open=0.153 -> Stage-1=0.815 -> 2-Stage=0.998`).
-`tests/test_closed_loop.sh` verifies zero `libCLIcore` linkage across all 10 `fpsexec` binaries and
-`cacaosim-bench-view`, modular 3D beam SHM pipelines, fused/modular `.bench` runs, edit-visualize-
-deploy workflows, and `milk-cli` loading.
+topological hardware splicing, `cacaosim-CTRL` headless TUI snapshots, and multi-stage closed-loop
+AO tests (`H-band Strehl: open=0.153 -> Stage-1=0.815 -> 2-Stage=0.998`).
+`tests/test_closed_loop.sh` verifies zero `libCLIcore` linkage across all 10 `fpsexec` binaries,
+`cacaosim-CTRL`, and `cacaosim-bench-view`, modular 3D beam SHM pipelines, fused/modular `.bench`
+runs, interactive `cacaosim-CTRL` PTY workflows, and `milk-cli` loading.
 
 Measured with `cacaosim-benchmark` on Intel Core i9-12950HX + NVIDIA RTX A5500 Laptop GPU:
 

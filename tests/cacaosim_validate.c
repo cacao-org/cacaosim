@@ -1906,6 +1906,142 @@ static void test_multistage_bench_dag(void)
     check_cond(er_ok, "Diagnostic error panel on invalid .bench", buf);
 }
 
+/* 12. Declarative .bench presets, topological editor & cacaosim-CTRL headless TUI */
+static void test_bench_configurator_and_tui(void)
+{
+    printf("\n=== 12. Hardware Configurator, Optical Splicing & cacaosim-CTRL TUI ===\n");
+    char err[256];
+    char detail[128];
+
+    /* 12a. All 6 built-in presets + format_str / parse_str lossless round-trip */
+    int presets_ok = 1;
+    for (int p = 0; p < CACAOSIM_PRESET_COUNT; p++)
+    {
+        cacaosim_bench_cfg_t cfg0, cfg1;
+        cacaosim_bench_ctx_t ctx0, ctx1;
+        if (cacaosim_bench_preset(&cfg0, p) != 0 ||
+            cacaosim_bench_analyze(&ctx0, &cfg0, err, sizeof(err)) != 0)
+        {
+            presets_ok = 0;
+            break;
+        }
+        char txt[16384];
+        int  flen = cacaosim_bench_format_str(&cfg0, txt, sizeof(txt));
+        if (flen <= 0 || flen >= (int) sizeof(txt) ||
+            cacaosim_bench_parse_str(txt, &cfg1, err, sizeof(err)) != 0 ||
+            cacaosim_bench_analyze(&ctx1, &cfg1, err, sizeof(err)) != 0 ||
+            ctx0.n_nodes != ctx1.n_nodes || ctx0.n_beams != ctx1.n_beams ||
+            ctx0.n_sensors != ctx1.n_sensors)
+        {
+            presets_ok = 0;
+            break;
+        }
+        for (uint32_t s = 0; s < ctx0.n_sensors; s++)
+        {
+            float f0 = ctx0.nodes[ctx0.sensor_node_idx[s]].eff_flux_ph;
+            float f1 = ctx1.nodes[ctx1.sensor_node_idx[s]].eff_flux_ph;
+            if (fabsf(f0 - f1) > 1e-3f * (f0 + 1.0f))
+            {
+                presets_ok = 0;
+                break;
+            }
+        }
+    }
+    snprintf(detail, sizeof(detail), "%d presets formatted, re-parsed & flux-matched",
+             CACAOSIM_PRESET_COUNT);
+    check_cond(presets_ok, "All .bench presets & INI/TOML round-trip", detail);
+
+    /* 12b. Smart element insertion, optical chain splicing, branch swap, clone & removal */
+    cacaosim_bench_cfg_t bcfg;
+    cacaosim_bench_ctx_t bctx;
+    cacaosim_bench_cfg_defaults(&bcfg);
+
+    int i_ttm  = cacaosim_bench_add_node(&bcfg, CACAOSIM_NODE_DM, 1, -1, NULL);
+    int i_dm   = cacaosim_bench_add_node(&bcfg, CACAOSIM_NODE_DM, 0, i_ttm, NULL);
+    int i_bs   = cacaosim_bench_add_node(&bcfg, CACAOSIM_NODE_SPLITTER, 0, i_dm, NULL);
+    int i_pyr  = cacaosim_bench_add_node(&bcfg, CACAOSIM_NODE_PYRWFS, 0, i_bs, NULL);
+    int i_coro = cacaosim_bench_add_node(&bcfg, CACAOSIM_NODE_CORO, 0, i_bs, NULL);
+    int i_zwfs = cacaosim_bench_add_node(&bcfg, CACAOSIM_NODE_ZWFS, 0, i_coro, NULL);
+    int i_sci  = cacaosim_bench_add_node(&bcfg, CACAOSIM_NODE_FPCAM, 0, i_coro, NULL);
+
+    int build_ok = (i_ttm >= 0 && i_dm >= 0 && i_bs >= 0 && i_pyr >= 0 && i_coro >= 0 &&
+                    i_zwfs >= 0 && i_sci >= 0 && bcfg.n_nodes == 7u &&
+                    cacaosim_bench_analyze(&bctx, &bcfg, err, sizeof(err)) == 0 &&
+                    bctx.n_dms == 2u && bctx.n_sensors == 3u);
+    snprintf(detail, sizeof(detail), "nodes=%u, dms=%u, sensors=%u, beams=%u", bcfg.n_nodes,
+             bctx.n_dms, bctx.n_sensors, bctx.n_beams);
+    check_cond(build_ok, "Smart auto-wired ExAO bench construction", detail);
+
+    /* Reorder DM upstream across TTM, back downstream, across Splitter, and back */
+    int mv1 = cacaosim_bench_move_node(&bcfg, 1u, -1);
+    int ok1 = (mv1 == 0 && strcmp(bcfg.nodes[0].id, "dm0") == 0 &&
+               cacaosim_bench_analyze(&bctx, &bcfg, err, sizeof(err)) == 0);
+    int mv2 = cacaosim_bench_move_node(&bcfg, 0u, +1);
+    int ok2 = (mv2 == 1 && strcmp(bcfg.nodes[1].id, "dm0") == 0 &&
+               cacaosim_bench_analyze(&bctx, &bcfg, err, sizeof(err)) == 0);
+    int mv3 = cacaosim_bench_move_node(&bcfg, 1u, +1);
+    int ok3 = (mv3 >= 2 && cacaosim_bench_analyze(&bctx, &bcfg, err, sizeof(err)) == 0);
+    int mv4 = (mv3 >= 0) ? cacaosim_bench_move_node(&bcfg, (uint32_t) mv3, -1) : -1;
+    int ok4 = (mv4 >= 0 && cacaosim_bench_analyze(&bctx, &bcfg, err, sizeof(err)) == 0);
+
+    int sw_ok = (cacaosim_bench_swap_branches(&bcfg, 2u) == 0 &&
+                 cacaosim_bench_analyze(&bctx, &bcfg, err, sizeof(err)) == 0 &&
+                 cacaosim_bench_swap_branches(&bcfg, 2u) == 0);
+    int cl_idx = cacaosim_bench_clone_node(&bcfg, 1u);
+    int rn_ok  = (cl_idx >= 0 &&
+                  cacaosim_bench_rename_node(&bcfg, (uint32_t) cl_idx, "tweeter_hi", err,
+                                             sizeof(err)) == 0);
+    int rm_ok  = (cacaosim_bench_remove_node(&bcfg, 0u) == 0 &&
+                  cacaosim_bench_analyze(&bctx, &bcfg, err, sizeof(err)) == 0);
+
+    snprintf(detail, sizeof(detail), "move=%d/%d/%d/%d, swap=%d, clone+rename=%d, bridge_del=%d",
+             ok1, ok2, ok3, ok4, sw_ok, rn_ok, rm_ok);
+    check_cond(ok1 && ok2 && ok3 && ok4 && sw_ok && rn_ok && rm_ok,
+               "Optical chain splicing, swap, clone & delete", detail);
+
+    /* 12c. Headless cacaosim-CTRL frame renderer across all 5 views (UTF-8 + 7-bit ASCII) */
+    char *hbuf = (char *) malloc(65536u);
+    int   tui_utf8_ok = 0;
+    if (hbuf != NULL)
+    {
+        int n = cacaosim_tui_render_headless(&bcfg, CACAOSIM_TUI_VIEW_BUILDER, 128, 40, 0, hbuf,
+                                             65536u);
+        tui_utf8_ok = (n > 2000 && strstr(hbuf, "cacaosim-CTRL") != NULL &&
+                       strstr(hbuf, "ELEMENTS & ARRANGER") != NULL &&
+                       strstr(hbuf, "2D OPTICAL SCHEMATIC") != NULL &&
+                       strstr(hbuf, "INSPECTOR") != NULL && strstr(hbuf, "tweeter_hi") != NULL &&
+                       strstr(hbuf, "\xe2\x95") != NULL);
+        snprintf(detail, sizeof(detail), "bytes=%d, UTF-8 3-pane Builder + DAG verified", n);
+    }
+    check_cond(tui_utf8_ok, "cacaosim-CTRL UTF-8 3-pane Builder snapshot", detail);
+
+    int    tui_ascii_ok      = (hbuf != NULL);
+    size_t total_ascii_bytes = 0u;
+    for (int v = 0; tui_ascii_ok && v < CACAOSIM_TUI_VIEW_COUNT; v++)
+    {
+        int n = cacaosim_tui_render_headless(&bcfg, v, 120, 36, 1, hbuf, 65536u);
+        if (n < 1000)
+        {
+            tui_ascii_ok = 0;
+            break;
+        }
+        for (int k = 0; k < n; k++)
+        {
+            unsigned char uc = (unsigned char) hbuf[k];
+            if (uc > 0x7Fu || uc == 0x1Bu)
+            {
+                tui_ascii_ok = 0;
+                break;
+            }
+        }
+        total_ascii_bytes += (size_t) n;
+    }
+    free(hbuf);
+    snprintf(detail, sizeof(detail), "all %d views rendered (%zu B), 100%% 7-bit ASCII",
+             CACAOSIM_TUI_VIEW_COUNT, total_ascii_bytes);
+    check_cond(tui_ascii_ok, "cacaosim-CTRL 5 views 7-bit ASCII render", detail);
+}
+
 int main(void)
 {
     printf("======================================================================\n");
@@ -1923,6 +2059,7 @@ int main(void)
     test_shwfs_physics();
     test_zwfs_and_coro_physics();
     test_multistage_bench_dag();
+    test_bench_configurator_and_tui();
 
     printf("\n======================================================================\n");
     printf("  Summary: %d passed, %d failed\n", g_pass, g_fail);
