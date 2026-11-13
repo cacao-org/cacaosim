@@ -5,6 +5,32 @@
 /**
  * @file    cacaosim_tui_params.c
  * @brief   Declarative parameter inspector tables, formatting, stepping, and validation
+ *
+ * Architectural Role in cacaosim-CTRL:
+ *   Implements the schema-driven parameter reflection, string serialization, incremental stepping,
+ *   and validated mutation layer backing the `F2:BUILDER` Inspector pane across `[bench]` entrance
+ *   settings and all optical node types (`dm` / `ttm`, `wfe`, `splitter`, `coro`, `pyrwfs`,
+ *   `shwfs`, `zwfs`, `fpcam`). Organizes every element's parameters into three consistent subtabs:
+ *   - Subtab `0` (`1:OPTICS`): Aperture geometry, passbands, masks, actuator grids, WFS optics.
+ *   - Subtab `1` (`2:DYN/DET`): Master/camera cadences, ZOH servo dynamics, photometry & RON.
+ *   - Subtab `2` (`3:SHM/WIRING`): Section ID, beam connectivity, SHM streams, 2D shift/rot.
+ *
+ * Design Rationale & Motivation:
+ *   1. Data-Driven Conditional Schema vs Static Offset Tables: Many AO node parameters are
+ *      meaningful only in specific operating modes (e.g., `nact_x`/`nact_y` only for Zonal DM,
+ *      `lambda_cut`/`band_width` only for dichroic splitters, `vortex_charge` vs `fpm_rad_ld` vs
+ *      `fpm_pixscale` across coronagraph architectures, manual `flux_ph` only when
+ *      `use_beam_flux == OFF`). Building `cs_param_desc_t` rows dynamically in `cs_params_build()`
+ *      keeps the UI decluttered while allowing a single generic widget renderer and input loop in
+ *      `cacaosim_tui_ansi.c` / `cacaosim_tui_render.c` (using the custom TrueColor + UTF-8 cell
+ *      canvas, SGR 1006 mouse wheel/click regions, and `DECSET 2026` synchronized diffing) to edit
+ *      over 80 distinct hardware parameters without bespoke per-node dialog code.
+ *   2. Coupled Invariants & Topological Side Effects: Routing both inline text edits and
+ *      arrow/wheel steps through `cs_param_set_str()` enforces cross-field invariants in one place:
+ *      even-integer grid rounding (`nwf`, `vortex_charge`), microsecond-to-second servo scaling
+ *      (`tau_us` <-> `tau_sec`), dual-struct registration/bandwidth mirroring, unique
+ *      `[<type>.<id>]` renames (`cacaosim_bench_rename_node()`), and automatic downstream consumer
+ *      rewiring (`cacaosim_bench_rewire_beam_out()`) whenever a produced optical beam is renamed.
  */
 
 #include <math.h>
@@ -15,9 +41,17 @@
 
 #include "bench/cacaosim_tui_internal.h"
 
+/**
+ * @brief Internal parameter dispatch identifiers (`cs_param_desc_t.id`).
+ *
+ * Partitioned into non-overlapping numeric blocks (`1..99` `[bench]`, `100..199` common node
+ * wiring & 2D pupil registration, `200..299` DM/TTM hardware, `300..399` beamsplitter, `400..499`
+ * coronagraph, `500..599` WFS & focal-plane cameras, `600..699` static WFE `[m]`) so a single
+ * `switch (pd->id)` in `cs_param_format_val()` and `cs_param_set_str()` dispatches cleanly.
+ */
 enum
 {
-    /* [bench] parameters */
+    /* [bench] global entrance telescope, star, atmosphere, and master clock parameters */
     PID_B_NAME = 1,
     PID_B_NWF,
     PID_B_PUP_DIAM,
@@ -40,7 +74,7 @@ enum
     PID_B_IN_AMP,
     PID_B_IN_NCPA,
 
-    /* Node common wiring & registration */
+    /* Node common section ID, beam/SHM wiring, throughput, and 2D affine pupil registration */
     PID_N_ID = 100,
     PID_N_IN_BEAM,
     PID_N_OUT_BEAM,
@@ -61,7 +95,7 @@ enum
     PID_N_ROT_DEG,
     PID_N_MAG_SCALE,
 
-    /* DM / TTM */
+    /* Deformable Mirror / 2-Axis Tip-Tilt Mirror geometry & discrete ZOH servo dynamics */
     PID_DM_MODE = 200,
     PID_DM_NACT_X,
     PID_DM_NACT_Y,
@@ -76,7 +110,7 @@ enum
     PID_DM_DAC_BITS,
     PID_DM_NONLIN,
 
-    /* Beamsplitter */
+    /* Gray & Dichroic (LP / SP / Band-Reflect) Beamsplitter parameters */
     PID_BS_MODE = 300,
     PID_BS_LAMBDA_CUT,
     PID_BS_BAND_WIDTH,
@@ -88,7 +122,7 @@ enum
     PID_BS_NCPA_REFL,
     PID_BS_NCPA_TRANS,
 
-    /* Coronagraph */
+    /* Coronagraph focal/pupil/Lyot masks & dual-mode LOWFS pickoff parameters */
     PID_CO_MODE = 400,
     PID_CO_LAMBDA,
     PID_CO_BW_FRAC,
@@ -113,7 +147,7 @@ enum
     PID_CO_IN_FPM_PHA,
     PID_CO_IN_LYOT_PHA,
 
-    /* Sensors (PyWFS / SHWFS / ZWFS / FPCAM) */
+    /* Wavefront & Focal-Plane Sensors (PyWFS / SHWFS / ZWFS / FPCAM) + detector readout */
     PID_S_NCAM = 500,
     PID_S_LAMBDA,
     PID_S_BW_FRAC,
@@ -139,13 +173,36 @@ enum
     PID_FP_PIXSCALE,
     PID_FP_NLAMBDA,
 
-    /* Static Wavefront Error */
+    /* Static Wavefront Error ([wfe.<id>], OPD in [meter]) synthesis & scaling parameters */
     PID_WFE_RMS_NM = 600,
     PID_WFE_ALPHA,
     PID_WFE_GAIN,
     PID_WFE_SEED
 };
 
+/**
+ * add_pd() - Append a scalar, boolean, string, beam, or ID parameter descriptor to @arr
+ * @arr:    Destination descriptor array
+ * @n:      In/out active count within @arr
+ * @max_n:  Maximum capacity of @arr
+ * @id:     Internal `PID_*` dispatch tag
+ * @key:    `.bench` INI property name
+ * @label:  Human-readable UI row title
+ * @unit:   Physical/logical unit string (NULL normalized to `""`)
+ * @type:   Value/widget classification (`cs_ptype_t`)
+ * @min_v:  Inclusive lower clamp bound for numeric types
+ * @max_v:  Inclusive upper clamp bound for numeric types
+ * @step_v: Fine keyboard/wheel step increment
+ * @tip:    Contextual help string displayed in status/hover tooltip (NULL normalized to `""`)
+ *
+ * Role:
+ *   Bounds-checked builder helper used throughout `cs_params_build()` to populate `cs_param_desc_t`
+ *   entries concisely.
+ *
+ * Rationale:
+ *   Normalizing NULL `unit`/`tip` pointers to `""` and guarding `*n < max_n` keeps rendering code
+ *   free of NULL checks and prevents buffer overruns if a subtab grows toward `CS_MAX_PARAMS`.
+ */
 static void add_pd(
     cs_param_desc_t *arr,
     int             *n,
@@ -177,6 +234,30 @@ static void add_pd(
     p->step_v = step_v;
 }
 
+/**
+ * add_enum_pd() - Append an enumerated-choice parameter descriptor (`<= 4` options) to @arr
+ * @arr:    Destination descriptor array
+ * @n:      In/out active count within @arr
+ * @max_n:  Maximum capacity of @arr
+ * @id:     Internal `PID_*` dispatch tag
+ * @key:    `.bench` INI property name
+ * @label:  Human-readable UI row title
+ * @n_enum: Number of active option strings `[1..4]`
+ * @e0:     Option 0 canonical string
+ * @e1:     Option 1 canonical string (or NULL)
+ * @e2:     Option 2 canonical string (or NULL)
+ * @e3:     Option 3 canonical string (or NULL)
+ * @tip:    Contextual help tooltip string
+ *
+ * Role:
+ *   Registers discrete `CS_PTYPE_ENUM` rows (e.g., `wf_unit`, `backend`, `dm_mode`, `dyn_mode`,
+ *   `splitter.mode`, `prop_mode`, `out_dtype`) supporting cyclic arrow/wheel stepping and
+ *   case-insensitive string entry.
+ *
+ * Rationale:
+ *   Embedding canonical option names directly in the descriptor lets `cs_param_step()` and
+ *   `cs_param_set_str()` validate and cycle any enum generically without per-field option tables.
+ */
 static void add_enum_pd(
     cs_param_desc_t *arr,
     int             *n,
@@ -213,6 +294,30 @@ static void add_enum_pd(
     p->enum_names[3] = e3;
 }
 
+/**
+ * add_enum6_pd() - Append a 6-option enumerated parameter descriptor to @arr
+ * @arr:   Destination descriptor array
+ * @n:     In/out active count within @arr
+ * @max_n: Maximum capacity of @arr
+ * @id:    Internal `PID_*` dispatch tag
+ * @key:   `.bench` INI property name
+ * @label: Human-readable UI row title
+ * @e0:    Option 0 canonical string
+ * @e1:    Option 1 canonical string
+ * @e2:    Option 2 canonical string
+ * @e3:    Option 3 canonical string
+ * @e4:    Option 4 canonical string
+ * @e5:    Option 5 canonical string
+ * @tip:   Contextual help tooltip string
+ *
+ * Role:
+ *   Registers 6-way enums such as coronagraph FPM architecture (`lyot_spot`, `phase_dimple`,
+ *   `vortex`, `4qpm`, `custom_mft`, `custom_fft`).
+ *
+ * Rationale:
+ *   Keeps the common `<= 4`-option `add_enum_pd()` call signature concise while accommodating wider
+ *   enums via `enum_names[4..5]`.
+ */
 static void add_enum6_pd(
     cs_param_desc_t *arr,
     int             *n,
@@ -236,6 +341,26 @@ static void add_enum6_pd(
     }
 }
 
+/**
+ * cs_params_build() - Construct active Inspector parameter descriptors for `(sel_item, subtab)`
+ * @cfg:      Source `.bench` configuration (must not be NULL)
+ * @sel_item: Selected item (`<= 0` or out-of-range selects `[bench]`; `1..n_nodes` selects node)
+ * @subtab:   Inspector category (`0` = OPTICS, `1` = DYN/DET, `2` = SHM/WIRING)
+ * @out:      Destination `cs_param_desc_t` array (must not be NULL)
+ * @max_out:  Capacity of @out (`<= CS_MAX_PARAMS`)
+ *
+ * Role:
+ *   Projects the currently selected `[bench]` or optical node configuration onto an ordered list of
+ *   typed UI rows tailored to the active subtab and operating mode.
+ *
+ * Rationale:
+ *   Evaluating conditional visibility rules live against `cfg` (e.g., hiding zonal `nact_x` and
+ *   `nact_y` when `dm_mode == 1` TTM, showing `band_width` only for `dichroic_bp`, switching
+ *   between analytic/vortex/custom coronagraph parameters, and hiding manual `flux_ph` when
+ *   `use_beam_flux != 0`) guarantees operators only see parameters that actively affect physics.
+ *
+ * Return: Number of populated descriptors in @out `[0..max_out]`.
+ */
 int cs_params_build(
     const cacaosim_bench_cfg_t *cfg,
     int                         sel_item,
@@ -249,7 +374,7 @@ int cs_params_build(
     }
     int n = 0;
 
-    /* Entrance [bench] section */
+    /* Entrance [bench] section: Subtab 0=Aperture, 1=Clock/Star/Atm/Backend, 2=Entrance SHM */
     if (sel_item <= 0 || (uint32_t) (sel_item - 1) >= cfg->n_nodes)
     {
         if (subtab == 0)
@@ -377,6 +502,7 @@ int cs_params_build(
                    0, 0, 0, "Optional sensor-arm static NCPA OPD stream");
         }
 
+        /* Splitters carry per-arm registration; all single-input elements share 2D reg fields */
         if (nd->kind != CACAOSIM_NODE_SPLITTER)
         {
             add_pd(out, &n, max_out, PID_N_SHIFT_X, "shift_x", "Pupil Shift X", "px",
@@ -398,6 +524,7 @@ int cs_params_build(
         {
             add_enum_pd(out, &n, max_out, PID_DM_MODE, "dm_mode", "Mirror Type", 2, "Zonal DM",
                         "2-Axis TTM", NULL, NULL, "0 = Zonal actuator grid, 1 = Tip-Tilt mirror");
+            /* Zonal actuator grid dimensions & Gaussian coupling apply only when dm_mode == 0 */
             if (nd->dm.dm_mode == 0)
             {
                 add_pd(out, &n, max_out, PID_DM_NACT_X, "nact_x", "Actuators X", "act",
@@ -441,6 +568,7 @@ int cs_params_build(
             add_enum_pd(out, &n, max_out, PID_BS_MODE, "mode", "Splitter Mode", 4, "gray",
                         "dichroic_lp", "dichroic_sp", "dichroic_bp",
                         "gray, longpass (refl<cut), shortpass (refl>cut), or band-reflect");
+            /* Expose gray R/T ratios vs wavelength cutoff/bandwidth depending on splitter mode */
             if (nd->split.mode == CACAOSIM_SPLIT_GRAY)
             {
                 add_pd(out, &n, max_out, PID_BS_R_GRAY, "r_gray", "Reflectance R", "",
@@ -487,6 +615,7 @@ int cs_params_build(
                    CS_PTYPE_INT, 1, 32, 1, "Polychromatic slices (auto-adopted from 3D mask cube)");
             add_enum_pd(out, &n, max_out, PID_CO_PHA_UNIT, "pha_unit", "Mask Phase Unit", 2, "rad",
                         "um", NULL, NULL, "Unit of custom phase masks: 0 = radians, 1 = OPD [um]");
+            /* Tailor focal-mask geometry rows to active analytic/vortex/MFT/FFT propagator */
             if (nd->coro.mode <= CACAOSIM_CORO_PHASE_DIMPLE)
             {
                 add_pd(out, &n, max_out, PID_CO_FPM_RAD, "fpm_rad_ld", "FPM Radius", "l/D",
@@ -531,6 +660,7 @@ int cs_params_build(
             add_enum_pd(out, &n, max_out, PID_CO_LOWFS_MODE, "lowfs_mode", "LOWFS Pickoff", 2,
                         "fpm_refl", "lyot_refl", NULL, NULL,
                         "0 = FPM-absorbed light reflected, 1 = Reflective Lyot stop");
+            /* Pupil-plane stop diameter on LOWFS arm applies only to FPM-reflection pickoff */
             if (nd->coro.lowfs_mode == CACAOSIM_LOWFS_FPM_REFL)
             {
                 add_pd(out, &n, max_out, PID_CO_LOWFS_PUP, "lowfs_pup_diam", "LOWFS Pupil Ap",
@@ -580,7 +710,7 @@ int cs_params_build(
         return n;
     }
 
-    /* Wavefront & Focal-Plane Sensors */
+    /* Wavefront & Focal-Plane Sensors: Subtab 0 = Diffractive Optics, Subtab 1 = Readout/Flux */
     if (subtab == 0)
     {
         if (nd->kind == CACAOSIM_NODE_PYRWFS)
@@ -654,6 +784,7 @@ int cs_params_build(
                "Detector quantum efficiency [e-/photon]");
         add_pd(out, &n, max_out, PID_S_USE_BFLUX, "use_beam_flux", "Auto Star Flux", "",
                CS_PTYPE_BOOL, 0, 1, 1, "Derive flux from stellar spectrum & upstream optics");
+        /* Manual photon budget row is exposed only when automatic stellar photometry is disabled */
         if (!nd->use_beam_flux)
         {
             add_pd(out, &n, max_out, PID_S_FLUX_PH, "flux_ph", "Manual Flux", "ph/fr",
@@ -670,6 +801,20 @@ int cs_params_build(
     return n;
 }
 
+/**
+ * node_det_ro() - Obtain a const pointer to the embedded detector config of a sensor node
+ * @nd: Sensor node (`PYRWFS`, `SHWFS`, `ZWFS`, or `FPCAM`)
+ *
+ * Role:
+ *   Unifies read access to `flux_ph`, `ron_e`, `photon_noise`, and `out_dtype` across all four
+ *   sensor structs inside `cs_param_format_val()`.
+ *
+ * Rationale:
+ *   Each sensor compute unit embeds its own `cacaosim_det_cfg_t det` sub-struct; factoring out
+ *   pointer resolution avoids duplicating four identical detector `switch` branches.
+ *
+ * Return: Non-NULL const pointer to the active `cacaosim_det_cfg_t` sub-struct.
+ */
 static const cacaosim_det_cfg_t *node_det_ro(const cacaosim_node_cfg_t *nd)
 {
     if (nd->kind == CACAOSIM_NODE_PYRWFS)
@@ -687,6 +832,20 @@ static const cacaosim_det_cfg_t *node_det_ro(const cacaosim_node_cfg_t *nd)
     return &nd->fpcam.det;
 }
 
+/**
+ * node_det_rw() - Obtain a writable pointer to the embedded detector config of a sensor node
+ * @nd: Mutable sensor node (`PYRWFS`, `SHWFS`, `ZWFS`, or `FPCAM`)
+ *
+ * Role:
+ *   Mutable counterpart to `node_det_ro()` used by `cs_param_set_str()` when updating detector
+ *   readout noise, shot noise, manual flux, or output datatype.
+ *
+ * Rationale:
+ *   Keeps `const`-correctness strict in `cs_param_format_val()` while sharing unified `PID_S_*`
+ *   detector parameter IDs across all WFS and science camera node kinds.
+ *
+ * Return: Non-NULL writable pointer to the active `cacaosim_det_cfg_t` sub-struct.
+ */
 static cacaosim_det_cfg_t *node_det_rw(cacaosim_node_cfg_t *nd)
 {
     if (nd->kind == CACAOSIM_NODE_PYRWFS)
@@ -704,6 +863,24 @@ static cacaosim_det_cfg_t *node_det_rw(cacaosim_node_cfg_t *nd)
     return &nd->fpcam.det;
 }
 
+/**
+ * cs_param_format_val() - Format a parameter's current value in @cfg as a UI string
+ * @cfg:      Optical bench configuration to inspect (ignored if NULL).
+ * @sel_item: Selected topology item (`0` for `[bench]` globals, `1..n_nodes` for a node).
+ * @pd:       Parameter descriptor identifying which field (`pd->id`) to read.
+ * @buf:      Destination character buffer receiving the NUL-terminated formatted text.
+ * @cap:      Capacity of @buf in bytes.
+ *
+ * Role: Read-side reflection projector converting typed fields in `cacaosim_bench_cfg_t`
+ * or `cacaosim_node_cfg_t` into human-readable inspector cell strings and initial text
+ * buffers for inline modal editing and incremental stepping (`cs_param_step()`).
+ *
+ * Rationale: Centralizing field-to-string formatting by `pd->id` ensures consistent
+ * decimal precision across physical units (e.g., `%.4f` for pupil fractions, `%.1f` after
+ * `1e6` scaling from `tau_sec` to microseconds, `ON`/`OFF` badges for booleans, and safe
+ * fallback defaults when optional parameters such as `mag_scale` or `fpm_pixscale_ld`
+ * hold zero sentinel values).
+ */
 void cs_param_format_val(
     const cacaosim_bench_cfg_t *cfg,
     int                         sel_item,
@@ -1099,6 +1276,22 @@ void cs_param_format_val(
     }
 }
 
+/**
+ * clamp_d() - Clamp a double-precision scalar to the closed interval [@lo, @hi]
+ * @v:  Input scalar value.
+ * @lo: Inclusive lower bound.
+ * @hi: Inclusive upper bound.
+ *
+ * Role: Numeric sanitizer applied to every user-entered or incrementally stepped scalar
+ * before casting into target configuration struct fields.
+ *
+ * Rationale: Clamping in `double` precision prior to integer rounding (`llround()`) or
+ * `float` narrowing avoids signed integer overflow and prevents out-of-domain physical
+ * values (such as negative aperture sizes, zero FFT grid dimensions, or unphysical filter
+ * roll-offs) from reaching downstream simulation kernels.
+ *
+ * Return: @v clamped to `[@lo, @hi]`.
+ */
 static double clamp_d(double v, double lo, double hi)
 {
     if (v < lo)
@@ -1112,6 +1305,30 @@ static double clamp_d(double v, double lo, double hi)
     return v;
 }
 
+/**
+ * cs_param_set_str() - Parse, validate, clamp, and apply a string edit to @cfg
+ * @cfg:      Optical bench configuration to mutate in place (must be non-NULL).
+ * @sel_item: Selected topology item (`0` for `[bench]` globals, `1..n_nodes` for a node).
+ * @pd:       Descriptor supplying type, `[min_v, max_v]` bounds, and enum vocabulary.
+ * @val_str:  NUL-terminated user input string to parse and commit.
+ * @err_buf:  Optional buffer receiving a human-readable diagnostic on parse/rename error.
+ * @err_cap:  Capacity of @err_buf in bytes (`0` if @err_buf is NULL).
+ *
+ * Role: Write-side reflection mutator committing inline text edits, enum selections,
+ * boolean toggles, and numeric step updates into `cacaosim_bench_cfg_t` while maintaining
+ * cross-field and topological invariants.
+ *
+ * Rationale: Funneling all parameter mutations through a single string-accepting entry
+ * point guarantees identical validation whether a change originates from keyboard text
+ * entry, left/right arrow stepping, or mouse wheel scrolling. Beyond basic range clamping,
+ * this mutator enforces structural bench invariants: unique node renaming via
+ * `cacaosim_bench_rename_node()`, cascading downstream `in_beam` rewires when an output
+ * stream name changes (`cacaosim_bench_rewire_beam_out()`), even-integer parity for FFT
+ * grids and vortex charges, DM/TTM actuator geometry resets, and dual-field mirroring for
+ * 2D registration and spectral bandwidth fields.
+ *
+ * Return: `0` on success, or `-1` if validation fails (leaving @cfg unmodified).
+ */
 int cs_param_set_str(
     cacaosim_bench_cfg_t  *cfg,
     int                    sel_item,
@@ -1125,6 +1342,10 @@ int cs_param_set_str(
         return -1;
     }
 
+    /*
+     * Node ID edits require collision checking against existing nodes and must preserve
+     * valid INI section identifier characters; delegate to the bench topology helper.
+     */
     if (pd->type == CS_PTYPE_ID)
     {
         if (sel_item <= 0 || (uint32_t) (sel_item - 1) >= cfg->n_nodes)
@@ -1135,7 +1356,10 @@ int cs_param_set_str(
                                           err_cap);
     }
 
-    /* Numeric / enum / bool parsing */
+    /*
+     * Parse numeric, boolean, and enumerated inputs upfront before touching @cfg so
+     * malformed strings fail atomically without partially mutating bench state.
+     */
     double dv = 0.0;
     int    iv = 0;
     if (pd->type == CS_PTYPE_FLOAT || pd->type == CS_PTYPE_INT || pd->type == CS_PTYPE_UINT)
@@ -1155,6 +1379,7 @@ int cs_param_set_str(
     }
     else if (pd->type == CS_PTYPE_BOOL)
     {
+        /* Accept standard INI/CLI truthy synonyms case-insensitively */
         iv = (strcasecmp(val_str, "1") == 0 || strcasecmp(val_str, "on") == 0 ||
               strcasecmp(val_str, "true") == 0 || strcasecmp(val_str, "yes") == 0)
                  ? 1
@@ -1171,6 +1396,7 @@ int cs_param_set_str(
                 break;
             }
         }
+        /* Allow numeric enum ordinal fallback (0..n_enum-1) for power-user quick entry */
         if (iv < 0)
         {
             char *endp = NULL;
@@ -1198,6 +1424,7 @@ int cs_param_set_str(
             snprintf(cfg->name, sizeof(cfg->name), "%s", val_str);
             break;
         case PID_B_NWF:
+            /* Round up to an even pixel count so pupil/FFT quadrants split symmetrically */
             cfg->nwf = (uint32_t) ((iv + 1) & ~1);
             break;
         case PID_B_PUP_DIAM:
@@ -1245,6 +1472,7 @@ int cs_param_set_str(
         case PID_B_OUT_BEAM:
             if (val_str[0] != '\0')
             {
+                /* Rewire downstream consumers attached to the old source beam stream */
                 cacaosim_bench_rewire_beam_out(cfg, cfg->out_beam, val_str);
                 snprintf(cfg->out_beam, sizeof(cfg->out_beam), "%s", val_str);
             }
@@ -1278,6 +1506,10 @@ int cs_param_set_str(
             snprintf(nd->in_beam, sizeof(nd->in_beam), "%s", val_str);
         }
         break;
+    /*
+     * Renaming any outgoing optical beam stream cascades automatically to downstream
+     * nodes currently wired to that stream so inline optical chains remain intact.
+     */
     case PID_N_OUT_BEAM:
         if (val_str[0] != '\0')
         {
@@ -1333,6 +1565,10 @@ int cs_param_set_str(
     case PID_N_TPUT:
         nd->tput = (float) dv;
         break;
+    /*
+     * Keep generic 2D pupil registration (`nd->reg.*`) synchronized with the DM-specific
+     * registration fields (`nd->dm.*`) used by standalone `cacaosim.dmsim` instances.
+     */
     case PID_N_SHIFT_X:
         nd->reg.shift_x = (float) dv;
         nd->dm.shift_x  = nd->reg.shift_x;
@@ -1352,6 +1588,7 @@ int cs_param_set_str(
 
     case PID_DM_MODE:
         nd->dm.dm_mode = iv;
+        /* Switch between 2x1 tip-tilt channels and a default 16x16 zonal grid cleanly */
         if (iv == 1)
         {
             nd->dm.nact_x = 2u;
@@ -1382,6 +1619,7 @@ int cs_param_set_str(
         nd->dm.dyn_mode = iv;
         break;
     case PID_DM_TAU_US:
+        /* Inspector displays microseconds for ergonomics; runtime kernel stores seconds */
         nd->dm.tau_sec = (float) dv * 1.0e-6f;
         break;
     case PID_DM_F0_HZ:
@@ -1438,6 +1676,7 @@ int cs_param_set_str(
         nd->coro.lambda_um = (float) dv;
         break;
     case PID_CO_BW_FRAC:
+        /* Mirror coronagraph fractional bandwidth into the generic node photometry field */
         nd->coro.bw_frac = (float) dv;
         nd->bw_frac      = nd->coro.bw_frac;
         break;
@@ -1463,6 +1702,7 @@ int cs_param_set_str(
         nd->coro.pad_factor = (uint32_t) iv;
         break;
     case PID_CO_VORTEX_Q:
+        /* Enforce even topological charge (`2, 4, 6, ...`) for on-axis vortex nulling */
         nd->coro.vortex_charge = (iv + 1) & ~1;
         break;
     case PID_CO_LOWFS_MODE:
@@ -1536,6 +1776,7 @@ int cs_param_set_str(
         }
         break;
     case PID_S_BW_FRAC:
+        /* Mirror sensor photometric bandpass into `fpcam.bw_frac` for polychromatic PSFs */
         nd->bw_frac       = (float) dv;
         nd->fpcam.bw_frac = nd->bw_frac;
         break;
@@ -1620,6 +1861,29 @@ int cs_param_set_str(
     return 0;
 }
 
+/**
+ * cs_param_step() - Increment, decrement, toggle, or cycle a parameter in @cfg
+ * @cfg:      Optical bench configuration to mutate in place (must be non-NULL).
+ * @sel_item: Selected topology item (`0` for `[bench]` globals, `1..n_nodes` for a node).
+ * @pd:       Parameter descriptor specifying type, `step_v`, `[min_v, max_v]`, and enums.
+ * @dir:      Step direction (`+1` to increment/next, `-1` to decrement/previous).
+ * @coarse:   Non-zero to multiply numeric `step_v` by `5.0` (e.g., Shift+Arrow / `[` `]`).
+ * @err_buf:  Optional diagnostic buffer forwarded to `cs_param_set_str()`.
+ * @err_cap:  Capacity of @err_buf in bytes.
+ *
+ * Role: Interactive jog controller driving Left/Right arrow adjustments, `[`/`]` coarse
+ * steps, Spacebar toggles, and mouse-wheel tweaks in the inspector pane without opening a
+ * modal text-entry dialog.
+ *
+ * Rationale: Reading the formatted current value via `cs_param_format_val()` and committing
+ * the stepped value back through `cs_param_set_str()` avoids duplicating per-field read/write
+ * switch tables while automatically inheriting every range clamp, even-parity rounding rule
+ * (`nwf`, `vortex_charge`), DM/TTM mode geometry reset, and dual-field mirror invariant.
+ * String (`CS_PTYPE_STR`) and node ID (`CS_PTYPE_ID`) rows intentionally return `-1`
+ * because arbitrary identifiers cannot be meaningfully stepped.
+ *
+ * Return: `0` if @cfg was updated, or `-1` if @pd is non-steppable or arguments are invalid.
+ */
 int cs_param_step(
     cacaosim_bench_cfg_t  *cfg,
     int                    sel_item,
@@ -1636,11 +1900,13 @@ int cs_param_step(
     char cur[128];
     cs_param_format_val(cfg, sel_item, pd, cur, sizeof(cur));
 
+    /* Booleans invert regardless of step direction */
     if (pd->type == CS_PTYPE_BOOL)
     {
         int on = (strcasecmp(cur, "ON") == 0) ? 0 : 1;
         return cs_param_set_str(cfg, sel_item, pd, on ? "ON" : "OFF", err_buf, err_cap);
     }
+    /* Enumerations wrap cyclically modulo `n_enum` in either direction */
     if (pd->type == CS_PTYPE_ENUM && pd->n_enum > 0)
     {
         int idx = 0;
@@ -1655,6 +1921,7 @@ int cs_param_step(
         idx = (idx + (dir > 0 ? 1 : pd->n_enum - 1)) % pd->n_enum;
         return cs_param_set_str(cfg, sel_item, pd, pd->enum_names[idx], err_buf, err_cap);
     }
+    /* Numeric types apply `dir * step_v * (coarse ? 5 : 1)` and route through clamping */
     if (pd->type == CS_PTYPE_FLOAT || pd->type == CS_PTYPE_INT || pd->type == CS_PTYPE_UINT)
     {
         double v    = strtod(cur, NULL);

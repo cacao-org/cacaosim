@@ -4,7 +4,41 @@
 
 /**
  * @file    cacaosim_bench_dag.c
- * @brief   Topological compiler, spectral photon budget, and CPU/CUDA multi-rate DAG runtime
+ * @brief   Topological compiler, 32-bin photon budget, and zero-hop CPU/CUDA multi-rate DAG engine
+ *
+ * Architectural Role:
+ *   Implements the graph compilation, physical photometry analysis, resource binding, and
+ *   real-time multi-rate execution engine for declarative `.bench` optical benches:
+ *     1. Topological Compiler (`topo_sort_and_wire_beams()`): Enforces a strict single-producer
+ *        invariant on every named optical beam, verifies that all downstream `in_beam` references
+ *        resolve to known producers, and orders nodes via a declaration-order-preserving Kahn
+ *        topological sort that rejects optical feedback cycles.
+ *     2. 32-Bin Physical Spectral Integrator (`propagate_spectra()`): Synthesizes a calibrated
+ *        `0.40..2.40 um` Planck blackbody stellar spectrum scaled to `tel_diam_m`, `cobs`,
+ *        `star_mag`, `star_teff`, and `tput_tel`, propagates per-bin `[photons/s]` rates across
+ *        reflective coatings, gray/dichroic splitters, and coronagraphic LOWFS pickoffs, and
+ *        integrates per-exposure detected photo-events (`eff_flux_ph`) and flux-weighted central
+ *        wavelengths (`eff_lambda_um`) for every multi-rate sensor.
+ *     3. Zero-FFT Static Analyzer (`cacaosim_bench_analyze()`): Runs steps (1) and (2) plus
+ *        multi-rate decimation quantization (`eff_navg`) with zero heap, FFT, GPU, or SHM side
+ *        effects so `cacaosim-CTRL` and `cacaosim-bench-view` render instant previews.
+ *     4. Runtime Arena, SHM Binder & Stepper (`cacaosim_bench_init()`, `cacaosim_bench_step()`,
+ *        `cacaosim_bench_free()`): Binds `ImageStreamIO` `IMGID` streams (or standalone C buffers),
+ *        promotes polychromatic `[nlam, nwf, nwf]` beam cubes downstream of broadband coronagraphs,
+ *        and advances the entire bench on a single shared `cudaStream_t` or aligned CPU arena.
+ *
+ * Design Rationale & Motivation:
+ *   - Zero-hop on-GPU / in-cache execution: Passing intermediate beams via device pointers
+ *     (`d_opd`, `d_amp`) on one `cudaStream_t` eliminates inter-process SHM serialization,
+ *     semaphore wakeups, OS context-switch jitter, and PCIe ping-pong across multi-kHz AO stages
+ *     while maintaining bit-identical physics to modular `cacaosim.*` FPS units.
+ *   - Decoupled microsecond static analysis: Separating `cacaosim_bench_analyze()` from FFTW3f /
+ *     cuFFT planning and CUDA initialization allows TUI/CLI tools to re-evaluate photon budgets
+ *     interactively in microseconds even on headless systems without a GPU or `MILK_SHM_DIR`.
+ *   - Deterministic subframe decimation (`eff_navg`): Accumulating coherent intensity on every
+ *     master tick (`*_accum_beam`) and gating noisy detector readout on `subframe_cnt >= eff_navg`
+ *     models true finite-exposure turbulence/DM smearing across heterogeneous sensor rates
+ *     (e.g. 2 kHz Vis-PyWFS + 500 Hz ZWFS LOWFS + 100 Hz H-band FPCam) without multi-thread locks.
  */
 
 #include <math.h>
@@ -20,6 +54,18 @@
 #include "common/cacaosim_mask.h"
 #include "pupil/cacaosim_pupil.h"
 
+/**
+ * dag_err() - Format a diagnostic message into an optional caller-supplied error buffer
+ * @buf: Optional output buffer (safely ignored if NULL or @cap == 0).
+ * @cap: Capacity of @buf in bytes including trailing NUL.
+ * @fmt: printf-compatible format string.
+ *
+ * Role:
+ *   Captures topology, allocation, mask-loading, or SHM-binding failure reasons for CLI/TUI logs.
+ *
+ * Rationale:
+ *   Centralizes NULL-safe `vsnprintf` formatting without touching global error state.
+ */
 static void dag_err(char *buf, size_t cap, const char *fmt, ...)
 {
     if (buf == NULL || cap == 0)
@@ -32,6 +78,21 @@ static void dag_err(char *buf, size_t cap, const char *fmt, ...)
     va_end(ap);
 }
 
+/**
+ * find_beam_name() - Look up a registered optical beam slot index by name
+ * @ctx:  Bench context whose `beams[0..n_beams-1]` table is searched (must not be NULL).
+ * @name: Beam identifier string to locate (returns -1 if NULL or empty).
+ *
+ * Role:
+ *   Resolves string `in_beam` references on consumer nodes into `O(1)` integer `beams[]` indices
+ *   during DAG compilation and checks for duplicate beam producers.
+ *
+ * Rationale:
+ *   Performed strictly once at compile/analyze time (`<= 32` beams) so `cacaosim_bench_step()`
+ *   addresses beams purely by integer index.
+ *
+ * Return: Beam slot index in `[0 .. ctx->n_beams - 1]`, or -1 if not registered.
+ */
 static int find_beam_name(const cacaosim_bench_ctx_t *ctx, const char *name)
 {
     if (name == NULL || name[0] == '\0')
@@ -48,6 +109,23 @@ static int find_beam_name(const cacaosim_bench_ctx_t *ctx, const char *name)
     return -1;
 }
 
+/**
+ * register_beam_name() - Register a newly produced optical beam and enforce single-producer safety
+ * @ctx:     Bench context being compiled (must not be NULL).
+ * @name:    Non-empty beam identifier produced by the entrance aperture or an optical node.
+ * @err_buf: Optional diagnostic buffer populated on duplicate producer or capacity overflow.
+ * @err_cap: Capacity of @err_buf in bytes.
+ *
+ * Role:
+ *   Allocates the next slot in `ctx->beams[]`, rejecting any duplicate producer (`-2`) or beam
+ *   table overflow (`-2`).
+ *
+ * Rationale:
+ *   Guaranteeing at most one producer per named optical beam ensures unambiguous physical
+ *   causality—every beam buffer has a single writer and arbitrarily many downstream readers.
+ *
+ * Return: New beam index `[0 .. CACAOSIM_BENCH_MAX_BEAMS - 1]`, -1 if empty, or -2 on error.
+ */
 static int register_beam_name(
     cacaosim_bench_ctx_t *ctx,
     const char           *name,
@@ -73,6 +151,18 @@ static int register_beam_name(
     return idx;
 }
 
+/**
+ * init_node_imgids() - Mark all ImageStreamIO `IMGID` handles on a runtime node as disconnected
+ * @nd: Runtime bench node struct whose `img_*` fields have just been zeroed (must not be NULL).
+ *
+ * Role:
+ *   Sets every `IMGID.ID` sentinel to `-1` immediately after `memset(nd, 0, ...)`.
+ *
+ * Rationale:
+ *   In `ImageStreamIO`, `ID == 0` is a valid slot index in the process image table (`-1` denotes
+ *   unbound); initializing all `ID` fields to `-1` prevents `cacaosim_bench_free()` from
+ *   accidentally closing `image[0]` during partial-init rollback or pure-C teardown.
+ */
 static void init_node_imgids(cacaosim_bench_node_t *nd)
 {
     nd->img_cmd.ID        = -1;
@@ -89,6 +179,17 @@ static void init_node_imgids(cacaosim_bench_node_t *nd)
     nd->img_pup_trans.ID  = -1;
 }
 
+/**
+ * free_imgid_if_valid() - Disconnect an ImageStreamIO `IMGID` handle if bound and reset to `-1`
+ * @img: Pointer to an `IMGID` handle (must not be NULL).
+ *
+ * Role:
+ *   Idempotently releases a connected SHM stream mapping and restores the `-1` sentinel.
+ *
+ * Rationale:
+ *   Allows `cacaosim_bench_free()` to safely clean up partially initialized nodes without
+ *   double-freeing unbound handles.
+ */
 static void free_imgid_if_valid(IMGID *img)
 {
     if (img->ID != -1)
@@ -98,6 +199,24 @@ static void free_imgid_if_valid(IMGID *img)
     }
 }
 
+/**
+ * connect_opt_2df32() - Opportunistically attach to an existing `[nwf x nwf]` float32 SHM stream
+ * @name:    Optional SHM stream name (returns NULL immediately if NULL or empty).
+ * @nwf:     Required 2D grid dimension `[nwf, nwf]`.
+ * @out_img: Output `IMGID` handle initialized to `-1` and populated if connected.
+ *
+ * Role:
+ *   Connects optional static calibration maps (`in_pup`, `in_ncpa`, `in_flat`, `ncpa_refl/trans`,
+ *   `pup_refl/trans`) and validates that their datatype (`_DATATYPE_FLOAT`) and `[nwf x nwf]`
+ *   dimensions match the bench grid before returning the raw pixel pointer.
+ *
+ * Rationale:
+ *   Missing or mismatched optional calibration streams gracefully fall back to `NULL` (identity /
+ *   zero map) rather than aborting bench startup, while still tracking `*out_img` for clean
+ *   unmapping on teardown.
+ *
+ * Return: Read-only host `float *` array pointer if valid `[nwf x nwf]` float32, else NULL.
+ */
 static const float *connect_opt_2df32(const char *name, uint32_t nwf, IMGID *out_img)
 {
     out_img->ID = -1;
@@ -114,6 +233,25 @@ static const float *connect_opt_2df32(const char *name, uint32_t nwf, IMGID *out
     return NULL;
 }
 
+/**
+ * load_opt_coro_mask() - Load an optional 2D/3D coronagraph mask from a FITS file or SHM stream
+ * @spec:        Mask specifier string (FITS path, SHM stream name, or empty `""`).
+ * @connect_shm: Non-zero when SHM mask attachment is enabled; 0 in pure-C file-only mode.
+ * @out:         Destination `cacaosim_mask_cube_t` zeroed on entry and populated if loaded.
+ * @err_buf:     Optional diagnostic buffer populated on missing/corrupt FITS file.
+ * @err_cap:     Capacity of @err_buf in bytes.
+ *
+ * Role:
+ *   Loads custom pupil, focal-plane, or Lyot amplitude/phase masks (`[Nx, Ny]` or polychromatic
+ *   `[Nx, Ny, Nlambda]`) during coronagraph node initialization.
+ *
+ * Rationale:
+ *   Explicit FITS file paths fail hard on I/O errors (surfacing typos immediately), whereas named
+ *   SHM streams are loaded best-effort when `connect_shm == 1` so analytic fallback masks remain
+ *   usable before external mask generators publish streams.
+ *
+ * Return: 0 on success (or unused/optional skip), -1 on FITS load error.
+ */
 static int load_opt_coro_mask(
     const char           *spec,
     int                   connect_shm,
@@ -137,6 +275,27 @@ static int load_opt_coro_mask(
     return 0;
 }
 
+/**
+ * upgrade_beam_poly() - Expand a beam slot from monochromatic `[1, nwf, nwf]` to `[nlam, nwf, nwf]`
+ * @ctx:     Active bench context owning CPU/CUDA flags and `npix_wf` (must not be NULL).
+ * @b:       Target beam slot to widen in place (must not be NULL).
+ * @nlam:    Desired number of coherent wavelength planes (clamped to `[1..CORO_MAX_LAMBDA]`).
+ * @lam_um:  Optional array `[nlam]` of channel center wavelengths `[um]` to record on @b.
+ * @err_buf: Optional diagnostic buffer populated on host/CUDA allocation failure.
+ * @err_cap: Capacity of @err_buf in bytes.
+ *
+ * Role:
+ *   Reallocates `b->opd` / `b->amp` (and `b->d_opd` / `b->d_amp` when `ctx->use_cuda == 1`) to
+ *   hold `nlam * npix_wf` floats whenever an upstream broadband coronagraph (or a relay optic
+ *   downstream of one) emits a multi-wavelength pupil field.
+ *
+ * Rationale:
+ *   All beams start at `nlam = 1` to minimize memory footprint and kernel bandwidth on common
+ *   achromatic pupil paths, and widen lazily along topological order only on branches downstream
+ *   of polychromatic coronagraphs.
+ *
+ * Return: 0 on success, -1 on host or GPU out-of-memory.
+ */
 static int upgrade_beam_poly(
     cacaosim_bench_ctx_t *ctx,
     cacaosim_beam_slot_t *b,
@@ -191,12 +350,40 @@ static int upgrade_beam_poly(
     return 0;
 }
 
+/**
+ * topo_sort_and_wire_beams() - Validate beam connectivity and topologically sort optical nodes
+ * @ctx:     Destination bench context receiving `beams[]` and sorted `nodes[]` (must not be NULL).
+ * @cfg:     Source parsed bench configuration (must not be NULL).
+ * @err_buf: Optional diagnostic buffer populated on missing/duplicate beam or optical cycle.
+ * @err_cap: Capacity of @err_buf in bytes.
+ *
+ * Role:
+ *   Compiles string-named `.bench` sections into an executable integer-indexed DAG in three passes:
+ *     - Pass 1: Registers the root telescope beam at `beams[0]` (`beam_prod[0] = -1`) and registers
+ *       every node-produced beam (`out_beam`, `out_refl`, `out_trans`, `out_lowfs`), recording its
+ *       unique producer node index in `beam_prod[b]`.
+ *     - Pass 2: Resolves each node's `in_beam` to `raw_in[i]` (failing on unknown/dangling names)
+ *       and sets its initial dependency in-degree `in_deg[i] = 1` if produced by another node or
+ *       `0` if fed directly by `beams[0]`.
+ *     - Pass 3: Executes Kahn's topological sort, scanning `0 .. n_nodes-1` each step to pick the
+ *       lowest-index ready node (`in_deg == 0`), copying it into `ctx->nodes[sorted_cnt]`, and
+ *       decrementing `in_deg` on all direct consumers of its output beam(s); if any unvisited
+ *       nodes remain with `in_deg > 0`, reports an optical cycle error.
+ *
+ * Rationale:
+ *   Always picking the lowest-index ready node makes Kahn's sort *stable* with respect to `.bench`
+ *   declaration order whenever parallel optical arms are independent, while strictly guaranteeing
+ *   producer-before-consumer execution even if sections were written out-of-order in the file.
+ *
+ * Return: 0 on valid acyclic DAG, -1 on missing input, duplicate producer, or cycle error.
+ */
 static int topo_sort_and_wire_beams(
     cacaosim_bench_ctx_t       *ctx,
     const cacaosim_bench_cfg_t *cfg,
     char                       *err_buf,
     size_t                      err_cap)
 {
+    /* Pass 1: Register root entrance beam at slot 0 and all node-produced output beams */
     const char *src_name = (cfg->out_beam[0] != '\0') ? cfg->out_beam : "b_pup";
     if (register_beam_name(ctx, src_name, err_buf, err_cap) < 0)
     {
@@ -285,6 +472,7 @@ static int topo_sort_and_wire_beams(
         }
     }
 
+    /* Pass 2: Resolve consumer input beams and compute upstream producer in-degrees (0 or 1) */
     int32_t raw_in[CACAOSIM_BENCH_MAX_NODES];
     int32_t in_deg[CACAOSIM_BENCH_MAX_NODES];
     for (uint32_t i = 0; i < cfg->n_nodes; i++)
@@ -300,7 +488,7 @@ static int topo_sort_and_wire_beams(
         in_deg[i] = (beam_prod[bi] >= 0) ? 1 : 0;
     }
 
-    /* Kahn's topological sort preserving declaration order among ready nodes */
+    /* Pass 3: Kahn's topological sort preserving declaration order among ready nodes */
     uint8_t visited[CACAOSIM_BENCH_MAX_NODES] = { 0 };
     uint32_t sorted_cnt                       = 0;
 
@@ -335,6 +523,7 @@ static int topo_sort_and_wire_beams(
         dst->sensor_slot = -1;
         sorted_cnt++;
 
+        /* Unlock downstream nodes whose upstream beam producer just completed */
         for (uint32_t j = 0; j < cfg->n_nodes; j++)
         {
             if (!visited[j] && beam_prod[raw_in[j]] == found)
@@ -348,6 +537,25 @@ static int topo_sort_and_wire_beams(
     return 0;
 }
 
+/**
+ * propagate_spectra() - Propagate 32-bin stellar photon rates and integrate per-sensor exposure
+ *                       flux
+ * @ctx: Topologically sorted bench context with `eff_navg` already resolved (must not be NULL).
+ *
+ * Role:
+ *   1. Populates `ctx->beams[0].spec` (`0.40..2.40 um` in 32 bins) from `[bench]` aperture area,
+ *      central obscuration, V-band Vega magnitude, blackbody `star_teff`, and `tput_tel`;
+ *   2. Walks `ctx->nodes[]` in topological order—multiplying by `tput` across DM/WFE surfaces,
+ *      splitting bins conservatively across gray/LP/SP/BP dichroics (`cacaosim_spec_split()`),
+ *      scaling coronagraph science (`tput`) and LOWFS pickoff (`tput * lowfs_refl^2`) arms, and
+ *      integrating sensor passband flux over `dt_exp = eff_navg * dt_master_s` with detector `qe`.
+ *
+ * Rationale:
+ *   Evaluating steady-state spectral photon budgets analytically over 32 wavelength bins requires
+ *   zero 2D FFTs yet captures blackbody color terms, dichroic roll-off losses, multi-stage beam
+ *   splitting, and sensor exposure cadences accurately for both runtime noise scaling and TUI
+ *   photon-budget displays.
+ */
 static void propagate_spectra(cacaosim_bench_ctx_t *ctx)
 {
     cacaosim_spec_star(&ctx->beams[0].spec, ctx->cfg.tel_diam_m, ctx->cfg.cobs, ctx->cfg.star_mag,
@@ -373,6 +581,7 @@ static void propagate_spectra(cacaosim_bench_ctx_t *ctx)
             cacaosim_spec_scale(in_spec, nd->cfg.tput, &ctx->beams[nd->out_idx].spec);
             if (nd->lowfs_idx >= 0)
             {
+                /* lowfs_refl is field-amplitude reflectivity; optical power scales as r^2 */
                 float r2 = nd->cfg.coro.lowfs_refl * nd->cfg.coro.lowfs_refl;
                 cacaosim_spec_scale(in_spec, nd->cfg.tput * r2, &ctx->beams[nd->lowfs_idx].spec);
             }
@@ -402,6 +611,7 @@ static void propagate_spectra(cacaosim_bench_ctx_t *ctx)
                 flx = nd->cfg.fpcam.det.flux_ph;
             }
 
+            /* Exposure duration spans eff_navg master ticks; bypass when use_beam_flux == 0 */
             float dt_exp      = (float) nd->eff_navg * ctx->dt_master_s;
             nd->eff_lambda_um = lam;
             if (nd->cfg.use_beam_flux && flx >= 0.0f)
@@ -417,6 +627,26 @@ static void propagate_spectra(cacaosim_bench_ctx_t *ctx)
     }
 }
 
+/**
+ * cacaosim_bench_analyze() - Compile DAG topology, multi-rate cadences, and 32-bin spectra without
+ *                            allocating pixel buffers, FFT plans, or SHM streams
+ * @ctx:     Destination bench context populated with static analysis metadata (must not be NULL).
+ * @cfg:     Read-only parsed bench configuration to analyze (must not be NULL).
+ * @err_buf: Optional diagnostic buffer populated on topology or capacity errors (may be NULL).
+ * @err_cap: Capacity of @err_buf in bytes.
+ *
+ * Role:
+ *   Validates graph connectivity and acyclicity, resolves `eff_navg` from `rate_hz` / `navg`,
+ *   populates `dm_node_idx[]` and `sensor_node_idx[]`, derives detector pixel dimensions (`ncam`),
+ *   and computes every beam's 32-bin photon spectrum and every sensor's `eff_flux_ph`.
+ *
+ * Rationale:
+ *   Completes in `< 0.1 ms` with zero dynamic memory allocation or GPU/SHM driver calls, enabling
+ *   flicker-free live topology and photometry updates inside `cacaosim-CTRL` and
+ *   `cacaosim-bench-view`.
+ *
+ * Return: 0 on success, -1 on validation or topology failure.
+ */
 int cacaosim_bench_analyze(
     cacaosim_bench_ctx_t       *ctx,
     const cacaosim_bench_cfg_t *cfg,
@@ -515,6 +745,37 @@ int cacaosim_bench_analyze(
     return 0;
 }
 
+/**
+ * cacaosim_bench_init() - Compile, allocate, and bind a runnable multi-stage CPU/CUDA bench DAG
+ * @ctx:         Destination runtime bench context zeroed and initialized (must not be NULL).
+ * @cfg:         Read-only parsed bench configuration to compile (must not be NULL).
+ * @ext_pup:     Optional caller-owned `[nwf * nwf]` pupil amplitude array (overrides SHM/fallback
+ *               when non-NULL).
+ * @connect_shm: Non-zero to bind/create `ImageStreamIO` SHM streams; 0 for standalone pure-C mode.
+ * @err_buf:     Optional diagnostic buffer populated on failure (may be NULL).
+ * @err_cap:     Capacity of @err_buf in bytes.
+ *
+ * Role:
+ *   Performs end-to-end transactional setup of the optical bench:
+ *     1. Compiles DAG topology via `topo_sort_and_wire_beams()`;
+ *     2. Creates a dedicated non-blocking `cudaStream_t` when CUDA is enabled and available;
+ *     3. Resolves the entrance pupil (`ext_pup` > SHM `in_pup` > anti-aliased `fallback_pup`) and
+ *        uploads static entrance maps to GPU VRAM;
+ *     4. Allocates `[1, nwf, nwf]` host/device `[OPD_um, Amplitude]` buffers for all named beams;
+ *     5. Resolves multi-rate `eff_navg` cadences and propagates 32-bin stellar spectra;
+ *     6. Initializes every node in topological order, binding SHM streams (or host buffers),
+ *        loading custom coronagraph FITS/SHM masks, synthesizing missing `[m]` static WFE streams,
+ *        propagating polychromatic `[nlam, nwf, nwf]` beam upgrades downstream of broadband
+ *        coronagraphs, and synchronizing the CUDA stream before returning.
+ *
+ * Rationale:
+ *   Initializing nodes strictly in topological order allows polychromatic channel counts (`nlam`)
+ *   and wavelength grids (`lam_um[]`) emitted by an upstream coronagraph to cascade naturally
+ *   through intermediate DMs, splitters, and WFEs into downstream `fpcam` broadband MFT/FFT plans,
+ *   while calling `cacaosim_bench_free(ctx)` on any failure prevents partial resource leaks.
+ *
+ * Return: 0 on success, -1 on topology, memory, mask I/O, or SHM error.
+ */
 int cacaosim_bench_init(
     cacaosim_bench_ctx_t       *ctx,
     const cacaosim_bench_cfg_t *cfg,
@@ -620,7 +881,7 @@ int cacaosim_bench_init(
         }
     }
 
-    /* Allocate named optical beam buffers */
+    /* Allocate named optical beam buffers (initially monochromatic nlam = 1) */
     for (uint32_t b = 0; b < ctx->n_beams; b++)
     {
         ctx->beams[b].nlam = 1u;
@@ -698,6 +959,7 @@ int cacaosim_bench_init(
                     dag_err(err_buf, err_cap, "Failed creating DM stream '%s'", nd->cfg.in_cmd);
                     return -1;
                 }
+                /* Adopt existing SHM actuator dimensions if stream was pre-created by cacao */
                 nd->cfg.dm.nact_x = nd->img_cmd.md->size[0];
                 nd->cfg.dm.nact_y = nd->img_cmd.md->size[1];
 
@@ -724,6 +986,7 @@ int cacaosim_bench_init(
                 dag_err(err_buf, err_cap, "Failed initializing DM '%s'", nd->cfg.id);
                 return -1;
             }
+            /* Propagate polychromatic cube width if DM sits downstream of a poly coronagraph */
             const cacaosim_beam_slot_t *bin_dm = &ctx->beams[nd->in_idx];
             if (bin_dm->nlam > 1u &&
                 upgrade_beam_poly(ctx, &ctx->beams[nd->out_idx], bin_dm->nlam, bin_dm->lam_um,
@@ -853,6 +1116,7 @@ int cacaosim_bench_init(
                 }
                 return -1;
             }
+            /* Widen output science beam to [eff_nlam, nwf, nwf] for broadband coronagraphs */
             if (nd->coro_ctx.eff_nlam > 1 &&
                 upgrade_beam_poly(ctx, &ctx->beams[nd->out_idx], (uint32_t) nd->coro_ctx.eff_nlam,
                                   nd->coro_ctx.lam_um, err_buf, err_cap) != 0)
@@ -863,6 +1127,7 @@ int cacaosim_bench_init(
         }
         else if (nd->cfg.kind == CACAOSIM_NODE_WFE)
         {
+            /* Static WFE maps are stored in SI meters [m] in SHM; auto-synthesize if absent */
             float rms_m = (nd->cfg.wfe_rms_nm > 0.0f) ? (nd->cfg.wfe_rms_nm * 1.0e-9f) : 0.0f;
             if (connect_shm)
             {
@@ -966,6 +1231,7 @@ int cacaosim_bench_init(
                 }
             }
 
+            /* Named beams always carry OPD in microns (wf_unit = 0) and integrated eff_flux_ph */
             int rc = -1;
             if (nd->cfg.kind == CACAOSIM_NODE_PYRWFS)
             {
@@ -1014,6 +1280,7 @@ int cacaosim_bench_init(
                 nd->out_dtype              = nd->cfg.fpcam.det.out_dtype;
                 if (in_nlam > 1u)
                 {
+                    /* Inherit coherent wavelength channels from upstream broadband coronagraph */
                     nd->cfg.fpcam.has_ext_lam = 1;
                     nd->cfg.fpcam.nlambda     = (int32_t) in_nlam;
                     for (uint32_t c = 0; c < in_nlam; c++)
@@ -1069,6 +1336,19 @@ int cacaosim_bench_init(
     return 0;
 }
 
+/**
+ * cacaosim_bench_free() - Release all compute contexts, host/CUDA memory, and SHM handles in @ctx
+ * @ctx: Runtime or analyzed bench context to tear down (safe no-op if NULL).
+ *
+ * Role:
+ *   Frees per-node optical engines (`dm`, `coro`, `pyrwfs`, `shwfs`, `zwfs`, `fpcam`), host and
+ *   device scratch/beam buffers, the shared CUDA stream, and all connected `IMGID` handles, then
+ *   zeroes `*ctx`.
+ *
+ * Rationale:
+ *   Safe to call on both fully initialized and partially initialized contexts (provided `IMGID.ID`
+ *   sentinels were set to `-1`), serving as a unified error-rollback and shutdown destructor.
+ */
 void cacaosim_bench_free(cacaosim_bench_ctx_t *ctx)
 {
     if (ctx == NULL)
@@ -1157,6 +1437,19 @@ void cacaosim_bench_free(cacaosim_bench_ctx_t *ctx)
     memset(ctx, 0, sizeof(*ctx));
 }
 
+/**
+ * node_kind_str() - Return uppercase mnemonic tag for a DAG node kind in summary tables
+ * @k:       Optical node kind (`cacaosim_node_kind_t`).
+ * @dm_mode: DM sub-mode (`1` for 2-axis `"TTM"`, `0` for zonal `"DM"`).
+ *
+ * Role:
+ *   Formats fixed-width type columns in `cacaosim_bench_print_summary()`.
+ *
+ * Rationale:
+ *   Distinguishing `"TTM"` from `"DM"` makes two-corrector benches immediately clear in text logs.
+ *
+ * Return: Static uppercase label string.
+ */
 static const char *node_kind_str(cacaosim_node_kind_t k, int dm_mode)
 {
     switch (k)
@@ -1182,6 +1475,20 @@ static const char *node_kind_str(cacaosim_node_kind_t k, int dm_mode)
     }
 }
 
+/**
+ * cacaosim_bench_print_summary() - Write a human-readable topology & photometry table to @fp
+ * @ctx: Analyzed or initialized bench context (ignored if NULL).
+ * @fp:  Output stdio stream (ignored if NULL).
+ *
+ * Role:
+ *   Emits the bench header (grid size, primary diameter, stellar V magnitude, master clock,
+ *   CPU/CUDA backend), integrated entrance photon rate across `0.40..2.40 um`, and one summary
+ *   line per topologically sorted node.
+ *
+ * Rationale:
+ *   Used when `stdout` is redirected to log files or tmux logs where ANSI box-drawing schematics
+ *   from `cacaosim_bench_render()` are undesirable.
+ */
 void cacaosim_bench_print_summary(const cacaosim_bench_ctx_t *ctx, FILE *fp)
 {
     if (ctx == NULL || fp == NULL)
@@ -1238,6 +1545,28 @@ void cacaosim_bench_print_summary(const cacaosim_bench_ctx_t *ctx, FILE *fp)
     }
 }
 
+/**
+ * cacaosim_bench_step() - Advance the compiled multi-rate optical bench DAG by one master tick
+ * @ctx:       Initialized bench context (safe no-op if NULL)
+ * @ext_wf:    Optional host 2D wavefront override [nwf x nwf] (NULL = use SHM in_wf or zero WF)
+ * @ext_amp:   Optional host 2D amplitude override [nwf x nwf] (NULL = use SHM in_amp or unity)
+ * @turb_gain: Live atmospheric turbulence multiplier (0.0 = flat calibration, 1.0 = nominal)
+ * @procinfo:  Optional MILK PROCESSINFO pointer for output stream signaling (NULL allowed)
+ *
+ * Role:
+ *   Executes one deterministic master clock tick (`1 / master_hz` seconds) of the entire optical
+ *   bench: synthesizes the entrance `[OPD_um, Amplitude]` beam, propagates it in topological order
+ *   through all active DMs, static WFE screens, dichroic splitters, and coronagraphs, accumulates
+ *   diffractive subframes on every WFS and science camera, and triggers detector readout + SHM
+ *   publication on each sensor whose `subframe_cnt` reaches its integer decimation `eff_navg`.
+ *
+ * Rationale:
+ *   Designed strictly around real-time hot-loop invariants: zero `malloc`/`free`, zero FFT plan
+ *   creation, and zero host/device round-trips between intermediate optical stages. When running
+ *   on CUDA, every beam slot (`d_opd`, `d_amp`) and DM surface (`dm_ctx.d_opd_out`) stays on the
+ *   shared `ctx->cuda_stream`, transferring only external turbulence inputs (H2D) and completed
+ *   camera frames (D2H at each sensor's decimated readout rate).
+ */
 MILK_HOT void cacaosim_bench_step(
     cacaosim_bench_ctx_t *ctx,
     const float          *ext_wf,
@@ -1253,6 +1582,11 @@ MILK_HOT void cacaosim_bench_step(
     const float *wf_ptr  = ext_wf;
     const float *amp_ptr = ext_amp;
 
+    /*
+     * Lazily attach optional SHM atmospheric phase (`in_wf`) and scintillation (`in_amp`) streams
+     * so external turbulence generators started after the bench come online automatically without
+     * restarting `cacaosim.htsim`.
+     */
     if (ctx->connect_shm)
     {
         if (ctx->img_wf.ID == -1 && ctx->cfg.in_wf[0] != '\0')
@@ -1275,11 +1609,12 @@ MILK_HOT void cacaosim_bench_step(
         }
     }
 
+    /* Convert phase [rad at ref_lambda] to OPD [um] when wf_unit == 1; else scale OPD [um] */
     float wf_scale = (ctx->cfg.wf_unit == 1)
                          ? (turb_gain * ctx->cfg.ref_lambda / (2.0f * CACAOSIM_PI_F))
                          : turb_gain;
 
-    /* 1. Synthesize entrance beam [OPD_um, Amplitude] */
+    /* 1. Synthesize entrance beam [OPD_um, Amplitude] in slot 0 (skip WF H2D if turb_gain == 0) */
     cacaosim_beam_slot_t *b0 = &ctx->beams[0];
     if (ctx->use_cuda)
     {
@@ -1304,13 +1639,18 @@ MILK_HOT void cacaosim_bench_step(
                                b0->opd, b0->amp);
     }
 
+    /* Use primary DM command stream as lineage trigger reference for sensor SHM updates */
     IMAGE       *trig_im = (ctx->connect_shm && ctx->n_dms > 0 &&
                             ctx->nodes[ctx->dm_node_idx[0]].img_cmd.ID != -1)
                                ? ctx->nodes[ctx->dm_node_idx[0]].img_cmd.im
                                : NULL;
     PROCESSINFO *pinfo   = (PROCESSINFO *) procinfo;
 
-    /* 2. Traverse optical DAG in topological order */
+    /*
+     * 2. Traverse optical DAG in compiled topological order (`ctx->nodes[0..n_nodes-1]`).
+     *    Topological compilation guarantees every upstream producer writes `bin` before any
+     *    downstream consumer reads it within the same master clock tick.
+     */
     for (uint32_t i = 0; i < ctx->n_nodes; i++)
     {
         cacaosim_bench_node_t      *nd  = &ctx->nodes[i];
@@ -1319,6 +1659,11 @@ MILK_HOT void cacaosim_bench_step(
 
         if (nd->cfg.kind == CACAOSIM_NODE_DM)
         {
+            /*
+             * Active DM / Tip-Tilt mirror: advance fractional-frame delay FIFO, DAC quantization,
+             * and ZOH actuator dynamics once, then subtract the resulting achromatic OPD [um] from
+             * every spectral plane `0..nl-1` of the incoming beam.
+             */
             cacaosim_beam_slot_t *bout = &ctx->beams[nd->out_idx];
             const float *cmd_in =
                 (ctx->connect_shm && nd->img_cmd.ID != -1) ? nd->img_cmd.im->array.F : nd->cmd_buf;
@@ -1359,6 +1704,12 @@ MILK_HOT void cacaosim_bench_step(
         }
         else if (nd->cfg.kind == CACAOSIM_NODE_SPLITTER)
         {
+            /*
+             * Gray or dichroic beamsplitter: relay wavefront OPD and pupil amplitude into the
+             * reflected and/or transmitted arm slots with per-arm static NCPA, stop mask, and 2D
+             * affine registration. Wavelength-dependent throughput and bandpass partitioning are
+             * already folded into each downstream sensor's `eff_flux_ph` and `eff_lambda_um`.
+             */
             uint32_t nl = (bin->nlam >= 1u) ? bin->nlam : 1u;
             if (nd->refl_idx >= 0)
             {
@@ -1405,6 +1756,10 @@ MILK_HOT void cacaosim_bench_step(
         }
         else if (nd->cfg.kind == CACAOSIM_NODE_CORO)
         {
+            /*
+             * Coronagraphic pupil/focal/Lyot stage: propagate `nl` polychromatic planes into
+             * post-Lyot science `bout` and optional reflective FPM / Lyot LOWFS pickoff `blow`.
+             */
             cacaosim_beam_slot_t *bout = &ctx->beams[nd->out_idx];
             cacaosim_beam_slot_t *blow = (nd->lowfs_idx >= 0) ? &ctx->beams[nd->lowfs_idx] : NULL;
             uint32_t              nl   = (bin->nlam >= 1u) ? bin->nlam : 1u;
@@ -1417,6 +1772,11 @@ MILK_HOT void cacaosim_bench_step(
         }
         else if (nd->cfg.kind == CACAOSIM_NODE_WFE)
         {
+            /*
+             * Inline static/quasi-static WFE screen (`in_wfe` stored in physical meters): poll
+             * `md->cnt0` so external SHM updates trigger a single H2D upload on GPU while static
+             * maps incur zero PCIe traffic, then convert `[m] * wfe_gain -> [um]` across `nl`.
+             */
             cacaosim_beam_slot_t *bout  = &ctx->beams[nd->out_idx];
             const float          *h_wfe = (ctx->connect_shm && nd->img_wfe.ID != -1)
                                               ? nd->img_wfe.im->array.F
@@ -1450,6 +1810,14 @@ MILK_HOT void cacaosim_bench_step(
         }
         else
         {
+            /*
+             * Terminal optical sensor (`PYRWFS`, `SHWFS`, `ZWFS`, `FPCAM`):
+             *   1. Optionally apply 2D affine pupil registration (`shift`, `rot`, `mag`, `flip`)
+             *      into pre-allocated node scratch buffers before diffractive propagation.
+             *   2. Accumulate one optical intensity subframe on every master tick.
+             *   3. Gate detector readout, noise injection, Strehl telemetry, and SHM publication
+             *      on `subframe_cnt >= eff_navg` to realize exact multi-rate sensor cadences.
+             */
             const float *h_opd = bin->opd;
             const float *h_amp = bin->amp;
             const float *d_opd = bin->d_opd;
@@ -1575,6 +1943,21 @@ MILK_HOT void cacaosim_bench_step(
     ctx->tick_cnt++;
 }
 
+/**
+ * cacaosim_bench_find_dm() - Resolve a DM node identifier to its compact DM slot index
+ * @ctx: Initialized bench context (may be NULL)
+ * @id:  NUL-terminated DM node `id` (e.g. `"woofer"` or `"tweeter"`; may be NULL)
+ *
+ * Role:
+ *   Looks up `@id` across `ctx->dm_node_idx[0..n_dms-1]` and returns the compact DM slot index
+ *   accepted by `cacaosim_bench_dm_cmd_ptr()`.
+ *
+ * Rationale:
+ *   Separates string-based lookup (performed once during test/controller setup) from O(1) slot
+ *   indexing inside high-rate in-process control loops.
+ *
+ * Return: Compact DM slot index in `[0, n_dms - 1]` on match, or `-1` if not found / NULL args.
+ */
 int cacaosim_bench_find_dm(const cacaosim_bench_ctx_t *ctx, const char *id)
 {
     if (ctx == NULL || id == NULL)
@@ -1592,6 +1975,21 @@ int cacaosim_bench_find_dm(const cacaosim_bench_ctx_t *ctx, const char *id)
     return -1;
 }
 
+/**
+ * cacaosim_bench_find_sensor() - Resolve a sensor node identifier to its compact sensor slot index
+ * @ctx: Initialized bench context (may be NULL)
+ * @id:  NUL-terminated sensor node `id` (e.g. `"pyr"`, `"lowfs"`, `"sci"`; may be NULL)
+ *
+ * Role:
+ *   Looks up `@id` across `ctx->sensor_node_idx[0..n_sensors-1]` and returns the compact sensor
+ *   slot index accepted by `cacaosim_bench_sensor_f32()` and `cacaosim_bench_sensor_u16()`.
+ *
+ * Rationale:
+ *   Allows headless CTest verification suites and embedded benchmarks to bind named WFS/camera
+ *   outputs once at startup without hardcoding topological node indices.
+ *
+ * Return: Compact sensor slot index in `[0, n_sensors - 1]`, or `-1` if not found / NULL args.
+ */
 int cacaosim_bench_find_sensor(const cacaosim_bench_ctx_t *ctx, const char *id)
 {
     if (ctx == NULL || id == NULL)
@@ -1609,6 +2007,22 @@ int cacaosim_bench_find_sensor(const cacaosim_bench_ctx_t *ctx, const char *id)
     return -1;
 }
 
+/**
+ * cacaosim_bench_dm_cmd_ptr() - Obtain a writable pointer to a DM node's actuator command buffer
+ * @ctx:     Initialized bench context (may be NULL)
+ * @dm_slot: Compact DM slot index returned by `cacaosim_bench_find_dm()`
+ *
+ * Role:
+ *   Returns the `[nact_x x nact_y]` `float32` command array read by `cacaosim_bench_step()` for
+ *   the specified DM, seamlessly selecting either the attached SHM `img_cmd` array (when
+ *   `connect_shm != 0`) or the internal aligned host buffer `nd->cmd_buf` (headless mode).
+ *
+ * Rationale:
+ *   Provides a single uniform zero-copy command injection API regardless of whether the bench is
+ *   backed by `milk` shared memory or running standalone in unit tests and benchmarks.
+ *
+ * Return: Writable `float *` command array of length `nact_x * nact_y`, or `NULL` if invalid.
+ */
 float *cacaosim_bench_dm_cmd_ptr(cacaosim_bench_ctx_t *ctx, int dm_slot)
 {
     if (ctx == NULL || dm_slot < 0 || (uint32_t) dm_slot >= ctx->n_dms)
@@ -1623,6 +2037,22 @@ float *cacaosim_bench_dm_cmd_ptr(cacaosim_bench_ctx_t *ctx, int dm_slot)
     return nd->cmd_buf;
 }
 
+/**
+ * cacaosim_bench_sensor_f32() - Obtain a read-only pointer to a sensor's float32 detector frame
+ * @ctx:         Initialized bench context (may be NULL)
+ * @sensor_slot: Compact sensor slot index returned by `cacaosim_bench_find_sensor()`
+ *
+ * Role:
+ *   Returns the `[ncam x ncam]` `float32` output image buffer populated on readout ticks when the
+ *   sensor's `out_dtype != 0`, resolving transparently to SHM (`img_cam.im->array.F`) or internal
+ *   host memory (`nd->cam_f32`).
+ *
+ * Rationale:
+ *   Lets headless tests, calibration loops, and benchmarks inspect calibrated `float32` detector
+ *   frames directly without touching SHM files or duplicating output buffers.
+ *
+ * Return: Read-only `const float *` frame pointer, or `NULL` if `@ctx` or `@sensor_slot` invalid.
+ */
 const float *cacaosim_bench_sensor_f32(const cacaosim_bench_ctx_t *ctx, int sensor_slot)
 {
     if (ctx == NULL || sensor_slot < 0 || (uint32_t) sensor_slot >= ctx->n_sensors)
@@ -1637,6 +2067,22 @@ const float *cacaosim_bench_sensor_f32(const cacaosim_bench_ctx_t *ctx, int sens
     return nd->cam_f32;
 }
 
+/**
+ * cacaosim_bench_sensor_u16() - Obtain a read-only pointer to a sensor's uint16 detector frame
+ * @ctx:         Initialized bench context (may be NULL)
+ * @sensor_slot: Compact sensor slot index returned by `cacaosim_bench_find_sensor()`
+ *
+ * Role:
+ *   Returns the `[ncam x ncam]` `uint16_t` camera ADU buffer populated on readout ticks when the
+ *   sensor's `out_dtype == 0`, resolving transparently to SHM (`img_cam.im->array.UI16`) or
+ *   internal host memory (`nd->cam_u16`).
+ *
+ * Rationale:
+ *   Mirrors hardware camera link / CoaXPress raw `uint16` ADU readout streams in both SHM-attached
+ *   and standalone headless test environments.
+ *
+ * Return: Read-only `const uint16_t *` frame pointer, or `NULL` if `@ctx` / `@sensor_slot` invalid.
+ */
 const uint16_t *cacaosim_bench_sensor_u16(const cacaosim_bench_ctx_t *ctx, int sensor_slot)
 {
     if (ctx == NULL || sensor_slot < 0 || (uint32_t) sensor_slot >= ctx->n_sensors)

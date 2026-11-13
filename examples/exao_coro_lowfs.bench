@@ -1,13 +1,50 @@
 # SPDX-FileCopyrightText: 2026 Olivier Guyon et al
 # SPDX-License-Identifier: LGPL-3.0-or-later
 #
-# ExAO Coronagraphic Bench with TTM, SHWFS, Lyot Coronagraph, and Zernike LOWFS:
+# =================================================================================================
+# ExAO Coronagraphic Bench with TTM, SHWFS, Lyot Coronagraph & Zernike LOWFS (exao_coro_lowfs.bench)
+# =================================================================================================
+#
+# Optical Architecture Overview:
 #   - 2-axis Tip-Tilt mirror (ttm0_cmd) + 16x16 DM (dm00disp)
 #   - Long-pass dichroic (1.00 um): Visible -> 16x16 Shack-Hartmann WFS @ 2 kHz
 #   - H-band -> Lyot-spot Coronagraph (3 lambda/D):
 #       * FPM core reflection -> H-band Zernike LOWFS @ 500 Hz (navg = 4)
 #       * Post-Lyot beam      -> Coronagraphic Science Camera @ 100 Hz (navg = 20)
+#
+# Optical Signal Flow (DAG):
+#   outarraypha + csim_pup -> [bench] -> b_pup -> [ttm.ttm0] -> b_post_ttm -> [dm.dm0] -> b_post_dm
+#     -> [splitter.bs_vis_nir]
+#          |-- refl (Vis <1.00 um) -> b_vis -> [shwfs.wfs_ho] -> aol0_shwfs (2 kHz)
+#          +-- trans (NIR >1.00 um) -> b_nir -> [coro.coro_h]
+#                |-- out_lowfs (FPM refl) -> b_coro_lowfs -> [zwfs.lowfs_z]   -> aol0_lowfs (500 Hz)
+#                +-- out (Post-Lyot)      -> b_coro_lyot  -> [fpcam.coro_cam] -> csim_corocam/long
+#
+# Physical Motivation:
+#   High-contrast exoplanet imaging with small-inner-working-angle coronagraphs (2..3 lambda/D) is
+#   exquisitely sensitive to sub-milliarcsecond pointing jitter and slowly drifting differential
+#   non-common-path aberrations (NCPA) between the Visible high-order WFS arm and the Near-IR
+#   coronagraphic focal plane. By reflecting the rejected on-axis starlight core directly off the
+#   coronagraphic focal-plane mask (FPM) into an H-band Zernike Low-Order Wavefront Sensor (LOWFS)
+#   (following SCExAO / GPI / Roman CGI architectures), zero science photons are sacrificed while
+#   achieving photon-noise-optimal pointing and low-order NCPA stabilization right at the FPM.
+# =================================================================================================
 
+# -------------------------------------------------------------------------------------------------
+# [bench] — Entrance Telescope Aperture, Bright ExAO Target & 2.0 kHz Master Clock
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Configures an 8.2 m obstructed primary pupil on a 128x128 wavefront grid, synthesizes stellar
+#   flux across 0.40..2.40 um for a bright ExAO target, and sets the 2.0 kHz master tick (500 us).
+#
+# Parameter Rationale:
+#   - nwf = 128, pup_diam = 0.9375, cobs = 0.30, nspider = 4, spider_w = 0.012, spider_deg = 45.0:
+#     120-pixel anti-aliased pupil diameter (6.83 cm/pix) with realistic 30% central obscuration
+#     and 45-deg spiders whose diffraction wings must be suppressed by the downstream Lyot stop.
+#   - star_mag = 6.0, star_teff = 5778.0, tput_tel = 0.78: Bright m_V = 6 solar-type exoplanet host
+#     providing high SNR for 2 kHz Visible SHWFS subapertures and 500 Hz H-band Zernike LOWFS.
+#   - master_hz = 2000.0: Base hardware clock driving wfs_ho at 1:1 rate (2 kHz), lowfs_z at 4:1
+#     decimation (500 Hz), and coro_cam at 20:1 decimation (100 Hz).
 [bench]
 name       = "exao_coro_lowfs"
 nwf        = 128
@@ -25,6 +62,18 @@ in_wf      = "outarraypha"
 in_pup     = "csim_pup"
 out_beam   = "b_pup"
 
+# -------------------------------------------------------------------------------------------------
+# [ttm.ttm0] — Dedicated 2-Axis Tip-Tilt Steering Mirror
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Applies 2-axis planar X/Y wavefront tip-tilt correction driven by 2x1 SHM command stream
+#   ttm0_cmd along optical path b_pup -> b_post_ttm ahead of the high-order deformable mirror.
+#
+# Parameter Rationale:
+#   - max_stroke = 10.0 [um edge stroke, 20.0 um OPD]: Absorbs large-amplitude atmospheric tilt
+#     and telescope wind-shake excursions so the downstream 4.0 um high-order DM never clips.
+#   - dyn_mode = 1, tau_us = 300.0, delay_frames = 1.0, tput = 0.99: Models a high-reflectivity
+#     piezo tip-tilt platform with a 300 us 1st-order ZOH mechanical settling time.
 [ttm.ttm0]
 in           = "b_pup"
 out          = "b_post_ttm"
@@ -35,6 +84,18 @@ dyn_mode     = 1
 tau_us       = 300.0
 delay_frames = 1.0
 
+# -------------------------------------------------------------------------------------------------
+# [dm.dm0] — High-Order ExAO Deformable Mirror (16x16)
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Flattens higher-order atmospheric turbulence and static NCPA up to an 8 lambda/D dark-hole
+#   control radius using SHM command stream dm00disp (b_post_ttm -> b_post_dm).
+#
+# Parameter Rationale:
+#   - nact_x = 16, nact_y = 16, if_coupling = 0.18, max_stroke = 4.0: Matches the 16x16 Fried
+#     lenslet geometry of wfs_ho with realistic 18% continuous-facesheet influence coupling.
+#   - dyn_mode = 1, tau_us = 100.0, delay_frames = 1.0: Fast 100 us (0.2-frame) MEMS/piezo ZOH
+#     response keeps actuator phase lag small across the 2 kHz ExAO control loop.
 [dm.dm0]
 in           = "b_post_ttm"
 out          = "b_post_dm"
@@ -48,6 +109,18 @@ dyn_mode     = 1
 tau_us       = 100.0
 delay_frames = 1.0
 
+# -------------------------------------------------------------------------------------------------
+# [splitter.bs_vis_nir] — Main Visible / Near-Infrared Long-Pass Dichroic
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Splits the AO-corrected pupil beam b_post_dm at 1.00 um, reflecting Visible (< 1.00 um) light
+#   into high-order WFS beam b_vis and transmitting Near-IR (> 1.00 um) light into coronagraphic
+#   science arm b_nir.
+#
+# Parameter Rationale:
+#   - mode = "dichroic_lp", lambda_cut = 1.00, eff_refl = 0.95, eff_trans = 0.95: Preserves 95% of
+#     H-band exoplanet/LOWFS photons while sending all optical stellar photons to the 2 kHz SHWFS.
+#     Differential optical drift downstream of this split motivates the FPM-reflected Zernike LOWFS.
 [splitter.bs_vis_nir]
 in         = "b_post_dm"
 out_refl   = "b_vis"
@@ -57,6 +130,18 @@ lambda_cut = 1.00
 eff_refl   = 0.95
 eff_trans  = 0.95
 
+# -------------------------------------------------------------------------------------------------
+# [shwfs.wfs_ho] — Visible Diffractive Shack-Hartmann High-Order WFS (2.0 kHz)
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Propagates Visible (0.75 um, 22% BW) beam b_vis through a 16x16 lenslet array onto an 8x8
+#   pixel/subaperture detector (128x128 total pixels -> SHM stream aol0_shwfs) at 2.0 kHz.
+#
+# Parameter Rationale:
+#   - n_sub = 16, pix_per_sub = 8: 1:1 Fried registration with the 16x16 high-order DM actuators
+#     with generous 8x8 subaperture FoV to prevent spot truncation during loop acquisition.
+#   - navg = 1, qe = 0.85, ron_e = 0.5, use_beam_flux = 1: Single-tick 500 us readout with low
+#     0.5 e- sCMOS/EMCCD read noise for full-bandwidth atmospheric turbulence rejection.
 [shwfs.wfs_ho]
 in            = "b_vis"
 out_cam       = "aol0_shwfs"
@@ -70,6 +155,25 @@ navg          = 1
 ron_e         = 0.5
 out_dtype     = "uint16"
 
+# -------------------------------------------------------------------------------------------------
+# [coro.coro_h] — H-Band Classical Lyot-Spot Coronagraph with Reflective-FPM LOWFS Pickoff
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Suppresses on-axis H-band (1.65 um) starlight via an opaque 3.0 lambda/D focal-plane occulting
+#   spot and an undersized/oversized Lyot stop (producing science beam b_coro_lyot), while
+#   simultaneously reflecting the rejected stellar PSF core into LOWFS pupil beam b_coro_lowfs.
+#
+# Parameter Rationale:
+#   - mode = "lyot_spot", fpm_rad_ld = 3.0, fpm_amp = 0.0: Blocks the bright central Airy core and
+#     first diffraction ring inside 3 lambda/D (~124 mas @ 1.65 um on 8.2 m) while transmitting
+#     off-axis companions outside the inner working angle unattenuated.
+#   - lowfs_mode = "fpm_refl", lowfs_pup_diam = 1.0, lowfs_refl = 0.95: Reflects 95% of the blocked
+#     on-axis core light through a 1.0 D relay stop directly into b_coro_lowfs so pointing/low-order
+#     modes are sensed at the exact FPM null without stealing science photons.
+#   - lyot_outer = 0.85, lyot_obs = 0.36, lyot_nspider = 4, lyot_spider_w = 0.02,
+#     lyot_spider_deg = 45.0: Undersizes the outer pupil (0.85 vs 1.00) and oversizes both the
+#     central obscuration (0.36 vs 0.30) and spiders (0.020 vs 0.012) to block residual edge and
+#     vane diffraction rings in the post-Lyot pupil.
 [coro.coro_h]
 in              = "b_nir"
 out             = "b_coro_lyot"
@@ -88,6 +192,20 @@ lyot_nspider    = 4
 lyot_spider_w   = 0.02
 lyot_spider_deg = 45.0
 
+# -------------------------------------------------------------------------------------------------
+# [zwfs.lowfs_z] — H-Band Zernike Phase-Contrast Low-Order Wavefront Sensor (500 Hz)
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Converts subtle tip-tilt and low-order NCPA phase errors in the FPM-reflected beam b_coro_lowfs
+#   into linear pupil-plane intensity variations on a 64x64 NIR camera (aol0_lowfs) at 500 Hz.
+#
+# Parameter Rationale:
+#   - lambda_um = 1.65, dimple_ld = 1.06, bw_frac = 0.18: Standard 1.06 lambda/D Zernike phase-shift
+#     dimple balances reference wave amplitude against outer pupil field for maximum phase-contrast
+#     linearity on FPM-reflected starlight.
+#   - navg = 4, qe = 0.85, ron_e = 0.5: Integrates 4 master ticks (2.0 ms exposure -> 500 Hz) to
+#     achieve high photon SNR against 0.5 e- SAPHIRA readout noise, tracking wind-shake and thermal
+#     quasi-static NCPA drifts well above telescope structural resonances.
 [zwfs.lowfs_z]
 in            = "b_coro_lowfs"
 out_cam       = "aol0_lowfs"
@@ -101,6 +219,20 @@ navg          = 4
 ron_e         = 0.5
 out_dtype     = "uint16"
 
+# -------------------------------------------------------------------------------------------------
+# [fpcam.coro_cam] — Post-Lyot H-Band Coronagraphic Science Camera (100 Hz)
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Forms broadband H-band (1.65 um, 18% BW) coronagraphic focal-plane images from post-Lyot beam
+#   b_coro_lyot onto a 128x128 detector at 100 Hz (navg = 20), writing individual exposures to
+#   csim_corocam and integrated deep-contrast PSFs to csim_corolong.
+#
+# Parameter Rationale:
+#   - prop_mode = "mft", ncam = 128, pixscale_ld = 3.0: Soummer Matrix-DFT samples the dark hole
+#     at 0.333 lambda/D per pixel (~13.8 mas/pix) across +/- 21.3 lambda/D, cleanly resolving both
+#     the 3 lambda/D Lyot-spot inner working angle and the 8 lambda/D 16x16 DM control radius.
+#   - navg = 20, qe = 0.85, ron_e = 0.8: Co-adds 20 dynamic 2 kHz speckle realizations per 10 ms
+#     readout to faithfully simulate post-coronagraphic raw contrast and pinned/halo speckle noise.
 [fpcam.coro_cam]
 in            = "b_coro_lyot"
 out_cam       = "csim_corocam"

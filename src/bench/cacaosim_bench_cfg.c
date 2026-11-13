@@ -4,7 +4,40 @@
 
 /**
  * @file    cacaosim_bench_cfg.c
- * @brief   INI/TOML-style parser for declarative multi-stage .bench optical configurations
+ * @brief   Zero-dependency INI/TOML-subset parser, defaults, and serializer for .bench files
+ *
+ * Architectural Role:
+ *   Implements the persistence and configuration-initialization layer of cacaosim's multi-stage
+ *   optical bench subsystem. Together with cacaosim_bench_edit.c (built-in architectural presets
+ *   and topological beam splicing) and cacaosim_bench_dag.c (cacaosim_bench_analyze() zero-FFT
+ *   static topology and 32-bin spectral photometry analyzer), this translation unit enables
+ *   cacaosim-CTRL, cacaosim-bench-view, and cacaosim.htsim to load, inspect, edit, and save
+ *   declarative .bench optical graphs instantaneously.
+ *
+ * Grammar & Serialization Conventions:
+ *   - One global [bench] section configures pupil grid dimensions, telescope aperture geometry,
+ *     stellar blackbody magnitude/temperature, master clock rate, entrance SHM streams, and
+ *     compute backend.
+ *   - Arbitrary [<type>.<id>] sections declare optical hardware and sensor nodes across nine
+ *     section prefixes: dm, ttm (alias for 2-axis dm_mode=1), splitter, coro, wfe / static_wfe,
+ *     pyrwfs, shwfs, zwfs, and fpcam.
+ *   - Supports quote-aware '#' and ';' comments, optional single or double quotes around string
+ *     and enum tokens, case-insensitive symbolic enum names alongside numeric codes, and physical
+ *     convenience aliases (e.g. tau_us / tau_sec, rms_nm / rms_m, in / in_beam, out / out_beam).
+ *   - Canonical serialization (cacaosim_bench_format_str()) emits symbolic enum names and elides
+ *     default-valued optional keys (such as identity 2D registration or zero dark current) so
+ *     saved .bench files stay concise, readable, and cleanly diffable in version control.
+ *
+ * Design Rationale & Motivation:
+ *   - Zero external parser dependencies: Implementing a self-contained ~500-line state-machine
+ *     parser avoids pulling third-party TOML/YAML libraries into libmilkcacaosim.so while giving
+ *     domain-tailored error diagnostics ("Line N: unknown key 'foo' in node 'dm0'").
+ *   - Reentrant error reporting: Every fallible entry point writes diagnostics into a caller-
+ *     supplied err_buf without touching errno or global state, making live parsing inside TUI
+ *     event loops completely side-effect-free.
+ *   - Two-pass snprintf-style formatting: cfg_writer_t counts exact required characters when
+ *     called with a NULL buffer so cacaosim_bench_save_file() allocates once and writes atomically
+ *     without fixed buffer truncation risks.
  */
 
 #include <ctype.h>
@@ -18,6 +51,19 @@
 
 #include "bench/cacaosim_bench.h"
 
+/**
+ * set_err() - Format a printf-style diagnostic message into an optional caller error buffer
+ * @buf: Destination character buffer (safely ignored when NULL or @cap == 0).
+ * @cap: Capacity of @buf in bytes including NUL terminator.
+ * @fmt: printf-compatible format string.
+ *
+ * Role:
+ *   Records human-readable parse or file-I/O diagnostics at the exact failure site.
+ *
+ * Rationale:
+ *   Centralizing NULL/zero-capacity checks lets callers pass NULL when diagnostics are unneeded
+ *   (e.g. when parsing trusted built-in preset strings) without cluttering parser error paths.
+ */
 static void set_err(char *buf, size_t cap, const char *fmt, ...)
 {
     if (buf == NULL || cap == 0)
@@ -30,6 +76,20 @@ static void set_err(char *buf, size_t cap, const char *fmt, ...)
     va_end(ap);
 }
 
+/**
+ * copy_str() - Copy a NUL-terminated string into a fixed-capacity field with guaranteed NUL
+ * @dst: Destination character array (safely ignored when NULL or @cap == 0).
+ * @cap: Capacity of @dst in bytes.
+ * @src: Source string (treated as empty string "" when NULL).
+ *
+ * Role:
+ *   Populates fixed-length identifier, stream-name, and file-path arrays inside
+ *   cacaosim_bench_cfg_t and cacaosim_node_cfg_t.
+ *
+ * Rationale:
+ *   Avoids strncpy() non-termination hazards and -Wformat-truncation warnings while gracefully
+ *   handling NULL optional strings.
+ */
 static void copy_str(char *dst, size_t cap, const char *src)
 {
     if (dst == NULL || cap == 0)
@@ -44,6 +104,21 @@ static void copy_str(char *dst, size_t cap, const char *src)
     snprintf(dst, cap, "%s", src);
 }
 
+/**
+ * trim_inplace() - Strip outer ASCII whitespace and matching outer quotes from a mutable C string
+ * @s: Mutable NUL-terminated token buffer to trim in place (must not be NULL).
+ *
+ * Role:
+ *   Normalizes section headers, keys, and right-hand-side values during line-by-line INI/TOML
+ *   lexing so `mode = "dichroic_lp"`, `mode = 'dichroic_lp'`, and `mode = dichroic_lp` parse
+ *   identically.
+ *
+ * Rationale:
+ *   Mutating a stack-local line copy in place avoids per-token heap allocations while supporting
+ *   both bare INI tokens and TOML-quoted string literals.
+ *
+ * Return: Pointer inside @s to the first non-whitespace, unquoted character.
+ */
 static char *trim_inplace(char *s)
 {
     while (*s != '\0' && isspace((unsigned char) *s))
@@ -55,6 +130,7 @@ static char *trim_inplace(char *s)
     {
         s[--len] = '\0';
     }
+    /* Strip one layer of matching double or single quotes if surrounding the trimmed token */
     if (len >= 2 && ((s[0] == '"' && s[len - 1] == '"') || (s[0] == '\'' && s[len - 1] == '\'')))
     {
         s[len - 1] = '\0';
@@ -63,6 +139,18 @@ static char *trim_inplace(char *s)
     return s;
 }
 
+/**
+ * strip_comment() - Truncate a mutable line at the first unquoted '#' or ';' comment delimiter
+ * @line: Mutable NUL-terminated input line modified in place (must not be NULL).
+ *
+ * Role:
+ *   Removes full-line and trailing inline comments before section or `key = value` splitting
+ *   while preserving '#' or ';' characters inside single- or double-quoted strings.
+ *
+ * Rationale:
+ *   Tracking single-quote (`in_sq`) and double-quote (`in_dq`) state ensures file paths or bench
+ *   names containing '#' or ';' are never prematurely truncated.
+ */
 static void strip_comment(char *line)
 {
     int in_dq = 0;
@@ -85,6 +173,19 @@ static void strip_comment(char *line)
     }
 }
 
+/**
+ * parse_bool() - Convert a case-insensitive boolean token into 1 or 0
+ * @v: Trimmed value string (must not be NULL).
+ *
+ * Role:
+ *   Parses boolean flags (`shutter`, `photon_noise`, `use_beam_flux`) across INI and TOML styles.
+ *
+ * Rationale:
+ *   Accepting "1", "true", "on", and "yes" accommodates milk FPS conventions ("ON"/"OFF"), TOML
+ *   booleans ("true"/"false"), and numeric C flags ("1"/"0").
+ *
+ * Return: 1 for truthy tokens, 0 otherwise.
+ */
 static int parse_bool(const char *v)
 {
     if (strcasecmp(v, "1") == 0 || strcasecmp(v, "true") == 0 || strcasecmp(v, "on") == 0 ||
@@ -95,6 +196,19 @@ static int parse_bool(const char *v)
     return 0;
 }
 
+/**
+ * parse_backend() - Resolve compute backend token ("auto", "cpu", "cuda"/"gpu", or integer)
+ * @v: Trimmed value string (must not be NULL).
+ *
+ * Role:
+ *   Maps `[bench] backend = ...` values to `cacaosim_backend_t` enumerators.
+ *
+ * Rationale:
+ *   Supports readable string identifiers in `.bench` files while preserving backward compatibility
+ *   with integer FPS backend codes (`0`, `1`, `2`).
+ *
+ * Return: `cacaosim_backend_t` value.
+ */
 static int parse_backend(const char *v)
 {
     if (strcasecmp(v, "cpu") == 0)
@@ -112,6 +226,18 @@ static int parse_backend(const char *v)
     return atoi(v);
 }
 
+/**
+ * parse_dtype() - Resolve detector pixel datatype token ("uint16"/"u16", "float32"/"f32", or int)
+ * @v: Trimmed value string (must not be NULL).
+ *
+ * Role:
+ *   Maps `out_dtype` sensor settings to `CACAOSIM_DTYPE_U16` (0) or `CACAOSIM_DTYPE_F32` (1).
+ *
+ * Rationale:
+ *   Lets `.bench` authors specify self-documenting datatype names instead of opaque integers.
+ *
+ * Return: `cacaosim_dtype_t` value.
+ */
 static int parse_dtype(const char *v)
 {
     if (strcasecmp(v, "float32") == 0 || strcasecmp(v, "f32") == 0 || strcasecmp(v, "float") == 0)
@@ -125,6 +251,20 @@ static int parse_dtype(const char *v)
     return atoi(v);
 }
 
+/**
+ * parse_split_mode() - Resolve beamsplitter / dichroic spectral mode token
+ * @v: Trimmed value string (must not be NULL).
+ *
+ * Role:
+ *   Maps `[splitter.<id>] mode` strings ("gray", "dichroic_lp"/"lp"/"longpass",
+ *   "dichroic_sp"/"sp"/"shortpass", "dichroic_bp"/"bp"/"band_reflect") to `cacaosim_split_mode_t`.
+ *
+ * Rationale:
+ *   Accepts both canonical serializer tokens and common optical shorthand ("lp", "sp", "bp") with
+ *   numeric fallback.
+ *
+ * Return: `cacaosim_split_mode_t` value.
+ */
 static int parse_split_mode(const char *v)
 {
     if (strcasecmp(v, "gray") == 0)
@@ -149,6 +289,20 @@ static int parse_split_mode(const char *v)
     return atoi(v);
 }
 
+/**
+ * parse_coro_mode() - Resolve coronagraph focal-plane mask architecture token
+ * @v: Trimmed value string (must not be NULL).
+ *
+ * Role:
+ *   Maps `[coro.<id>] mode` strings ("lyot_spot", "phase_dimple"/"roddier", "vortex", "4qpm",
+ *   "custom_mft"/"custom", "custom_fft") to `cacaosim_coro_mode_t` enumerators.
+ *
+ * Rationale:
+ *   Distinguishes analytic MFT/FFT coronagraphs from arbitrary FITS/SHM mask propagators using
+ *   domain-familiar names.
+ *
+ * Return: `cacaosim_coro_mode_t` value.
+ */
 static int parse_coro_mode(const char *v)
 {
     if (strcasecmp(v, "lyot_spot") == 0 || strcasecmp(v, "lyot") == 0)
@@ -178,6 +332,22 @@ static int parse_coro_mode(const char *v)
     return atoi(v);
 }
 
+/**
+ * parse_lowfs_mode() - Resolve coronagraph LOWFS pickoff plane token ("fpm_refl" vs "lyot_refl")
+ * @v: Trimmed value string (must not be NULL).
+ *
+ * Role:
+ *   Selects whether `out_lowfs` collects starlight rejected at the focal-plane mask (`fpm_refl`,
+ *   clipped to `lowfs_pup_diam`) or light reflected off the opaque region of a reflective Lyot
+ *   stop (`lyot_refl`).
+ *
+ * Rationale:
+ *   Both FPM-reflective LOWFS (SCExAO/WFIRST CGI style) and Lyot-reflective LOWFS (Lyot-stop
+ *   ZWFS/SHWFS style) are widely deployed ExAO architectures; symbolic strings keep `.bench`
+ *   intent explicit.
+ *
+ * Return: `CACAOSIM_LOWFS_FPM_REFL` or `CACAOSIM_LOWFS_LYOT_REFL`.
+ */
 static int parse_lowfs_mode(const char *v)
 {
     if (strcasecmp(v, "fpm_refl") == 0 || strcasecmp(v, "fpm") == 0)
@@ -191,6 +361,21 @@ static int parse_lowfs_mode(const char *v)
     return atoi(v) ? CACAOSIM_LOWFS_LYOT_REFL : CACAOSIM_LOWFS_FPM_REFL;
 }
 
+/**
+ * init_det_defaults() - Populate baseline CMOS/EMCCD/sCMOS detector readout parameters
+ * @det:  Destination detector configuration struct (must not be NULL).
+ * @flux: Fallback manual photon count per frame [photons] when `use_beam_flux == 0`.
+ * @ron:  Gaussian readout noise [e- RMS].
+ *
+ * Role:
+ *   Initializes shared readout electronics defaults (unity gain, 100 ADU bias pedestal, 16-bit
+ *   65535 ADU saturation, open shutter, Poisson shot noise enabled, uint16 output) for WFS and
+ *   science camera nodes.
+ *
+ * Rationale:
+ *   A non-zero 100 ADU bias offset prevents negative read-noise excursions from clipping at zero
+ *   in unsigned `uint16_t` camera streams, matching real astronomical camera controllers.
+ */
 static void init_det_defaults(cacaosim_det_cfg_t *det, float flux, float ron)
 {
     memset(det, 0, sizeof(*det));
@@ -205,6 +390,23 @@ static void init_det_defaults(cacaosim_det_cfg_t *det, float flux, float ron)
     det->out_dtype    = CACAOSIM_DTYPE_U16;
 }
 
+/**
+ * init_node_defaults() - Populate physically realistic defaults for a newly created optical node
+ * @nd:     Destination node configuration struct (must not be NULL).
+ * @kind:   Optical element category (`cacaosim_node_kind_t`).
+ * @id:     Unique section identifier string used to synthesize default SHM stream names.
+ * @is_ttm: Non-zero for a 2-axis Tip-Tilt mirror (`dm_mode = 1`, `2x1`), 0 for zonal DM (`16x16`).
+ * @idx:    0-based node index used to salt PRNG seeds deterministically across nodes.
+ *
+ * Role:
+ *   Establishes complete, physically sensible parameters for every node kind so users only need
+ *   to specify connectivity (`in`, `out`) and the few optical parameters they wish to customize.
+ *
+ * Rationale:
+ *   Salting `seed_base = 10007 + 7919 * (idx + 1)` with distinct prime constants ensures multiple
+ *   WFS detectors or synthesized static WFE screens in the same bench never exhibit identical
+ *   correlated noise realizations, while remaining 100% reproducible across runs.
+ */
 static void init_node_defaults(
     cacaosim_node_cfg_t *nd,
     cacaosim_node_kind_t kind,
@@ -225,10 +427,12 @@ static void init_node_defaults(
     nd->reg_refl.scale  = 1.0f;
     nd->reg_trans.scale = 1.0f;
 
+    /* Prime-offset deterministic PRNG seed decorrelating sibling sensors and WFE screens */
     uint64_t seed_base = 10007ULL + 7919ULL * (uint64_t) (idx + 1u);
 
     if (kind == CACAOSIM_NODE_DM)
     {
+        /* Reflective MEMS/piezo DM or 2-axis TTM with 1-frame RTC delay and 120 us RC lag */
         snprintf(nd->in_cmd, sizeof(nd->in_cmd), "%s_cmd", id);
         nd->tput            = 0.98f;
         nd->dm.dm_mode      = is_ttm ? 1 : 0;
@@ -248,6 +452,7 @@ static void init_node_defaults(
     }
     else if (kind == CACAOSIM_NODE_SPLITTER)
     {
+        /* 0.95 um long-pass Vis/NIR dichroic reflecting visible to WFS and passing NIR to sci */
         nd->split.mode       = CACAOSIM_SPLIT_DICHROIC_LP;
         nd->split.r_gray     = 0.50f;
         nd->split.t_gray     = 0.50f;
@@ -259,6 +464,7 @@ static void init_node_defaults(
     }
     else if (kind == CACAOSIM_NODE_CORO)
     {
+        /* H-band (1.65 um) classical Lyot spot coronagraph with 3 lambda/D FPM & 85% Lyot stop */
         nd->tput                 = 0.92f;
         nd->coro.mode            = CACAOSIM_CORO_LYOT_SPOT;
         nd->coro.lowfs_mode      = CACAOSIM_LOWFS_FPM_REFL;
@@ -283,6 +489,7 @@ static void init_node_defaults(
     }
     else if (kind == CACAOSIM_NODE_WFE)
     {
+        /* Static polishing/NCPA wavefront error map (50 nm RMS, f^-1.6 amplitude spectrum) */
         snprintf(nd->in_wfe, sizeof(nd->in_wfe), "%s_wfe", id);
         nd->tput       = 0.98f;
         nd->wfe_rms_nm = 50.0f;
@@ -292,6 +499,7 @@ static void init_node_defaults(
     }
     else if (kind == CACAOSIM_NODE_PYRWFS)
     {
+        /* Visible (0.75 um) 4-sided Pyramid WFS with 3 lambda/D 16-point circular modulation */
         snprintf(nd->out_cam, sizeof(nd->out_cam), "%s_cam", id);
         nd->pyrwfs.pad_factor = 2u;
         nd->pyrwfs.ncam       = 64u;
@@ -306,6 +514,7 @@ static void init_node_defaults(
     }
     else if (kind == CACAOSIM_NODE_SHWFS)
     {
+        /* Visible (0.75 um) 16x16 diffractive Shack-Hartmann lenslet WFS (8x8 px/subaperture) */
         snprintf(nd->out_cam, sizeof(nd->out_cam), "%s_cam", id);
         nd->shwfs.n_sub       = 16u;
         nd->shwfs.pix_per_sub = 8u;
@@ -316,6 +525,7 @@ static void init_node_defaults(
     }
     else if (kind == CACAOSIM_NODE_ZWFS)
     {
+        /* Zernike phase-contrast WFS with 1.06 lambda/D pi/2 phase dimple */
         snprintf(nd->out_cam, sizeof(nd->out_cam), "%s_cam", id);
         nd->zwfs.ncam       = 64u;
         nd->zwfs.n_mft      = 32u;
@@ -328,6 +538,7 @@ static void init_node_defaults(
     }
     else if (kind == CACAOSIM_NODE_FPCAM)
     {
+        /* H-band (1.65 um, 18% BW) Nyquist+ Soummer-MFT focal-plane science PSF camera */
         snprintf(nd->out_cam, sizeof(nd->out_cam), "%s_cam", id);
         nd->bw_frac           = 0.18f;
         nd->qe                = 0.85f;
@@ -343,6 +554,21 @@ static void init_node_defaults(
     }
 }
 
+/**
+ * cacaosim_bench_node_defaults() - Public wrapper initializing one optical node's default config
+ * @nd:     Caller-owned destination node configuration (no-op if NULL).
+ * @kind:   Optical element kind (`cacaosim_node_kind_t`).
+ * @id:     Node identifier string (defaults to "node" if NULL).
+ * @is_ttm: Non-zero for 2-axis Tip-Tilt mirror when @kind == CACAOSIM_NODE_DM.
+ * @idx:    0-based node slot index for PRNG seed decorrelation.
+ *
+ * Role:
+ *   Exposes `init_node_defaults()` to external callers such as `cacaosim_bench_edit.c` and TUI
+ *   builders with NULL-pointer safety.
+ *
+ * Rationale:
+ *   Avoids duplicating default parameter tables across the parser and interactive bench editor.
+ */
 void cacaosim_bench_node_defaults(
     cacaosim_node_cfg_t *nd,
     cacaosim_node_kind_t kind,
@@ -357,6 +583,20 @@ void cacaosim_bench_node_defaults(
     init_node_defaults(nd, kind, (id != NULL) ? id : "node", is_ttm, idx);
 }
 
+/**
+ * cacaosim_bench_cfg_defaults() - Reset a top-level bench configuration to 8 m-class AO defaults
+ * @cfg: Caller-owned bench configuration struct (must not be NULL).
+ *
+ * Role:
+ *   Populates `[bench]` defaults (128x128 grid, 0.9375 clear pupil fraction, 30% central
+ *   obscuration, 4 spiders at 45 deg, 8.2 m Subaru/VLT aperture, V=8.0 G2V 5778 K star, 75%
+ *   telescope throughput, 2 kHz master clock, `outarraypha` phase radians at 0.50 um, root beam
+ *   `b_pup`, auto backend).
+ *
+ * Rationale:
+ *   Provides a complete, physically calibrated starting state before applying `[bench]` key-value
+ *   overrides so minimal `.bench` files require only a few lines.
+ */
 void cacaosim_bench_cfg_defaults(cacaosim_bench_cfg_t *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
@@ -381,6 +621,25 @@ void cacaosim_bench_cfg_defaults(cacaosim_bench_cfg_t *cfg)
     cfg->backend    = CACAOSIM_BACKEND_AUTO;
 }
 
+/**
+ * apply_det_kv() - Dispatch shared detector readout and PRNG seed key-value pairs
+ * @det:  Destination detector configuration struct inside a sensor node (must not be NULL).
+ * @seed: Optional destination PRNG seed pointer for `rng_seed` (may be NULL).
+ * @k:    Trimmed key name.
+ * @v:    Trimmed value string.
+ *
+ * Role:
+ *   Handles the ten detector-electronics keys (`flux_ph`, `dark_e`, `ron_e`/`ron`, `gain_eadu`,
+ *   `bias_adu`, `sat_adu`, `shutter`, `photon_noise`, `out_dtype`, `rng_seed`) shared across
+ *   `pyrwfs`, `shwfs`, `zwfs`, and `fpcam` sections.
+ *
+ * Rationale:
+ *   Factoring shared detector keys into one helper guarantees uniform detector syntax across all
+ *   four sensor types; returning 1 when matched vs 0 when unmatched lets `apply_node_kv()` fall
+ *   through cleanly to sensor-specific optical parameters.
+ *
+ * Return: 1 if @k was recognized and applied, 0 if @k belongs to another parameter group.
+ */
 static int apply_det_kv(cacaosim_det_cfg_t *det, uint64_t *seed, const char *k, const char *v)
 {
     if (strcmp(k, "flux_ph") == 0)
@@ -436,6 +695,23 @@ static int apply_det_kv(cacaosim_det_cfg_t *det, uint64_t *seed, const char *k, 
     return 0;
 }
 
+/**
+ * apply_bench_kv() - Apply one `key = value` assignment inside the top-level `[bench]` section
+ * @cfg: Destination bench configuration struct (must not be NULL).
+ * @k:   Trimmed `[bench]` key name.
+ * @v:   Trimmed value string.
+ *
+ * Role:
+ *   Updates pupil grid geometry, telescope collecting area, stellar blackbody photometry, master
+ *   clock frequency, entrance SHM stream names, input wavefront unit scaling, and backend choice.
+ *
+ * Rationale:
+ *   Supports ergonomic synonyms (`obs_frac` for `cobs`, `n_spiders` for `nspider`, `tel_tput` for
+ *   `tput_tel`, `frame_rate` for `master_hz`, `source_beam` for `out_beam`) while strictly
+ *   rejecting unknown keys (-1) so typos in `.bench` files are caught immediately at load time.
+ *
+ * Return: 0 on success, -1 if @k is not a valid `[bench]` parameter.
+ */
 static int apply_bench_kv(cacaosim_bench_cfg_t *cfg, const char *k, const char *v)
 {
     if (strcmp(k, "name") == 0)
@@ -533,8 +809,29 @@ static int apply_bench_kv(cacaosim_bench_cfg_t *cfg, const char *k, const char *
     return 0;
 }
 
+/**
+ * apply_node_kv() - Apply one `key = value` assignment inside an optical node `[<type>.<id>]`
+ * @nd: Destination node configuration struct (must not be NULL; `nd->kind` already set).
+ * @k:  Trimmed node parameter key name.
+ * @v:  Trimmed parameter value string.
+ *
+ * Role:
+ *   Processes common connectivity (`in`, `out`), throughput (`tput`), and 2D registration
+ *   (`shift_x`, `shift_y`, `rot_deg`, `mag_scale`) keys first, then dispatches to the active
+ *   `nd->kind` schema (`dm`/`ttm`, `splitter`, `coro`, `wfe`, or shared + specific sensor keys),
+ *   performing unit normalizations (`tau_us -> tau_sec`, `rms_m -> wfe_rms_nm`) on the fly.
+ *
+ * Rationale:
+ *   Mirroring 2D registration fields into both `nd->reg` (used by generic WFE/sensor relays and
+ *   the canonical serializer) and `nd->dm` (used directly by influence-function synthesis in
+ *   `cacaosim_dm_init()`) keeps DM misregistration zero-copy at runtime without special-casing
+ *   serialization.
+ *
+ * Return: 0 on success, -1 if @k is invalid for `nd->kind`.
+ */
 static int apply_node_kv(cacaosim_node_cfg_t *nd, const char *k, const char *v)
 {
+    /* Universal beam-wiring, throughput, and 2D pupil-registration keys */
     if (strcmp(k, "in") == 0 || strcmp(k, "in_beam") == 0)
     {
         copy_str(nd->in_beam, sizeof(nd->in_beam), v);
@@ -655,6 +952,7 @@ static int apply_node_kv(cacaosim_node_cfg_t *nd, const char *k, const char *v)
         }
         else if (strcmp(k, "tau_us") == 0)
         {
+            /* Convert ergonomic microsecond time constant into SI seconds */
             nd->dm.tau_sec = strtof(v, NULL) * 1.0e-6f;
         }
         else if (strcmp(k, "f0_hz") == 0)
@@ -914,6 +1212,7 @@ static int apply_node_kv(cacaosim_node_cfg_t *nd, const char *k, const char *v)
         }
         else if (strcmp(k, "rms_m") == 0)
         {
+            /* Normalize meter RMS specification into nanometers for internal storage */
             nd->wfe_rms_nm = strtof(v, NULL) * 1.0e9f;
         }
         else if (strcmp(k, "psd_alpha") == 0 || strcmp(k, "alpha") == 0)
@@ -935,7 +1234,7 @@ static int apply_node_kv(cacaosim_node_cfg_t *nd, const char *k, const char *v)
         return 0;
     }
 
-    /* Sensor common parameters */
+    /* Sensor common parameters (shared by pyrwfs, shwfs, zwfs, and fpcam) */
     if (strcmp(k, "out_cam") == 0)
     {
         copy_str(nd->out_cam, sizeof(nd->out_cam), v);
@@ -1129,6 +1428,26 @@ static int apply_node_kv(cacaosim_node_cfg_t *nd, const char *k, const char *v)
     return -1;
 }
 
+/**
+ * cacaosim_bench_parse_str() - Parse a complete .bench INI/TOML-subset document from memory
+ * @text:    NUL-terminated source document string (must not be NULL).
+ * @cfg:     Destination configuration struct reset and populated in place (must not be NULL).
+ * @err_buf: Optional diagnostic buffer receiving line-numbered error messages (may be NULL).
+ * @err_cap: Capacity of @err_buf in bytes.
+ *
+ * Role:
+ *   Scans @text line by line without modifying @text, strips quote-aware comments, transitions
+ *   across `[bench]` and `[<type>.<id>]` section headers, initializes per-node defaults upon
+ *   entering each node section, enforces node-ID uniqueness, applies `key = value` pairs, and
+ *   validates minimum grid size (`nwf >= 8`) and non-empty node count (`n_nodes >= 1`).
+ *
+ * Rationale:
+ *   Copying each line into a fixed 512-byte stack buffer avoids heap allocation and keeps @text
+ *   strictly read-only (essential when parsing compile-time `const char *` preset literals in
+ *   rodata).
+ *
+ * Return: 0 on success, -1 on syntax, unknown key, capacity, or validation error.
+ */
 int cacaosim_bench_parse_str(
     const char           *text,
     cacaosim_bench_cfg_t *cfg,
@@ -1153,6 +1472,7 @@ int cacaosim_bench_parse_str(
     uint32_t             line_no = 0;
     const char          *p       = text;
 
+    /* Scan line-by-line without mutating the read-only input buffer */
     while (*p != '\0')
     {
         const char *nl  = strchr(p, '\n');
@@ -1176,6 +1496,7 @@ int cacaosim_bench_parse_str(
             continue;
         }
 
+        /* Section header: either [bench] or [<type>.<id>] */
         if (s[0] == '[')
         {
             char *rb = strchr(s, ']');
@@ -1211,6 +1532,7 @@ int cacaosim_bench_parse_str(
                 return -1;
             }
 
+            /* Map section type prefix (including [ttm.*] and [static_wfe.*] aliases) to kind */
             cacaosim_node_kind_t kind;
             int                  is_ttm = 0;
             if (strcasecmp(type_str, "dm") == 0)
@@ -1256,6 +1578,7 @@ int cacaosim_bench_parse_str(
                 return -1;
             }
 
+            /* Enforce bench-wide node ID uniqueness across all node kinds */
             for (uint32_t i = 0; i < cfg->n_nodes; i++)
             {
                 if (strcmp(cfg->nodes[i].id, id_str) == 0)
@@ -1272,6 +1595,7 @@ int cacaosim_bench_parse_str(
             continue;
         }
 
+        /* Key-value assignment inside the active section */
         char *eq = strchr(s, '=');
         if (eq == NULL)
         {
@@ -1319,6 +1643,23 @@ int cacaosim_bench_parse_str(
     return 0;
 }
 
+/**
+ * cacaosim_bench_load_file() - Read a .bench file from disk and parse it into @cfg
+ * @path:    Filesystem path to the .bench file (must be non-NULL and non-empty).
+ * @cfg:     Destination bench configuration struct (must not be NULL).
+ * @err_buf: Optional diagnostic buffer receiving I/O or syntax error messages (may be NULL).
+ * @err_cap: Capacity of @err_buf in bytes.
+ *
+ * Role:
+ *   Opens @path in binary mode, verifies that its size lies in `[0 .. 1 MiB]`, reads the entire
+ *   contents into a NUL-terminated buffer, and delegates parsing to `cacaosim_bench_parse_str()`.
+ *
+ * Rationale:
+ *   Capping input size at 1 MiB protects callers against inadvertently pointing `.bench_file` at
+ *   multi-gigabyte FITS cubes or device files while keeping disk reads single-syscall fast.
+ *
+ * Return: 0 on success, -1 on file open, size, memory, or parse failure.
+ */
 int cacaosim_bench_load_file(
     const char           *path,
     cacaosim_bench_cfg_t *cfg,
@@ -1367,6 +1708,16 @@ int cacaosim_bench_load_file(
     return rc;
 }
 
+/**
+ * struct cfg_writer_t - Bounded / dry-run string-formatting cursor for .bench serialization
+ * @buf: Optional caller output buffer (NULL during pass-1 length measurement).
+ * @cap: Capacity of @buf in bytes including trailing NUL (0 during dry-run sizing).
+ * @len: Cumulative characters formatted so far (continues advancing even if @len >= @cap).
+ *
+ * Rationale:
+ *   Mirrors POSIX `snprintf` semantics across dozens of sequential `cw_printf()` calls so a
+ *   single serialization code path handles both exact byte-length queries and bounded writes.
+ */
 typedef struct
 {
     char  *buf;
@@ -1374,6 +1725,19 @@ typedef struct
     size_t len;
 } cfg_writer_t;
 
+/**
+ * cw_printf() - Append formatted text to @w while tracking cumulative byte length
+ * @w:   Active formatting cursor (must not be NULL).
+ * @fmt: printf-compatible format string checked by the compiler via `format(printf, 2, 3)`.
+ *
+ * Role:
+ *   Appends formatted key-value lines into `w->buf` up to `w->cap` while unconditionally
+ *   accumulating the true formatted byte count into `w->len`.
+ *
+ * Rationale:
+ *   Prevents buffer overruns on fixed caller buffers and eliminates manual length bookkeeping
+ *   across multi-hundred-line `.bench` serializers.
+ */
 static void cw_printf(cfg_writer_t *w, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 
@@ -1391,6 +1755,19 @@ static void cw_printf(cfg_writer_t *w, const char *fmt, ...)
     }
 }
 
+/**
+ * split_mode_str() - Convert a beamsplitter mode code to its canonical `.bench` string token
+ * @m: `cacaosim_split_mode_t` value.
+ *
+ * Role:
+ *   Maps numeric splitter modes back to human-readable `"gray"`, `"dichroic_lp"`,
+ *   `"dichroic_sp"`, or `"dichroic_bp"` tokens during serialization.
+ *
+ * Rationale:
+ *   Guarantees round-trip symmetry with `parse_split_mode()`.
+ *
+ * Return: Static NUL-terminated mode name string.
+ */
 static const char *split_mode_str(int32_t m)
 {
     switch (m)
@@ -1408,6 +1785,19 @@ static const char *split_mode_str(int32_t m)
     }
 }
 
+/**
+ * coro_mode_str() - Convert a coronagraph mode code to its canonical `.bench` string token
+ * @m: `cacaosim_coro_mode_t` value.
+ *
+ * Role:
+ *   Maps numeric coronagraph mask architectures back to `"lyot_spot"`, `"phase_dimple"`,
+ *   `"vortex"`, `"4qpm"`, `"custom_mft"`, or `"custom_fft"`.
+ *
+ * Rationale:
+ *   Guarantees round-trip symmetry with `parse_coro_mode()`.
+ *
+ * Return: Static NUL-terminated mode name string.
+ */
 static const char *coro_mode_str(int32_t m)
 {
     switch (m)
@@ -1429,6 +1819,19 @@ static const char *coro_mode_str(int32_t m)
     }
 }
 
+/**
+ * dyn_mode_str() - Convert a DM temporal dynamics code to its canonical `.bench` string token
+ * @m: DM dynamics mode (0 = instant, 1 = 1st-order RC lag, 2 = 2nd-order damped oscillator).
+ *
+ * Role:
+ *   Serializes `dm.dyn_mode` as `"instant"`, `"rc"`, or `"osc"`.
+ *
+ * Rationale:
+ *   Self-documenting string names clarify which dynamical parameters (`tau_us` vs `f0_hz`/`zeta`)
+ *   govern actuator response.
+ *
+ * Return: Static NUL-terminated dynamics mode string.
+ */
 static const char *dyn_mode_str(int32_t m)
 {
     switch (m)
@@ -1444,6 +1847,19 @@ static const char *dyn_mode_str(int32_t m)
     }
 }
 
+/**
+ * cw_write_reg() - Emit non-identity 2D pupil-registration keys (`shift_x/y`, `rot_deg`, `scale`)
+ * @w:   Active formatting cursor (must not be NULL).
+ * @reg: 2D affine pupil registration descriptor to inspect (must not be NULL).
+ *
+ * Role:
+ *   Writes `shift_x`, `shift_y`, `rot_deg`, and `mag_scale` lines only when their values differ
+ *   from the identity transform `(0, 0, 0 deg, 1.0)`.
+ *
+ * Rationale:
+ *   Most optical elements sit nominally registered; eliding identity registration parameters
+ *   keeps `.bench` files uncluttered while faithfully preserving misalignments when configured.
+ */
 static void cw_write_reg(cfg_writer_t *w, const cacaosim_reg_t *reg)
 {
     if (fabsf(reg->shift_x) > 1e-6f)
@@ -1464,6 +1880,20 @@ static void cw_write_reg(cfg_writer_t *w, const cacaosim_reg_t *reg)
     }
 }
 
+/**
+ * cw_write_det() - Emit shared detector readout keys while eliding standard electronics defaults
+ * @w:             Active formatting cursor (must not be NULL).
+ * @det:           Detector readout configuration to format (must not be NULL).
+ * @use_beam_flux: Non-zero when flux is computed from the stellar spectrum (`flux_ph` elided).
+ *
+ * Role:
+ *   Serializes `ron_e`, `photon_noise`, `out_dtype`, and any non-default electronics settings
+ *   (`flux_ph` when manual, `dark_e`, `gain_eadu`, `bias_adu`, `sat_adu`, closed `shutter`).
+ *
+ * Rationale:
+ *   Hiding `flux_ph` when `use_beam_flux == 1` prevents confusion over which parameter controls
+ *   exposure photometry while keeping manual-flux overrides explicit when `use_beam_flux == 0`.
+ */
 static void cw_write_det(
     cfg_writer_t             *w,
     const cacaosim_det_cfg_t *det,
@@ -1499,6 +1929,24 @@ static void cw_write_det(
               (det->out_dtype == CACAOSIM_DTYPE_F32) ? "float32" : "uint16");
 }
 
+/**
+ * cacaosim_bench_format_str() - Serialize a `cacaosim_bench_cfg_t` AST into canonical `.bench` INI
+ * @cfg: Read-only bench configuration to format (returns -1 if NULL).
+ * @buf: Optional output character buffer (NULL allowed when @cap == 0 for pass-1 sizing).
+ * @cap: Capacity of @buf in bytes.
+ *
+ * Role:
+ *   Formats the explanatory header banner, `[bench]` global block, and each `[<type>.<id>]` node
+ *   section (`[ttm.*]` for 2-axis `dm_mode == 1`, mode-relevant parameters for DM dynamics,
+ *   dichroics, coronagraphs, static WFEs, and multi-rate sensors).
+ *
+ * Rationale:
+ *   Emitting only mode-active parameters (e.g. `tau_us` for RC lag vs `f0_hz`/`zeta` for 2nd-order
+ *   oscillators; `rate_hz` when specified vs `navg` otherwise) produces clean configurations that
+ *   round-trip identically through `cacaosim_bench_parse_str()`.
+ *
+ * Return: Total formatted byte length (excluding NUL), or -1 if @cfg is NULL.
+ */
 int cacaosim_bench_format_str(
     const cacaosim_bench_cfg_t *cfg,
     char                       *buf,
@@ -1983,6 +2431,24 @@ int cacaosim_bench_format_str(
     return (int) w.len;
 }
 
+/**
+ * cacaosim_bench_save_file() - Format and write a `.bench` configuration cleanly to disk
+ * @path:    Destination file path (must be non-NULL and non-empty).
+ * @cfg:     Read-only bench configuration to serialize (must not be NULL).
+ * @err_buf: Optional diagnostic buffer receiving formatting or I/O errors (may be NULL).
+ * @err_cap: Capacity of @err_buf in bytes.
+ *
+ * Role:
+ *   Queries the exact formatted byte count via a pass-1 dry run of `cacaosim_bench_format_str()`,
+ *   allocates an exact-sized heap buffer, formats the configuration in pass 2, writes all bytes
+ *   to @path, and verifies both `fwrite()` and `fclose()` completion.
+ *
+ * Rationale:
+ *   Formatting into memory before opening the destination file ensures @path is never truncated
+ *   to zero bytes if `@cfg` is invalid or memory allocation fails.
+ *
+ * Return: 0 on success, -1 on invalid arguments, out-of-memory, or short/failed disk write.
+ */
 int cacaosim_bench_save_file(
     const char                 *path,
     const cacaosim_bench_cfg_t *cfg,

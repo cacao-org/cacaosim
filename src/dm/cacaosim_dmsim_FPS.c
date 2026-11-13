@@ -5,6 +5,26 @@
 /**
  * @file    cacaosim_dmsim_FPS.c
  * @brief   MILK_RUNNABLE compute unit for zonal DM / Tip-Tilt mirror hardware & in-line beam OPD
+ *
+ * Architectural Role:
+ *   Implements `cacaosim.dmsim` (`milk-fpsexec-cacaosim-dmsim`), the standalone
+ *   and plugin FPS wrapper around `cacaosim_dm_ctx_t`. Triggered by an upstream
+ *   actuator command stream (`.in_cmd`, e.g. CACAO's `dm00disp`), it steps DAC
+ *   quantization, stroke rails, fractional transport delay, and exact ZOH
+ *   kinematics, publishes the 2D reflective OPD map `.out_opd` `[um]`, and
+ *   optionally relays `.in_beam -> .out_beam` in line.
+ *
+ * Design Rationale & Motivation:
+ *   - Dual standalone vs inline beam modes: Publishing `.out_opd` unconditionally
+ *     provides full telemetry for CACAO response-matrix calibration and real-time
+ *     DM monitoring, while optionally subtracting `.out_opd` from `.in_beam`
+ *     (`out_opd_beam = in_opd_beam - dm_opd`, scaling spectrum by `.tput`) lets
+ *     multiple `cacaosim.dmsim` processes form cascaded Woofer -> Tweeter -> TTM
+ *     optical paths without auxiliary beam-combiner processes.
+ *   - Seamless CACAO stream interop: Automatically adopts `nx x ny` actuator
+ *     dimensions from an existing `.in_cmd` SHM stream (unless `dm_mode == 1`
+ *     Tip-Tilt forces `2x1`) and transparently promotes `UINT16` raw DAC command
+ *     streams to `float` alongside standard `FLOAT32` `[um]` command streams.
  */
 
 #include <stdint.h>
@@ -16,6 +36,11 @@
 #include "dm/cacaosim_dm.h"
 #include "dm/cacaosim_dmsim_FPS.h"
 
+/*
+ * Module-static FPS parameter backing storage for cacaosim.dmsim.
+ * Defaults model a 16x16 zonal DM on a 128x128 pupil grid with 15% inter-actuator coupling,
+ * +-5 um mechanical stroke, 16-bit DAC, and 150 us 1st-order RC settling at 2 kHz (dt = 0.5 ms).
+ */
 static char     param_in_cmd[FUNCTION_PARAMETER_STRMAXLEN]   = "dm00disp";
 static char     param_out_opd[FUNCTION_PARAMETER_STRMAXLEN]  = "csim_dmopd";
 static char     param_in_beam[FUNCTION_PARAMETER_STRMAXLEN]  = "";
@@ -44,6 +69,37 @@ static float    param_rot_deg                                = 0.0f;
 static float    param_mag_scale                              = 1.0f;
 static int32_t  param_backend                                = 0;
 
+/**
+ * CACAOSIM_DMSIM_PARAMS(X) - X-macro FPS parameter table for `cacaosim.dmsim`
+ *
+ * Parameters:
+ *   - `.in_cmd`       (STREAMNAME, trigger): Actuator stroke stream [um] (`FLOAT32` or `UINT16`).
+ *   - `.out_opd`      (STREAMNAME, required): Output `[nwf x nwf]` `FLOAT32` DM OPD stream [um].
+ *   - `.in_beam`      (STRING): Optional upstream `[nwf x nwf x 2]` `FLOAT32` optical beam.
+ *   - `.out_beam`     (STRING): Optional downstream `[nwf x nwf x 2]` `FLOAT32` corrected beam
+ *                     (`OPD_out = OPD_in - dm_opd`, skipped if empty `""`).
+ *   - `.dm_mode`      (INT32): `0` = 2D zonal DM (`nx x ny`), `1` = 2-axis Tip-Tilt mirror (`2x1`).
+ *   - `.nwf`          (UINT32): Output 2D wavefront grid dimension [pixels] (`>= 8`).
+ *   - `.nact_x`, `.nact_y` (UINT32): Fallback actuator counts when `.in_cmd` is auto-created.
+ *   - `.dm_diam`      (FLOAT32): Active DM actuator span as fraction of `nwf`.
+ *   - `.if_coupling`  (FLOAT32): Gaussian influence coupling at 1 actuator pitch `[0.005..0.45]`.
+ *   - `.refl_scale`   (FLOAT32): Optical OPD [um] per mechanical stroke [um] (`2.0` reflection).
+ *   - `.tput`         (FLOAT32, WRITERUN): Mirror reflectivity `[0..1]` scaling `.out_beam` flux.
+ *   - `.max_stroke`   (FLOAT32, WRITERUN): Bipolar stroke limit [um] (`<= 0` disables rail/DAC).
+ *   - `.dac_bits`     (INT32): DAC bit depth `[4..24]` over `[-max_stroke, +max_stroke]` (`0`=off).
+ *   - `.nonlin_quad`  (FLOAT32): Quadratic electrostrictive coefficient `k_nl` [1/um].
+ *   - `.dyn_mode`     (INT32): `0` = instant, `1` = 1st-order RC, `2` = 2nd-order oscillator.
+ *   - `.dt_sec`       (FLOAT32): Physics integration step [s] (`0.0005` = 2 kHz).
+ *   - `.tau_sec`      (FLOAT32, WRITERUN): 1st-order RC `1/e` time constant [s] (`dyn_mode == 1`).
+ *   - `.f0_hz`        (FLOAT32): 2nd-order natural resonance frequency [Hz] (`dyn_mode == 2`).
+ *   - `.zeta`         (FLOAT32): 2nd-order viscous damping ratio (`dyn_mode == 2`).
+ *   - `.delay_frames` (FLOAT32, WRITERUN): Pure transport delay [frames, fractional supported].
+ *   - `.shift_x`, `.shift_y` (FLOAT32): DM-to-pupil lateral registration shift [pixels].
+ *   - `.rot_deg`      (FLOAT32): DM-to-pupil counter-clockwise rotation [degrees].
+ *   - `.mag_scale`    (FLOAT32): DM-to-pupil isotropic magnification (`1.0` = unity).
+ *   - `.in_flat`      (STRING): Optional `[nwf x nwf]` `FLOAT32` static DM figure error OPD [um].
+ *   - `.backend`      (INT32): `0` = auto (CUDA if available), `1` = CPU, `2` = CUDA.
+ */
 #define CACAOSIM_DMSIM_PARAMS(X)                                                        \
     X(".in_cmd", param_in_cmd, FPTYPE_STREAMNAME, 1,                                    \
       FPFLAG_DEFAULT_INPUT | FPFLAG_TRIGGER_STREAM,                                     \
@@ -107,6 +163,20 @@ static int32_t  param_backend                                = 0;
 
 MILK_PARAMS_DEFINE(cacaosim_dmsim, CACAOSIM_DMSIM_PARAMS);
 
+/**
+ * dmsim_confcheck() - Enforce `FPFLAG_WRITERUN` on live-tunable DM hardware parameters
+ *
+ * Role:
+ *   FPS `confcheck` hook preserving live run-time writability on `.max_stroke`,
+ *   `.tau_sec`, `.delay_frames`, and `.tput` across FPS reloads.
+ *
+ * Rationale:
+ *   Enables real-time closed-loop experiments where actuator saturation limits,
+ *   servo transport latency, RC bandwidth, or mirror reflectivity are perturbed on
+ *   the fly via `cacaosim-CTRL` or `milk-fps-set` without tearing down the DM loop.
+ *
+ * Return: Always `RETURN_SUCCESS`.
+ */
 static MILK_COLD errno_t dmsim_confcheck(void)
 {
     if (dcfpsptr != NULL)
@@ -124,6 +194,25 @@ static MILK_COLD errno_t dmsim_confcheck(void)
     return RETURN_SUCCESS;
 }
 
+/**
+ * dmsim_compute() - Real-time FPS loop stepping DM physics, `.out_opd`, and inline `.out_beam`
+ * @self: Pointer to `runnable_cacaosim_dmsim` descriptor
+ *
+ * Role:
+ *   Connects (or creates) `.in_cmd` and `.out_opd`, optionally attaches `.in_beam`,
+ *   `.out_beam`, and `.in_flat`, initializes `cacaosim_dm_ctx_t` (CPU or CUDA), and
+ *   steps the DM hardware model on every `.in_cmd` trigger event.
+ *
+ * Rationale:
+ *   - Supports both standalone OPD synthesis (`.out_beam` empty) and inline optical
+ *     beam correction (`.out_beam` set), subtracting `dm_opd` from `.in_beam` via
+ *     `cacaosim_beam_apply_dm_cpu()` to model phase conjugation on reflection.
+ *   - Pre-allocates `cmd_f32` once outside the loop only when `.in_cmd` is non-float
+ *     (e.g. `UINT16`), upholding the strict zero-allocation hot-loop invariant.
+ *
+ * Return: `RETURN_SUCCESS` on clean loop exit, or `RETURN_FAILURE` on invalid
+ *         parameters, SHM failure, or `cacaosim_dm_init()` error.
+ */
 static MILK_HOT errno_t dmsim_compute(const MILK_RUNNABLE *self)
 {
     if (param_in_cmd[0] == '\0' || param_out_opd[0] == '\0' || param_nwf < 8)
@@ -131,6 +220,7 @@ static MILK_HOT errno_t dmsim_compute(const MILK_RUNNABLE *self)
         return RETURN_FAILURE;
     }
 
+    /* Connect existing CACAO command stream (e.g. dm00disp) or create fallback nx x ny stream */
     uint32_t req_nx = (param_dm_mode == 1) ? 2u : param_nact_x;
     uint32_t req_ny = (param_dm_mode == 1) ? 1u : param_nact_y;
 
@@ -146,6 +236,7 @@ static MILK_HOT errno_t dmsim_compute(const MILK_RUNNABLE *self)
         return RETURN_FAILURE;
     }
 
+    /* Adopt actual SHM command grid dimensions (forced to 2x1 in 2-axis Tip-Tilt mode) */
     uint32_t nx   = (param_dm_mode == 1) ? 2u : img_cmd.md->size[0];
     uint32_t ny   = (param_dm_mode == 1)
                         ? 1u
@@ -164,6 +255,7 @@ static MILK_HOT errno_t dmsim_compute(const MILK_RUNNABLE *self)
         return RETURN_FAILURE;
     }
 
+    /* Optionally attach inline optical beam streams (.in_beam -> .out_beam) and static flat OPD */
     IMGID img_in_beam  = { 0 };
     IMGID img_out_beam = { 0 };
     IMGID img_flat     = { 0 };
@@ -221,6 +313,7 @@ static MILK_HOT errno_t dmsim_compute(const MILK_RUNNABLE *self)
         .backend      = param_backend,
     };
 
+    /* Precompute 16-tap gather stencil and allocate aligned CPU / optional CUDA buffers */
     cacaosim_dm_ctx_t dm_ctx;
     if (cacaosim_dm_init(&dm_ctx, &cfg, NULL) != 0)
     {
@@ -241,6 +334,7 @@ static MILK_HOT errno_t dmsim_compute(const MILK_RUNNABLE *self)
         return RETURN_FAILURE;
     }
 
+    /* Pre-allocate conversion buffer only when .in_cmd uses integer (e.g. UINT16) datatype */
     float *cmd_f32 = NULL;
     if (img_cmd.md->datatype != _DATATYPE_FLOAT)
     {
@@ -253,6 +347,7 @@ static MILK_HOT errno_t dmsim_compute(const MILK_RUNNABLE *self)
     MILK_PROCINFO_INIT(self)
     MILK_PROCINFO_LOOPSTART(self)
     {
+        /* Lazily reconnect upstream beam if launched asynchronously after dmsim */
         if (img_in_beam.ID == -1 && param_in_beam[0] != '\0')
         {
             img_in_beam = stream_connect(param_in_beam);
@@ -279,11 +374,13 @@ static MILK_HOT errno_t dmsim_compute(const MILK_RUNNABLE *self)
             flat_ptr = img_flat.im->array.F;
         }
 
+        /* Mode A (always active): step DM hardware physics and publish 2D .out_opd [um] */
         img_opd.md->write = 1;
         cacaosim_dm_step(&dm_ctx, cmd_ptr, flat_ptr, param_delay_fr, param_tau_sec,
                          param_max_stroke, img_opd.im->array.F);
         processinfo_update_output_stream(processinfo, img_opd.im, img_cmd.im);
 
+        /* Mode B (optional inline relay): subtract reflective DM OPD & scale beam reflectivity */
         if (img_out_beam.ID != -1)
         {
             const float *b_opd = NULL;
@@ -330,6 +427,7 @@ static MILK_HOT errno_t dmsim_compute(const MILK_RUNNABLE *self)
     return RETURN_SUCCESS;
 }
 
+/* Public MILK_RUNNABLE registration and standalone milk-fpsexec-cacaosim-dmsim export */
 const MILK_RUNNABLE runnable_cacaosim_dmsim = {
     .kind = MILK_RUNNABLE_FPS,
     .app  = { .fps_name    = "csim_dmsim",

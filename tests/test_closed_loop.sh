@@ -2,20 +2,60 @@
 # SPDX-FileCopyrightText: 2026 Olivier Guyon et al
 # SPDX-License-Identifier: LGPL-3.0-or-later
 #
+# =================================================================================================
 # test_closed_loop.sh — End-to-end SHM IPC, fpsexec, multi-stage .bench & milkatmturb test
+# =================================================================================================
+#
+# Architectural Role:
+#   System-level UNIX process & POSIX shared-memory (`ImageStreamIO` + Function Parameter Structure
+#   `milk_fps`) integration suite for `cacaosim`. Exercises all 11 standalone `milk-fpsexec-*`
+#   executables, the `cacaosim-bench` turnkey orchestrator in both `fused` and `modular` topologies,
+#   the `cacaosim-bench-view` schematic renderer, the interactive `cacaosim-CTRL` TUI inside a
+#   real pseudo-terminal (PTY), 3D polychromatic FITS mask streaming, `milkatmturb` phase-screen
+#   ingestion, and `milk-cli` lazy shared-library (`libmilkcacaosim.so`) loading.
+#
+# Design Rationale:
+#   1. Complementarity to C Unit Tests: `cacaosim_validate` proves analytical physics and CPU/CUDA
+#      parity in-process, whereas real `cacao` real-time control loops interact with `cacaosim`
+#      exclusively through `/dev/shm` streams (`.im.shm`), FPS parameter tables (`.fps.shm`),
+#      semaphore triggers (`triggermode = 3`), and lifecycle verbs (`fpsinit`, `run`, `runstart`,
+#      `runstop`). This script validates those exact IPC contracts end-to-end.
+#   2. Strict Sandbox Isolation (`MILK_SHM_DIR`): Allocates ephemeral per-run directories under
+#      `/dev/shm/cacaosim_test_XXXXXX` and `/tmp/cacaosim_work_XXXXXX` so parallel CTest jobs or
+#      runs on live telescope/laboratory RTC machines never collide with `/milk/shm`.
+#   3. Fused vs Modular Equivalence: Deploys `examples/two_stage_ao.bench` first as a single
+#      zero-copy `cacaosim.htsim` daemon (`--mode fused`) and then as a multi-process chain of
+#      semaphore-coupled `fpsexec` daemons (`--mode modular`), verifying that both topologies honor
+#      the same declarative `.bench` specification.
+# =================================================================================================
 
 set -euo pipefail
 
+# Resolve repository, CMake build tree, and local milk installation prefix (`_install/`).
 SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${1:-${SCRIPT_ROOT}/_build}"
 INSTALL_DIR="${2:-/home/oguyon/src-frameworkdev/milk/_install/milk-1.03.00}"
 
+# Provision isolated POSIX shared-memory (`MILK_SHM_DIR`) and scratch working directories so no
+# `.im.shm` or `.fps.shm` artifacts leak into host `/milk/shm` or collide across concurrent runs.
 TEST_SHM="$(mktemp -d /dev/shm/cacaosim_test_XXXXXX)"
 TEST_WORK="$(mktemp -d /tmp/cacaosim_work_XXXXXX)"
 export MILK_SHM_DIR="${TEST_SHM}"
 export PATH="${BUILD_DIR}:${SCRIPT_ROOT}/scripts:${INSTALL_DIR}/bin:${PATH}"
 export LD_LIBRARY_PATH="${BUILD_DIR}:${INSTALL_DIR}/lib:${LD_LIBRARY_PATH:-}"
 
+# -------------------------------------------------------------------------------------------------
+# cleanup() — Deterministic EXIT Trap for Daemon Teardown & Tmpfs Reclamation
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Halts any background FPS loops (`cacaosim-bench stop` and individual `runstop` dispatches),
+#   interrupts remaining child processes (`milkatmturb`), waits for exit, and removes `TEST_SHM`
+#   and `TEST_WORK`.
+#
+# Rationale:
+#   Daemonized `runstart` units run with `loopcntMax = -1` (infinite real-time loop). If any test
+#   assertion fails under `set -e`, ungraceful exit without `runstop` would leave orphaned RT
+#   processes spinning in background and leak tmpfs RAM in `/dev/shm`.
 cleanup() {
     cacaosim-bench stop >/dev/null 2>&1 || true
     for unit in htsim mkbeam fpcam pyrwfs shwfs zwfs coro beamsplit dmsim wfe; do
@@ -29,6 +69,18 @@ trap cleanup EXIT
 
 cd "${TEST_WORK}"
 
+# -------------------------------------------------------------------------------------------------
+# Stage [1/8]: Standalone Executable Help Flags & Zero `libCLIcore` Linkage Audit
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Invokes `-h1` / `-h2` / `-hm` self-documentation flags on all 11 `milk-fpsexec-cacaosim-*`
+#   units, `cacaosim-bench-view`, and `cacaosim-CTRL`, and inspects their ELF dynamic symbol tables
+#   with `ldd` to verify `libCLIcore` is absent.
+#
+# Rationale:
+#   Per the `milk_module_example` architecture, standalone `fpsexec` and TUI binaries must link
+#   only lightweight `milk_fps` / `ImageStreamIO` libraries and never pull in `libCLIcore.so`
+#   (which brings heavy interactive CLI interpreter state and startup overhead).
 echo "=== [1/8] Checking fpsexec & visualizer -h1 help & zero CLIcore linkage ==="
 ALL_UNITS=(mkpupil mkbeam wfe dmsim beamsplit coro pyrwfs shwfs zwfs fpcam htsim)
 for unit in "${ALL_UNITS[@]}"; do
@@ -58,6 +110,17 @@ if ldd "$(command -v cacaosim-CTRL)" | grep -q "libCLIcore"; then
 fi
 echo "  [PASS] cacaosim-CTRL (-h1/-h2/-hm OK, no libCLIcore)"
 
+# -------------------------------------------------------------------------------------------------
+# Stage [2/8]: One-Shot Static Stream Provisioning (Pupil, NCPA [um] & Static WFE [m])
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Executes `mkpupil` (`--no-procinfo exec`) and `wfe` (`.init_only=ON`) to synthesize persistent
+#   shared-memory maps `csim_pup`, `csim_ncpa` [um], and `csim_wfe_m` [OPD meter].
+#
+# Rationale:
+#   Verifies synchronous one-shot execution (`exec` without FPS daemonization) used to pre-populate
+#   calibration/geometry streams prior to starting continuous optical loops, including SI `[meter]`
+#   wavefront error stream generation (`65 nm` RMS -> `6.5e-8 m`).
 echo "=== [2/8] Testing oneshot pupil + NCPA + static WFE [meter] stream creation ==="
 milk-fpsexec-cacaosim-mkpupil --no-procinfo exec \
     .nwf=128 \
@@ -77,6 +140,22 @@ test -f "${TEST_SHM}/csim_ncpa.im.shm"
 test -f "${TEST_SHM}/csim_wfe_m.im.shm"
 echo "  [PASS] csim_pup, csim_ncpa, and csim_wfe_m [OPD m] created in ${TEST_SHM}"
 
+# -------------------------------------------------------------------------------------------------
+# Stage [3/8]: Modular Multi-Process Optical Beam Pipeline & 3D Polychromatic FITS Masks
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Steps every individual optical FPS unit sequentially (`fpsinit` -> `triggermode = 0`,
+#   `loopcntMax = 5` -> `run`) across a full branched ExAO optical train:
+#     mkbeam -> wfe -> dmsim -> beamsplit (1.00 um LP)
+#       |-- refl (Vis): shwfs (aol0_shwfs) + pyrwfs (aol0_wfsim)
+#       +-- trans (NIR): coro -> zwfs (aol0_zwfs) + fpcam (csim_fpcam / csim_fplong)
+#   Also generates 3D WCS-tagged (`CRVAL3`/`CDELT3`/`CUNIT3 = 'um'`) pupil-amplitude and focal-
+#   phase FITS cubes and propagates them through `coro` (`coro_mode = 4` custom MFT) + `fpcam`.
+#
+# Rationale:
+#   Proves that 2-slice `[OPD_um, Amplitude]` SHM beam cubes and their 32-bin spectral photometry
+#   keywords serialize and deserialize cleanly across independent OS processes, and verifies FITS
+#   3D polychromatic mask loading through the FPS CLI parameter interface.
 echo "=== [3/8] Testing modular beam pipeline (mkbeam -> wfe -> dm -> split -> shwfs + coro) ==="
 milk-fpsexec-cacaosim-mkbeam fpsinit \
     .nwf=128 \
@@ -193,6 +272,8 @@ milk-fpsexec-cacaosim-fpcam run
 test -f "${TEST_SHM}/csim_fpcam.im.shm"
 test -f "${TEST_SHM}/csim_fplong.im.shm"
 
+# Synthesize 4-wavelength (1.50..1.80 um) big-endian IEEE-754 float32 FITS cubes with spectral WCS
+# cards and verify custom 3D polychromatic coronagraph + focal-plane camera SHM execution.
 if command -v python3 >/dev/null 2>&1; then
     P3_FITS="${TEST_WORK}/pup_apod_3d.fits"
     F3_FITS="${TEST_WORK}/fpm_pha_3d.fits"
@@ -254,6 +335,17 @@ PYEOF
 fi
 echo "  [PASS] Modular optical beam + 3D custom coronagraph masks + WFS + FPcam verified"
 
+# -------------------------------------------------------------------------------------------------
+# Stage [4/7]: Flat Fused `htsim`, Live `milkatmturb` Stream & Default `cacaosim-bench` Lifecycle
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Streams dynamic 0.6"-seeing phase screens (`outarraypha`) from `milk-fpsexec-atmturb-mkwfs`
+#   (if installed) into `cacaosim.htsim` at 2 kHz (`fp_navg = 5`), then tests default single-stage
+#   daemonized `cacaosim-bench start / status / stop` orchestration.
+#
+# Rationale:
+#   Confirms zero-copy fused single-stage compatibility with live external `milk` turbulence
+#   streams and validates background FPS daemon start/stop PID and unit tracking.
 echo "=== [4/7] Testing fused htsim + milkatmturb live stream + default cacaosim-bench ==="
 if command -v milk-fpsexec-atmturb-mkwfs >/dev/null 2>&1; then
     milk-fpsexec-atmturb-mkwfs --no-procinfo exec \
@@ -288,6 +380,17 @@ cacaosim-bench status >/dev/null
 cacaosim-bench stop
 echo "  [PASS] Flat fused htsim + milkatmturb + cacaosim-bench start/status/stop verified"
 
+# -------------------------------------------------------------------------------------------------
+# Stage [5/7]: Declarative 2-Stage `.bench` DAG in Fused Zero-Hop Mode (`two_stage_ao.bench`)
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Clears `TEST_SHM`, deploys `examples/two_stage_ao.bench` inside a single `cacaosim.htsim`
+#   process (`--mode fused`), and asserts creation of all hardware boundary SHM streams (`dm01disp`,
+#   `dm02disp`, `aol1_wfsim`, `aol2_wfsim`, `csim_fpcam`, `csim_fplong`).
+#
+# Rationale:
+#   Verifies that fused `.bench` execution exposes the exact DM command and WFS/science camera SHM
+#   interfaces expected by `cacao` loops `aol1` and `aol2` without creating intermediate beam IPC.
 echo "=== [5/7] Testing 2-stage .bench DAG in FUSED mode (two_stage_ao.bench) ==="
 rm -f "${TEST_SHM}"/*.im.shm "${TEST_SHM}"/*.fps.shm
 cacaosim-bench start --config "${SCRIPT_ROOT}/examples/two_stage_ao.bench" --mode fused --rate 600
@@ -298,6 +401,18 @@ done
 cacaosim-bench stop
 echo "  [PASS] Fused two_stage_ao.bench streams (dm01disp, dm02disp, aol1/2_wfsim, fpcam) OK"
 
+# -------------------------------------------------------------------------------------------------
+# Stage [6/7]: Declarative 2-Stage `.bench` DAG in Modular Multi-Process FPS Mode
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Clears `TEST_SHM`, deploys the same `examples/two_stage_ao.bench` file via `--mode modular`,
+#   and asserts creation of both intermediate optical beam SHM streams (`b_pup`, `b_post_dm1`,
+#   `b_nir_wfs`, `b_stg2_in`, `b_post_dm2`) and endpoint DM/WFS streams.
+#
+# Rationale:
+#   Validates the `awk`-synthesized multi-process launcher in `cacaosim-bench`, confirming that
+#   semaphore-triggered (`triggermode = 3`) downstream FPS daemons wake up and propagate frames
+#   driven by root `csim_mkbeam` (`triggermode = 0`).
 echo "=== [6/7] Testing 2-stage .bench DAG in MODULAR FPS mode (two_stage_ao.bench) ==="
 rm -f "${TEST_SHM}"/*.im.shm "${TEST_SHM}"/*.fps.shm
 cacaosim-bench start --config "${SCRIPT_ROOT}/examples/two_stage_ao.bench" --mode modular --rate 300
@@ -308,6 +423,21 @@ done
 cacaosim-bench stop
 echo "  [PASS] Modular two_stage_ao.bench multi-process beam & sensor streams OK"
 
+# -------------------------------------------------------------------------------------------------
+# Stage [7/8]: Edit -> Visualize -> Deploy Workflow & Interactive PTY `cacaosim-CTRL` Verification
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   1. Generates a starter `.bench` template (`--init`), customizes actuator count, checks offline
+#      `STANDBY` rendering and `--theme night` palette, deploys live via `--deploy --mode fused`,
+#      and verifies transition to `SHM LIVE` telemetry badges.
+#   2. Spawns `cacaosim-CTRL` attached to a real `128x40` pseudo-terminal (`pty.openpty()`), injects
+#      interactive keystrokes (ExAO preset -> add DM -> add WFE -> cycle F2..F6 tabs -> save ->
+#      quit), and checks synchronized-output CSI sequences plus valid saved `.bench` output.
+#
+# Rationale:
+#   Exercises real TTY `TIOCSWINSZ` window sizing, raw-mode escape-sequence parsing, DEC Mode 2026
+#   flicker-free synchronized frame commits (`\x1b[?2026h`), and alternate-screen restoration
+#   (`\x1b[?1049l`) that headless string rendering alone cannot test.
 echo "=== [7/8] Testing edit -> visualize -> deploy & run workflow (cacaosim-bench-view) ==="
 rm -f "${TEST_SHM}"/*.im.shm "${TEST_SHM}"/*.fps.shm
 CUSTOM_BENCH="${TEST_WORK}/custom_edit_test.bench"
@@ -333,6 +463,8 @@ grep -q "SHM LIVE" <<<"${VIEW_LIVE}"
 cacaosim-bench stop
 echo "  [PASS] Edit .bench -> visualize -> deploy & run -> SHM LIVE indicator verified"
 
+# Drive `cacaosim-CTRL` interactively inside a `128x40` pseudo-terminal (`pty.openpty()`) to test
+# preset selection, node addition, F-key view switching, `.bench` file saving, and clean TTY exit.
 if command -v python3 >/dev/null 2>&1; then
     PTY_BENCH="${TEST_WORK}/pty_ctrl_built.bench"
     python3 - "${PTY_BENCH}" <<'PYEOF'
@@ -384,6 +516,17 @@ PYEOF
     echo "  [PASS] cacaosim-CTRL interactive PTY (preset -> add DM+WFE -> F2..F6 -> save -> quit)"
 fi
 
+# -------------------------------------------------------------------------------------------------
+# Stage [8/8]: Dynamic `milk-cli` Shared-Library Plugin Loading (`libmilkcacaosim.so`)
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   When `milk-cli` and `libmilkcacaosim.so` are installed under `INSTALL_DIR`, verifies that the
+#   `milk` command-line interpreter lazy-loads `cacaosim.*` commands (`pyrwfs`, `shwfs`, `coro`,
+#   `wfe`, `mkpupil`) via `MILK_MODULE_RUNNABLES` and creates a 64x64 pupil SHM stream.
+#
+# Rationale:
+#   Ensures binary ABI and runnable-registration compatibility with interactive `milk` / `cacao`
+#   CLI scripts in addition to standalone `milk-fpsexec-cacaosim-*` executables.
 echo "=== [8/8] Testing milk-cli dynamic module load (cacaosim) ==="
 if [[ -x "${INSTALL_DIR}/bin/milk-cli" && -f "${INSTALL_DIR}/lib/libmilkcacaosim.so" ]]; then
     CLI_OUT="$("${INSTALL_DIR}/bin/milk-cli" -q -c \

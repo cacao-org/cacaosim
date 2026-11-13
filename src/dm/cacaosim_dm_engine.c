@@ -5,6 +5,29 @@
 /**
  * @file    cacaosim_dm_engine.c
  * @brief   DM actuator electronics, exact discrete ZOH kinematics, and 16-tap gather OPD engine
+ *
+ * Architectural Role:
+ *   Implements the hardware-physics state machine and CPU 2D OPD surface
+ *   synthesizer declared in `cacaosim_dm.h` for both 2D zonal Deformable Mirrors
+ *   (`dm_mode == 0`) and 2-axis Tip-Tilt Mirrors (`dm_mode == 1`).
+ *
+ * Design Rationale & Motivation:
+ *   - Unified 16-tap gather representation: Encoding both 2D Gaussian actuator
+ *     influence functions (with inverse affine DM-to-pupil registration) and
+ *     2-axis Tip-Tilt linear ramps into the same `[npix_wf * 16]` `(idx, weight)`
+ *     table lets CPU and CUDA hot loops execute a single branchless 16-tap dot
+ *     product per pixel regardless of mirror type or misregistration angle.
+ *   - Unclipped 4x4 lattice partition-of-unity normalization: Discrete Gaussian
+ *     actuator lattices exhibit periodic "print-through" ripple under uniform
+ *     piston commands unless normalized by the local lattice sum. Evaluating the
+ *     normalization denominator over the unclipped 4x4 infinite-lattice stencil
+ *     eliminates interior print-through completely while preserving natural
+ *     free-boundary roll-off outside the outermost actuator ring.
+ *   - Exact analytical Zero-Order Hold (ZOH) kinematics: Using closed-form 1st-
+ *     and 2nd-order state-transition matrices (handling underdamped, critically
+ *     damped, and overdamped regimes analytically) guarantees unconditional
+ *     numerical stability and exact phase/amplitude response at arbitrary ratios
+ *     of `dt_sec` to `tau_sec` or resonance period `1 / f0_hz`.
  */
 
 #include <math.h>
@@ -19,6 +42,26 @@
 
 /**
  * dm_build_gather_stencil() - Precompute 4x4 nearest-actuator or 2-axis TTM weights per WF pixel
+ * @ctx: DM context with allocated `stencil_idx` and `stencil_w` arrays (`[npix_wf * 16]`)
+ *
+ * Role:
+ *   Cold-path geometry builder called once by `cacaosim_dm_init()` before any
+ *   optional H2D upload to CUDA. Maps every 2D wavefront pixel `(ix, jy)` through
+ *   the inverse 2D affine DM-to-pupil registration transform and populates its
+ *   16 gather indices and `refl_scale`-weighted influence coefficients.
+ *
+ * Rationale:
+ *   - For `dm_mode == 1` (2-axis Tip-Tilt mirror), maps transformed pupil
+ *     coordinates `(ux, uy)` normalized to `[-1, +1]` at radius `span / 2` into
+ *     taps `0` and `1` (referencing actuators `0` and `1`) and zeros taps `2..15`,
+ *     so `pos[0]` and `pos[1]` directly command X and Y edge stroke in `[um]`.
+ *   - For `dm_mode == 0` (2D zonal DM), uses a Gaussian influence profile
+ *     `exp(-alpha * r^2)` with `alpha = -ln(if_coupling)` so inter-actuator
+ *     cross-coupling at `r = 1` pitch equals `if_coupling`. Normalizing by the
+ *     unclipped 4x4 lattice sum `lat_sum` enforces exact partition of unity
+ *     (`sum_k w_k = refl_scale`) across the interior so uniform actuator piston
+ *     yields zero spatial ripple, while zeroing out-of-bounds taps `(ax, ay)`
+ *     outside `[0, nx) x [0, ny)` preserves smooth free-edge mechanical roll-off.
  */
 static void MILK_COLD dm_build_gather_stencil(cacaosim_dm_ctx_t *ctx)
 {
@@ -30,6 +73,7 @@ static void MILK_COLD dm_build_gather_stencil(cacaosim_dm_ctx_t *ctx)
                                : 0.9375f;
     const float    span  = diam * (float) nwf;
     const float    ctr   = 0.5f * (float) (nwf - 1u);
+    /* Precompute inverse 2D affine transform: pupil pixel (ix, jy) -> DM frame */
     const float    sc    = (ctx->cfg.mag_scale > 1e-4f) ? ctx->cfg.mag_scale : 1.0f;
     const float    invs  = 1.0f / sc;
     const float    rad   = -ctx->cfg.rot_deg * (CACAOSIM_PI_F / 180.0f);
@@ -53,6 +97,7 @@ static void MILK_COLD dm_build_gather_stencil(cacaosim_dm_ctx_t *ctx)
                 float    uy   = (sr * vx + cr * vy) * inv_r;
                 uint64_t base = ((uint64_t) jy * nwf + ix) * CACAOSIM_DM_STENCIL;
 
+                /* Pack X and Y linear tilt planes into taps 0 & 1; pad taps 2..15 with zeros */
                 ctx->stencil_idx[base + 0] = 0;
                 ctx->stencil_w[base + 0]   = ctx->cfg.refl_scale * ux;
                 ctx->stencil_idx[base + 1] = (ctx->nact_total >= 2u) ? 1 : 0;
@@ -68,6 +113,7 @@ static void MILK_COLD dm_build_gather_stencil(cacaosim_dm_ctx_t *ctx)
         return;
     }
 
+    /* Zonal 2D actuator grid pitch (px, py) and origin (x0, y0) of actuator (0, 0) in WF pixels */
     const float px = (nx > 1u) ? (span / (float) (nx - 1u)) : span;
     const float py = (ny > 1u) ? (span / (float) (ny - 1u)) : span;
     const float x0 = ctr - 0.5f * (float) (nx - 1u) * px;
@@ -92,6 +138,7 @@ static void MILK_COLD dm_build_gather_stencil(cacaosim_dm_ctx_t *ctx)
 
         for (uint32_t ix = 0; ix < nwf; ix++)
         {
+            /* Map pupil pixel (ix, jy) into fractional actuator-grid coordinates (fx, fy) */
             float    vx   = (float) ix - ctr - shx;
             float    mx   = ctr + cr * vx - sr * vy;
             float    my   = ctr + sr * vx + cr * vy;
@@ -101,7 +148,11 @@ static void MILK_COLD dm_build_gather_stencil(cacaosim_dm_ctx_t *ctx)
             int      ay0  = (int) floorf(fy) - 1;
             uint64_t base = ((uint64_t) jy * nwf + ix) * CACAOSIM_DM_STENCIL;
 
-            /* Unclipped 4x4 lattice partition-of-unity denominator for flat piston response */
+            /*
+             * Unclipped 4x4 lattice partition-of-unity denominator for flat piston response:
+             * summing over the unbounded 4x4 grid prevents print-through ripple in the interior,
+             * while zeroing out-of-bounds taps below yields physical free-edge roll-off.
+             */
             float lat_sum = 0.0f;
             for (int dy = 0; dy < 4; dy++)
             {
@@ -133,6 +184,7 @@ static void MILK_COLD dm_build_gather_stencil(cacaosim_dm_ctx_t *ctx)
                     }
                     else
                     {
+                        /* Out-of-bounds tap safely indexes actuator 0 with zero weight */
                         ctx->stencil_idx[base + tap] = 0;
                         ctx->stencil_w[base + tap]   = 0.0f;
                     }
@@ -143,6 +195,24 @@ static void MILK_COLD dm_build_gather_stencil(cacaosim_dm_ctx_t *ctx)
     }
 }
 
+/**
+ * cacaosim_dm_init() - Precompute gather stencil and allocate CPU/CUDA DM state
+ * @ctx:         Destination DM context to initialize
+ * @cfg:         DM geometry, electronics, and kinematics configuration
+ * @ext_stream:  Optional external `cudaStream_t` (`void *`) to borrow (NULL = private stream)
+ *
+ * Role:
+ *   Cold-path constructor allocating all 64-byte aligned host buffers, building
+ *   the 16-tap gather stencil, and initializing CUDA device buffers when
+ *   `cfg->backend` permits GPU execution and a CUDA device is present.
+ *
+ * Rationale:
+ *   Enforces `2x1` actuator geometry in Tip-Tilt mode (`dm_mode == 1`), defaults
+ *   `refl_scale` to `2.0` (normal-incidence optical path doubling) and `dt_sec`
+ *   to `0.0005` s (`2 kHz`), and cleanly rolls back partial allocations on OOM.
+ *
+ * Return: `0` on success, `-1` on invalid arguments or host memory allocation failure.
+ */
 int MILK_COLD cacaosim_dm_init(
     cacaosim_dm_ctx_t       *ctx,
     const cacaosim_dm_cfg_t *cfg,
@@ -175,6 +245,7 @@ int MILK_COLD cacaosim_dm_init(
     size_t nact = ctx->nact_total;
     size_t ntap = (size_t) ctx->npix_wf * CACAOSIM_DM_STENCIL;
 
+    /* Allocate 64-byte cache-line aligned host buffers for AVX2/AVX-512 SIMD hot loops */
     ctx->cmd_ring =
         (float *) cacaosim_aligned_calloc(CACAOSIM_DM_MAX_DELAY * nact, sizeof(float));
     ctx->act_cmd_delayed = (float *) cacaosim_aligned_calloc(nact, sizeof(float));
@@ -193,6 +264,7 @@ int MILK_COLD cacaosim_dm_init(
 
     dm_build_gather_stencil(ctx);
 
+    /* Probe and initialize CUDA backend when requested (gracefully falls back to CPU on failure) */
     int want_cuda = (cfg->backend == CACAOSIM_BACKEND_AUTO ||
                      cfg->backend == CACAOSIM_BACKEND_CUDA);
     if (want_cuda && cacaosim_cuda_available())
@@ -206,6 +278,19 @@ int MILK_COLD cacaosim_dm_init(
     return 0;
 }
 
+/**
+ * cacaosim_dm_reset() - Zero actuator history, positions, and velocities
+ * @ctx: Initialized DM context (ignored if NULL)
+ *
+ * Role:
+ *   Clears the circular command delay ring buffer and actuator displacement/velocity
+ *   vectors back to zero rest state while keeping precomputed stencils and
+ *   dead-actuator masks intact.
+ *
+ * Rationale:
+ *   Provides fast deterministic state re-initialization between closed-loop AO
+ *   runs without incurring stencil recomputation or CUDA memory reallocation.
+ */
 void MILK_COLD cacaosim_dm_reset(cacaosim_dm_ctx_t *ctx)
 {
     if (ctx == NULL)
@@ -221,6 +306,18 @@ void MILK_COLD cacaosim_dm_reset(cacaosim_dm_ctx_t *ctx)
     ctx->ring_filled = 0;
 }
 
+/**
+ * cacaosim_dm_free() - Release all host and device buffers owned by DM context
+ * @ctx: DM context to destroy (ignored if NULL)
+ *
+ * Role:
+ *   Tears down optional CUDA device allocations, frees all aligned host arrays,
+ *   and zeroes `*ctx` to prevent dangling pointer reuse.
+ *
+ * Rationale:
+ *   Safe to invoke both at normal teardown and from `cacaosim_dm_init()` error
+ *   recovery when only a subset of buffers succeeded.
+ */
 void MILK_COLD cacaosim_dm_free(cacaosim_dm_ctx_t *ctx)
 {
     if (ctx == NULL)
@@ -241,6 +338,27 @@ void MILK_COLD cacaosim_dm_free(cacaosim_dm_ctx_t *ctx)
     __builtin_memset(ctx, 0, sizeof(*ctx));
 }
 
+/**
+ * cacaosim_dm_step_actuators() - Advance DAC, stroke clip, delay ring, and ZOH dynamics
+ * @ctx:          Active DM context
+ * @cmd_in:       Host actuator command array `[nact_total]` in mechanical stroke `[um]`
+ * @delay_frames: Live pure transport latency [frames] (`[0, CACAOSIM_DM_MAX_DELAY - 2]`)
+ * @tau_sec:      Live 1st-order RC time constant [s] (`dyn_mode == 1`)
+ * @max_stroke:   Live mechanical stroke rail [um] (`<= 0` disables clipping & DAC quantization)
+ *
+ * Role:
+ *   Hot-path actuator state-space integrator advancing drive electronics, pure
+ *   transport latency, and mechanical kinematics by one discrete step `cfg.dt_sec`.
+ *
+ * Rationale:
+ *   - Fractional frame delay via linear interpolation between ring-buffer slots
+ *     `t - floor(d)` and `t - floor(d) - 1` reproduces exact phase lag in AO
+ *     servo Bode responses without forcing fine sub-frame time steps.
+ *   - Analytical ZOH matrix exponentials (`[e(dt); v(dt)] = A(dt) [e(0); v(0)]`
+ *     where `e = pos - u`) compute scalar transition coefficients once outside the
+ *     `#pragma omp simd` loop, updating every actuator in 4 vector FMAs with zero
+ *     numerical damping or Courant/Euler step-size restrictions.
+ */
 void MILK_HOT cacaosim_dm_step_actuators(
     cacaosim_dm_ctx_t       *ctx,
     const float *__restrict  cmd_in,
@@ -279,11 +397,13 @@ void MILK_HOT cacaosim_dm_step_actuators(
         }
         if (do_dac)
         {
+            /* Uniform mid-round quantization over [-max_stroke, +max_stroke] in 2^B - 1 steps */
             float code = floorf((c + max_stroke) * inv_dac_q + 0.5f);
             c          = code * dac_q - max_stroke;
         }
         if (k_nl != 0.0f)
         {
+            /* Symmetric odd-function electrostrictive nonlinearity preserving stroke sign */
             c += k_nl * c * fabsf(c);
         }
         ring_slot[a] = c;
@@ -337,10 +457,12 @@ void MILK_HOT cacaosim_dm_step_actuators(
 
     if (mode == 0)
     {
+        /* Mode 0: Infinite-bandwidth instantaneous settling */
         __builtin_memcpy(pos, del, nact * sizeof(float));
     }
     else if (mode == 1)
     {
+        /* Mode 1: Exact 1st-order RC step response x(t+dt) = u + exp(-dt/tau) * (x(t) - u) */
         float alpha = (tau_sec > 1e-7f) ? expf(-dt / tau_sec) : 0.0f;
 #pragma omp simd
         for (uint32_t a = 0; a < nact; a++)
@@ -350,6 +472,10 @@ void MILK_HOT cacaosim_dm_step_actuators(
     }
     else
     {
+        /*
+         * Mode 2: Exact 2nd-order damped oscillator e'' + 2*zeta*w0*e' + w0^2*e = 0
+         * in tracking-error state coordinates e(t) = pos(t) - u, v(t) = vel(t).
+         */
         const float f0   = (ctx->cfg.f0_hz > 1.0f) ? ctx->cfg.f0_hz : 2500.0f;
         const float zeta = (ctx->cfg.zeta > 0.001f) ? ctx->cfg.zeta : 0.7f;
         const float w0   = CACAOSIM_TWO_PI_F * f0;
@@ -361,6 +487,7 @@ void MILK_HOT cacaosim_dm_step_actuators(
 
         if (zeta < 0.9999f)
         {
+            /* Underdamped regime (0 < zeta < 1): complex-conjugate poles -zeta*w0 +- i*wd */
             float wd = w0 * sqrtf(1.0f - zeta * zeta);
             float E  = expf(-zeta * w0 * dt);
             float C  = cosf(wd * dt);
@@ -373,6 +500,7 @@ void MILK_HOT cacaosim_dm_step_actuators(
         }
         else if (zeta <= 1.0001f)
         {
+            /* Critically damped regime (zeta ~ 1): repeated real pole -w0, avoiding wd -> 0 */
             float E = expf(-w0 * dt);
             a_ee    = E * (1.0f + w0 * dt);
             a_ev    = E * dt;
@@ -381,6 +509,7 @@ void MILK_HOT cacaosim_dm_step_actuators(
         }
         else
         {
+            /* Overdamped regime (zeta > 1): distinct negative real poles r1v, r2v */
             float gam = w0 * sqrtf(zeta * zeta - 1.0f);
             float r1v = -w0 * zeta + gam;
             float r2v = -w0 * zeta - gam;
@@ -406,6 +535,21 @@ void MILK_HOT cacaosim_dm_step_actuators(
     }
 }
 
+/**
+ * cacaosim_dm_render_opd_cpu() - Synthesize 2D DM OPD surface on CPU via 16-tap gather
+ * @ctx:      Active DM context with updated `ctx->act_pos`
+ * @flat_opd: Optional static DM flat/figure OPD map `[npix_wf]` in `[um]` (NULL -> `0`)
+ * @opd_out:  Destination host 2D reflective OPD buffer `[npix_wf]` in microns `[um]`
+ *
+ * Role:
+ *   Hot-path CPU spatial surface synthesizer evaluating the 16-tap gather stencil
+ *   across all `nwf * nwf` wavefront pixels.
+ *
+ * Rationale:
+ *   Gates OpenMP multi-threading on `npix >= 16384` (`>= 128x128`) so small grids
+ *   avoid thread-fork barrier latency while larger XAO grids scale linearly across
+ *   CPU cores with contiguous 64-byte aligned stencil reads.
+ */
 void MILK_HOT cacaosim_dm_render_opd_cpu(
     const cacaosim_dm_ctx_t *ctx,
     const float *__restrict  flat_opd,
@@ -438,6 +582,25 @@ void MILK_HOT cacaosim_dm_render_opd_cpu(
     }
 }
 
+/**
+ * cacaosim_dm_step() - Full DM step (actuators + 2D OPD surface on active backend)
+ * @ctx:          Active DM context
+ * @cmd_in:       Host actuator command array `[nact_total]` in mechanical stroke `[um]`
+ * @flat_opd:     Optional host static DM flat OPD `[npix_wf]` in `[um]` (NULL -> `0`)
+ * @delay_frames: Live transport delay [frames]
+ * @tau_sec:      Live 1st-order time constant [s]
+ * @max_stroke:   Live mechanical stroke limit [um]
+ * @host_opd_out: Destination host OPD buffer `[npix_wf]` [um] (NULL = keep in `ctx->d_opd_out`)
+ *
+ * Role:
+ *   Top-level per-frame DM physics and OPD synthesis entry point.
+ *
+ * Rationale:
+ *   Always advances actuator kinematics on CPU (`cacaosim_dm_step_actuators`), then
+ *   routes 2D spatial rendering to CUDA (`cacaosim_dm_cuda_render`) when `use_cuda`
+ *   is enabled and `flat_opd == NULL`, or to `cacaosim_dm_render_opd_cpu` when CPU
+ *   execution or a host-resident `flat_opd` overlay is requested.
+ */
 void MILK_HOT cacaosim_dm_step(
     cacaosim_dm_ctx_t       *ctx,
     const float *__restrict  cmd_in,

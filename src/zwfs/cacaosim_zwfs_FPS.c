@@ -5,6 +5,31 @@
 /**
  * @file    cacaosim_zwfs_FPS.c
  * @brief   MILK_RUNNABLE compute unit for Babinet MFT Zernike phase-contrast WFS and detector
+ *
+ * Architectural Role in cacaosim:
+ *   Implements the standalone FPS process (`cacaosim.zwfs`, `milk-fpsexec-cacaosim-zwfs`) that
+ *   connects `ImageStreamIO` shared-memory optical streams to the Babinet Matrix-DFT Zernike WFS
+ *   engine (`cacaosim_zwfs_ctx_t`). Supports both:
+ *   - Unified 3D `[nwf x nwf x 2]` optical beam streams (`in_beam`, e.g., coronagraphic `out_lowfs`
+ *     reflective focal-plane or Lyot-stop pickoffs and dichroic beamsplitter arms) with 32-bin
+ *     spectral band photometry and 2D pupil affine registration (`shift_x/y`, `rot_deg`,
+ *     `mag_scale`).
+ *   - Split 2D streams (`in_pup`, `in_wf`, `in_amp`, `in_dm`, `in_ncpa`) for classical single-arm
+ *     AO loop testing.
+ *
+ * Design Rationale & Physics / Algorithmic Motivation:
+ *   1. Exact Fine-Sampled Dimple Physics at Multi-kHz Loop Rates:
+ *      Zernike's `~1.06 lambda/D` (`pi/2` phase-shifting) focal dimple converts wavefront phase
+ *      directly into linear pupil-plane intensity interference with near-quantum-optimal photon
+ *      sensitivity, making it ideal for high-sensitivity AO and coronagraphic LOWFS tip-tilt /
+ *      low-order sensing. Using Babinet's principle (`Psi_out = Psi_pup + MFT^-1[(t_d*e^{i*phi}-1)
+ *      * D * MFT[Psi_pup]]`) replaces huge zero-padded 2D FFTs with four tiny `cblas_cgemm` /
+ *      `cublasCgemm` calls, easily sustaining multi-kHz CACAO real-time telemetry rates.
+ *   2. Multi-Subframe Exposure Integration & Deterministic Pacing:
+ *      Accumulating `navg` optical subframes per camera readout models physical exposure smearing
+ *      of fast turbulence/jitter before applying single-readout Poisson + RON + ADU quantization,
+ *      paced either by drift-free monotonic `TIMER_ABSTIME` deadlines (`frame_rate > 0`) or
+ *      upstream `FPFLAG_TRIGGER_STREAM` semaphore wakeup (`frame_rate == 0`).
  */
 
 #include <stdint.h>
@@ -18,6 +43,11 @@
 #include "zwfs/cacaosim_zwfs.h"
 #include "zwfs/cacaosim_zwfs_FPS.h"
 
+/*
+ * Static FPS parameter backing storage bound by CACAOSIM_ZWFS_PARAMS(X).
+ * Parameters marked with FPFLAG_WRITERUN can be tuned live during closed-loop execution (e.g.,
+ * guide-star flux, shutter state, turbulence gain, QE, exposure subframe averaging `navg`).
+ */
 static char     param_out_cam[FUNCTION_PARAMETER_STRMAXLEN] = "csim_zwfs";
 static char     param_in_beam[FUNCTION_PARAMETER_STRMAXLEN] = "";
 static char     param_in_wf[FUNCTION_PARAMETER_STRMAXLEN]   = "outarraypha";
@@ -58,6 +88,19 @@ static float    param_frame_rate                            = 0.0f;
 static uint64_t param_rng_seed                              = 34567;
 static int32_t  param_backend                               = 0;
 
+/**
+ * CACAOSIM_ZWFS_PARAMS() - X-macro table defining the FPS parameter schema for `cacaosim.zwfs`
+ * @X: Visitor `(key, ptr, type, required, flags, description)` expanded by `MILK_PARAMS_DEFINE`
+ *
+ * Groups parameters into:
+ *   1. Shared-memory stream bindings (`.out_cam`, `.in_dm`, `.in_beam`, `.in_wf`, `.in_amp`,
+ *      `.in_pup`, `.in_ncpa`).
+ *   2. Pupil, camera, and Zernike focal-dimple optical geometry (`.nwf`, `.ncam`, `.n_mft`,
+ *      `.pup_diam`, `.lambda_um`, `.dimple_ld`, `.dimple_rad`, `.dimple_amp`).
+ *   3. Spectral photometry, subframe integration, and 2D pupil registration (`.bw_frac`, `.qe`,
+ *      `.dt_exp`, `.use_beam_flux`, `.navg`, `.shift_x`, `.shift_y`, `.rot_deg`, `.mag_scale`).
+ *   4. Wavefront unit scaling, detector noise / quantization physics, pacing, and compute backend.
+ */
 #define CACAOSIM_ZWFS_PARAMS(X)                                                         \
     X(".out_cam", param_out_cam, FPTYPE_STREAMNAME, 1, FPFLAG_DEFAULT_INPUT,            \
       "Output 2D Zernike WFS camera stream")                                            \
@@ -154,6 +197,21 @@ static int32_t  param_backend                               = 0;
 
 MILK_PARAMS_DEFINE(cacaosim_zwfs, CACAOSIM_ZWFS_PARAMS);
 
+/**
+ * zwfs_confcheck() - Validate FPS configuration and enforce `FPFLAG_WRITERUN` on live parameters
+ *
+ * Role:
+ *   Cold-path FPS `confcheck` callback executed during `confstart` / parameter updates before the
+ *   real-time compute loop starts.
+ *
+ * Rationale:
+ *   Re-asserts `FPFLAG_WRITERUN` on runtime-tunable photometry, detector, shutter, turbulence, and
+ *   pacing parameters even when reconnecting to a pre-existing shared-memory FPS table created by
+ *   an older session, enabling live dark-frame acquisition (`shutter = OFF`) and magnitude sweeps
+ *   without restarting the WFS process.
+ *
+ * Return: `RETURN_SUCCESS`.
+ */
 static MILK_COLD errno_t zwfs_confcheck(void)
 {
     if (dcfpsptr != NULL)
@@ -175,6 +233,29 @@ static MILK_COLD errno_t zwfs_confcheck(void)
     return RETURN_SUCCESS;
 }
 
+/**
+ * zwfs_compute() - Main real-time FPS compute loop for the Zernike phase-contrast WFS unit
+ * @self: Pointer to the owning `MILK_RUNNABLE` instance
+ *
+ * Role:
+ *   Connects or creates input/output `ImageStreamIO` shared-memory streams, initializes the
+ *   Babinet Matrix-DFT ZWFS engine (`cacaosim_zwfs_init`), executes the paced or stream-triggered
+ *   optical integration and camera readout loop, publishes frames via
+ *   `processinfo_update_output_stream()`, and releases all resources on loop exit.
+ *
+ * Rationale:
+ *   - Synthesizes an anti-aliased default telescope pupil automatically when `in_pup` is absent so
+ *     standalone ZWFS / CACAO tests run out of the box with zero external setup scripts.
+ *   - Pre-creates `in_beam` (`[nwf x nwf x 2]`) with initialized beam keywords if requested before
+ *     upstream optical stages start, allowing arbitrary process startup ordering in `.bench` runs.
+ *   - Re-attempts lazy `stream_connect()` on optional split streams (`in_dm`, `in_wf`, `in_amp`)
+ *     each iteration until connected, supporting dynamic hot-plugging of DM and turbulence loops.
+ *   - Follows strict `ImageStreamIO` write ordering (`md->write = 1` before pixel mutation,
+ *     `processinfo_update_output_stream()` with trigger source provenance upon completion).
+ *
+ * Return: `RETURN_SUCCESS` on clean loop exit, or `RETURN_FAILURE` on invalid geometry or init
+ *         error.
+ */
 static MILK_HOT errno_t zwfs_compute(const MILK_RUNNABLE *self)
 {
     if (param_out_cam[0] == '\0' || param_nwf < 8 || param_ncam < 4)
@@ -194,6 +275,7 @@ static MILK_HOT errno_t zwfs_compute(const MILK_RUNNABLE *self)
     float       *fallback_pup = NULL;
     const float *pup_ptr      = NULL;
 
+    /* Connect upstream pupil stream if available; otherwise synthesize a fallback pupil mask */
     if (img_pup.ID != -1 && img_pup.md->datatype == _DATATYPE_FLOAT)
     {
         pup_ptr = img_pup.im->array.F;
@@ -228,6 +310,7 @@ static MILK_HOT errno_t zwfs_compute(const MILK_RUNNABLE *self)
     img_amp.ID     = -1;
     img_ncpa.ID    = -1;
 
+    /* Pre-create 3D [OPD_um, Amp] beam stream if needed so startup order is decoupled */
     if (param_in_beam[0] != '\0')
     {
         img_beam = stream_connect(param_in_beam);
@@ -306,6 +389,7 @@ static MILK_HOT errno_t zwfs_compute(const MILK_RUNNABLE *self)
         return RETURN_FAILURE;
     }
 
+    /* Allocate 2D pupil affine registration scratch only when non-identity alignment is set */
     cacaosim_reg_t reg = {
         .shift_x = param_shift_x,
         .shift_y = param_shift_y,
@@ -324,6 +408,7 @@ static MILK_HOT errno_t zwfs_compute(const MILK_RUNNABLE *self)
     MILK_PROCINFO_INIT(self)
     MILK_PROCINFO_LOOPSTART(self)
     {
+        /* Optional internal drift-free monotonic frame pacing when not semaphore-triggered */
         if (param_frame_rate > 0.1f)
         {
             uint64_t period_ns = (uint64_t) (1.0e9f / param_frame_rate);
@@ -331,6 +416,7 @@ static MILK_HOT errno_t zwfs_compute(const MILK_RUNNABLE *self)
             cacaosim_sleep_until(&deadline);
         }
 
+        /* Lazily attach late-starting upstream split streams without stalling the loop */
         if (img_dm.ID == -1 && param_in_dm[0] != '\0')
         {
             img_dm = stream_connect(param_in_dm);
@@ -347,6 +433,7 @@ static MILK_HOT errno_t zwfs_compute(const MILK_RUNNABLE *self)
         float eff_flux = param_flux_ph;
         if (img_beam.ID != -1 && cacaosim_beam_shm_is_valid(img_beam.im, nwf))
         {
+            /* Unified 3D beam mode: slice 0 = OPD [um], slice 1 = pupil amplitude */
             const float *b_opd = img_beam.im->array.F;
             const float *b_amp = img_beam.im->array.F + npix;
             if (reg_buf != NULL)
@@ -358,6 +445,7 @@ static MILK_HOT errno_t zwfs_compute(const MILK_RUNNABLE *self)
             }
             cacaosim_zwfs_accum_beam(&wfs_ctx, b_opd, b_amp, ncpa_ptr, NULL, NULL);
 
+            /* Integrate 32-bin beam photon spectrum across WFS passband and navg exposure window */
             cacaosim_spec_t b_spec;
             if (param_use_beam_flux && param_flux_ph >= 0.0f &&
                 cacaosim_beam_shm_read_spec(img_beam.im, &b_spec))
@@ -372,6 +460,7 @@ static MILK_HOT errno_t zwfs_compute(const MILK_RUNNABLE *self)
         }
         else
         {
+            /* Legacy split-stream mode: combine static pupil, atmospheric WF/amp, and DM OPD */
             const float *dm_ptr  = (img_dm.ID != -1 && img_dm.md->datatype == _DATATYPE_FLOAT &&
                                     img_dm.md->size[0] == nwf)
                                        ? img_dm.im->array.F
@@ -389,6 +478,7 @@ static MILK_HOT errno_t zwfs_compute(const MILK_RUNNABLE *self)
                                          NULL, param_turb_gain);
         }
 
+        /* Read out noisy detector frame and post SHM semaphores once navg subframes accumulate */
         uint32_t target_navg = (param_navg >= 1u) ? param_navg : 1u;
         if (wfs_ctx.subframe_cnt >= target_navg)
         {
@@ -450,6 +540,13 @@ static MILK_HOT errno_t zwfs_compute(const MILK_RUNNABLE *self)
     return RETURN_SUCCESS;
 }
 
+/**
+ * runnable_cacaosim_zwfs - Exported `MILK_RUNNABLE` definition for `cacaosim.zwfs`
+ *
+ * Role:
+ *   Binds the `csim_zwfs` FPS parameter table, `zwfs_confcheck` live-parameter validator, and
+ *   `zwfs_compute` real-time loop into both `libmilkcacaosim.so` and `milk-fpsexec-cacaosim-zwfs`.
+ */
 const MILK_RUNNABLE runnable_cacaosim_zwfs = {
     .kind = MILK_RUNNABLE_FPS,
     .app  = { .fps_name    = "csim_zwfs",

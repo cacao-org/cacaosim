@@ -5,6 +5,31 @@
 /**
  * @file    cacaosim_benchmark.c
  * @brief   Latency (mean / p50 / p99 us) and throughput (kHz) benchmark suite for cacaosim
+ *
+ * Architectural Overview & Benchmarking Philosophy
+ * ------------------------------------------------
+ * Adaptive Optics real-time control (RTC) loops operate at kilohertz frame rates (1..4 kHz) under
+ * strict per-frame jitter budgets: a single tail-latency spike caused by dynamic heap allocation,
+ * lazy FFT plan creation, cache thrashing, or uncaptured GPU kernel launch overhead stalls the WFS
+ * telemetry stream and injects servo lag into the closed loop.
+ *
+ * Consequently, reporting mean frame rate alone is insufficient for qualifying AO simulation
+ * kernels. This benchmark suite characterizes both standalone optical/hardware primitives and
+ * complete multi-rate optical bench DAGs across CPU (OpenMP SIMD + FFTW3f + CBLAS) and GPU (CUDA +
+ * cuFFT + cuBLAS + CUDA Graphs) backends using monotonic nanosecond timing (cacaosim_now_ns()):
+ *
+ *   1. Untimed Warm-Up Protocol: Every benchmark runs 20..25 untimed warm-up steps before sampling
+ *      to fault in aligned pages, spin up OpenMP worker threads, populate instruction/data caches,
+ *      and trigger first-step CUDA Graph stream capture/instantiation so timed samples reflect true
+ *      steady-state closed-loop execution.
+ *   2. Order-Statistic Telemetry: Reports arithmetic Mean [us], Median p50 [us], 99th-percentile
+ *      tail latency p99 [us], and sustained throughput [kHz = 1000 / mean_us] side by side.
+ *   3. End-to-End Parity: Measures individual components (DM, PyWFS, SHWFS, ZWFS, Coronagraph,
+ *      FPcam), zero-IPC fused single-stage pipelines (DM + PyWFS + decimated FPcam sharing one
+ *      CUDA stream and device OPD pointer), and declarative multi-stage .bench topologies loaded
+ *      from CACAOSIM_SRC_DIR (falling back to ".").
+ *   4. Graceful Hardware Fallback: When compiled without CUDA or executed on a host lacking a
+ *      CUDA-capable GPU, CUDA benchmark rows cleanly self-skip without failing the suite.
  */
 
 #include <stdint.h>
@@ -13,6 +38,22 @@
 
 #include "milkcacaosim.h"
 
+/**
+ * @brief Ascending qsort() comparator for double-precision latency arrays.
+ *
+ * Role:
+ *   Orders per-iteration latency measurements [us] from smallest to largest so non-parametric
+ *   empirical quantiles (median p50 and tail p99) can be indexed directly.
+ *
+ * Rationale:
+ *   Uses the branchless three-way idiom `(da > db) - (da < db)` rather than casting `da - db` to
+ *   `int`, preventing truncation-to-zero bugs when comparing sub-microsecond latency differences
+ *   (`|da - db| < 1.0 us`).
+ *
+ * @param[in] a  Pointer to first double sample.
+ * @param[in] b  Pointer to second double sample.
+ * @return -1 if `*a < *b`, 0 if `*a == *b`, or +1 if `*a > *b`.
+ */
 static int cmp_double(const void *a, const void *b)
 {
     double da = *(const double *) a;
@@ -20,6 +61,24 @@ static int cmp_double(const void *a, const void *b)
     return (da > db) - (da < db);
 }
 
+/**
+ * @brief Compute and print mean, p50, p99 latency [us] and throughput [kHz] for a benchmark run.
+ *
+ * Role:
+ *   Sorts `lat_us` in-place, evaluates the sample mean, median (`n / 2`), 99th percentile
+ *   (`0.99 * (n - 1)`), and sustained frame rate (`1000 / mean`), and formats one table row.
+ *
+ * Rationale:
+ *   Pairing `p50` and `p99` alongside `mean` immediately exposes OS scheduling jitter, OpenMP
+ *   barrier skew, or GPU synchronization stalls that would violate deterministic `TIMER_ABSTIME`
+ *   pacing in real-time `cacao` hardware-in-the-loop operation.
+ *
+ * @param[in]     label    Human-readable pipeline configuration description.
+ * @param[in]     backend  Active execution backend tag (`"CPU"` or `"CUDA"`).
+ * @param[in,out] lat_us   Array of `n` per-frame wall-clock latencies in microseconds (sorted
+ *                         in-place by this function).
+ * @param[in]     n        Number of timed iterations in `lat_us`.
+ */
 static void print_stats(const char *label, const char *backend, double *lat_us, int n)
 {
     qsort(lat_us, (size_t) n, sizeof(double), cmp_double);
@@ -36,6 +95,26 @@ static void print_stats(const char *label, const char *backend, double *lat_us, 
            p99, khz);
 }
 
+/**
+ * @brief Benchmark deformable mirror temporal dynamics and gather-stencil 2D OPD rendering.
+ *
+ * Role:
+ *   Measures full-step latency of `cacaosim_dm_step()`—including fractional command ring-buffer
+ *   lookup (`delay_frames = 1.0`), 16-bit DAC quantization, stroke saturation, exact 1st-order ZOH
+ *   actuator state update (`tau = 120 us`, `dt = 500 us`), and compact influence-function surface
+ *   evaluation (plus D2H transfer into host `opd` when running on CUDA).
+ *
+ * Rationale:
+ *   Evaluated at both `20x20 -> 128x128` (classical 8 m AO / Woofer scale) and `50x50 -> 256x256`
+ *   (2,500-actuator ExAO Tweeter scale) to verify that compact gather-stencil evaluation scales as
+ *   `O(N_wf^2)` independent of total actuator count `N_act^2`, sustaining multi-kHz rates. Twenty-
+ *   five untimed warm-up iterations prime the command delay ring and thread/GPU state.
+ *
+ * @param[in] nact     Linear actuator grid dimension (`nact x nact` actuators).
+ * @param[in] nwf      Wavefront OPD grid dimension (`nwf x nwf` pixels).
+ * @param[in] backend  Requested compute backend (`CACAOSIM_BACKEND_CPU` or `CUDA`).
+ * @param[in] niter    Number of timed iterations to record after warm-up.
+ */
 static void bench_dm(uint32_t nact, uint32_t nwf, int32_t backend, int niter)
 {
     cacaosim_dm_cfg_t cfg = {
@@ -63,6 +142,7 @@ static void bench_dm(uint32_t nact, uint32_t nwf, int32_t backend, int niter)
         cmd[i] = 0.2f;
     }
 
+    /* Warm up OpenMP threads / GPU context and fill the 1-frame command delay ring */
     for (int w = 0; w < 25; w++)
     {
         cacaosim_dm_step(&ctx, cmd, NULL, 1.0f, 0.00012f, 5.0f, opd);
@@ -84,6 +164,29 @@ static void bench_dm(uint32_t nact, uint32_t nwf, int32_t backend, int niter)
     free(cmd);
 }
 
+/**
+ * @brief Benchmark 4-sided Pyramid WFS diffractive propagation and noisy EMCCD readout.
+ *
+ * Role:
+ *   Measures per-frame latency of `cacaosim_pyrwfs_step()` across unmodulated (`mod_r = 0`) and
+ *   ring-modulated (`mod_r = 3 lambda/D`, `mod_n = 16` tip-tilt points) configurations, including
+ *   `2x`-padded FFT propagation, 4-quadrant intensity accumulation, Poisson photon shot noise,
+ *   sub-electron Gaussian readout noise (`0.5 e-`), and `uint16` quantization.
+ *
+ * Rationale:
+ *   Modulated Pyramid WFS dominates single-sensor compute cost in ExAO simulation because our
+ *   precomputed shifted-focal-mask reduction executes `1` forward pupil FFT plus `N_mod` inverse
+ *   FFTs (`17` 2D FFTs of size `(2 * nwf)^2` per frame when `mod_n = 16`). Running 20 warm-up
+ *   frames ensures one-time CUDA Graph capture completes before timing begins, isolating steady-
+ *   state `cudaGraphLaunch` replay performance against multi-threaded `FFTW3f` on CPU.
+ *
+ * @param[in] nwf      Input wavefront grid size (`nwf x nwf` pixels).
+ * @param[in] ncam     Output WFS detector size (`ncam x ncam` pixels).
+ * @param[in] mod_r    Circular modulation radius in units of `lambda / D` (`0.0` = unmodulated).
+ * @param[in] mod_n    Number of discrete modulation points around the ring when `mod_r > 0`.
+ * @param[in] backend  Requested compute backend (`CACAOSIM_BACKEND_CPU` or `CUDA`).
+ * @param[in] niter    Number of timed iterations to record after warm-up.
+ */
 static void bench_pyrwfs(uint32_t nwf, uint32_t ncam, float mod_r, int32_t mod_n, int32_t backend,
                          int niter)
 {
@@ -126,6 +229,7 @@ static void bench_pyrwfs(uint32_t nwf, uint32_t ncam, float mod_r, int32_t mod_n
     }
 
     double *lat = (double *) calloc((size_t) niter, sizeof(double));
+    /* Warm-up triggers initial CUDA Graph capture/instantiation on GPU and warms FFTW caches */
     for (int w = 0; w < 20; w++)
     {
         cacaosim_pyrwfs_step(&ctx, pup, NULL, wf, NULL, NULL, NULL, 1.0f, mod_r, &cfg.det, out,
@@ -151,6 +255,29 @@ static void bench_pyrwfs(uint32_t nwf, uint32_t ncam, float mod_r, int32_t mod_n
     free(pup);
 }
 
+/**
+ * @brief Benchmark focal-plane science PSF camera propagation (MFT vs FFT, mono vs broadband).
+ *
+ * Role:
+ *   Measures per-frame execution time of `cacaosim_fpcam_step()` (complex pupil phasor synthesis,
+ *   Fraunhofer propagation to focal plane, Strehl ratio telemetry, and Poisson + Gaussian `uint16`
+ *   detector readout) across Soummer Matrix-DFT (`prop_mode = 0`) and 2x-padded FFT
+ *   (`prop_mode = 1`), for both monochromatic (`nlam = 1`) and 20%-bandwidth polychromatic
+ *   (`nlam = 5`) H-band (`1.65 um`) configurations.
+ *
+ * Rationale:
+ *   Directly compares separable two-step complex GEMM (`cblas_cgemm` / strided-batched
+ *   `cublasCgemmStridedBatched`) at arbitrary `3.0 px / (lambda/D)` sampling against padded 2D
+ *   FFTs, and quantifies polychromatic batching efficiency when synthesizing broadband chromatic
+ *   speckle elongation across `nlam = 5` spectral channels.
+ *
+ * @param[in] nwf        Input pupil wavefront grid size (`nwf x nwf` pixels).
+ * @param[in] ncam       Output focal-plane detector size (`ncam x ncam` pixels).
+ * @param[in] prop_mode  Optical propagator (`0` = Soummer Matrix-DFT, `1` = padded 2D FFT).
+ * @param[in] nlam       Number of discrete spectral channels (`1` = mono, `> 1` = 20% broadband).
+ * @param[in] backend    Requested compute backend (`CACAOSIM_BACKEND_CPU` or `CUDA`).
+ * @param[in] niter      Number of timed iterations to record after warm-up.
+ */
 static void bench_fpcam(uint32_t nwf, uint32_t ncam, int32_t prop_mode, int32_t nlam,
                         int32_t backend, int niter)
 {
@@ -216,6 +343,27 @@ static void bench_fpcam(uint32_t nwf, uint32_t ncam, int32_t prop_mode, int32_t 
     free(pup);
 }
 
+/**
+ * @brief Benchmark the zero-IPC fused single-stage AO pipeline (DM + PyWFS + decimated FPcam).
+ *
+ * Role:
+ *   Measures per-master-tick latency of the core `cacaosim.htsim` fused loop: stepping the DM,
+ *   evaluating a 16-point modulated Pyramid WFS at 1:1 rate, accumulating instantaneous H-band
+ *   focal-plane subframes every tick, and executing noisy science detector readout every 10th tick
+ *   (`fp.subframe_cnt >= 10u`).
+ *
+ * Rationale:
+ *   Demonstrates the latency reduction achieved by sharing `dm.cuda_stream` across all three
+ *   engines and passing the device-resident `dm.d_opd_out` pointer directly into `pyrwfs` and
+ *   `fpcam` (`opd = NULL` on CUDA), completely eliminating intermediate host-device PCIe copies
+ *   and inter-process SHM semaphore round-trips on the critical WFS path.
+ *
+ * @param[in] nwf      Wavefront grid size (`nwf x nwf` pixels).
+ * @param[in] nact     Linear DM actuator count (`nact x nact` actuators).
+ * @param[in] nwfs     Pyramid WFS camera size (`nwfs x nwfs` pixels).
+ * @param[in] backend  Requested compute backend (`CACAOSIM_BACKEND_CPU` or `CUDA`).
+ * @param[in] niter    Number of timed master ticks to record after 20 warm-up ticks.
+ */
 static void bench_fused_htsim(uint32_t nwf, uint32_t nact, uint32_t nwfs, int32_t backend,
                               int niter)
 {
@@ -273,6 +421,7 @@ static void bench_fused_htsim(uint32_t nwf, uint32_t nact, uint32_t nwfs, int32_
         free(pup);
         return;
     }
+    /* Bind PyWFS and FPcam onto dm.cuda_stream for zero-sync GPU pipeline chaining */
     cacaosim_pyrwfs_init(&wfs, &wcfg, pup, NULL, dm.cuda_stream);
     cacaosim_fpcam_init(&fp, &fcfg, pup, NULL, dm.cuda_stream);
 
@@ -280,6 +429,7 @@ static void bench_fused_htsim(uint32_t nwf, uint32_t nact, uint32_t nwfs, int32_
     for (int k = -20; k < niter; k++)
     {
         uint64_t t0 = cacaosim_now_ns();
+        /* Keep DM OPD strictly in VRAM on CUDA (host opd = NULL) and pass dm.d_opd_out directly */
         cacaosim_dm_step(&dm, cmd, NULL, 1.0f, 0.00012f, 5.0f, dm.use_cuda ? NULL : opd);
         cacaosim_pyrwfs_step(&wfs, pup, NULL, wf, dm.use_cuda ? NULL : opd, NULL,
                              dm.use_cuda ? dm.d_opd_out : NULL, 1.0f, 3.0f, &wcfg.det, wout, NULL);
@@ -311,6 +461,25 @@ static void bench_fused_htsim(uint32_t nwf, uint32_t nact, uint32_t nwfs, int32_
     free(pup);
 }
 
+/**
+ * @brief Benchmark diffractive Shack-Hartmann lenslet array WFS propagation and detector readout.
+ *
+ * Role:
+ *   Measures per-frame latency of `cacaosim_shwfs_step()` across `n_sub x n_sub` lenslets (`pps`
+ *   detector pixels per lenslet, `pad_factor = 2` per-subaperture FFTs) including Poisson photon
+ *   shot noise, `0.5 e-` readout noise, and `uint16` detector quantization.
+ *
+ * Rationale:
+ *   Contrasts OpenMP thread-local L1-cache-resident `FFTW3f` subaperture FFTs on CPU against a
+ *   single batched `cufftPlanMany` execution across all `n_sub^2` (`256`) subapertures on GPU,
+ *   verifying multi-kilohertz suitability for classical and ExAO Shack-Hartmann loops.
+ *
+ * @param[in] nwf      Input wavefront grid size (`nwf x nwf` pixels).
+ * @param[in] n_sub    Linear subaperture count across the pupil (`n_sub x n_sub` lenslets).
+ * @param[in] pps      Detector pixels per subaperture (`ncam = n_sub * pps`).
+ * @param[in] backend  Requested compute backend (`CACAOSIM_BACKEND_CPU` or `CUDA`).
+ * @param[in] niter    Number of timed iterations to record after 20 warm-up steps.
+ */
 static void bench_shwfs(uint32_t nwf, uint32_t n_sub, uint32_t pps, int32_t backend, int niter)
 {
     uint32_t  ncam = n_sub * pps;
@@ -373,6 +542,24 @@ static void bench_shwfs(uint32_t nwf, uint32_t n_sub, uint32_t pps, int32_t back
     free(pup);
 }
 
+/**
+ * @brief Benchmark Babinet Matrix-DFT Zernike phase-contrast WFS and detector readout.
+ *
+ * Role:
+ *   Measures per-frame execution latency of `cacaosim_zwfs_step()` evaluating a `1.06 lambda/D`,
+ *   `pi/2`-radian focal phase dimple via a compact `32x32` Soummer Matrix-DFT (`cblas_cgemm` /
+ *   `cublasCgemm`), Babinet pupil-plane interference, and noisy `uint16` readout.
+ *
+ * Rationale:
+ *   Illustrates why Babinet decomposition over the compact `1.06 lambda/D` dimple support achieves
+ *   sub-100-microsecond CPU and ~10-kHz GPU latencies—avoiding `8x..16x` zero-padded full-plane
+ *   FFTs otherwise required to sample a `1 lambda/D` focal mask without edge aliasing.
+ *
+ * @param[in] nwf      Input wavefront grid size (`nwf x nwf` pixels).
+ * @param[in] ncam     Output pupil-imaging camera size (`ncam x ncam` pixels).
+ * @param[in] backend  Requested compute backend (`CACAOSIM_BACKEND_CPU` or `CUDA`).
+ * @param[in] niter    Number of timed iterations to record after 20 warm-up steps.
+ */
 static void bench_zwfs(uint32_t nwf, uint32_t ncam, int32_t backend, int niter)
 {
     float    *pup = (float *) cacaosim_aligned_calloc((size_t) nwf * nwf, sizeof(float));
@@ -435,6 +622,26 @@ static void bench_zwfs(uint32_t nwf, uint32_t ncam, int32_t backend, int niter)
     free(pup);
 }
 
+/**
+ * @brief Benchmark dual-output coronagraphic beam propagation (post-Lyot + LOWFS pickoff).
+ *
+ * Role:
+ *   Measures `cacaosim_coro_step_beam()` latency for two complementary coronagraphic propagators:
+ *     - `CACAOSIM_CORO_LYOT_SPOT`: Compact `48x48` Babinet Matrix-DFT over a `3.0 lambda/D` spot.
+ *     - `CACAOSIM_CORO_VORTEX`: Full-plane `4x`-padded 2D FFT for an unbounded charge-2 vortex.
+ *   Both modes simultaneously synthesize the post-Lyot `[OPD, Amplitude]` science beam and the
+ *   reflected `[OPD, Amplitude]` LOWFS beam.
+ *
+ * Rationale:
+ *   On CUDA, input/output beam planes (`d_iopd..d_lamp`) are pre-allocated in device memory so the
+ *   timed region (`cacaosim_coro_step_beam` + `cacaosim_cuda_stream_sync`) accurately reflects
+ *   in-VRAM execution inside a fused ExAO optical bench DAG without artificial PCIe transfer bias.
+ *
+ * @param[in] nwf      Pupil wavefront grid dimension (`nwf x nwf` pixels).
+ * @param[in] mode     Coronagraph mode (`CACAOSIM_CORO_LYOT_SPOT` or `CACAOSIM_CORO_VORTEX`).
+ * @param[in] backend  Requested compute backend (`CACAOSIM_BACKEND_CPU` or `CUDA`).
+ * @param[in] niter    Number of timed iterations to record after 20 warm-up steps.
+ */
 static void bench_coro(uint32_t nwf, int32_t mode, int32_t backend, int niter)
 {
     uint64_t np      = (uint64_t) nwf * nwf;
@@ -479,6 +686,7 @@ static void bench_coro(uint32_t nwf, int32_t mode, int32_t backend, int niter)
         return;
     }
 
+    /* Pre-stage input/output pupil planes in GPU VRAM to isolate pure kernel execution latency */
     float *d_iopd = ctx.use_cuda ? cacaosim_cuda_alloc_f32(np) : NULL;
     float *d_iamp = ctx.use_cuda ? cacaosim_cuda_alloc_f32(np) : NULL;
     float *d_oopd = ctx.use_cuda ? cacaosim_cuda_alloc_f32(np) : NULL;
@@ -529,6 +737,25 @@ static void bench_coro(uint32_t nwf, int32_t mode, int32_t backend, int niter)
     free(pup);
 }
 
+/**
+ * @brief Benchmark end-to-end master-tick execution of a declarative multi-stage .bench DAG file.
+ *
+ * Role:
+ *   Loads `<CACAOSIM_SRC_DIR>/<rel_path>` via `cacaosim_bench_load_file()`, overrides `cfg.backend`
+ *   to CPU or CUDA, initializes the full topological optical graph (`cacaosim_bench_init()`), and
+ *   measures per-master-tick wall-clock latency of `cacaosim_bench_step()`.
+ *
+ * Rationale:
+ *   Qualifies real-world system frame rates on complete multi-arm observatory topologies (such as
+ *   2-stage Woofer+Tweeter cascaded AO and ExAO TTM+DM+SHWFS+Coronagraph+Z-LOWFS+FPcam), capturing
+ *   beam-relay overhead, dichroic routing, and periodic `navg` detector readouts in `p99` tail
+ *   statistics so users can verify margin above each bench's target `master_hz` (`2..3 kHz`).
+ *
+ * @param[in] rel_path  Path to `.bench` file relative to `$CACAOSIM_SRC_DIR` (or `.`).
+ * @param[in] label     Row label printed in the benchmark summary table.
+ * @param[in] backend   Requested compute backend (`CACAOSIM_BACKEND_CPU` or `CUDA`).
+ * @param[in] niter     Number of timed master ticks to record after 20 warm-up ticks.
+ */
 static void bench_dag_file(const char *rel_path, const char *label, int32_t backend, int niter)
 {
     const char *src_dir = getenv("CACAOSIM_SRC_DIR");
@@ -583,6 +810,21 @@ static void bench_dag_file(const char *rel_path, const char *label, int32_t back
     cacaosim_bench_free(&ctx);
 }
 
+/**
+ * @brief Entry point running all unit and full-DAG latency/throughput benchmarks.
+ *
+ * Role:
+ *   Prints the formatted table header and sequentially executes CPU and CUDA benchmarks across DM
+ *   surfaces, Pyramid/Shack-Hartmann/Zernike WFSs, Lyot/Vortex coronagraphs, MFT/FFT/broadband
+ *   science cameras, fused single-stage HT loops, and multi-stage `.bench` topologies.
+ *
+ * Rationale:
+ *   Iteration counts (`50..500`) balance statistical convergence of `p99` quantiles against total
+ *   wall-clock runtime on CPU-heavy configurations (such as `256x256` 16-point modulated PyWFS),
+ *   allowing interactive regression profiling in a few seconds.
+ *
+ * @return Always `0`.
+ */
 int main(void)
 {
     printf("==================================================================================\n");
@@ -592,11 +834,13 @@ int main(void)
            "p50 us", "p99 us", "Throughput");
     printf("----------------------------------------------------------------------------------\n");
 
+    /* 1. Deformable Mirror dynamics + gather-stencil OPD rendering (classical & ExAO scales) */
     bench_dm(20, 128, CACAOSIM_BACKEND_CPU, 500);
     bench_dm(20, 128, CACAOSIM_BACKEND_CUDA, 500);
     bench_dm(50, 256, CACAOSIM_BACKEND_CPU, 300);
     bench_dm(50, 256, CACAOSIM_BACKEND_CUDA, 500);
 
+    /* 2. 4-sided Pyramid WFS (unmodulated vs 16-point ring modulation, 128 & 256 grids) */
     bench_pyrwfs(128, 64, 0.0f, 1, CACAOSIM_BACKEND_CPU, 300);
     bench_pyrwfs(128, 64, 0.0f, 1, CACAOSIM_BACKEND_CUDA, 500);
     bench_pyrwfs(128, 64, 3.0f, 16, CACAOSIM_BACKEND_CPU, 150);
@@ -604,17 +848,20 @@ int main(void)
     bench_pyrwfs(256, 128, 3.0f, 16, CACAOSIM_BACKEND_CPU, 50);
     bench_pyrwfs(256, 128, 3.0f, 16, CACAOSIM_BACKEND_CUDA, 300);
 
+    /* 3. Diffractive Shack-Hartmann WFS & Babinet MFT Zernike phase-contrast WFS */
     bench_shwfs(128, 16, 8, CACAOSIM_BACKEND_CPU, 200);
     bench_shwfs(128, 16, 8, CACAOSIM_BACKEND_CUDA, 500);
 
     bench_zwfs(128, 64, CACAOSIM_BACKEND_CPU, 300);
     bench_zwfs(128, 64, CACAOSIM_BACKEND_CUDA, 500);
 
+    /* 4. Coronagraphic starlight suppression + LOWFS pickoff (Babinet MFT vs 4x-padded FFT) */
     bench_coro(128, CACAOSIM_CORO_LYOT_SPOT, CACAOSIM_BACKEND_CPU, 200);
     bench_coro(128, CACAOSIM_CORO_LYOT_SPOT, CACAOSIM_BACKEND_CUDA, 500);
     bench_coro(128, CACAOSIM_CORO_VORTEX, CACAOSIM_BACKEND_CPU, 100);
     bench_coro(128, CACAOSIM_CORO_VORTEX, CACAOSIM_BACKEND_CUDA, 500);
 
+    /* 5. Focal-plane science PSF camera (Soummer MFT mono/5-lambda broadband vs 2x FFT) */
     bench_fpcam(128, 128, 0, 1, CACAOSIM_BACKEND_CPU, 300);
     bench_fpcam(128, 128, 0, 1, CACAOSIM_BACKEND_CUDA, 500);
     bench_fpcam(128, 128, 0, 5, CACAOSIM_BACKEND_CPU, 150);
@@ -622,6 +869,7 @@ int main(void)
     bench_fpcam(128, 128, 1, 1, CACAOSIM_BACKEND_CPU, 300);
     bench_fpcam(128, 128, 1, 1, CACAOSIM_BACKEND_CUDA, 500);
 
+    /* 6. Zero-IPC fused single-stage HT bench & declarative multi-stage .bench DAGs */
     bench_fused_htsim(128, 20, 64, CACAOSIM_BACKEND_CPU, 150);
     bench_fused_htsim(128, 20, 64, CACAOSIM_BACKEND_CUDA, 500);
     bench_fused_htsim(256, 50, 128, CACAOSIM_BACKEND_CUDA, 300);

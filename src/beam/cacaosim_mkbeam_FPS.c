@@ -5,6 +5,31 @@
 /**
  * @file    cacaosim_mkbeam_FPS.c
  * @brief   MILK_RUNNABLE compute unit synthesizing an [OPD, Amp] optical beam + stellar spectrum
+ *
+ * Architectural Role:
+ *   Implements `cacaosim.mkbeam` (`milk-fpsexec-cacaosim-mkbeam`), the optical
+ *   entrance-pupil source node of modular `cacaosim` benches. Combines a 2D
+ *   anti-aliased telescope pupil mask (`.in_pup` or an internally generated
+ *   fallback), live atmospheric turbulence wavefront phase/OPD (`.in_wf`) and
+ *   optional scintillation amplitude (`.in_amp`), optional static telescope NCPA
+ *   (`.in_ncpa`), and a 32-bin Vega-calibrated Planck blackbody photon spectrum
+ *   into a single 3D `[nwf x nwf x 2]` `FLOAT32` SHM optical beam stream
+ *   (`.out_beam`).
+ *
+ * Design Rationale & Motivation:
+ *   - Wavelength-agnostic `[OPD_um, Amplitude]` packaging: Storing achromatic
+ *     optical path difference in microns alongside pupil amplitude defers
+ *     `exp(i * 2*pi * OPD / lambda)` evaluation to terminal WFS, coronagraph, and
+ *     camera units, enabling polychromatic broadband integration and multi-arm
+ *     dichroic splitting without duplicating upstream propagation cubes.
+ *   - Dual clocking topology: When `.frame_rate <= 0.1`, `mkbeam` runs slaved to
+ *     the `.in_wf` `FPFLAG_TRIGGER_STREAM` semaphore (e.g., CACAO's `outarraypha`
+ *     turbulence stream). When `.frame_rate > 0.1`, an absolute `CLOCK_MONOTONIC`
+ *     deadline timer (`cacaosim_sleep_until`) paces free-running kHz execution
+ *     without cumulative OS sleep drift, even when `.in_wf` is static or absent.
+ *   - Self-healing startup: Auto-synthesizes an aligned fallback pupil if `.in_pup`
+ *     is missing and lazily reconnects `.in_wf` / `.in_amp` on each frame so
+ *     multi-process tmux benches start cleanly regardless of process launch order.
  */
 
 #include <stdint.h>
@@ -17,6 +42,11 @@
 #include "common/cacaosim_time.h"
 #include "pupil/cacaosim_pupil.h"
 
+/*
+ * Module-static FPS parameter backing storage for cacaosim.mkbeam.
+ * Defaults model an 8.2m Subaru/VLT-class telescope observing an m_V = 8.0 G2V (5778 K) guide
+ * star at 75% atmosphere+telescope throughput, reading phase [rad] at 0.50 um from outarraypha.
+ */
 static char     param_out_beam[FUNCTION_PARAMETER_STRMAXLEN] = "csim_beam0";
 static char     param_in_wf[FUNCTION_PARAMETER_STRMAXLEN]    = "outarraypha";
 static char     param_in_amp[FUNCTION_PARAMETER_STRMAXLEN]   = "";
@@ -36,6 +66,36 @@ static float    param_ref_lambda                             = 0.50f;
 static float    param_turb_gain                              = 1.0f;
 static float    param_frame_rate                             = 0.0f;
 
+/**
+ * CACAOSIM_MKBEAM_PARAMS(X) - X-macro FPS parameter table for `cacaosim.mkbeam`
+ *
+ * Parameters:
+ *   - `.out_beam`   (STREAMNAME, required): Output `[nwf x nwf x 2]` `FLOAT32` optical beam stream
+ *                   (`slice 0 = OPD [um]`, `slice 1 = Amplitude`, plus `CSIM_S00..S31` keywords).
+ *   - `.in_wf`      (STREAMNAME, trigger): Optional upstream `[nwf x nwf]` `FLOAT32` atmospheric
+ *                   turbulence stream (e.g. CACAO `outarraypha`).
+ *   - `.in_amp`     (STRING): Optional upstream `[nwf x nwf]` `FLOAT32` atmospheric scintillation
+ *                   amplitude stream (e.g. `outarrayamp`), multiplied with pupil amplitude.
+ *   - `.in_pup`     (STRING): Input `[nwf x nwf]` `FLOAT32` pupil mask stream; auto-synthesized
+ *                   internally from `.pup_diam`/`.obs_frac`/`.n_spiders`/`.spider_w` if absent.
+ *   - `.in_ncpa`    (STRING): Optional `[nwf x nwf]` `FLOAT32` static telescope NCPA OPD [um].
+ *   - `.nwf`        (UINT32): Square pupil grid size [pixels] (`>= 8`, default `128`).
+ *   - `.pup_diam`   (FLOAT32): Clear pupil diameter fraction of `nwf` for fallback pupil.
+ *   - `.obs_frac`   (FLOAT32): Linear central obscuration ratio `D_sec / D_tel` `[0..1)` used both
+ *                   for fallback pupil geometry and collecting-area photon budget.
+ *   - `.n_spiders`  (INT32): Radial spider vane count for fallback pupil synthesis.
+ *   - `.spider_w`   (FLOAT32): Spider vane width fraction of `pup_diam` for fallback pupil.
+ *   - `.tel_diam_m` (FLOAT32): Primary mirror diameter [m] determining geometric collecting area.
+ *   - `.star_mag`   (FLOAT32, WRITERUN): Apparent V-band Vega magnitude (`0.55 um` zero-point).
+ *   - `.star_teff`  (FLOAT32, WRITERUN): Stellar effective blackbody temperature [K] (`5778` G2V).
+ *   - `.tel_tput`   (FLOAT32, WRITERUN): End-to-end atmosphere + telescope throughput `[0..1]`.
+ *   - `.wf_unit`    (INT32): Physical unit of `.in_wf`: `0` = OPD [um], `1` = phase [rad].
+ *   - `.ref_lambda` (FLOAT32): Reference wavelength [um] converting phase [rad] -> OPD [um] when
+ *                   `.wf_unit == 1` (`OPD = turb_gain * phase * ref_lambda / (2*pi)`).
+ *   - `.turb_gain`  (FLOAT32, WRITERUN): Live dimensionless multiplier on `.in_wf` (`0` = flat).
+ *   - `.frame_rate` (FLOAT32, WRITERUN): Internal monotonic pacing rate [Hz] (`<= 0.1` uses
+ *                   trigger stream pacing).
+ */
 #define CACAOSIM_MKBEAM_PARAMS(X)                                                       \
     X(".out_beam", param_out_beam, FPTYPE_STREAMNAME, 1, FPFLAG_DEFAULT_INPUT,          \
       "Output 3D [nwf x nwf x 2] optical beam stream (slice0=OPD_um, slice1=Amp)")      \
@@ -82,6 +142,23 @@ static float    param_frame_rate                             = 0.0f;
 
 MILK_PARAMS_DEFINE(cacaosim_mkbeam, CACAOSIM_MKBEAM_PARAMS);
 
+/**
+ * mkbeam_confcheck() - Validate FPS configuration and enforce live run-time writability flags
+ *
+ * Role:
+ *   FPS `confcheck` callback executed during `CONF` state updates prior to `RUN`.
+ *   Ensures live photometric, turbulence-gain, and pacing parameters retain
+ *   `FPFLAG_WRITERUN` and clamps `.nwf` to a valid minimum grid dimension (`>= 8`).
+ *
+ * Rationale:
+ *   When reattaching to a pre-existing shared-memory FPS file created by an older
+ *   session or external script, `FPFLAG_WRITERUN` bits might be absent on disk.
+ *   Explicitly OR-ing `FPFLAG_WRITERUN` onto `.star_mag`, `.star_teff`,
+ *   `.tel_tput`, `.turb_gain`, and `.frame_rate` guarantees interactive GUI/CLI
+ *   tuning (`cacaosim-CTRL`, `milk-fpsCTRL`) works seamlessly while the loop runs.
+ *
+ * Return: Always `RETURN_SUCCESS`.
+ */
 static MILK_COLD errno_t mkbeam_confcheck(void)
 {
     if (dcfpsptr != NULL)
@@ -105,11 +182,34 @@ static MILK_COLD errno_t mkbeam_confcheck(void)
     return RETURN_SUCCESS;
 }
 
+/**
+ * mkbeam_compute() - Main real-time loop packaging pupil, atmosphere, and star into `.out_beam`
+ * @self: Pointer to `runnable_cacaosim_mkbeam` descriptor
+ *
+ * Role:
+ *   Allocates `.out_beam` (`[nwf x nwf x 2]`, `FLOAT32`) with fixed `CSIM_BM`
+ *   spectral keyword slots, resolves `.in_pup` (or synthesizes an aligned 4x4
+ *   anti-aliased fallback pupil), and continuously updates `[OPD_um, Amplitude]`
+ *   plus the 32-bin photon-rate spectrum on each frame.
+ *
+ * Rationale:
+ *   - Re-evaluates `cacaosim_spec_star()` and `cacaosim_wf_to_opd_scale()` inside
+ *     the frame loop (costing only 32 scalar bin evaluations) so live edits to
+ *     `.star_mag`, `.star_teff`, `.tel_tput`, or `.turb_gain` take effect on the
+ *     very next frame with zero heap allocation or stream reconnection.
+ *   - Uses absolute `CLOCK_MONOTONIC` deadlines (`cacaosim_timespec_add_ns` +
+ *     `cacaosim_sleep_until`) when `.frame_rate > 0.1` so compute jitter never
+ *     accumulates into long-term frame-rate drift.
+ *
+ * Return: `RETURN_SUCCESS` on loop exit, or `RETURN_FAILURE` if `.out_beam` or
+ *         fallback pupil allocation fails.
+ */
 static MILK_HOT errno_t mkbeam_compute(const MILK_RUNNABLE *self)
 {
     uint32_t nwf  = (param_nwf >= 8) ? param_nwf : 128;
     uint64_t npix = (uint64_t) nwf * nwf;
 
+    /* Create 3D [nwf x nwf x 2] beam cube (slice 0 = OPD [um], slice 1 = Amp) & init keywords */
     IMGID img_beam = stream_connect_create_3Df32(param_out_beam, nwf, nwf, 2);
     if (img_beam.ID == -1)
     {
@@ -117,6 +217,7 @@ static MILK_HOT errno_t mkbeam_compute(const MILK_RUNNABLE *self)
     }
     cacaosim_beam_shm_init_kw(img_beam.im);
 
+    /* Attach to external 2D pupil SHM stream if compatible; otherwise synthesize a local mask */
     IMGID  img_pup      = { 0 };
     float *fallback_pup = NULL;
     img_pup.ID          = -1;
@@ -150,6 +251,7 @@ static MILK_HOT errno_t mkbeam_compute(const MILK_RUNNABLE *self)
         pup_ptr = fallback_pup;
     }
 
+    /* Probe optional upstream turbulence WF, scintillation amplitude, and static NCPA streams */
     IMGID img_wf   = { 0 };
     IMGID img_amp  = { 0 };
     IMGID img_ncpa = { 0 };
@@ -176,6 +278,7 @@ static MILK_HOT errno_t mkbeam_compute(const MILK_RUNNABLE *self)
     MILK_PROCINFO_INIT(self)
     MILK_PROCINFO_LOOPSTART(self)
     {
+        /* Optional internal drift-free hardware pacing via absolute CLOCK_MONOTONIC deadline */
         if (param_frame_rate > 0.1f)
         {
             uint64_t period_ns = (uint64_t) (1.0e9f / param_frame_rate);
@@ -183,6 +286,7 @@ static MILK_HOT errno_t mkbeam_compute(const MILK_RUNNABLE *self)
             cacaosim_sleep_until(&deadline);
         }
 
+        /* Lazily attach to turbulence streams if the atmospheric generator started after mkbeam */
         if (img_wf.ID == -1 && param_in_wf[0] != '\0')
         {
             img_wf = stream_connect(param_in_wf);
@@ -192,6 +296,7 @@ static MILK_HOT errno_t mkbeam_compute(const MILK_RUNNABLE *self)
             img_amp = stream_connect(param_in_amp);
         }
 
+        /* Validate stream datatypes and dimensions before dereferencing SHM pixel arrays */
         const float *wf_ptr = (img_wf.ID != -1 && img_wf.md->datatype == _DATATYPE_FLOAT &&
                                img_wf.md->size[0] == nwf && img_wf.md->size[1] == nwf)
                                   ? img_wf.im->array.F
@@ -205,6 +310,7 @@ static MILK_HOT errno_t mkbeam_compute(const MILK_RUNNABLE *self)
                                     ? img_ncpa.im->array.F
                                     : NULL;
 
+        /* Synthesize 32-bin [0.40..2.40 um] stellar photon-rate spectrum from live parameters */
         cacaosim_spec_t spec;
         cacaosim_spec_star(&spec, param_tel_diam_m, param_obs_frac, param_star_mag, param_star_teff,
                            param_tel_tput);
@@ -212,6 +318,7 @@ static MILK_HOT errno_t mkbeam_compute(const MILK_RUNNABLE *self)
         float wf_to_opd =
             cacaosim_wf_to_opd_scale(param_wf_unit, param_ref_lambda, param_turb_gain);
 
+        /* Write slice 0 (OPD_um), slice 1 (Amp), and O(1) spectral keywords into SHM beam */
         img_beam.md->write = 1;
         cacaosim_beam_init_cpu(pup_ptr, amp_ptr, wf_ptr, ncpa_ptr, wf_to_opd, nwf,
                                img_beam.im->array.F, img_beam.im->array.F + npix);
@@ -243,6 +350,7 @@ static MILK_HOT errno_t mkbeam_compute(const MILK_RUNNABLE *self)
     return RETURN_SUCCESS;
 }
 
+/* Public MILK_RUNNABLE registration and standalone milk-fpsexec-cacaosim-mkbeam export */
 const MILK_RUNNABLE runnable_cacaosim_mkbeam = {
     .kind = MILK_RUNNABLE_FPS,
     .app  = { .fps_name    = "csim_mkbeam",

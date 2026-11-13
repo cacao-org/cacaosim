@@ -4,7 +4,40 @@
 
 /**
  * @file    cacaosim_htsim_FPS.c
- * @brief   Fused zero-hop High-Throughput AO hardware bench simulator (DM + PyWFS + FPcam)
+ * @brief   Dual-mode fused zero-hop High-Throughput AO bench FPS (`cacaosim.htsim`)
+ *
+ * Architectural Role in `cacaosim`:
+ *   Implements the `csim_htsim` (`cacaosim.htsim` / `milk-fpsexec-cacaosim-htsim`) real-time
+ *   Function Parameter Structure (FPS) runnable. It operates in two complementary modes selected
+ *   by the `.bench_file` parameter:
+ *     1. **Declarative Multi-Stage `.bench` DAG Mode (`.bench_file` non-empty)**:
+ *        Loads an arbitrary multi-stage optical bench description (woofer/tweeter DMs, Tip-Tilt
+ *        mirrors, static/SHM WFE screens, gray/dichroic beamsplitters, coronagraphs with LOWFS
+ *        pickoffs, Pyramid/SH/Zernike WFSs, and polychromatic focal-plane cameras), compiles and
+ *        validates its multi-rate DAG via `cacaosim_bench_init()`, prints an ANSI schematic (on
+ *        interactive terminals) or compact topology summary (in log files), and steps the entire
+ *        bench in-process via `cacaosim_bench_step()`.
+ *     2. **Flat Single-Stage SCAO Fast Path (`.bench_file` empty)**:
+ *        Directly couples a single Deformable Mirror (`cacaosim_dm_ctx_t`), 4-sided Pyramid WFS
+ *        (`cacaosim_pyrwfs_ctx_t`), and optional Soummer MFT focal-plane science camera
+ *        (`cacaosim_fpcam_ctx_t`) configured purely from flat FPS parameters—requiring zero
+ *        external configuration files for standard `cacao` SCAO closed-loop setups.
+ *
+ * Design Rationale & Motivation:
+ *   - **Zero-Hop In-Memory & On-GPU Wavefront Passing**: Running modular `cacaosim` FPS processes
+ *     (`mkbeam`, `dmsim`, `pyrwfs`, `fpcam`) separately requires writing and reading intermediate
+ *     `[OPD, Amplitude]` streams through POSIX SHM, waking OS threads via semaphores, and copying
+ *     wavefront grids across PCIe on every multi-kHz tick. Fusing the optical bench inside one
+ *     process on a single shared `cudaStream_t` keeps DM surfaces (`dm_ctx.d_opd_out`) and complex
+ *     beams resident in GPU L2/VRAM, transferring only small `[nact x nact]` DM commands in and
+ *     readout-rate `[ncam x ncam]` detector pixels out—while executing the exact same physical
+ *     kernels as the standalone modular FPS units.
+ *   - **Drift-Free Monotonic Hardware Clocking**: Real-time AO controllers (`cacao`) rely on
+ *     deterministic camera frame arrival times. `htsim` paces its master tick with absolute
+ *     `CLOCK_MONOTONIC` deadlines (`cacaosim_timespec_add_ns` + `cacaosim_sleep_until` using
+ *     `TIMER_ABSTIME`) so variable per-frame compute time never accumulates into clock drift,
+ *     while `.frame_rate = 0` falls back cleanly to `PROCESSINFO` stream-triggered stepping for
+ *     deterministic offline replay and latency benchmarking.
  */
 
 #include <stdint.h>
@@ -24,6 +57,11 @@
 #include "pupil/cacaosim_pupil.h"
 #include "pyrwfs/cacaosim_pyrwfs.h"
 
+/* ---------------------------------------------------------------------------------------------- */
+/* Static FPS Parameter Backing Store                                                             */
+/* ---------------------------------------------------------------------------------------------- */
+
+/* Mode selector & SHM stream names (used in flat SCAO mode; `.bench_file` selects DAG mode) */
 static char     param_bench_file[FUNCTION_PARAMETER_STRMAXLEN] = "";
 static char     param_in_dmcmd[FUNCTION_PARAMETER_STRMAXLEN]   = "aol0_dmC";
 static char     param_out_wfscam[FUNCTION_PARAMETER_STRMAXLEN] = "aol0_wfsim";
@@ -34,6 +72,8 @@ static char     param_out_fplong[FUNCTION_PARAMETER_STRMAXLEN] = "csim_fplong";
 static char     param_in_wf[FUNCTION_PARAMETER_STRMAXLEN]      = "outarraypha";
 static char     param_in_amp[FUNCTION_PARAMETER_STRMAXLEN]     = "";
 static char     param_in_pup[FUNCTION_PARAMETER_STRMAXLEN]     = "csim_pup";
+
+/* Flat-mode pupil geometry & DM hardware actuator/dynamics configuration */
 static uint32_t param_nwf                                      = 128;
 static float    param_pup_diam                                 = 0.9375f;
 static uint32_t param_nact_x                                   = 20;
@@ -46,6 +86,8 @@ static float    param_f0_hz                                    = 2500.0f;
 static float    param_zeta                                     = 0.70f;
 static float    param_max_stroke                               = 5.0f;
 static int32_t  param_dac_bits                                 = 16;
+
+/* Flat-mode 4-sided Pyramid WFS optical & detector readout configuration */
 static uint32_t param_wfs_ncam                                 = 64;
 static float    param_wfs_lambda                               = 0.75f;
 static float    param_mod_rad                                  = 3.0f;
@@ -53,6 +95,8 @@ static int32_t  param_mod_npts                                 = 16;
 static float    param_wfs_flux                                 = 100000.0f;
 static float    param_wfs_ron                                  = 0.5f;
 static int64_t  param_wfs_shutter                              = 1;
+
+/* Flat-mode Soummer MFT focal-plane science PSF camera & subframe integration controls */
 static uint32_t param_fp_ncam                                  = 128;
 static float    param_fp_lambda                                = 1.65f;
 static float    param_fp_pixscale                              = 3.0f;
@@ -60,6 +104,8 @@ static uint32_t param_fp_navg                                  = 10;
 static float    param_fp_flux                                  = 1000000.0f;
 static float    param_fp_ron                                   = 1.0f;
 static int64_t  param_reset_long                               = 0;
+
+/* Shared noise, atmospheric scaling, monotonic master clock, PRNG, backend, & Strehl telemetry */
 static int64_t  param_photon_noise                             = 1;
 static int32_t  param_out_dtype                                = 0;
 static int32_t  param_wf_unit                                  = 1;
@@ -71,6 +117,16 @@ static int32_t  param_backend                                  = 0;
 static float    param_strehl_inst                              = 0.0f;
 static float    param_strehl_ave                               = 0.0f;
 
+/**
+ * CACAOSIM_HTSIM_PARAMS - X-macro FPS parameter schema for `cacaosim.htsim`
+ * @X: Visitor macro invoked as `X(key, ptr, type, required, flags, description)`
+ *
+ * Exposes both the `.bench_file` multi-stage DAG selector and the complete set of flat SCAO
+ * parameters. Parameters marked with `FPFLAG_WRITERUN` remain live-editable via `milk-fpsCTRL` or
+ * `milk-fps-set` while the real-time compute loop is running (e.g. setting `.turb_gain = 0` and
+ * toggling `.wfs_shutter` during `cacao` dark/response-matrix acquisition without restarting the
+ * hardware simulator).
+ */
 #define CACAOSIM_HTSIM_PARAMS(X)                                                        \
     X(".bench_file", param_bench_file, FPTYPE_STRING, 0, FPFLAG_DEFAULT_INPUT,          \
       "Optional declarative multi-stage .bench DAG file (empty = flat single-stage)")   \
@@ -180,8 +236,25 @@ static float    param_strehl_ave                               = 0.0f;
     X(".strehl_ave", &param_strehl_ave, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_OUTPUT,       \
       "Cumulative long-exposure peak Strehl ratio [0..1]")
 
+/* Generate `milk_runnable.h` FPS parameter binding descriptors for `cacaosim_htsim` */
 MILK_PARAMS_DEFINE(cacaosim_htsim, CACAOSIM_HTSIM_PARAMS);
 
+/**
+ * htsim_confcheck() - FPS configuration validation & live-writable flag enforcement callback
+ *
+ * Role:
+ *   Invoked during the `milk` FPS `CONF` stage (`confstart` / `confcheck`). Ensures all 14
+ *   real-time operational knobs carry `FPFLAG_WRITERUN` inside the shared-memory `dcfpsptr`
+ *   table, even when reattaching to a pre-existing FPS SHM segment created by an older session.
+ *
+ * Rationale:
+ *   `cacao` calibration and loop-closing workflows routinely toggle WFS shutters, zero atmospheric
+ *   turbulence (`turb_gain = 0`), adjust PyWFS modulation (`mod_rad`), or reset cumulative Strehl
+ *   integrations (`reset_long = 1`) while `RUN` is active. Asserting `FPFLAG_WRITERUN` in
+ *   `confcheck` guarantees live mutability across FPS restarts without deleting `.fps.shm` files.
+ *
+ * Return: Always `RETURN_SUCCESS`.
+ */
 static MILK_COLD errno_t htsim_confcheck(void)
 {
     if (dcfpsptr != NULL)
@@ -203,6 +276,27 @@ static MILK_COLD errno_t htsim_confcheck(void)
     return RETURN_SUCCESS;
 }
 
+/**
+ * resolve_bench_path() - Resolve a `.bench_file` specification into a readable filesystem path
+ * @spec: User-supplied `.bench_file` string (e.g. `"@env"`, `"scao_pyrwfs.bench"`, or full path)
+ * @out:  Caller-allocated output buffer receiving the resolved path
+ * @cap:  Byte capacity of `@out` (including terminating NUL)
+ *
+ * Role:
+ *   Implements deterministic 4-tier search precedence for `.bench` configuration files:
+ *     1. `"@env"` sentinel -> `$CACAOSIM_BENCH_FILE` environment variable (if set and non-empty).
+ *     2. Direct readable path (`access(spec, R_OK) == 0`) relative to CWD or absolute.
+ *     3. Session shared-memory directory (`$MILK_SHM_DIR/<spec>`) for transient benches saved by
+ *        `cacaosim-CTRL` or `cacaosim-bench`.
+ *     4. Installed examples directory (`$MILK_ROOT/share/cacaosim/examples/<spec>`).
+ *     5. Verbatim fallback (`spec`) so `cacaosim_bench_load_file()` reports the exact missing name.
+ *
+ * Rationale:
+ *   FPS string parameters have bounded length (`FUNCTION_PARAMETER_STRMAXLEN`, typically 64 bytes),
+ *   which can be exceeded by deep workspace paths. Supporting `"@env"` plus `$MILK_SHM_DIR` and
+ *   `$MILK_ROOT/share/cacaosim/examples` short names lets `cacao` launch scripts and TUI tools
+ *   reference benches concisely without path truncation.
+ */
 static void resolve_bench_path(const char *spec, char *out, size_t cap)
 {
     if (strcmp(spec, "@env") == 0)
@@ -243,6 +337,24 @@ static void resolve_bench_path(const char *spec, char *out, size_t cap)
     snprintf(out, cap, "%s", spec);
 }
 
+/**
+ * htsim_run_bench() - Execute `cacaosim.htsim` in declarative multi-stage `.bench` DAG mode
+ * @self: Pointer to the owning `MILK_RUNNABLE` descriptor for `PROCESSINFO` lifecycle macros
+ *
+ * Role:
+ *   Loads and compiles the `.bench` file named by `param_bench_file`, reconciles top-level FPS
+ *   overrides (`.backend`, `.frame_rate`, `.turb_gain`) with `[bench]` file settings, prints a
+ *   human-readable optical topology diagram/summary, runs the monotonic real-time stepping loop
+ *   via `cacaosim_bench_step()`, and tears down all GPU/CPU/SHM resources cleanly on loop exit.
+ *
+ * Rationale:
+ *   Isolating `.bench` execution into a dedicated routine keeps the multi-stage DAG lifecycle
+ *   (`cacaosim_bench_init` -> `MILK_PROCINFO_LOOPSTART` -> `cacaosim_bench_free`) self-contained
+ *   while still honoring standard `milk` `PROCESSINFO` triggers, loop-stop signals, live FPS
+ *   `turb_gain` / `frame_rate` / `reset_long` updates, and output Strehl telemetry.
+ *
+ * Return: `RETURN_SUCCESS` on clean loop termination, or `RETURN_FAILURE` on parse/compile error.
+ */
 static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
 {
     cacaosim_bench_cfg_t bcfg;
@@ -257,6 +369,11 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
         return RETURN_FAILURE;
     }
 
+    /*
+     * Reconcile FPS parameters with `[bench]` file defaults: non-default FPS values override the
+     * file, whereas untouched default FPS values inherit the `.bench` values so `milk-fpsCTRL`
+     * reflects the true running master clock and turbulence gain.
+     */
     if (param_backend != 0)
     {
         bcfg.backend = param_backend;
@@ -278,11 +395,14 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
         param_turb_gain = bcfg.turb_gain;
     }
 
+    /* Compile topological DAG, allocate CPU/CUDA beam slots, and bind SHM (`connect_shm = 1`) */
     if (cacaosim_bench_init(&bctx, &bcfg, NULL, 1, err_buf, sizeof(err_buf)) != 0)
     {
         fprintf(stderr, "[cacaosim.htsim] .bench init error: %s\n", err_buf);
         return RETURN_FAILURE;
     }
+
+    /* Emit full ANSI box-drawing schematic on interactive TTYs; plain summary when piped to logs */
     if (isatty(STDOUT_FILENO))
     {
         cacaosim_view_opts_t vopts;
@@ -301,6 +421,7 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
     MILK_PROCINFO_INIT(self)
     MILK_PROCINFO_LOOPSTART(self)
     {
+        /* Drift-free absolute monotonic pacing when `.frame_rate > 0.1 Hz` */
         if (param_frame_rate > 0.1f)
         {
             uint64_t period_ns = (uint64_t) (1.0e9f / param_frame_rate);
@@ -308,6 +429,7 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
             cacaosim_sleep_until(&deadline);
         }
 
+        /* One-shot reset of cumulative long-exposure PSFs across every FPCAM node in the DAG */
         if (param_reset_long)
         {
             for (uint32_t i = 0; i < bctx.n_nodes; i++)
@@ -320,6 +442,7 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
             param_reset_long = 0;
         }
 
+        /* Advance entire multi-rate bench by one master tick and publish Strehl telemetry */
         cacaosim_bench_step(&bctx, NULL, NULL, param_turb_gain, processinfo);
         param_strehl_inst = bctx.last_strehl_inst;
         param_strehl_ave  = bctx.last_strehl_ave;
@@ -330,8 +453,35 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
     return RETURN_SUCCESS;
 }
 
+/**
+ * htsim_compute() - Primary FPS real-time execution entry point (`RUN` stage)
+ * @self: Pointer to the owning `MILK_RUNNABLE` descriptor for `PROCESSINFO` lifecycle macros
+ *
+ * Role:
+ *   Dispatches to `htsim_run_bench()` when `.bench_file` is non-empty; otherwise executes the
+ *   zero-hop flat single-stage SCAO fast path coupling one DM (`cacaosim_dm_ctx_t`), one 4-sided
+ *   Pyramid WFS (`cacaosim_pyrwfs_ctx_t`), and an optional focal-plane science PSF camera
+ *   (`cacaosim_fpcam_ctx_t`).
+ *
+ * Rationale:
+ *   In the flat fast path:
+ *     - `wfs_ctx` and `fp_ctx` explicitly share `dm_ctx.cuda_stream` so DM surface synthesis,
+ *       modulated Pyramid FFT propagation, and Soummer MFT PSF accumulation execute pipelined on a
+ *       single CUDA stream without inter-stream event synchronization.
+ *     - When `.out_dmopd` is left empty in CUDA mode, `host_dm_dst` is `NULL` (`cacaosim_dm_step`
+ *       skips the D2H OPD transfer entirely) and `dm_ctx.d_opd_out` is passed directly as
+ *       `d_dm_ext` to both `cacaosim_pyrwfs_step()` and `cacaosim_fpcam_accum_subframe()`,
+ *       achieving true zero-copy GPU-resident optical coupling.
+ *     - Detector structs (`wfs_det`, `fp_det`) and DM dynamic scalars (`param_delay_frames`,
+ *       `param_tau_us`, `param_max_stroke`) are re-sampled from `FPFLAG_WRITERUN` parameters on
+ *       every tick so live calibration/shutter/flux adjustments take effect immediately without
+ *       allocating memory or rebuilding FFT plans.
+ *
+ * Return: `RETURN_SUCCESS` on clean loop exit, or `RETURN_FAILURE` on invalid stream/init setup.
+ */
 static MILK_HOT errno_t htsim_compute(const MILK_RUNNABLE *self)
 {
+    /* Delegate to full multi-stage `.bench` DAG host whenever `.bench_file` is configured */
     if (param_bench_file[0] != '\0')
     {
         return htsim_run_bench(self);
@@ -342,6 +492,10 @@ static MILK_HOT errno_t htsim_compute(const MILK_RUNNABLE *self)
         return RETURN_FAILURE;
     }
 
+    /*
+     * Attach optional external pupil stream (`in_pup`); if absent, synthesize an anti-aliased
+     * circular telescope pupil with 30% central obscuration and 45-degree 4-vane spiders.
+     */
     IMGID img_pup = { 0 };
     img_pup.ID    = -1;
     if (param_in_pup[0] != '\0')
@@ -376,6 +530,7 @@ static MILK_HOT errno_t htsim_compute(const MILK_RUNNABLE *self)
         pup_ptr = fallback_pup;
     }
 
+    /* Connect or auto-create required DM command input and Pyramid WFS camera output SHM streams */
     IMGID img_cmd = stream_connect_create_2Df32(param_in_dmcmd, param_nact_x, param_nact_y);
     if (img_cmd.ID == -1)
     {
@@ -395,6 +550,7 @@ static MILK_HOT errno_t htsim_compute(const MILK_RUNNABLE *self)
         return RETURN_FAILURE;
     }
 
+    /* Bind optional DM diagnostic OPD, focal-plane short/long PSF outputs, and atm inputs */
     IMGID img_dmopd  = { 0 };
     IMGID img_fpcam  = { 0 };
     IMGID img_fplong = { 0 };
@@ -430,6 +586,7 @@ static MILK_HOT errno_t htsim_compute(const MILK_RUNNABLE *self)
 
     float dt_sec = (param_frame_rate > 1.0f) ? (1.0f / param_frame_rate) : 0.0005f;
 
+    /* Initialize DM hardware context (`refl_scale = 2.0` converts mechanical stroke to OPD) */
     cacaosim_dm_cfg_t dm_cfg = {
         .nact_x       = img_cmd.md->size[0],
         .nact_y       = img_cmd.md->size[1],
@@ -462,6 +619,7 @@ static MILK_HOT errno_t htsim_compute(const MILK_RUNNABLE *self)
         return RETURN_FAILURE;
     }
 
+    /* Initialize 4-sided Pyramid WFS on `dm_ctx.cuda_stream` for zero-hop GPU pipelining */
     cacaosim_pyrwfs_cfg_t wfs_cfg = {
         .nwf        = nwf,
         .pad_factor = 2,
@@ -499,6 +657,7 @@ static MILK_HOT errno_t htsim_compute(const MILK_RUNNABLE *self)
         return RETURN_FAILURE;
     }
 
+    /* Optionally initialize Soummer MFT focal-plane camera on the same `dm_ctx.cuda_stream` */
     if (param_enable_fpcam && img_fpcam.ID != -1)
     {
         cacaosim_fpcam_cfg_t fp_cfg = {
@@ -533,6 +692,10 @@ static MILK_HOT errno_t htsim_compute(const MILK_RUNNABLE *self)
         }
     }
 
+    /*
+     * Allocate internal host DM OPD buffer only on the CPU backend when `.out_dmopd` is unused;
+     * on CUDA without `.out_dmopd`, `host_dm_dst` stays NULL so zero PCIe D2H copy occurs.
+     */
     float *cpu_dm_buf = NULL;
     if (!dm_ctx.use_cuda && img_dmopd.ID == -1)
     {
@@ -545,6 +708,7 @@ static MILK_HOT errno_t htsim_compute(const MILK_RUNNABLE *self)
     MILK_PROCINFO_INIT(self)
     MILK_PROCINFO_LOOPSTART(self)
     {
+        /* 1. Pace master loop via monotonic absolute deadline when `.frame_rate > 0.1 Hz` */
         if (param_frame_rate > 0.1f)
         {
             uint64_t period_ns = (uint64_t) (1.0e9f / param_frame_rate);
@@ -552,6 +716,7 @@ static MILK_HOT errno_t htsim_compute(const MILK_RUNNABLE *self)
             cacaosim_sleep_until(&deadline);
         }
 
+        /* 2. Lazily attach atmospheric phase/amplitude SHM streams if started after `htsim` */
         if (img_wf.ID == -1 && param_in_wf[0] != '\0')
         {
             img_wf = stream_connect(param_in_wf);
@@ -570,6 +735,7 @@ static MILK_HOT errno_t htsim_compute(const MILK_RUNNABLE *self)
                                    ? img_amp.im->array.F
                                    : NULL;
 
+        /* 3. Advance DM actuator delay FIFO, DAC quantization, and discrete ZOH dynamics */
         float *host_dm_dst = (img_dmopd.ID != -1) ? img_dmopd.im->array.F : cpu_dm_buf;
         if (img_dmopd.ID != -1)
         {
@@ -584,9 +750,11 @@ static MILK_HOT errno_t htsim_compute(const MILK_RUNNABLE *self)
             processinfo_update_output_stream(NULL, img_dmopd.im, img_cmd.im);
         }
 
+        /* Route GPU-resident `d_opd_out` directly in CUDA mode; host OPD buffer in CPU mode */
         const float *d_dm_ext    = dm_ctx.use_cuda ? dm_ctx.d_opd_out : NULL;
         const float *host_dm_src = dm_ctx.use_cuda ? NULL : host_dm_dst;
 
+        /* 4. Step modulated 4-sided Pyramid WFS and publish detector readout frame */
         cacaosim_det_cfg_t wfs_det = {
             .flux_ph      = param_wfs_flux,
             .dark_e       = 0.0f,
@@ -606,6 +774,7 @@ static MILK_HOT errno_t htsim_compute(const MILK_RUNNABLE *self)
                              (param_out_dtype != 0) ? img_wfs.im->array.F : NULL);
         processinfo_update_output_stream(processinfo, img_wfs.im, img_cmd.im);
 
+        /* 5. Accumulate science PSF subframe and read out every `fp_navg` WFS ticks */
         if (has_fp)
         {
             if (param_reset_long)
@@ -653,6 +822,7 @@ static MILK_HOT errno_t htsim_compute(const MILK_RUNNABLE *self)
     }
     MILK_PROCINFO_END(self)
 
+    /* Tear down optical contexts in reverse dependency order (`dm_ctx` owns `cuda_stream`) */
     if (has_fp)
     {
         cacaosim_fpcam_free(&fp_ctx);
@@ -691,6 +861,7 @@ static MILK_HOT errno_t htsim_compute(const MILK_RUNNABLE *self)
     return RETURN_SUCCESS;
 }
 
+/* Public `milk` FPS runnable descriptor (`cacaosim.htsim` CLI & `milk-fpsexec-cacaosim-htsim`) */
 const MILK_RUNNABLE runnable_cacaosim_htsim = {
     .kind = MILK_RUNNABLE_FPS,
     .app  = { .fps_name    = "csim_htsim",

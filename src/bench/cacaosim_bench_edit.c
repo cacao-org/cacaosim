@@ -4,7 +4,34 @@
 
 /**
  * @file    cacaosim_bench_edit.c
- * @brief   Optical bench (.bench) presets and topological node editing/splicing helpers
+ * @brief   Built-in AO bench presets and invariant-preserving topological beam-splicing editor
+ *
+ * Architectural Role:
+ *   Implements high-level graph mutation and optical-beam splicing primitives over
+ *   `cacaosim_bench_cfg_t` together with the built-in hardware preset catalog (`g_preset_ini[]`).
+ *   Interactive configurators (`cacaosim-CTRL`) and programmatic bench builders call this module
+ *   to bootstrap complete AO architectures (SCAO, cascaded woofer/tweeter, ExAO coronagraph +
+ *   LOWFS, dual fast/truth WFS) and perform live surgical edits:
+ *     - Splicing inline elements (DM, TTM, static WFE, coronagraph) onto an existing beam by
+ *       auto-minting collision-free intermediate beam names and rewiring downstream consumers;
+ *     - Branching optical paths with gray or dichroic splitters and auto-tuning newly attached
+ *       sensor wavelengths to the upstream spectral arm;
+ *     - Deleting inline or branching optics while healing upstream-to-downstream beam continuity;
+ *     - Commuting adjacent optical elements (`cacaosim_bench_move_node()`) and swapping dual
+ *       output arms (`cacaosim_bench_swap_branches()`);
+ *     - Validating and propagating node ID and beam renames safely across the entire graph.
+ *
+ * Design Rationale & Motivation:
+ *   - Why topological splicing instead of raw field editing? In a declarative beam-named DAG,
+ *     inserting a DM or dichroic between two existing elements by hand requires inventing a new
+ *     intermediate beam name, avoiding collisions on SHM stream names, and manually updating
+ *     every downstream consumer's `in_beam`. Encapsulating these graph invariants in atomic splice
+ *     operations guarantees that every interactive keystroke in `cacaosim-CTRL` yields a valid,
+ *     acyclic, single-producer DAG ready for immediate microsecond `cacaosim_bench_analyze()`
+ *     feedback.
+ *   - Why store built-in presets as canonical `.bench` INI strings? Parsing `g_preset_ini[]`
+ *     through `cacaosim_bench_parse_str()` dogfoods the production parser and defaults table,
+ *     ensuring presets never drift from `.bench` file syntax or omit required invariants.
  */
 
 #include <ctype.h>
@@ -13,6 +40,18 @@
 
 #include "bench/cacaosim_bench.h"
 
+/**
+ * edit_copy_str() - Bounded NUL-terminated string copy helper for fixed-length AST fields
+ * @dst: Destination character array (must not be NULL when @cap > 0).
+ * @cap: Capacity of @dst in bytes (no-op if 0).
+ * @src: Source NUL-terminated string (writes "" if NULL).
+ *
+ * Role:
+ *   Safely updates node IDs, beam identifiers, and SHM stream names during graph mutations.
+ *
+ * Rationale:
+ *   Guarantees NUL-termination and safely handles aliasing-free temporary buffers during rewires.
+ */
 static void edit_copy_str(char *dst, size_t cap, const char *src)
 {
     if (cap == 0u)
@@ -27,6 +66,19 @@ static void edit_copy_str(char *dst, size_t cap, const char *src)
     snprintf(dst, cap, "%s", src);
 }
 
+/**
+ * edit_set_err() - Write a human-readable validation error into an optional caller buffer
+ * @err_buf: Optional destination buffer (ignored if NULL or @err_cap == 0).
+ * @err_cap: Capacity of @err_buf in bytes.
+ * @msg:     Static diagnostic string (falls back to "Error" if NULL).
+ *
+ * Role:
+ *   Reports why an interactive edit (such as renaming a node to an invalid or duplicate ID) was
+ *   rejected so `cacaosim-CTRL` can display a status-bar message.
+ *
+ * Rationale:
+ *   Keeps validation helpers side-effect-free when callers pass `err_buf == NULL`.
+ */
 static void edit_set_err(char *err_buf, size_t err_cap, const char *msg)
 {
     if (err_buf != NULL && err_cap > 0u)
@@ -35,6 +87,21 @@ static void edit_set_err(char *err_buf, size_t err_cap, const char *msg)
     }
 }
 
+/**
+ * node_id_exists() - Test whether a node section identifier is already in use within @cfg
+ * @cfg:      Read-only bench configuration to scan (must not be NULL).
+ * @id:       Candidate node identifier string (must not be NULL).
+ * @skip_idx: Node index to ignore during self-rename checks, or -1 to check all nodes.
+ *
+ * Role:
+ *   Enforces bench-wide uniqueness of `nodes[i].id` during node creation, cloning, and renaming.
+ *
+ * Rationale:
+ *   Allowing @skip_idx lets `cacaosim_bench_rename_node()` accept an unchanged identifier as a
+ *   benign no-op while rejecting collisions with any other node.
+ *
+ * Return: 1 if @id collides with an existing node, 0 otherwise.
+ */
 static int node_id_exists(const cacaosim_bench_cfg_t *cfg, const char *id, int skip_idx)
 {
     for (uint32_t i = 0; i < cfg->n_nodes; i++)
@@ -51,6 +118,22 @@ static int node_id_exists(const cacaosim_bench_cfg_t *cfg, const char *id, int s
     return 0;
 }
 
+/**
+ * beam_name_exists() - Test whether an optical beam name is referenced anywhere in @cfg
+ * @cfg:  Read-only bench configuration to scan (must not be NULL).
+ * @beam: Candidate beam name (returns 0 if NULL or empty).
+ *
+ * Role:
+ *   Checks the root telescope `cfg->out_beam` and all node input/output beam slots (`in_beam`,
+ *   `out_beam`, `out_refl`, `out_trans`, `out_lowfs`) for collisions.
+ *
+ * Rationale:
+ *   Checking both producers and consumers guarantees newly minted intermediate beams cannot
+ *   accidentally hijack an existing or dangling beam edge, preserving the DAG's single-producer
+ *   invariant.
+ *
+ * Return: 1 if @beam already appears in @cfg, 0 otherwise.
+ */
 static int beam_name_exists(const cacaosim_bench_cfg_t *cfg, const char *beam)
 {
     if (beam == NULL || beam[0] == '\0')
@@ -74,6 +157,22 @@ static int beam_name_exists(const cacaosim_bench_cfg_t *cfg, const char *beam)
     return 0;
 }
 
+/**
+ * shm_name_exists() - Test whether an ImageStreamIO shared-memory stream name is used in @cfg
+ * @cfg: Read-only bench configuration to scan (must not be NULL).
+ * @shm: Candidate SHM stream name (returns 0 if NULL or empty).
+ *
+ * Role:
+ *   Scans entrance streams (`in_wf`, `in_pup`, `in_amp`, `in_ncpa`) and per-node active streams
+ *   (`in_cmd`, `out_opd`, `in_wfe`, `out_cam`, `out_long`) for existing bindings.
+ *
+ * Rationale:
+ *   Prevents newly added or cloned DMs, static WFEs, and cameras from overwriting each other's
+ *   `/milk/shm/<name>.im.shm` files at runtime (e.g. minting `aol0_wfsim_1` when `aol0_wfsim` is
+ *   already taken).
+ *
+ * Return: 1 if @shm is already bound in @cfg, 0 otherwise.
+ */
 static int shm_name_exists(const cacaosim_bench_cfg_t *cfg, const char *shm)
 {
     if (shm == NULL || shm[0] == '\0')
@@ -98,6 +197,20 @@ static int shm_name_exists(const cacaosim_bench_cfg_t *cfg, const char *shm)
     return 0;
 }
 
+/**
+ * make_unique_id() - Mint the lowest-numbered unused node ID `<prefix><n>` (e.g. "dm0", "dm1")
+ * @cfg:    Read-only bench configuration to check against (must not be NULL).
+ * @prefix: Kind-specific short stem such as "dm", "ttm", "bs", "coro", "pyr", "sh", "sci".
+ * @out:    Destination character buffer receiving the unique ID.
+ * @cap:    Capacity of @out in bytes.
+ *
+ * Role:
+ *   Generates compact, predictable section identifiers when inserting or cloning nodes.
+ *
+ * Rationale:
+ *   Scanning `0..255` far exceeds `CACAOSIM_BENCH_MAX_NODES` (32), guaranteeing termination on an
+ *   unused `<prefix><n>` slot in O(n_nodes) time.
+ */
 static void make_unique_id(
     const cacaosim_bench_cfg_t *cfg,
     const char                 *prefix,
@@ -115,6 +228,20 @@ static void make_unique_id(
     snprintf(out, cap, "%s_x", prefix);
 }
 
+/**
+ * make_unique_beam() - Mint a collision-free optical beam name from @base
+ * @cfg:  Read-only bench configuration to check against (must not be NULL).
+ * @base: Preferred beam name, e.g. "b_dm0" or "b_bs0_refl".
+ * @out:  Destination character buffer receiving the unique beam name.
+ * @cap:  Capacity of @out in bytes.
+ *
+ * Role:
+ *   Uses @base verbatim when free, or appends `_1`, `_2`, ... if @base already exists in @cfg.
+ *
+ * Rationale:
+ *   Preserves clean canonical names (`b_dm0`) in common cases while guaranteeing single-producer
+ *   safety even after arbitrary manual renames by the user.
+ */
 static void make_unique_beam(
     const cacaosim_bench_cfg_t *cfg,
     const char                 *base,
@@ -136,6 +263,21 @@ static void make_unique_beam(
     }
 }
 
+/**
+ * make_unique_shm() - Mint a collision-free ImageStreamIO SHM stream name from @base
+ * @cfg:  Read-only bench configuration to check against (must not be NULL).
+ * @base: Preferred SHM stream name, e.g. "aol0_wfsim" or "csim_fpcam".
+ * @out:  Destination character buffer receiving the unique SHM stream name.
+ * @cap:  Capacity of @out in bytes.
+ *
+ * Role:
+ *   Keeps standard `cacao`-compatible stream names (`aol0_wfsim`, `csim_fpcam`) for the first
+ *   sensor on the bench and automatically suffixes `_1`, `_2`, ... for additional sensors.
+ *
+ * Rationale:
+ *   Gives zero-configuration plug-and-play with `cacao` loop 0 on the primary WFS while preventing
+ *   SHM collisions on multi-WFS or dual-camera benches.
+ */
 static void make_unique_shm(
     const cacaosim_bench_cfg_t *cfg,
     const char                 *base,
@@ -157,6 +299,22 @@ static void make_unique_shm(
     }
 }
 
+/**
+ * count_beam_consumers() - Count how many nodes currently take @beam as their `in_beam`
+ * @cfg:      Read-only bench configuration to inspect (must not be NULL).
+ * @beam:     Beam name to query (returns 0 if NULL or empty).
+ * @skip_idx: Optional node index to exclude from the count, or -1 to count all nodes.
+ *
+ * Role:
+ *   Detects open/unpopulated pickoff arms (such as an unused splitter `out_refl` or coronagraph
+ *   `out_lowfs`) when auto-routing newly added sensors in `derive_auto_target_beam()`.
+ *
+ * Rationale:
+ *   Preferring an unpopulated arm (`cnt == 0`) lets sequential "Add Splitter -> Add WFS -> Add
+ *   Sci Cam" workflows automatically populate both arms of a dichroic without manual rewiring.
+ *
+ * Return: Number of nodes consuming @beam.
+ */
 static uint32_t count_beam_consumers(
     const cacaosim_bench_cfg_t *cfg,
     const char                 *beam,
@@ -181,6 +339,22 @@ static uint32_t count_beam_consumers(
     return cnt;
 }
 
+/**
+ * rewire_consumers_except() - Redirect downstream `in_beam` edges from @old_beam to @new_beam
+ * @cfg:      Bench configuration to mutate in place (must not be NULL).
+ * @old_beam: Existing beam name to replace (no-op if NULL or empty).
+ * @new_beam: Replacement beam name (no-op if NULL or empty).
+ * @skip_a:   First node index to leave untouched (or -1).
+ * @skip_b:   Second node index to leave untouched (or -1).
+ *
+ * Role:
+ *   Core splice primitive used by node insertion, node deletion, and adjacent node reordering to
+ *   re-point downstream consumers without creating self-loops on the participating node(s).
+ *
+ * Rationale:
+ *   Accepting two exclusion indices (`skip_a`, `skip_b`) supports pairwise adjacent swaps in
+ *   `cacaosim_bench_move_node()` cleanly in a single pass without temporary mark arrays.
+ */
 static void rewire_consumers_except(
     cacaosim_bench_cfg_t *cfg,
     const char           *old_beam,
@@ -205,17 +379,61 @@ static void rewire_consumers_except(
     }
 }
 
+/**
+ * is_wfs_kind() - Return non-zero if @k is a wavefront sensor (`PYRWFS`, `SHWFS`, or `ZWFS`)
+ * @k: Optical node category (`cacaosim_node_kind_t`).
+ *
+ * Role:
+ *   Distinguishes wavefront sensors from science cameras and inline optics during automatic
+ *   splitter/coronagraph arm selection.
+ *
+ * Rationale:
+ *   In astronomical AO benches, WFSs conventionally attach to dichroic reflected arms (`out_refl`)
+ *   or coronagraphic LOWFS pickoffs (`out_lowfs`), whereas science cameras and downstream optics
+ *   continue along transmitted / post-Lyot science arms.
+ *
+ * Return: 1 if @k is a WFS node kind, 0 otherwise.
+ */
 static int is_wfs_kind(cacaosim_node_kind_t k)
 {
     return (k == CACAOSIM_NODE_PYRWFS || k == CACAOSIM_NODE_SHWFS || k == CACAOSIM_NODE_ZWFS);
 }
 
+/**
+ * is_inline_single_kind() - Return non-zero if @k has a primary inline `in_beam -> out_beam` path
+ * @k: Optical node category (`cacaosim_node_kind_t`).
+ *
+ * Role:
+ *   Identifies inline optical modifiers (`DM`, `CORO`, `WFE`) that splice in-series onto a single
+ *   propagating beam and can commute with adjacent elements during `cacaosim_bench_move_node()`.
+ *
+ * Rationale:
+ *   Groups the three node kinds that expose `nd->out_beam` as their primary forward optical path.
+ *
+ * Return: 1 for `DM`, `CORO`, or `WFE`; 0 for splitters and terminal sensors.
+ */
 static int is_inline_single_kind(cacaosim_node_kind_t k)
 {
     return (k == CACAOSIM_NODE_DM || k == CACAOSIM_NODE_CORO || k == CACAOSIM_NODE_WFE);
 }
 
-/* Suggest a sensible sensor wavelength based on upstream dichroic arm if applicable */
+/**
+ * auto_tune_sensor_wavelength() - Match a newly inserted sensor's `lambda_um` to its upstream arm
+ * @cfg:    Read-only bench configuration containing upstream nodes (must not be NULL).
+ * @sensor: Newly created sensor node whose `in_beam` is already assigned (must not be NULL).
+ *
+ * Role:
+ *   Inspects the immediate upstream producer of `sensor->in_beam`: if fed by a chromatic dichroic
+ *   (`LP`, `SP`, or `BP`), selects a sensible in-band central wavelength (e.g. 0.75 um visible on
+ *   an LP reflected arm, 1.65 um H-band on an LP transmitted arm, or `lambda_cut` on a BP
+ *   reflected arm); if fed by a coronagraph (`out_beam` or `out_lowfs`), inherits the
+ *   coronagraph's operating `lambda_um` for ZWFS / FPCAM.
+ *
+ * Rationale:
+ *   Prevents a common interactive pitfall where attaching a default 0.75 um WFS onto a >0.95 um
+ *   long-pass transmitted arm (or a 1.65 um camera onto a <0.95 um reflected arm) would otherwise
+ *   yield ~0 photons/frame in the 32-bin spectral budget until manually retuned.
+ */
 static void auto_tune_sensor_wavelength(
     const cacaosim_bench_cfg_t *cfg,
     cacaosim_node_cfg_t        *sensor)
@@ -294,6 +512,19 @@ static void auto_tune_sensor_wavelength(
     }
 }
 
+/**
+ * cacaosim_bench_preset_name() - Return short menu title for built-in preset @preset_id
+ * @preset_id: Preset index in `[0 .. CACAOSIM_PRESET_COUNT - 1]`.
+ *
+ * Role:
+ *   Maps a `cacaosim_preset_t` ID to its display name in TUI dialogs and CLI listings.
+ *
+ * Rationale:
+ *   Provides a total function returning `"Unknown Preset"` on out-of-bounds indices so UI callers
+ *   never dereference NULL.
+ *
+ * Return: Static NUL-terminated preset title.
+ */
 const char *cacaosim_bench_preset_name(int preset_id)
 {
     switch (preset_id)
@@ -315,6 +546,18 @@ const char *cacaosim_bench_preset_name(int preset_id)
     }
 }
 
+/**
+ * cacaosim_bench_preset_desc() - Return one-line architecture summary for preset @preset_id
+ * @preset_id: Preset index in `[0 .. CACAOSIM_PRESET_COUNT - 1]`.
+ *
+ * Role:
+ *   Summarizes the corrector geometry, spectral splits, sensor types, and cadences of @preset_id.
+ *
+ * Rationale:
+ *   Lets users preview preset topology in status bars before applying a template.
+ *
+ * Return: Static NUL-terminated description string (`""` if out of range).
+ */
 const char *cacaosim_bench_preset_desc(int preset_id)
 {
     switch (preset_id)
@@ -336,6 +579,13 @@ const char *cacaosim_bench_preset_desc(int preset_id)
     }
 }
 
+/**
+ * g_preset_ini - Embedded canonical `.bench` INI templates indexed by `cacaosim_preset_t`
+ *
+ * Each entry is a complete, self-contained `.bench` document parsed via
+ * `cacaosim_bench_parse_str()` in `cacaosim_bench_preset()`, guaranteeing 100% parity between
+ * built-in templates and disk-loaded `.bench` configurations.
+ */
 static const char *const g_preset_ini[CACAOSIM_PRESET_COUNT] = {
     /* CACAOSIM_PRESET_SINGLE_PYRWFS */
     "[bench]\n"
@@ -638,6 +888,20 @@ static const char *const g_preset_ini[CACAOSIM_PRESET_COUNT] = {
     "navg       = 10\n",
 };
 
+/**
+ * cacaosim_bench_preset() - Populate @cfg by parsing a built-in `.bench` hardware template
+ * @cfg:       Destination bench configuration struct (must not be NULL).
+ * @preset_id: Preset index in `[0 .. CACAOSIM_PRESET_COUNT - 1]`.
+ *
+ * Role:
+ *   Replaces @cfg with the selected reference AO architecture (`g_preset_ini[preset_id]`).
+ *
+ * Rationale:
+ *   Delegating directly to `cacaosim_bench_parse_str()` ensures presets initialize every node
+ *   default, seed, and `[bench]` attribute identically to loading an example `.bench` file.
+ *
+ * Return: 0 on success, -1 if @cfg is NULL or @preset_id is out of bounds.
+ */
 int cacaosim_bench_preset(cacaosim_bench_cfg_t *cfg, int preset_id)
 {
     if (cfg == NULL || preset_id < 0 || preset_id >= CACAOSIM_PRESET_COUNT)
@@ -647,6 +911,20 @@ int cacaosim_bench_preset(cacaosim_bench_cfg_t *cfg, int preset_id)
     return cacaosim_bench_parse_str(g_preset_ini[preset_id], cfg, NULL, 0u);
 }
 
+/**
+ * push_unique_beam() - Append a non-empty beam name to @beams if not already present
+ * @beams: Output array `[cap][CACAOSIM_BENCH_NAME_LEN]`.
+ * @n:     In/out current element count in @beams.
+ * @cap:   Maximum capacity of @beams.
+ * @name:  Candidate beam identifier (ignored if NULL, empty, or duplicate).
+ *
+ * Role:
+ *   Deduplicates beam identifiers while preserving topological/declaration encounter order.
+ *
+ * Rationale:
+ *   Linear membership scan over `<= 32` beams fits inside a couple of CPU cache lines and avoids
+ *   auxiliary hash structures.
+ */
 static void push_unique_beam(
     char        beams[][CACAOSIM_BENCH_NAME_LEN],
     uint32_t   *n,
@@ -668,6 +946,22 @@ static void push_unique_beam(
     (*n)++;
 }
 
+/**
+ * cacaosim_bench_list_beams() - Enumerate all produced optical beam names in @cfg
+ * @cfg:       Read-only bench configuration (returns 0 if NULL).
+ * @beams:     Destination array `[max_beams][CACAOSIM_BENCH_NAME_LEN]` (returns 0 if NULL).
+ * @max_beams: Capacity of @beams.
+ *
+ * Role:
+ *   Records the root entrance beam (`cfg->out_beam`, defaulting to `"b_pup"`) followed by every
+ *   non-empty `out_beam`, `out_refl`, `out_trans`, and `out_lowfs` produced across `cfg->nodes[]`.
+ *
+ * Rationale:
+ *   Enumerating only produced beams (rather than arbitrary consumer strings) ensures interactive
+ *   beam pickers in `cacaosim-CTRL` only offer physically valid upstream optical sources.
+ *
+ * Return: Number of unique produced beams written to @beams.
+ */
 uint32_t cacaosim_bench_list_beams(
     const cacaosim_bench_cfg_t *cfg,
     char                        beams[][CACAOSIM_BENCH_NAME_LEN],
@@ -690,6 +984,30 @@ uint32_t cacaosim_bench_list_beams(
     return n;
 }
 
+/**
+ * derive_auto_target_beam() - Infer the most natural upstream beam when inserting after an anchor
+ * @cfg:            Read-only bench configuration (must not be NULL).
+ * @new_kind:       Optical kind of the node being inserted.
+ * @after_node_idx: Anchor node index (`< 0` selects the root telescope beam).
+ * @out_beam:       Destination buffer receiving the chosen upstream beam name.
+ * @cap:            Capacity of @out_beam in bytes.
+ *
+ * Role:
+ *   Applies optical-bench domain heuristics when the caller does not specify `target_beam`:
+ *     - After `-1` or on an empty bench: attaches to the root entrance beam (`b_pup`).
+ *     - After a DM or static WFE: attaches in-series to `prev->out_beam`.
+ *     - After a coronagraph: attaches a WFS to an open `out_lowfs` pickoff if available, else
+ *       attaches to the post-Lyot science beam `prev->out_beam`.
+ *     - After a beamsplitter: routes WFSs preferentially to `out_refl` (especially if empty) and
+ *       science cameras / downstream optics preferentially to `out_trans`.
+ *     - After a terminal sensor: shares `prev->in_beam` (allowing inline optics to splice right
+ *       in front of that sensor or a sibling sensor to share the arm).
+ *
+ * Rationale:
+ *   Makes sequential cursor-based node insertion in `cacaosim-CTRL` ("Add DM -> Add Splitter ->
+ *   Add PyWFS -> Add FPCam") build the intended optical schematic automatically with zero manual
+ *   beam typing.
+ */
 static void derive_auto_target_beam(
     const cacaosim_bench_cfg_t *cfg,
     cacaosim_node_kind_t        new_kind,
@@ -716,6 +1034,7 @@ static void derive_auto_target_beam(
     }
     if (prev->kind == CACAOSIM_NODE_CORO)
     {
+        /* Route a newly added WFS onto the coronagraph's open LOWFS pickoff arm first */
         if (is_wfs_kind(new_kind) && prev->out_lowfs[0] != '\0' &&
             count_beam_consumers(cfg, prev->out_lowfs, -1) == 0u)
         {
@@ -727,6 +1046,7 @@ static void derive_auto_target_beam(
     }
     if (prev->kind == CACAOSIM_NODE_SPLITTER)
     {
+        /* Route WFSs to reflected arm and science/relay optics to transmitted arm by default */
         uint32_t n_refl  = count_beam_consumers(cfg, prev->out_refl, -1);
         uint32_t n_trans = count_beam_consumers(cfg, prev->out_trans, -1);
         if (is_wfs_kind(new_kind))
@@ -759,6 +1079,29 @@ static void derive_auto_target_beam(
     edit_copy_str(out_beam, cap, prev->in_beam[0] ? prev->in_beam : root);
 }
 
+/**
+ * cacaosim_bench_add_node() - Insert a new optical node into @cfg and splice downstream beams
+ * @cfg:            Bench configuration to mutate in place (must not be NULL).
+ * @kind:           Optical element category to instantiate (`cacaosim_node_kind_t`).
+ * @is_ttm:         Non-zero to instantiate a 2-axis Tip-Tilt mirror when @kind == CACAOSIM_NODE_DM.
+ * @after_node_idx: Cursor anchor index (`-1` for entrance pupil, or `[0..n_nodes-1]`).
+ * @target_beam:    Optional explicit input beam override (`NULL` or `""` for automatic routing).
+ *
+ * Role:
+ *   Creates a uniquely identified node, binds it to `in_beam`, mints collision-free output beam(s)
+ *   and SHM stream(s), splices existing consumers of `in_beam` onto the new node's forward output
+ *   beam (`out_beam` for DM/WFE/CORO, `out_trans` for SPLITTER), auto-tunes sensor wavelengths,
+ *   and inserts the node into `cfg->nodes[]` (placing inline/splitter optics immediately *before*
+ *   a selected terminal sensor when splicing onto that sensor's input beam).
+ *
+ * Rationale:
+ *   Rewiring existing consumers of `in_beam` *before* appending `nd` into `cfg->nodes[]` cleanly
+ *   inserts `nd` in-series (`Producer -> nd -> OldConsumers`) without needing special exclusion
+ *   indices, while adjusting `ins = after_node_idx` when anchored on a terminal sensor keeps
+ *   declaration order aligned with topological flow.
+ *
+ * Return: Inserted index `[0..n_nodes-1]`, or -1 if @cfg is NULL or at `CACAOSIM_BENCH_MAX_NODES`.
+ */
 int cacaosim_bench_add_node(
     cacaosim_bench_cfg_t *cfg,
     cacaosim_node_kind_t  kind,
@@ -821,6 +1164,7 @@ int cacaosim_bench_add_node(
     cacaosim_bench_node_defaults(&nd, kind, id, is_ttm, cfg->n_nodes);
     edit_copy_str(nd.in_beam, sizeof(nd.in_beam), in_beam);
 
+    /* Mint unique output beams/SHMs and splice existing consumers of in_beam downstream */
     char base_buf[CACAOSIM_BENCH_NAME_LEN];
     if (kind == CACAOSIM_NODE_DM)
     {
@@ -891,6 +1235,23 @@ int cacaosim_bench_add_node(
     return ins;
 }
 
+/**
+ * cacaosim_bench_clone_node() - Duplicate an existing optical node with collision-free bindings
+ * @cfg:     Bench configuration to mutate in place (must not be NULL).
+ * @src_idx: Source node index `[0..n_nodes-1]` to clone.
+ *
+ * Role:
+ *   Splices a new node of identical kind via `cacaosim_bench_add_node()`, copies all physical and
+ *   detector parameters from `cfg->nodes[src_idx]`, restores the newly minted unique ID, beam
+ *   routing, and SHM stream names, clears optional `out_opd` telemetry to prevent SHM contention,
+ *   and increments `wfe_seed` for cloned WFE screens.
+ *
+ * Rationale:
+ *   Delegating placement and naming to `cacaosim_bench_add_node()` first guarantees that cloning
+ *   obeys the exact same beam-splicing and uniqueness invariants as fresh node insertion.
+ *
+ * Return: Inserted clone index `[0..n_nodes-1]`, or -1 on error.
+ */
 int cacaosim_bench_clone_node(cacaosim_bench_cfg_t *cfg, uint32_t src_idx)
 {
     if (cfg == NULL || src_idx >= cfg->n_nodes || cfg->n_nodes >= CACAOSIM_BENCH_MAX_NODES)
@@ -906,6 +1267,7 @@ int cacaosim_bench_clone_node(cacaosim_bench_cfg_t *cfg, uint32_t src_idx)
         return -1;
     }
 
+    /* Copy physics settings from src while preserving unique ID, beam edges, and SHM bindings */
     cacaosim_node_cfg_t *dst = &cfg->nodes[idx];
     char                 saved_id[CACAOSIM_BENCH_NAME_LEN];
     char                 saved_in[CACAOSIM_BENCH_NAME_LEN];
@@ -948,6 +1310,23 @@ int cacaosim_bench_clone_node(cacaosim_bench_cfg_t *cfg, uint32_t src_idx)
     return idx;
 }
 
+/**
+ * cacaosim_bench_remove_node() - Remove node @node_idx and bridge its downstream consumers
+ * @cfg:      Bench configuration to mutate in place (must not be NULL).
+ * @node_idx: Target node index `[0..n_nodes-1]` to delete.
+ *
+ * Role:
+ *   Bridges every downstream consumer of `rem.out_beam`, `rem.out_trans`, `rem.out_refl`, and
+ *   `rem.out_lowfs` back onto `rem.in_beam` (or root `b_pup`), then shifts subsequent nodes down
+ *   by one slot.
+ *
+ * Rationale:
+ *   When removing a splitter or coronagraph, merging both downstream branches onto `rem.in_beam`
+ *   keeps every surviving WFS and camera attached to a valid live optical beam rather than
+ *   failing DAG compilation with an unknown-beam error.
+ *
+ * Return: 0 on success, -1 if @cfg is NULL or @node_idx is out of range.
+ */
 int cacaosim_bench_remove_node(cacaosim_bench_cfg_t *cfg, uint32_t node_idx)
 {
     if (cfg == NULL || node_idx >= cfg->n_nodes)
@@ -959,6 +1338,7 @@ int cacaosim_bench_remove_node(cacaosim_bench_cfg_t *cfg, uint32_t node_idx)
     const char         *bridge = rem.in_beam[0] ? rem.in_beam
                                                 : (cfg->out_beam[0] ? cfg->out_beam : "b_pup");
 
+    /* Heal optical graph continuity across all output arms owned by the deleted node */
     if (rem.out_beam[0] != '\0')
     {
         rewire_consumers_except(cfg, rem.out_beam, bridge, (int) node_idx, -1);
@@ -984,6 +1364,31 @@ int cacaosim_bench_remove_node(cacaosim_bench_cfg_t *cfg, uint32_t node_idx)
     return 0;
 }
 
+/**
+ * cacaosim_bench_move_node() - Swap node @node_idx with neighbor @dir and commute beam causality
+ * @cfg:      Bench configuration to mutate in place (must not be NULL).
+ * @node_idx: Target node index `[0..n_nodes-1]`.
+ * @dir:      Direction step: `-1` (up / upstream) or `+1` (down / downstream).
+ *
+ * Role:
+ *   Normalizes the adjacent pair `(a_idx, b_idx)` with `a_idx < b_idx`, splices beam connections
+ *   across three physical commutation topologies before swapping array entries:
+ *     - Case 1 (`Inline A -> Inline B`): Rewires `in0 -> A -> B -> Downstream` into
+ *       `in0 -> B -> A -> Downstream`.
+ *     - Case 2 (`Inline A -> Splitter B`): Pushes `A` from the common path onto `B`'s transmitted
+ *       arm (`in0 -> B(trans) -> A -> TransConsumers`), leaving `B(refl)` uncorrected by `A`.
+ *     - Case 3 (`Splitter A -> Inline B`): Hoists `B` from `A`'s reflected or transmitted arm up
+ *       into the common path (`in0 -> B -> A -> ArmConsumers`).
+ *   For independent parallel branches or terminal sensors, swaps declaration order directly
+ *   (which also controls tie-breaking order in Kahn's topological sort).
+ *
+ * Rationale:
+ *   Gives interactive "Move Up / Move Down" commands in `cacaosim-CTRL` intuitive physical
+ *   meaning—for example, moving a DM or NCPA screen between common-path and non-common-path arms
+ *   of a dichroic in a single keystroke.
+ *
+ * Return: Updated node index `node_idx + dir`, or -1 if at array boundary or invalid arguments.
+ */
 int cacaosim_bench_move_node(cacaosim_bench_cfg_t *cfg, uint32_t node_idx, int dir)
 {
     if (cfg == NULL || node_idx >= cfg->n_nodes || (dir != -1 && dir != 1))
@@ -1056,6 +1461,21 @@ int cacaosim_bench_move_node(cacaosim_bench_cfg_t *cfg, uint32_t node_idx, int d
     return dst_idx;
 }
 
+/**
+ * cacaosim_bench_swap_branches() - Swap downstream consumers across a splitter or coronagraph
+ * @cfg:      Bench configuration to mutate in place (must not be NULL).
+ * @node_idx: Target splitter or coronagraph node index `[0..n_nodes-1]`.
+ *
+ * Role:
+ *   Exchanges `b1` and `b2` across every other node's `in_beam`, where `(b1, b2)` is
+ *   `(out_refl, out_trans)` on a splitter or `(out_beam, out_lowfs)` on a coronagraph.
+ *
+ * Rationale:
+ *   Single-pass simultaneous swap (`if == b1 -> b2; else if == b2 -> b1`) exchanges entire
+ *   downstream sub-trees cleanly without temporary beam names or cycle risk.
+ *
+ * Return: 0 on success, -1 if @node_idx is not a two-arm node.
+ */
 int cacaosim_bench_swap_branches(cacaosim_bench_cfg_t *cfg, uint32_t node_idx)
 {
     if (cfg == NULL || node_idx >= cfg->n_nodes)
@@ -1099,6 +1519,24 @@ int cacaosim_bench_swap_branches(cacaosim_bench_cfg_t *cfg, uint32_t node_idx)
     return 0;
 }
 
+/**
+ * cacaosim_bench_rename_node() - Validate and apply a new section identifier to node @node_idx
+ * @cfg:      Bench configuration to mutate in place (must not be NULL).
+ * @node_idx: Target node index `[0..n_nodes-1]`.
+ * @new_id:   Candidate identifier string (`[A-Za-z0-9_-]`, length `1..63`).
+ * @err_buf:  Optional error message buffer populated on failure (may be NULL).
+ * @err_cap:  Capacity of @err_buf in bytes.
+ *
+ * Role:
+ *   Checks pointer validity, length bounds, allowed identifier characters, and uniqueness across
+ *   all sibling nodes before writing `cfg->nodes[node_idx].id`.
+ *
+ * Rationale:
+ *   Forbidding `.`, `[`, `]`, quotes, and whitespace guarantees that serialized `[<type>.<id>]`
+ *   section headers always re-parse unambiguously.
+ *
+ * Return: 0 on success, -1 on invalid syntax or duplicate identifier.
+ */
 int cacaosim_bench_rename_node(
     cacaosim_bench_cfg_t *cfg,
     uint32_t              node_idx,
@@ -1135,6 +1573,21 @@ int cacaosim_bench_rename_node(
     return 0;
 }
 
+/**
+ * cacaosim_bench_rewire_beam_out() - Update all downstream consumers when a beam is renamed
+ * @cfg:      Bench configuration to mutate in place (must not be NULL).
+ * @old_beam: Previous beam name (must not be NULL).
+ * @new_beam: New non-empty beam name (must not be NULL or empty).
+ *
+ * Role:
+ *   Scans `cfg->nodes[]` and replaces any `in_beam` matching @old_beam with @new_beam.
+ *
+ * Rationale:
+ *   Called when the user edits `cfg->out_beam` or an upstream node's `out_beam` / `out_refl` /
+ *   `out_trans` / `out_lowfs` in `cacaosim-CTRL` so downstream consumers remain connected.
+ *
+ * Return: 0 on success, -1 on NULL or empty arguments.
+ */
 int cacaosim_bench_rewire_beam_out(
     cacaosim_bench_cfg_t *cfg,
     const char           *old_beam,

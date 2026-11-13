@@ -5,6 +5,29 @@
 /**
  * @file    cacaosim_coro_cuda.cu
  * @brief   CUDA cuBLAS StridedBatched MFT + cuFFT polychromatic custom-mask coronagraph backend
+ *
+ * Architectural Role in cacaosim:
+ *   Provides the GPU-accelerated polychromatic optical diffraction backend for `cacaosim.coro`.
+ *   Mirrors every optical capability of `cacaosim_coro_engine.c` — custom 2D/3D pupil apodizers,
+ *   compact Soummer Babinet Matrix-DFT focal masks (`lyot_spot`, `phase_dimple`, `custom_mft`),
+ *   shifted full-plane padded 2D FFT focal masks (`vortex`, `fqpm`, `custom_fft`), complex Lyot
+ *   stops, and dual `out_lowfs` pickoffs (`fpm_refl` and `lyot_refl`) — while keeping all static
+ *   optical tables and intermediate complex fields resident in GPU VRAM.
+ *
+ * Design Rationale & GPU Execution Strategy:
+ *   - Zero-Transpose Row-Major to Column-Major cuBLAS Mapping:
+ *     Host MFT basis matrices (`fwd_U`, `fwd_V`, `inv_U`, `inv_V`) are stored in row-major C
+ *     order. Because a row-major `[M x N]` matrix in memory is identical to its `[N x M]`
+ *     transpose `M^T` in cuBLAS's native column-major convention, the row-major product
+ *     `C = A * B` maps directly to `C^T = B^T * A^T` with `CUBLAS_OP_N` on both operands and
+ *     swapped argument order. Using `cublasCgemmStridedBatched`, all `eff_nlam` spectral channels
+ *     execute in parallel in just four batched GEMM launches per frame.
+ *   - Fused Device-Resident Pipeline vs Host SHM Staging:
+ *     When invoked with device pointers (`d_in_opd != NULL && d_out_opd != NULL`) inside the
+ *     multi-rate `cacaosim.htsim` bench engine, kernels enqueue asynchronously onto the shared
+ *     `cudaStream_t` with zero PCIe copies or host stalls. When invoked from standalone SHM FPS
+ *     processes, `cudaMemcpyAsync` / `cudaMemcpy2DAsync` gather and scatter strided `[OPD, Amp]`
+ *     slices transparently.
  */
 
 #ifdef HAVE_CUDA
@@ -18,6 +41,40 @@
 
 #include "coro/cacaosim_coro.h"
 
+/**
+ * struct coro_cuda_state_t - Private device buffers and library handles for `cacaosim.coro`
+ * @stream:           Active CUDA stream (private non-blocking or borrowed from `ext_stream`).
+ * @owns_stream:      Non-zero if `stream` was created locally and must be destroyed on free.
+ * @cublas:           cuBLAS handle bound to `stream` for Babinet MFT `CgemmStridedBatched`.
+ * @fft_plan:         2D `CUFFT_C2C` handle of size `nfft x nfft` bound to `stream`.
+ * @has_fft:          Non-zero when `fft_plan` has been initialized (`!is_babinet`).
+ * @d_lam_um:         Device wavelength array `[eff_nlam]` in `[um]`.
+ * @d_lowfs_pup_mask: Device 2D relay pupil stop `[npix_wf]` for `fpm_refl` LOWFS pickoff.
+ * @d_pup_mask:       Optional device pre-FPM complex pupil apodizer `[eff_nlam * npix_wf]`.
+ * @d_lyot_cplx:      Device post-FPM complex Lyot stop cube `[eff_nlam * npix_wf]`.
+ * @d_in_opd:         Staging buffer for host-to-device input OPD `[eff_nlam * npix_wf]`.
+ * @d_in_amp:         Staging buffer for host-to-device input amplitude `[eff_nlam * npix_wf]`.
+ * @d_out_opd:        Staging buffer for device-to-host output OPD `[eff_nlam * npix_wf]`.
+ * @d_out_amp:        Staging buffer for device-to-host output amplitude `[eff_nlam * npix_wf]`.
+ * @d_lowfs_opd:      Staging buffer for device-to-host 2D LOWFS OPD `[npix_wf]`.
+ * @d_lowfs_amp:      Staging buffer for device-to-host 2D LOWFS amplitude `[npix_wf]`.
+ * @d_epup:           Batched complex entrance pupil field `[eff_nlam * npix_wf]`.
+ * @d_fwd_U:          Device forward MFT Y-axis matrices `[eff_nlam * ny_mft * nwf]`.
+ * @d_fwd_V:          Device forward MFT X-axis matrices `[eff_nlam * nwf * nx_mft]`.
+ * @d_inv_U:          Device inverse MFT Y-axis matrices `[eff_nlam * nwf * ny_mft]`.
+ * @d_inv_V:          Device inverse MFT X-axis matrices `[eff_nlam * nx_mft * nwf]`.
+ * @d_fpm_delta:      Device Babinet core perturbation `T - 1` `[eff_nlam * npix_mft]`.
+ * @d_fpm_refl_w:     Device real FPM reflection weights `sqrt(1 - |T|^2)` `[eff_nlam * npix_mft]`.
+ * @d_ecore:          Batched inverse-MFT pupil perturbation `[eff_nlam * npix_wf]`.
+ * @d_tmp:            Batched intermediate MFT product `[eff_nlam * max(nx_mft, ny_mft) * nwf]`.
+ * @d_efoc:           Batched complex MFT focal field `[eff_nlam * npix_mft]`.
+ * @d_efoc_r:         Single-channel reflected MFT focal field `[npix_mft]` for `fpm_refl` LOWFS.
+ * @d_shift_1d:       Device 1D half-bin pupil shift phasors `[2 * nfft]` (`sh_x` then `sh_y`).
+ * @d_fft_mask:       Device pre-normalized (`1/nfft^2`) complex FFT mask `[eff_nlam * npix_fft]`.
+ * @d_fft_refl_w:     Device pre-normalized (`1/nfft^2`) FFT LOWFS reflection weight `[npix_fft]`.
+ * @d_fft_buf:        In-place `nfft x nfft` complex FFT buffer `[npix_fft]`.
+ * @d_fft_lo_buf:     In-place `nfft x nfft` complex FFT buffer `[npix_fft]` for `fpm_refl` LOWFS.
+ */
 typedef struct
 {
     cudaStream_t   stream;
@@ -58,6 +115,26 @@ typedef struct
     cuComplex     *d_fft_lo_buf;
 } coro_cuda_state_t;
 
+/**
+ * k_coro_build_epup_batch() - Synthesize batched complex entrance pupil across spectral channels
+ * @opd:       Device input OPD `[um]` (`in_nlam` slices at `@in_stride`; NULL -> 0).
+ * @amp:       Device input amplitude (`in_nlam` slices at `@in_stride`; NULL -> 1).
+ * @in_nlam:   Number of input channels (`1` broadcasts slice 0 to all `@eff_nlam` channels).
+ * @in_stride: Float stride between consecutive input slices.
+ * @pup_mask:  Optional pre-FPM complex pupil apodizer `[eff_nlam * npix_wf]` (may be NULL).
+ * @lam_um:    Device channel wavelengths `[eff_nlam]` in `[um]`.
+ * @npix_wf:   Pupil pixel count (`nwf * nwf`).
+ * @eff_nlam:  Number of output coronagraph channels.
+ * @epup:      Output complex pupil field `[eff_nlam * npix_wf]`.
+ *
+ * Role:
+ *   Hot 2D-grid `(pixel, channel)` CUDA kernel converting `[OPD_um, Amplitude]` inputs into
+ *   complex pupil phasors `A * exp(i * 2*pi * OPD / lam_c)` multiplied by optional `pup_mask`.
+ *
+ * Rationale:
+ *   Uses hardware fast intrinsics (`__sincosf`) and early-exits on zero-amplitude pixels outside
+ *   the clear aperture while preparing all `eff_nlam` slices in a single kernel launch.
+ */
 __global__ static void k_coro_build_epup_batch(
     const float *__restrict__     opd,
     const float *__restrict__     amp,
@@ -106,6 +183,29 @@ __global__ static void k_coro_build_epup_batch(
     epup[out_idx] = make_cuComplex(pr, pi);
 }
 
+/**
+ * k_coro_apply_lyot_batch() - Apply complex Lyot stop directly when `skip_fpm == 1`
+ * @epup:       Batched complex entrance pupil field `[eff_nlam * npix_wf]`.
+ * @lyot_cplx:  Batched complex Lyot stop cube `[eff_nlam * npix_wf]`.
+ * @lam_um:     Device channel wavelengths `[eff_nlam]` in `[um]`.
+ * @refl:       Scalar amplitude reflectivity into LOWFS arm.
+ * @lo_lyot:    Non-zero when `lowfs_mode == CACAOSIM_LOWFS_LYOT_REFL`.
+ * @npix_wf:    Pupil pixel count (`nwf * nwf`).
+ * @eff_nlam:   Number of spectral channels.
+ * @c_mid:      Central channel index `eff_nlam / 2` used for 2D LOWFS extraction.
+ * @out_stride: Float stride between output wavelength slices.
+ * @out_opd:    Output post-Lyot OPD `[um]` (`eff_nlam` slices at `@out_stride`).
+ * @out_amp:    Output post-Lyot amplitude (`eff_nlam` slices at `@out_stride`).
+ * @lowfs_opd:  Optional output 2D LOWFS OPD `[um]` `[npix_wf]`.
+ * @lowfs_amp:  Optional output 2D LOWFS amplitude `[npix_wf]`.
+ *
+ * Role:
+ *   Hot FPM-bypass kernel for pure pupil/Lyot apodizers (e.g. Shaped Pupil / vAPP).
+ *
+ * Rationale:
+ *   Multiplies `epup` directly by `lyot_cplx`, extracts `[OPD_um, Amplitude]`, and computes the
+ *   reflective-Lyot (`lyot_refl`) LOWFS beam in a single fused memory pass.
+ */
 __global__ static void k_coro_apply_lyot_batch(
     const cuComplex *__restrict__ epup,
     const cuComplex *__restrict__ lyot_cplx,
@@ -158,6 +258,20 @@ __global__ static void k_coro_apply_lyot_batch(
     }
 }
 
+/**
+ * k_coro_scale_real_copy() - Multiply complex focal field by real FPM reflection weight into `dst`
+ * @src:  Input complex focal field `[npix]`.
+ * @w:    Real amplitude reflection weight `sqrt(1 - |T|^2)` `[npix]`.
+ * @dst:  Output weighted complex focal field `[npix]`.
+ * @npix: Number of focal pixels (`npix_mft` or `npix_fft`).
+ *
+ * Role:
+ *   Prepares the reflected focal-plane field `w * E_foc` non-destructively for `fpm_refl` LOWFS
+ *   inverse propagation while preserving `@src` for the transmitted science Babinet/FFT branch.
+ *
+ * Rationale:
+ *   Writing to a separate `@dst` buffer avoids re-running the forward MFT/FFT for the science arm.
+ */
 __global__ static void k_coro_scale_real_copy(
     const cuComplex *__restrict__ src,
     const float *__restrict__     w,
@@ -173,6 +287,23 @@ __global__ static void k_coro_scale_real_copy(
     }
 }
 
+/**
+ * k_coro_write_lowfs() - Extract `[OPD_um, Amplitude]` from inverse-MFT LOWFS relay pupil field
+ * @ecore:          Complex pupil field inverse-transformed from FPM reflection `[npix]`.
+ * @lowfs_pup_mask: Relay circular pupil stop amplitude `[npix]` (may be NULL).
+ * @refl:           Scalar LOWFS coating amplitude reflectivity.
+ * @rad_to_opd:     Conversion factor `lam_mid / (2 * pi)` `[um / rad]`.
+ * @npix:           Pupil pixel count (`npix_wf`).
+ * @lowfs_opd:      Output 2D LOWFS OPD `[um]` `[npix]`.
+ * @lowfs_amp:      Output 2D LOWFS amplitude `[npix]`.
+ *
+ * Role:
+ *   Finalizes the `fpm_refl` LOWFS pupil output in Babinet MFT mode.
+ *
+ * Rationale:
+ *   Applies both scalar mirror reflectivity `@refl` and the relay pupil stop `@lowfs_pup_mask`
+ *   before converting complex phasors into `[OPD_um, Amplitude]`.
+ */
 __global__ static void k_coro_write_lowfs(
     const cuComplex *__restrict__ ecore,
     const float *__restrict__     lowfs_pup_mask,
@@ -193,6 +324,19 @@ __global__ static void k_coro_write_lowfs(
     }
 }
 
+/**
+ * k_coro_mul_cplx() - In-place elementwise complex multiplication `efoc[i] *= delta[i]`
+ * @efoc:  Batched complex MFT focal field `[total]` updated in place.
+ * @delta: Batched complex Babinet perturbation `T(u,v,lam) - 1` `[total]`.
+ * @total: Total complex elements across all channels (`eff_nlam * npix_mft`).
+ *
+ * Role:
+ *   Applies the polychromatic Babinet focal core mask across all spectral channels in one 1D grid.
+ *
+ * Rationale:
+ *   Flattening `(eff_nlam, npix_mft)` into a single contiguous 1D launch maximizes GPU occupancy
+ *   even when `npix_mft` per channel is small (e.g. `48 * 48 = 2304`).
+ */
 __global__ static void k_coro_mul_cplx(
     cuComplex *__restrict__       efoc,
     const cuComplex *__restrict__ delta,
@@ -207,6 +351,30 @@ __global__ static void k_coro_mul_cplx(
     }
 }
 
+/**
+ * k_coro_babinet_finalize_batch() - Sum `epup + ecore`, apply Lyot stop, and extract OPD/Amp
+ * @epup:       Batched complex entrance pupil field `[eff_nlam * npix_wf]`.
+ * @ecore:      Batched inverse-MFT Babinet core perturbation `[eff_nlam * npix_wf]`.
+ * @lyot_cplx:  Batched complex Lyot stop cube `[eff_nlam * npix_wf]`.
+ * @lam_um:     Device channel wavelengths `[eff_nlam]` in `[um]`.
+ * @refl:       Scalar amplitude reflectivity for `lyot_refl` LOWFS pickoff.
+ * @npix_wf:    Pupil pixel count (`nwf * nwf`).
+ * @eff_nlam:   Number of spectral channels.
+ * @c_mid:      Central channel index `eff_nlam / 2` for LOWFS extraction.
+ * @out_stride: Float stride between output wavelength slices.
+ * @out_opd:    Output post-Lyot OPD `[um]` (`eff_nlam` slices at `@out_stride`).
+ * @out_amp:    Output post-Lyot amplitude (`eff_nlam` slices at `@out_stride`).
+ * @lowfs_opd:  Optional output 2D `lyot_refl` LOWFS OPD `[um]` `[npix_wf]` (NULL when inactive).
+ * @lowfs_amp:  Optional output 2D `lyot_refl` LOWFS amplitude `[npix_wf]` (NULL when inactive).
+ *
+ * Role:
+ *   Fused finalization kernel for the GPU Babinet MFT pipeline.
+ *
+ * Rationale:
+ *   Combines Babinet superposition `U = epup + ecore`, complex Lyot filtering `L * U`, polar
+ *   `[OPD_um, Amplitude]` conversion, and optional reflective-Lyot (`lyot_refl`) LOWFS pickoff
+ *   into one bandwidth-bound kernel pass over `[eff_nlam * npix_wf]`.
+ */
 __global__ static void k_coro_babinet_finalize_batch(
     const cuComplex *__restrict__ epup,
     const cuComplex *__restrict__ ecore,
@@ -254,6 +422,22 @@ __global__ static void k_coro_babinet_finalize_batch(
     }
 }
 
+/**
+ * k_coro_fft_embed_epup() - Zero-pad `[nwf x nwf]` pupil into `[nfft x nfft]` with half-bin shift
+ * @epup_c:  Single-channel complex entrance pupil `[nwf * nwf]`.
+ * @shift_x: 1D X half-bin shift phasor `exp(-i * pi * gx / nfft)` `[nfft]`.
+ * @shift_y: 1D Y half-bin shift phasor `exp(-i * pi * gy / nfft)` `[nfft]`.
+ * @nwf:     Pupil grid width `[pixels]`.
+ * @nfft:    Padded FFT grid width `[pixels]`.
+ * @fft_buf: Output complex padded FFT grid `[nfft * nfft]`.
+ *
+ * Role:
+ *   Prepares the zero-padded, phase-ramped input array for forward 2D `cufftExecC2C`.
+ *
+ * Rationale:
+ *   Fuses zero-clearing the outer guard band and center-embedding `epup_c * shift_x * shift_y`
+ *   into one coalesced write pass over `nfft * nfft`, eliminating a separate `cudaMemsetAsync`.
+ */
 __global__ static void k_coro_fft_embed_epup(
     const cuComplex *__restrict__ epup_c,
     const cuComplex *__restrict__ shift_x,
@@ -290,6 +474,19 @@ __global__ static void k_coro_fft_embed_epup(
     fft_buf[idx] = make_cuComplex(ep.x * sr - ep.y * si, ep.x * si + ep.y * sr);
 }
 
+/**
+ * k_coro_fft_mul_mask() - Multiply complex focal spectrum by pre-normalized FFT coronagraph mask
+ * @fft_buf:  In-place complex focal spectrum `[npix_fft]`.
+ * @mask:     Pre-normalized (`1/nfft^2`) complex focal mask slice `[npix_fft]`.
+ * @npix_fft: Total FFT pixels (`nfft * nfft`).
+ *
+ * Role:
+ *   Applies Vortex, 4QPM, or `CUSTOM_FFT` focal phase/amplitude transmission in the Fourier domain.
+ *
+ * Rationale:
+ *   Because `1 / nfft^2` was baked into `@mask` during `coro_precompute_fft_mask()`, no extra
+ *   normalization pass is needed after the subsequent `CUFFT_INVERSE` transform.
+ */
 __global__ static void k_coro_fft_mul_mask(
     cuComplex *__restrict__       fft_buf,
     const cuComplex *__restrict__ mask,
@@ -304,6 +501,26 @@ __global__ static void k_coro_fft_mul_mask(
     }
 }
 
+/**
+ * k_coro_fft_extract_lowfs_fpm() - Crop inverse-FFT reflected field, unshift, and write LOWFS beam
+ * @fft_lo_buf:     Inverse-FFT reflected pupil buffer `[nfft * nfft]`.
+ * @shift_x:        1D X half-bin forward shift phasor `[nfft]` (conjugated in kernel).
+ * @shift_y:        1D Y half-bin forward shift phasor `[nfft]` (conjugated in kernel).
+ * @lowfs_pup_mask: Relay circular pupil stop `[nwf * nwf]` (may be NULL).
+ * @refl:           Scalar LOWFS coating amplitude reflectivity.
+ * @rad_to_opd:     Conversion factor `lam_mid / (2 * pi)` `[um / rad]`.
+ * @nwf:            Pupil grid width `[pixels]`.
+ * @nfft:           Padded FFT grid width `[pixels]`.
+ * @lowfs_opd:      Output 2D LOWFS OPD `[um]` `[nwf * nwf]`.
+ * @lowfs_amp:      Output 2D LOWFS amplitude `[nwf * nwf]`.
+ *
+ * Role:
+ *   Extracts the central `[nwf x nwf]` pupil window on the `fpm_refl` LOWFS branch in FFT modes.
+ *
+ * Rationale:
+ *   Multiplies by `conj(shift_x) * conj(shift_y)` to remove the linear pupil phase ramp introduced
+ *   by `k_coro_fft_embed_epup()` so downstream LOWFS tip/tilt sensing sees zero artificial tilt.
+ */
 __global__ static void k_coro_fft_extract_lowfs_fpm(
     const cuComplex *__restrict__ fft_lo_buf,
     const cuComplex *__restrict__ shift_x,
@@ -343,6 +560,29 @@ __global__ static void k_coro_fft_extract_lowfs_fpm(
     lowfs_opd[p]   = (la > 1e-12f) ? (atan2f(ui, ur) * rad_to_opd) : 0.0f;
 }
 
+/**
+ * k_coro_fft_extract_cplx() - Crop inverse-FFT Lyot pupil, unshift, apply Lyot stop, & write OPD
+ * @fft_buf:    Inverse-FFT science buffer `[nfft * nfft]`.
+ * @shift_x:    1D X half-bin forward shift phasor `[nfft]` (conjugated in kernel).
+ * @shift_y:    1D Y half-bin forward shift phasor `[nfft]` (conjugated in kernel).
+ * @lyot_c:     Single-channel complex Lyot stop `[nwf * nwf]`.
+ * @refl:       Scalar amplitude reflectivity for `lyot_refl` LOWFS pickoff.
+ * @rad_to_opd: Conversion factor `lam_c / (2 * pi)` `[um / rad]`.
+ * @nwf:        Pupil grid width `[pixels]`.
+ * @nfft:       Padded FFT grid width `[pixels]`.
+ * @out_opd:    Output channel post-Lyot OPD `[um]` `[nwf * nwf]`.
+ * @out_amp:    Output channel post-Lyot amplitude `[nwf * nwf]`.
+ * @lowfs_opd:  Optional output 2D `lyot_refl` LOWFS OPD `[um]` `[nwf * nwf]` (NULL otherwise).
+ * @lowfs_amp:  Optional output 2D `lyot_refl` LOWFS amplitude `[nwf * nwf]` (NULL otherwise).
+ *
+ * Role:
+ *   Finalizes one spectral channel of the padded-FFT coronagraph pipeline.
+ *
+ * Rationale:
+ *   Crops the central `[nwf x nwf]` pupil sub-grid, cancels the half-bin shift ramp via
+ *   `conj(shift_x) * conj(shift_y)`, applies `lyot_c`, and optionally extracts the reflective-Lyot
+ *   LOWFS field in one pass.
+ */
 __global__ static void k_coro_fft_extract_cplx(
     const cuComplex *__restrict__ fft_buf,
     const cuComplex *__restrict__ shift_x,
@@ -396,6 +636,23 @@ __global__ static void k_coro_fft_extract_cplx(
     }
 }
 
+/**
+ * cacaosim_coro_cuda_init() - Allocate device buffers, cuBLAS/cuFFT plans, and upload static masks
+ * @ctx:        Host-initialized coronagraph context with precomputed MFT or FFT tables.
+ * @ext_stream: Optional external `cudaStream_t` (NULL creates a private non-blocking stream).
+ *
+ * Role:
+ *   Cold-path CUDA backend setup allocating GPU memory for polychromatic pupil/Lyot masks,
+ *   staging I/O buffers, and either `cublasHandle_t` + Babinet MFT basis cubes or `cufftHandle` +
+ *   2D FFT focal masks.
+ *
+ * Rationale:
+ *   Synchronizes `cs->stream` once at the end of initialization after queueing asynchronous H2D
+ *   transfers of all static optical arrays, guaranteeing zero host-to-device mask traffic during
+ *   the real-time loop.
+ *
+ * Return: 0 on success, -1 on CUDA/cuBLAS/cuFFT error (with partial allocations rolled back).
+ */
 extern "C" int cacaosim_coro_cuda_init(cacaosim_coro_ctx_t *ctx, void *ext_stream)
 {
     coro_cuda_state_t *cs = (coro_cuda_state_t *) calloc(1, sizeof(*cs));
@@ -534,6 +791,17 @@ extern "C" int cacaosim_coro_cuda_init(cacaosim_coro_ctx_t *ctx, void *ext_strea
     return 0;
 }
 
+/**
+ * cacaosim_coro_cuda_free() - Destroy cuBLAS/cuFFT handles and release device coronagraph memory
+ * @ctx: Coronagraph context owning `cuda_priv` (safe when `cuda_priv == NULL`).
+ *
+ * Role:
+ *   Cold-path teardown freeing all device buffers, library plans, and private CUDA stream.
+ *
+ * Rationale:
+ *   `cudaFree(NULL)` is a safe no-op in the CUDA runtime, allowing partial allocations from failed
+ *   `cacaosim_coro_cuda_init()` calls to be cleaned up safely through a single code path.
+ */
 extern "C" void cacaosim_coro_cuda_free(cacaosim_coro_ctx_t *ctx)
 {
     coro_cuda_state_t *cs = (coro_cuda_state_t *) ctx->cuda_priv;
@@ -583,6 +851,35 @@ extern "C" void cacaosim_coro_cuda_free(cacaosim_coro_ctx_t *ctx)
     ctx->cuda_priv = NULL;
 }
 
+/**
+ * cacaosim_coro_cuda_step_poly() - Execute polychromatic coronagraph propagation on CUDA GPU
+ * @ctx:         Active coronagraph context with initialized `cuda_priv`.
+ * @h_in_opd:    Host input OPD `[um]` (used when `!dev_mode`).
+ * @h_in_amp:    Host input amplitude (used when `!dev_mode`).
+ * @in_nlam:     Number of input wavelength channels (`1` = monochromatic broadcast).
+ * @in_stride:   Float stride between input channels.
+ * @h_out_opd:   Host output post-Lyot OPD `[um]` (populated when `!dev_mode`).
+ * @h_out_amp:   Host output post-Lyot amplitude (populated when `!dev_mode`).
+ * @out_stride:  Float stride between output channels.
+ * @h_lowfs_opd: Optional host 2D LOWFS OPD `[um]` `[npix_wf]`.
+ * @h_lowfs_amp: Optional host 2D LOWFS amplitude `[npix_wf]`.
+ * @d_in_opd:    Optional resident device input OPD (`dev_mode` when paired with `@d_out_opd`).
+ * @d_in_amp:    Optional resident device input amplitude.
+ * @d_out_opd:   Optional resident device output post-Lyot OPD.
+ * @d_out_amp:   Optional resident device output post-Lyot amplitude.
+ * @d_lowfs_opd: Optional resident device 2D LOWFS OPD.
+ * @d_lowfs_amp: Optional resident device 2D LOWFS amplitude.
+ *
+ * Role:
+ *   Hot-path GPU propagator orchestrating optional strided H2D staging, batched pupil construction,
+ *   Babinet `cublasCgemmStridedBatched` MFT or per-channel `cufftExecC2C` 2D FFT diffraction,
+ *   `fpm_refl` / `lyot_refl` LOWFS pickoffs, and optional strided D2H writeback.
+ *
+ * Rationale:
+ *   Uses `cudaMemcpy2DAsync` whenever host SHM cubes interleave `[OPD_c, Amp_c]` slices
+ *   (`in_stride == 2 * npix_wf`), packing slices contiguously into `cs->d_in_opd`/`cs->d_in_amp`
+ *   in a single DMA transaction without per-channel host loops.
+ */
 extern "C" void cacaosim_coro_cuda_step_poly(
     cacaosim_coro_ctx_t *ctx,
     const float         *h_in_opd,
@@ -622,6 +919,7 @@ extern "C" void cacaosim_coro_cuda_step_poly(
     float       *dlo_o = want_lo ? ((d_lowfs_opd != NULL) ? d_lowfs_opd : cs->d_lowfs_opd) : NULL;
     float       *dlo_a = want_lo ? ((d_lowfs_amp != NULL) ? d_lowfs_amp : cs->d_lowfs_amp) : NULL;
 
+    /* Stage host SHM slices to contiguous GPU buffers when not running purely device-resident */
     if (!dev_mode)
     {
         dev_in_stride = npix_wf;
@@ -686,6 +984,11 @@ extern "C" void cacaosim_coro_cuda_step_poly(
         const long long int str_t  = (long long int) max_m * nwf;
         const long long int str_ef = (long long int) ctx->npix_mft;
 
+        /*
+         * Batched forward 2D MFT via column-major transpose identity (A*B)^T = B^T * A^T:
+         *   Row-major tmp[my x nwf] = fwd_U[my x nwf] * epup[nwf x nwf]
+         *   Row-major efoc[my x mx] = tmp[my x nwf]   * fwd_V[nwf x mx]
+         */
         cublasCgemmStridedBatched(cs->cublas, CUBLAS_OP_N, CUBLAS_OP_N, nwf, my, nwf, &one,
                                   cs->d_epup, nwf, str_ep, cs->d_fwd_U, nwf, str_u, &zero,
                                   cs->d_tmp, nwf, str_t, eff_nlam);
@@ -693,6 +996,7 @@ extern "C" void cacaosim_coro_cuda_step_poly(
                                   cs->d_fwd_V, mx, str_v, cs->d_tmp, nwf, str_t, &zero, cs->d_efoc,
                                   mx, str_ef, eff_nlam);
 
+        /* Central-channel fpm_refl LOWFS inverse MFT: ecore = inv_U * (w * efoc) * inv_V */
         if (want_lo && !lo_lyot && dlo_o != NULL && dlo_a != NULL)
         {
             uint32_t bl_m1 = (uint32_t) ((ctx->npix_mft + 255ULL) / 256ULL);
@@ -709,6 +1013,7 @@ extern "C" void cacaosim_coro_cuda_step_poly(
                 cs->d_ecore, cs->d_lowfs_pup_mask, refl, rad_to_opd_mid, npix_wf, dlo_o, dlo_a);
         }
 
+        /* Apply Babinet focal perturbation (T - 1) and batched inverse 2D MFT back to pupil */
         uint64_t total_mft = (uint64_t) eff_nlam * ctx->npix_mft;
         uint32_t bl_mft    = (uint32_t) ((total_mft + 255ULL) / 256ULL);
         k_coro_mul_cplx<<<bl_mft, 256, 0, cs->stream>>>(cs->d_efoc, cs->d_fpm_delta, total_mft);
@@ -727,6 +1032,7 @@ extern "C" void cacaosim_coro_cuda_step_poly(
     }
     else
     {
+        /* Per-channel padded 2D cuFFT pipeline (Vortex, 4QPM, and CUSTOM_FFT) */
         const uint32_t   bl_fft = (uint32_t) ((ctx->npix_fft + 255ULL) / 256ULL);
         const cuComplex *sh_x   = cs->d_shift_1d;
         const cuComplex *sh_y   = cs->d_shift_1d + ctx->nfft;
@@ -763,6 +1069,7 @@ extern "C" void cacaosim_coro_cuda_step_poly(
         }
     }
 
+    /* Scatter GPU outputs back to host SHM buffers and synchronize when in host staging mode */
     if (!dev_mode)
     {
         if (h_out_opd != NULL)

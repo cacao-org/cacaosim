@@ -2,14 +2,50 @@
 # SPDX-FileCopyrightText: 2026 Olivier Guyon et al
 # SPDX-License-Identifier: LGPL-3.0-or-later
 #
+# =================================================================================================
 # cacaosim-bench — Turnkey launcher for single- and multi-stage cacaosim AO benches
+# =================================================================================================
+#
+# Architectural Role:
+#   Unified command-line orchestrator for configuring, visualizing, launching, inspecting, and
+#   stopping Adaptive Optics hardware simulations within a `milk` / `cacao` POSIX shared-memory
+#   domain (`MILK_SHM_DIR`, defaulting to `/milk/shm`). Bridges interactive frontends
+#   (`cacaosim-CTRL`, `cacaosim-bench-view`, `$EDITOR`) with real-time `milk-fpsexec-cacaosim-*`
+#   and `milk-fpsexec-atmturb-mkwfs` daemons.
+#
+# Execution Topologies (`--mode fused` vs `--mode modular`):
+#   1. Fused Mode (`--mode fused`, default):
+#      Executes the entire optical bench inside a single `milk-fpsexec-cacaosim-htsim` process
+#      paced by monotonic `TIMER_ABSTIME` (`procinfo.triggermode = 0`). All intermediate optical
+#      beams (`[OPD_um, Amplitude]`) remain in CPU cache or GPU VRAM with zero IPC hops, exposing
+#      only external hardware SHM boundaries (DM commands and WFS/science detector streams) to
+#      `cacao` for maximum kilohertz throughput and sub-10-microsecond jitter.
+#   2. Modular Mode (`--mode modular`):
+#      Compiles a declarative `.bench` file (or default single-stage layout) into separate OS
+#      processes (`csim_<id>` per optical element). Downstream optical elements and sensors block
+#      on `ImageStreamIO` semaphores (`procinfo.triggermode = 3` watching their input beam stream),
+#      while root `csim_mkbeam` ticks autonomously at `master_hz` (`triggermode = 0`). Useful for
+#      inspecting intermediate pupil/focal beams in SHM, splicing custom external processes, or
+#      isolating per-unit CPU/GPU core affinities.
+#
+# Environment Isolation & Process Lifecycle:
+#   - All active daemon registries (`cacaosim_bench.units`, `cacaosim_bench.pids`) and the active
+#     topology snapshot (`csim_active.bench`) live inside `MILK_SHM_DIR`, allowing multiple
+#     isolated benches to coexist concurrently in separate `MILK_SHM_DIR` sandboxes.
+#   - Units follow the `milk` FPS lifecycle: `fpsinit` (create `.fps.shm` parameter table) ->
+#     `milk-fps-set` (configure `triggermode` / `triggersname` / `loopcntMax = -1`) -> `runstart`
+#     (spawn background RT loop) -> `runstop` (request cooperative end-of-frame exit on `stop`).
+# =================================================================================================
 
 set -euo pipefail
 
+# Prepend sibling scripts and sibling `<prefix>/bin` to PATH so uninstalled build-tree and
+# installed `<prefix>/bin/cacaosim-bench` invocations resolve helper binaries identically.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export PATH="${SCRIPT_DIR}:${PREFIX_DIR}/bin:${PATH}"
 
+# Default runtime parameters for zero-config single-stage startup (`cacaosim-bench start`).
 MODE="fused"
 BENCH_CFG=""
 NWF=128
@@ -24,6 +60,15 @@ WITH_ATMTURB=0
 SEEING=0.7
 SHOW_VIEW=1
 
+# -------------------------------------------------------------------------------------------------
+# usage() — Print CLI Command & Runtime Flag Reference
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Outputs concise synopsis of subcommands and simulation override flags to stdout.
+#
+# Rationale:
+#   Interpolates live script defaults (`${NWF}`, `${NACT}`, `${RATE_HZ}`, etc.) directly from the
+#   variables above so help output can never drift out of sync with actual default behavior.
 usage() {
     cat <<EOF
 Usage: cacaosim-bench [command] [options]
@@ -55,12 +100,25 @@ Options:
 EOF
 }
 
+# Extract optional positional subcommand (`start` if omitted or if first argument is a `--flag`).
 CMD="start"
 if [[ $# -gt 0 && "$1" != -* ]]; then
     CMD="$1"
     shift
 fi
 
+# -------------------------------------------------------------------------------------------------
+# Fast-Path Interactive / Visualization Subcommands (`view`, `gui`/`ctrl`/`tui`, `edit`)
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Delegates directly to `cacaosim-bench-view`, `cacaosim-CTRL`, or `$VISUAL`/`$EDITOR` via `exec`
+#   without modifying `MILK_SHM_DIR` daemon state files.
+#
+# Rationale:
+#   Using `exec` replaces the bash wrapper process in-place so terminal resize (`SIGWINCH`) and
+#   keyboard signals (`SIGINT`) reach the TUI or editor directly. For `edit`, non-existent `.bench`
+#   targets are auto-bootstrapped with a commented 2-stage template (`--init`), and saving/exiting
+#   the editor immediately renders `cacaosim-bench-view` to validate DAG connectivity and flux.
 case "${CMD}" in
     view|show)
         exec cacaosim-bench-view "$@"
@@ -94,6 +152,8 @@ case "${CMD}" in
         ;;
 esac
 
+# Parse runtime flags for `start`, `stop`, and `status` commands (`RATE_SET=1` records whether
+# `--rate` was explicitly supplied on the CLI so it can override `master_hz` in `.bench` files).
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --config)    BENCH_CFG="$2"; shift 2 ;;
@@ -113,11 +173,26 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Bind tracking files inside `MILK_SHM_DIR` so concurrent sandboxed benches stay independent.
 SHM_DIR="${MILK_SHM_DIR:-/milk/shm}"
 mkdir -p "${SHM_DIR}"
 PID_FILE="${SHM_DIR}/cacaosim_bench.pids"
 UNIT_FILE="${SHM_DIR}/cacaosim_bench.units"
 
+# -------------------------------------------------------------------------------------------------
+# Daemon Lifecycle Subcommands (`stop` and `status`)
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   - `stop`: Sends cooperative `runstop` signals to every custom-named `<binary>:<fps_name>` pair
+#     recorded in `UNIT_FILE`, sweeps all default singleton `cacaosim` / `atmturb` FPS unit names,
+#     and sends `SIGINT` to background PIDs tracked in `PID_FILE`.
+#   - `status`: Renders the active `.bench` optical schematic (with live SHM stream status probes)
+#     and lists `.im.shm` shared-memory files in `SHM_DIR`.
+#
+# Rationale:
+#   Signaling `runstop` through FPS (rather than `kill -9`) allows running optical loops to finish
+#   their in-flight frame, clear `md->write = 0`, and tear down FFTW/CUDA contexts cleanly without
+#   corrupting shared-memory semaphores.
 case "${CMD}" in
     stop)
         if [[ -f "${UNIT_FILE}" ]]; then
@@ -170,6 +245,17 @@ esac
 
 rm -f "${PID_FILE}" "${UNIT_FILE}"
 
+# -------------------------------------------------------------------------------------------------
+# start_atmturb() — Optional Live Kolmogorov/von Karman Phase-Screen Generator
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   When `--atmturb` is passed, launches `milk-fpsexec-atmturb-mkwfs` in the background to stream
+#   evolving atmospheric wavefront maps (`outarraypha`) at grid size `wf_sz` and time step `1/rate`.
+#
+# Rationale:
+#   Deriving `time_step = 1.0 / rate` locks the frozen-flow turbulence temporal evolution to the
+#   bench master clock (`master_hz` or `--rate`), while brief `sleep 0.3` ensures `outarraypha`
+#   exists in `SHM_DIR` before `htsim` or `mkbeam` binds to it on startup.
 start_atmturb() {
     local wf_sz="$1"
     local rate="$2"
@@ -193,6 +279,18 @@ start_atmturb() {
 }
 
 # ── Declarative Multi-Stage .bench Mode ──────────────────────────────────────
+# Role:
+#   Deploys an arbitrary multi-arm optical DAG defined in a `.bench` INI/TOML file into `SHM_DIR`
+#   in either `fused` (`cacaosim.htsim`) or `modular` (multi-process `fpsexec`) execution mode.
+#
+# Rationale:
+#   1. Path Resolution & Active Snapshot: Resolves bare filenames (e.g., `two_stage_ao.bench`)
+#      against installed `<prefix>/share/cacaosim/examples/` or source `../examples/` and copies
+#      the resolved file to `${SHM_DIR}/csim_active.bench` so `cacaosim-bench status` and `htsim`
+#      always reference a stable snapshot inside `MILK_SHM_DIR`.
+#   2. Pass-1 `awk` `[bench]` Header Extraction: Parses aperture geometry (`nwf`, `pup_diam`,
+#      `cobs`, spiders) and `master_hz` so one-shot `mkpupil` and optional `start_atmturb` can
+#      pre-create `in_pup` and `outarraypha` before any continuous loop attaches to them.
 if [[ -n "${BENCH_CFG}" ]]; then
     if [[ ! -f "${BENCH_CFG}" ]]; then
         if [[ -f "${PREFIX_DIR}/share/cacaosim/examples/${BENCH_CFG}" ]]; then
@@ -270,6 +368,8 @@ if [[ -n "${BENCH_CFG}" ]]; then
     start_atmturb "${B_NWF}" "${EFF_RATE}"
 
     if [[ "${MODE}" == "fused" ]]; then
+        # Fused DAG path: single `csim_htsim` daemon executes all optical nodes in-memory at
+        # `EFF_RATE` Hz (`triggermode = 0`, `loopcntMax = -1`).
         echo "[cacaosim-bench] Starting fused .bench DAG (${BENCH_ABS}, ${EFF_RATE} Hz)..."
         export CACAOSIM_BENCH_FILE="${BENCH_ABS}"
         milk-fpsexec-cacaosim-htsim -n csim_htsim fpsinit \
@@ -281,6 +381,11 @@ if [[ -n "${BENCH_CFG}" ]]; then
         milk-fpsexec-cacaosim-htsim -n csim_htsim runstart
         echo "milk-fpsexec-cacaosim-htsim:csim_htsim" >> "${UNIT_FILE}"
     elif [[ "${MODE}" == "modular" ]]; then
+        # Modular multi-process path: Pass-2 `awk` compiler translates every `[kind.id]` block into
+        # its corresponding `milk-fpsexec-cacaosim-* -n csim_<id>` daemon (`MOD_SH`).
+        # Rationale for startup ordering: all downstream optical relays and sensors are initialized
+        # and armed on semaphore `triggermode = 3` (`triggersname = <in_beam>`) BEFORE root
+        # `csim_mkbeam` starts ticking (`triggermode = 0`), preventing missed startup frames.
         echo "[cacaosim-bench] Starting modular FPS pipeline from ${BENCH_ABS}..."
         MOD_SH="${SHM_DIR}/cacaosim_modular_launch.sh"
         awk -v eff_rate="${EFF_RATE}" -v backend="${BACKEND}" -v ufile="${UNIT_FILE}" '
@@ -527,6 +632,14 @@ if [[ -n "${BENCH_CFG}" ]]; then
 fi
 
 # ── Default Flat Single-Stage Mode ───────────────────────────────────────────
+# Role:
+#   Zero-config fallback when `--config` is omitted: provisions `csim_pup` and launches a canonical
+#   single-stage AO loop (`aol0_dmC -> aol0_wfsim + csim_fpcam/csim_fplong`) parameterized directly
+#   by `--nwf`, `--nact`, `--wfs-ncam`, `--fp-ncam`, `--rate`, `--mod-rad`, and `--backend`.
+#
+# Rationale:
+#   Enables one-command `cacao` loop prototyping (`cacaosim-bench start`) using `cacao` loop 0's
+#   default stream conventions without requiring a `.bench` file on disk.
 echo "[cacaosim-bench] Generating ${NWF}x${NWF} anti-aliased pupil (csim_pup)..."
 milk-fpsexec-cacaosim-mkpupil --no-procinfo exec \
     .nwf="${NWF}" \

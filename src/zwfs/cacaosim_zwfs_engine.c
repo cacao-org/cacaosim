@@ -5,6 +5,29 @@
 /**
  * @file    cacaosim_zwfs_engine.c
  * @brief   Babinet Matrix-DFT Zernike phase-contrast WFS CPU engine and host orchestration
+ *
+ * Architectural Role in cacaosim:
+ *   Implements precomputation of separable Soummer Matrix-DFT (`MFT`) operators and subpixel-
+ *   anti-aliased Babinet focal dimple masks, OpenBLAS `cblas_cgemm` CPU optical propagation,
+ *   area-conserving detector binning, multi-subframe (`navg`) exposure accumulation, and backend
+ *   dispatch to `cacaosim_zwfs_cuda.cu`.
+ *
+ * Design Rationale & Physics / Algorithmic Motivation:
+ *   1. Babinet Decomposition & Fine-Sampled Matrix-DFT:
+ *      Discretizing Zernike's `~1.06 lambda/D` phase-shifting dimple on a direct 2D FFT grid
+ *      suffers severe staircase aliasing unless padded to thousands of pixels. By Babinet's
+ *      principle, writing the focal mask transmission as `1 + (t_d * exp(i*theta) - 1) * D(u, v)`
+ *      (equivalently `1 - (1 - t_d * exp(i*theta)) * D(u, v)`) restricts the Fourier integral
+ *      exclusively to the compact `~2 lambda/D` dimple patch:
+ *        `Psi_out = Psi_pup + MFT^-1[(t_d * exp(i*theta) - 1) * D * MFT[Psi_pup]]`
+ *      Pre-multiplying `(t_d * exp(i*theta) - 1)` into `mask_bab_cplx` lets the final inverse MFT
+ *      `cblas_cgemm` superpose the dimple-diffracted reference wave onto `epup` in-place via
+ *      `beta = +1` (`Epup := 1 * (inv_U * Efoc) * inv_V + 1 * Epup`).
+ *   2. Cache-Hot Micro-GEMMs & Thread Control:
+ *      For `nwf = 128` and `n_mft = 32`, each MFT matrix occupies only `32 KiB`, fitting entirely
+ *      inside CPU L1/L2 cache so four `cblas_cgemm` calls finish in microseconds. Pinning OpenBLAS
+ *      to 1 thread via weak symbol `openblas_set_num_threads(1)` avoids BLAS thread-pool spin-wait
+ *      contention inside real-time multi-process AO loops.
  */
 
 #define _GNU_SOURCE
@@ -19,20 +42,46 @@
 #include "common/cacaosim_cuda.h"
 #include "zwfs/cacaosim_zwfs.h"
 
+/*
+ * Optional weak symbol for OpenBLAS thread-count control: resolves to NULL when linked against
+ * Netlib BLAS, Intel MKL, or BLIS without requiring build-time BLAS vendor conditionals.
+ */
 extern void openblas_set_num_threads(int num_threads) __attribute__((weak));
 
+/**
+ * zwfs_bin_image_cpu() - Flux-conserving 2D rebinning from pupil grid onto detector pixels
+ * @src:  Source 2D pupil-plane intensity map `[nsrc x nsrc]` (`|Psi_out|^2`)
+ * @nsrc: Linear dimension of the source pupil grid [pixels]
+ * @ncam: Linear dimension of the target WFS camera grid [pixels]
+ * @dst:  Output 2D detector intensity map `[ncam x ncam]`
+ *
+ * Role:
+ *   Hot-loop CPU helper that resamples the `nsrc x nsrc` Zernike output pupil intensity onto the
+ *   `ncam x ncam` detector pixel array while strictly conserving total integrated optical flux.
+ *
+ * Rationale:
+ *   Decouples optical wavefront sampling (`nwf`, chosen to resolve fine spiders, segments, and
+ *   high-order aberrations) from physical camera geometry (`ncam`). Specializes three regimes:
+ *   1. Direct `memcpy` fast path when `ncam == nsrc` (1:1 pixel mapping).
+ *   2. Exact integer `bin x bin` superpixel box-summation when `nsrc` is an integer multiple of
+ *      `ncam` (e.g., `128 -> 64`), avoiding floating-point overlap bounds inside the inner loop.
+ *   3. Exact 2D fractional pixel-overlap area integration (`wx * wy`) for arbitrary non-integer
+ *      pupil-to-camera magnification ratios or upsampling (`ncam > nsrc`).
+ */
 static void MILK_HOT zwfs_bin_image_cpu(
     const float *__restrict src,
     uint32_t                nsrc,
     uint32_t                ncam,
     float *__restrict       dst)
 {
+    /* Fast path 1: 1:1 pupil-to-detector pixel match */
     if (ncam == nsrc)
     {
         __builtin_memcpy(dst, src, (size_t) nsrc * nsrc * sizeof(float));
         return;
     }
 
+    /* Fast path 2: exact integer superpixel box binning (e.g. 128 -> 64 with bin = 2) */
     if (nsrc > ncam && (nsrc % ncam) == 0u)
     {
         const uint32_t bin = nsrc / ncam;
@@ -57,6 +106,7 @@ static void MILK_HOT zwfs_bin_image_cpu(
         return;
     }
 
+    /* General path: exact 2D geometric overlap area integration across fractional source pixels */
     const float scale = (float) nsrc / (float) ncam;
     for (uint32_t cy = 0; cy < ncam; cy++)
     {
@@ -105,6 +155,29 @@ static void MILK_HOT zwfs_bin_image_cpu(
     }
 }
 
+/**
+ * zwfs_precompute_babinet() - Build separable Soummer MFT matrices and anti-aliased Babinet mask
+ * @ctx: ZWFS engine context with allocated MFT and mask buffers
+ *
+ * Role:
+ *   Cold-path setup routine called once by `cacaosim_zwfs_init()` to precompute the forward and
+ *   inverse 1D Fourier projection matrices (`fwd_U_cplx`, `fwd_V_cplx`, `inv_U_cplx`,
+ *   `inv_V_cplx`) and the 2D complex Babinet focal-plane dimple mask (`mask_bab_cplx`).
+ *
+ * Rationale:
+ *   Sampling Zernike's `~1.06 lambda/D` phase-shifting dimple accurately on a conventional FFT
+ *   grid would demand massive `20x..32x` zero-padding (`~4096 x 4096` 2D FFTs). Decomposing the
+ *   focal transmission via Babinet's principle as `T(u, v) = 1 + (t_d * exp(i*theta) - 1) * D(u,v)`
+ *   confines the Fourier integral to a compact square focal window `fov = max(1.4 * dimple_ld, 2)`
+ *   [lambda/D] sampled on `m x m` (`n_mft x n_mft`, default `32 x 32`) fine grid points:
+ *   - Symmetric factor `nrm = sqrt(du / dpix)` split across forward and inverse MFT kernels
+ *     enforces unitary Parseval energy conservation between pupil pixels and `[lambda/D]` units.
+ *   - `8 x 8` (`64`-point) subpixel supersampling of circular dimple boundary `u^2 + v^2 <= r^2`
+ *     eliminates staircase discretization errors in dimple diameter sensitivity.
+ *   - Pre-multiplying the complex Babinet scalar `(t_amp * exp(i * dimple_rad) - 1)` into
+ *     `mask_bab_cplx` eliminates an arithmetic subtraction stage at runtime so the final inverse
+ *     MFT GEMM accumulates directly onto `epup` with `beta = +1`.
+ */
 static void zwfs_precompute_babinet(cacaosim_zwfs_ctx_t *ctx)
 {
     const uint32_t nwf   = ctx->cfg.nwf;
@@ -114,10 +187,13 @@ static void zwfs_precompute_babinet(cacaosim_zwfs_ctx_t *ctx)
     const float    p0    = 0.5f * (float) (nwf - 1u);
     const float    d_ld  = (ctx->cfg.dimple_ld > 0.05f) ? ctx->cfg.dimple_ld : 1.06f;
     const float    r_ld  = 0.5f * d_ld;
+    /* Margin around dimple diameter ensures clean support inside the MFT focal patch */
     const float    fov   = (1.4f * d_ld > 2.0f) ? (1.4f * d_ld) : 2.0f;
     const float    du    = fov / (float) m;
+    /* Unitary Soummer MFT normalization sqrt(du / D_pup) shared equally by fwd and inv matrices */
     const float    nrm   = sqrtf(du / dpix);
 
+    /* Separable 1D DFT kernels centered symmetrically on pixel midpoint p0 and focal origin */
     for (uint32_t k = 0; k < m; k++)
     {
         const float u = (((float) k + 0.5f) / (float) m - 0.5f) * fov;
@@ -136,6 +212,7 @@ static void zwfs_precompute_babinet(cacaosim_zwfs_ctx_t *ctx)
             ctx->fwd_V_cplx[idx_pk]   = nrm * co;
             ctx->fwd_V_cplx[idx_pk + 1] = nrm * s;
 
+            /* Conjugate transpose kernels (+2*pi*xt*u) for inverse MFT back to pupil plane */
             ctx->inv_U_cplx[idx_pk]   = nrm * co;
             ctx->inv_U_cplx[idx_pk + 1] = -nrm * s;
             ctx->inv_V_cplx[idx_kp]   = nrm * co;
@@ -143,6 +220,7 @@ static void zwfs_precompute_babinet(cacaosim_zwfs_ctx_t *ctx)
         }
     }
 
+    /* Complex Babinet contrast coefficient: c = t_d * exp(i * dimple_rad) - 1 */
     float t_amp = (ctx->cfg.dimple_amp >= 0.0f && ctx->cfg.dimple_amp <= 1.0f)
                       ? ctx->cfg.dimple_amp
                       : 1.0f;
@@ -181,6 +259,30 @@ static void zwfs_precompute_babinet(cacaosim_zwfs_ctx_t *ctx)
     }
 }
 
+/**
+ * zwfs_propagate_cpu() - Propagate one optical subframe through the Babinet MFT Zernike WFS on CPU
+ * @ctx:       Initialized ZWFS context
+ * @pup_amp:   2D entrance pupil amplitude `[nwf x nwf]`, or NULL for uniform unit amplitude
+ * @atm_amp:   Optional multiplicative scintillation amplitude `[nwf x nwf]`, or NULL
+ * @wf_in:     Optional incident wavefront map `[nwf x nwf]`, or NULL
+ * @dm_opd:    Optional subtracted DM correction OPD `[nwf x nwf]` [um], or NULL
+ * @ncpa_opd:  Optional additive static WFS-path NCPA OPD `[nwf x nwf]` [um], or NULL
+ * @wf_to_opd: Conversion factor mapping `wf_in` units into optical path difference [um]
+ *
+ * Role:
+ *   Core hot-loop CPU diffractive propagator that builds the complex entrance pupil field,
+ *   evaluates Zernike phase-contrast interference via four `cblas_cgemm` matrix multiplies,
+ *   computes output pupil intensity `|Psi_out|^2`, and rebins onto `ctx->cpu_cam_int`.
+ *
+ * Rationale:
+ *   Implements Babinet's exact identity
+ *   `Psi_out = Psi_pup + inv_U * (mask_bab .* (fwd_U * Psi_pup * fwd_V)) * inv_V`:
+ *   - Passing `beta = c_one` (`+1 + 0i`) to the final `cblas_cgemm` fuses the Babinet reference-
+ *     wave addition with the inverse MFT matrix product directly onto `epup` in-place, saving an
+ *     extra full-pupil buffer allocation and memory sweep.
+ *   - OpenMP parallelization of pupil phasor `sincosf()` synthesis is gated on `npix_wf >= 16384`
+ *     (`nwf >= 128`) so thread-fork overhead never penalizes compact LOWFS grids.
+ */
 static void MILK_HOT zwfs_propagate_cpu(
     cacaosim_zwfs_ctx_t    *ctx,
     const float *__restrict pup_amp,
@@ -199,6 +301,7 @@ static void MILK_HOT zwfs_propagate_cpu(
 
     float *__restrict epup = MILK_ASSUME_ALIGNED(ctx->cpu_epup_cplx);
 
+    /* Synthesize complex entrance pupil Psi_pup(x, y) = A(x, y) * exp(i * 2*pi/lambda * OPD) */
 #pragma omp parallel for num_threads(nth) if (nth > 1) schedule(static)
     for (uint64_t p = 0; p < npix_wf; p++)
     {
@@ -258,12 +361,13 @@ static void MILK_HOT zwfs_propagate_cpu(
         ef[2u * i + 1] = er * mi + ei * mr;
     }
 
-    /* Inverse MFT + Babinet superposition: Epup += inv_U * Efoc * inv_V */
+    /* Inverse MFT + Babinet superposition: Epup += inv_U * Efoc * inv_V (in-place via beta = +1) */
     cblas_cgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, (int) nwf, (int) m, (int) m, c_one,
                 ctx->inv_U_cplx, (int) m, ef, (int) m, c_zero, ctx->cpu_tmp_cplx, (int) m);
     cblas_cgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, (int) nwf, (int) nwf, (int) m, c_one,
                 ctx->cpu_tmp_cplx, (int) m, ctx->inv_V_cplx, (int) nwf, c_one, epup, (int) nwf);
 
+    /* Convert interfered output pupil field into intensity |Psi_out|^2 and bin onto detector */
     float *__restrict pint = MILK_ASSUME_ALIGNED(ctx->cpu_pup_int);
 #pragma omp simd
     for (uint64_t p = 0; p < npix_wf; p++)
@@ -276,6 +380,28 @@ static void MILK_HOT zwfs_propagate_cpu(
     zwfs_bin_image_cpu(pint, nwf, ctx->cfg.ncam, ctx->cpu_cam_int);
 }
 
+/**
+ * zwfs_accum_cpu_common() - Propagate one CPU subframe and lazily accumulate multi-subframe flux
+ * @ctx:       Initialized ZWFS context
+ * @pup_amp:   2D entrance pupil amplitude `[nwf x nwf]`
+ * @atm_amp:   Optional scintillation amplitude `[nwf x nwf]`, or NULL
+ * @wf_in:     Optional incident wavefront map `[nwf x nwf]`, or NULL
+ * @dm_opd:    Optional DM correction OPD `[nwf x nwf]` [um], or NULL
+ * @ncpa_opd:  Optional static WFS-path NCPA OPD `[nwf x nwf]` [um], or NULL
+ * @wf_to_opd: Scale factor converting `wf_in` units to OPD [um]
+ *
+ * Role:
+ *   Shared CPU subframe integration wrapper called by `cacaosim_zwfs_accum_subframe()` and
+ *   `cacaosim_zwfs_accum_beam()` to support `navg >= 1` temporal turbulence averaging prior to
+ *   detector readout.
+ *
+ * Rationale:
+ *   Uses lazy accumulator initialization (`subframe_cnt == 1u`): for the common single-subframe
+ *   case (`navg == 1`), `subframe_cnt` is `0` here and `1` at `cacaosim_zwfs_readout()`, so
+ *   `cpu_cam_int` is read out directly without ever touching `cpu_accum_int`. Only if a second
+ *   subframe is integrated within the same camera exposure is subframe 0 copied into
+ *   `cpu_accum_int` and summed with subsequent subframes.
+ */
 static void MILK_HOT zwfs_accum_cpu_common(
     cacaosim_zwfs_ctx_t *ctx,
     const float         *pup_amp,
@@ -285,6 +411,7 @@ static void MILK_HOT zwfs_accum_cpu_common(
     const float         *ncpa_opd,
     float                wf_to_opd)
 {
+    /* Lazily seed multi-subframe accumulator from subframe 0 only when subframe 1 arrives */
     if (ctx->subframe_cnt == 1u)
     {
         __builtin_memcpy(ctx->cpu_accum_int, ctx->cpu_cam_int, ctx->npix_cam * sizeof(float));
@@ -304,6 +431,32 @@ static void MILK_HOT zwfs_accum_cpu_common(
     }
 }
 
+/**
+ * cacaosim_zwfs_init() - Initialize Zernike phase-contrast WFS context, MFT operators, and GPU
+ * @ctx:        Uninitialized ZWFS engine context to populate (non-NULL)
+ * @cfg:        ZWFS optical, MFT, and detector configuration parameters (non-NULL)
+ * @pup_amp:    Static 2D telescope or coronagraphic LOWFS pupil amplitude `[nwf x nwf]` (non-NULL)
+ * @ncpa_opd:   Optional static WFS-path NCPA OPD `[nwf x nwf]` [um], or NULL
+ * @ext_stream: Optional caller-owned `cudaStream_t` (`void *`) for fused GPU execution, or NULL
+ *
+ * Role:
+ *   Cold-path lifecycle constructor that validates geometry, pins OpenBLAS to single-threaded
+ *   mode, allocates cache-aligned workspace buffers, precomputes the Babinet MFT operators and
+ *   anti-aliased dimple mask, calibrates open-pupil photometric normalization, and initializes the
+ *   optional `cuBLAS` GPU backend.
+ *
+ * Rationale:
+ *   1. Pre-allocating all aligned CPU and GPU workspaces upfront guarantees strictly zero dynamic
+ *      memory allocations (`malloc`/`cudaMalloc`) inside the real-time kHz AO loop.
+ *   2. Calibrating `flat_flux_norm = sum(|pup_amp|^2)` against the open entrance pupil (without
+ *      the dimple mask) via Parseval's identity ensures `flux_ph` represents true incident photons
+ *      entering the WFS while physically preserving throughput attenuation when a partially
+ *      absorbing dimple (`dimple_amp < 1.0`) is configured.
+ *   3. Gracefully falls back to the OpenBLAS CPU engine if `CACAOSIM_BACKEND_AUTO` is requested on
+ *      a host without a usable CUDA device.
+ *
+ * Return: `0` on success, or `-1` on invalid geometry or memory allocation failure.
+ */
 int MILK_COLD cacaosim_zwfs_init(
     cacaosim_zwfs_ctx_t       *ctx,
     const cacaosim_zwfs_cfg_t *cfg,
@@ -323,6 +476,7 @@ int MILK_COLD cacaosim_zwfs_init(
     ctx->npix_mft = (uint64_t) ctx->n_mft * ctx->n_mft;
     ctx->npix_cam = (uint64_t) cfg->ncam * cfg->ncam;
 
+    /* Prevent OpenBLAS thread-pool spin-wait contention on tiny cache-resident micro-GEMMs */
     if (openblas_set_num_threads != NULL)
     {
         openblas_set_num_threads(1);
@@ -374,6 +528,18 @@ int MILK_COLD cacaosim_zwfs_init(
     return 0;
 }
 
+/**
+ * cacaosim_zwfs_free() - Release all CPU, detector PRNG, and CUDA resources owned by a ZWFS context
+ * @ctx: ZWFS context to tear down (safe to pass NULL or partially initialized context)
+ *
+ * Role:
+ *   Cold-path destructor that frees `cuBLAS` handles, device buffers, PRNG state, and aligned host
+ *   arrays, then zeros `*ctx` to prevent dangling-pointer reuse.
+ *
+ * Rationale:
+ *   Centralizes cleanup so both normal shutdown and partial `cacaosim_zwfs_init()` rollback share
+ *   a single leak-free code path.
+ */
 void MILK_COLD cacaosim_zwfs_free(cacaosim_zwfs_ctx_t *ctx)
 {
     if (ctx == NULL)
@@ -399,6 +565,28 @@ void MILK_COLD cacaosim_zwfs_free(cacaosim_zwfs_ctx_t *ctx)
     __builtin_memset(ctx, 0, sizeof(*ctx));
 }
 
+/**
+ * cacaosim_zwfs_accum_subframe() - Propagate and integrate one split-stream optical subframe
+ * @ctx:       Initialized ZWFS context
+ * @pup_amp:   Host 2D pupil amplitude `[nwf x nwf]` (used on CPU; cached on GPU at init)
+ * @atm_amp:   Optional host atmospheric scintillation amplitude `[nwf x nwf]`, or NULL
+ * @wf_in:     Optional host atmospheric wavefront `[nwf x nwf]`, or NULL
+ * @dm_opd:    Optional host DM correction OPD `[nwf x nwf]` [um], or NULL
+ * @ncpa_opd:  Optional host static NCPA OPD `[nwf x nwf]` [um] (cached on GPU at init), or NULL
+ * @d_dm_opd:  Optional zero-copy device pointer to DM OPD `[nwf x nwf]` [um] on GPU, or NULL
+ * @turb_gain: Live atmospheric turbulence multiplier (`0.0f` disables `wf_in`)
+ *
+ * Role:
+ *   Hot-loop split-stream subframe entry point that scales `wf_in` to microns OPD, dispatches to
+ *   the active CUDA or CPU Babinet MFT backend, and increments `ctx->subframe_cnt`.
+ *
+ * Rationale:
+ *   Decoupling optical subframe accumulation from `cacaosim_zwfs_readout()` enables multi-rate AO
+ *   benches (`navg > 1`) where fast atmospheric/DM physics evolve multiple steps per WFS camera
+ *   exposure, capturing realistic phase-contrast fringe smearing before noise injection. Setting
+ *   `wf_eff = NULL` when `turb_gain == 0.0f` skips redundant PCIe H2D transfers during closed-loop
+ *   calibration and interaction-matrix acquisition.
+ */
 void MILK_HOT cacaosim_zwfs_accum_subframe(
     cacaosim_zwfs_ctx_t *ctx,
     const float         *pup_amp,
@@ -425,6 +613,27 @@ void MILK_HOT cacaosim_zwfs_accum_subframe(
     ctx->subframe_cnt++;
 }
 
+/**
+ * cacaosim_zwfs_accum_beam() - Propagate and integrate one unified `[OPD_um, Amp]` beam subframe
+ * @ctx:        Initialized ZWFS context
+ * @beam_opd:   Host 2D beam OPD slice `[nwf x nwf]` [um], or NULL when using `d_beam_opd`
+ * @beam_amp:   Host 2D beam amplitude slice `[nwf x nwf]`, or NULL when using `d_beam_amp`
+ * @ncpa_opd:   Optional host static WFS-path NCPA OPD `[nwf x nwf]` [um], or NULL
+ * @d_beam_opd: Optional zero-copy device beam OPD slice `[nwf x nwf]` [um], or NULL
+ * @d_beam_amp: Optional zero-copy device beam amplitude slice `[nwf x nwf]`, or NULL
+ *
+ * Role:
+ *   Hot-loop optical-bench entry point for propagating a 3D `[nwf x nwf x 2]` beam stream (such as
+ *   a coronagraphic `out_lowfs` reflective focal-mask or Lyot-stop pickoff beam, or a dichroic
+ *   beamsplitter arm) through the Zernike phase-contrast WFS.
+ *
+ * Rationale:
+ *   Unlike `cacaosim_zwfs_accum_subframe()`, which assumes a static entrance pupil, `in_beam`
+ *   carries a dynamic per-frame amplitude slice `beam_amp` (crucial for coronagraphic LOWFS
+ *   pickoffs where upstream tip-tilt shifts diffraction rings across the reflective focal stop).
+ *   Accepting optional device pointers (`d_beam_opd`, `d_beam_amp`) allows `cacaosim.htsim` to
+ *   chain coronagraph and LOWFS stages entirely in GPU VRAM with zero host round-trips.
+ */
 void MILK_HOT cacaosim_zwfs_accum_beam(
     cacaosim_zwfs_ctx_t *ctx,
     const float         *beam_opd,
@@ -445,6 +654,24 @@ void MILK_HOT cacaosim_zwfs_accum_beam(
     ctx->subframe_cnt++;
 }
 
+/**
+ * cacaosim_zwfs_readout() - Finalize exposure average, apply detector physics, and reset counter
+ * @ctx:      Initialized ZWFS context with `subframe_cnt >= 1` integrated subframes
+ * @det_live: Optional live detector parameters (flux, RON, gain, shutter), or NULL for `ctx->cfg`
+ * @out_u16:  Destination `uint16_t` camera buffer `[ncam x ncam]` when `out_dtype == 0`, or NULL
+ * @out_f32:  Destination `float` camera buffer `[ncam x ncam]` when `out_dtype != 0`, or NULL
+ *
+ * Role:
+ *   Hot-loop exposure completion routine that normalizes the accumulated optical subframes by
+ *   `1 / subframe_cnt`, applies photometric scaling, Poisson shot noise, dark current, Gaussian
+ *   readout noise, gain/bias quantization, and saturation clipping, and resets `subframe_cnt = 0`.
+ *
+ * Rationale:
+ *   Applying detector readout physics strictly once after averaging `navg` optical subframes
+ *   accurately models physical charge integration in a CCD/CMOS/sCMOS pixel well (where photon
+ *   arrival statistics depend on integrated exposure flux while readout noise `ron_e` is paid once
+ *   per frame readout).
+ */
 void MILK_HOT cacaosim_zwfs_readout(
     cacaosim_zwfs_ctx_t      *ctx,
     const cacaosim_det_cfg_t *det_live,
@@ -466,6 +693,7 @@ void MILK_HOT cacaosim_zwfs_readout(
         return;
     }
 
+    /* Normalize multi-subframe sum into mean optical intensity per frame prior to readout */
     if (ctx->subframe_cnt > 1u)
     {
         const float             inv_n = 1.0f / (float) ctx->subframe_cnt;
@@ -483,6 +711,28 @@ void MILK_HOT cacaosim_zwfs_readout(
     ctx->subframe_cnt = 0u;
 }
 
+/**
+ * cacaosim_zwfs_step() - Convenience single-subframe (`navg = 1`) ZWFS propagation and readout
+ * @ctx:       Initialized ZWFS context
+ * @pup_amp:   Host 2D pupil amplitude `[nwf x nwf]`
+ * @atm_amp:   Optional host atmospheric scintillation amplitude `[nwf x nwf]`, or NULL
+ * @wf_in:     Optional host atmospheric wavefront `[nwf x nwf]`, or NULL
+ * @dm_opd:    Optional host DM correction OPD `[nwf x nwf]` [um], or NULL
+ * @ncpa_opd:  Optional host static WFS-path NCPA OPD `[nwf x nwf]` [um], or NULL
+ * @d_dm_opd:  Optional zero-copy device DM OPD `[nwf x nwf]` [um], or NULL
+ * @turb_gain: Live atmospheric turbulence multiplier
+ * @det_live:  Optional live detector configuration override, or NULL
+ * @out_u16:   Destination `uint16_t` camera frame `[ncam x ncam]`, or NULL
+ * @out_f32:   Destination `float` camera frame `[ncam x ncam]`, or NULL
+ *
+ * Role:
+ *   Single-call wrapper combining `cacaosim_zwfs_accum_subframe()` and `cacaosim_zwfs_readout()`
+ *   for synchronous 1:1 WFS simulation benchmarks and unit tests.
+ *
+ * Rationale:
+ *   Provides an ergonomic atomic frame step API while delegating all optical and noise physics to
+ *   the exact same subframe accumulation and readout pipeline used in multi-rate benches.
+ */
 void MILK_HOT cacaosim_zwfs_step(
     cacaosim_zwfs_ctx_t      *ctx,
     const float              *pup_amp,

@@ -4,7 +4,31 @@
 
 /**
  * @file    cacaosim_beam.c
- * @brief   CPU implementation of spectral bandpass photometry, 2D beam relay, and SHM beam IO
+ * @brief   CPU implementation of Planck photometry, dichroic splitting, 2D beam relay, and SHM I/O
+ *
+ * Architectural Role:
+ *   Implements the CPU execution and metadata routines declared in `cacaosim_beam.h`:
+ *     1. Analytical stellar Planck photon radiometry (`cacaosim_spec_star`), gray attenuation,
+ *        dichroic/beamsplitter spectral partitioning (`cacaosim_spec_split`), and sub-bin sensor
+ *        filter integration (`cacaosim_spec_band_flux`).
+ *     2. OpenMP + SIMD pupil-plane `[OPD_um, Amplitude]` synthesis, DM subtraction, inverse-affine
+ *        bilinear 2D relay registration, and scaled static WFE injection.
+ *     3. Fixed-slot `O(1)` `ImageStreamIO` SHM keyword serialization (`CSIM_BM`, `CSIM_L0`,
+ *        `CSIM_L1`, `CSIM_FLX`, `CSIM_S00..S31`, `CSIM_NWL`, `CSIM_WL0`, `CSIM_WL1`).
+ *
+ * Design Rationale & Motivation:
+ *   - Numerically stable Planck photometry: Evaluates photon spectral density `1 / (lambda^4 *
+ *     (exp(hc / (lambda * k_B * T)) - 1))` using `expm1f(x)` so long-wavelength / high-temperature
+ *     Rayleigh-Jeans evaluations (`x << 1`) do not suffer catastrophic cancellation, while clamping
+ *     deep Wien-tail arguments (`x > 80`) to zero to avoid `expf` overflow (`Inf`).
+ *   - Realistic smooth dichroic coatings: Models dielectric cutoff edges with a logistic sigmoid
+ *     `1 / (1 + exp(4 * (lam - cut) / roll))` rather than discontinuous step functions, capturing
+ *     spectral cross-talk near the dichroic transition while strictly enforcing `R(lam) + T(lam)
+ *     <= 1` per bin.
+ *   - Race-free OpenMP bilinear pupil warping: Inverse destination-to-source mapping (`dst -> src`)
+ *     guarantees every output pixel is written by exactly one thread without holes or atomic
+ *     splats; when `out` aliases `in` (`cacaosim_beam_relay_cpu`), temporary aligned bounce
+ *     buffers prevent parallel read-after-write hazards.
  */
 
 #include <math.h>
@@ -16,12 +40,30 @@
 #include "milk_types.h"
 #include "common/cacaosim_beam.h"
 
+/**
+ * cacaosim_reg_is_identity() - Determine whether a 2D affine pupil registration is a no-op
+ * @reg: Candidate registration parameters (`NULL` is treated as identity)
+ *
+ * Role:
+ *   Fast-path predicate queried by both CPU (`cacaosim_beam_relay_cpu`,
+ *   `cacaosim_beam_apply_wfe_cpu`) and CUDA (`cacaosim_cuda_beam_relay`,
+ *   `cacaosim_cuda_beam_apply_wfe`) dispatchers before choosing between 1-to-1 elementwise and
+ *   bilinear warp kernels.
+ *
+ * Rationale:
+ *   Treats `scale <= 1e-4f` (e.g., default zero-initialized structs where `scale == 0.0f`) as
+ *   unity magnification `1.0f`, and compares translation, rotation, and scale deviation against
+ *   `1e-5f` so floating-point config round-trips do not accidentally trigger expensive warping.
+ *
+ * Return: `1` if identity within `1e-5`, `0` if non-trivial warping is required.
+ */
 int cacaosim_reg_is_identity(const cacaosim_reg_t *reg)
 {
     if (reg == NULL)
     {
         return 1;
     }
+    /* Uninitialized / zero scale maps to 1.0f by convention across .bench and FPS configs */
     float sc = (reg->scale > 1e-4f) ? reg->scale : 1.0f;
     return (fabsf(reg->shift_x) < 1e-5f && fabsf(reg->shift_y) < 1e-5f &&
             fabsf(reg->rot_deg) < 1e-5f && fabsf(sc - 1.0f) < 1e-5f)
@@ -30,17 +72,33 @@ int cacaosim_reg_is_identity(const cacaosim_reg_t *reg)
 }
 
 /**
- * planck_photon_rel() - Planck photon spectral density N_lambda(lam) normalized to 1 at 0.55 um
+ * planck_photon_rel() - Relative Planck photon spectral density `N_lambda(lam) / N_lambda(0.55 um)`
+ * @lam_um: Wavelength at which to evaluate photon density `[um]` (`> 0`)
+ * @teff_k: Stellar effective blackbody temperature `[K]` (`<= 500 K` defaults to solar `5778 K`)
+ *
+ * Role:
+ *   Internal helper called by `cacaosim_spec_star()` to compute the dimensionless spectral shape
+ *   normalized to unity at astronomical V-band (`0.55 um`).
+ *
+ * Rationale:
+ *   Planck energy radiance `B_lambda ~ lambda^-5 / (exp(x) - 1)` divided by photon energy
+ *   `hc / lambda` gives photon spectral density `N_lambda ~ lambda^-4 / (exp(x) - 1)` with second
+ *   radiation constant `hc / k_B = 14387.77 um * K`. Normalizing by `N_lambda(0.55 um)` cancels
+ *   all leading physical constants (`2*c`, solid angle) so V-band Vega zero-point scaling applies
+ *   directly.
+ *
+ * Return: Dimensionless photon-rate ratio relative to `0.55 um` (`0.0f` in extreme Wien tail).
  */
 static float planck_photon_rel(
     float lam_um,
     float teff_k)
 {
-    /* h*c / k_B = 14387.77 um * K */
+    /* Second radiation constant h*c / k_B = 14387.77 um * K */
     const float hc_k = 14387.77f;
     float       T    = (teff_k > 500.0f) ? teff_k : 5778.0f;
     float       x    = hc_k / (lam_um * T);
     float       x0   = hc_k / (0.55f * T);
+    /* Prevent expm1f float32 overflow (~88.7) in the deep UV/cool-star Wien regime */
     if (x > 80.0f)
     {
         return 0.0f;
@@ -50,6 +108,25 @@ static float planck_photon_rel(
     return (n_v > 0.0f) ? (n_lam / n_v) : 1.0f;
 }
 
+/**
+ * cacaosim_spec_star() - Populate 32-bin stellar blackbody photon spectrum from V-band magnitude
+ * @out:        Output 32-bin photon arrival rate spectrum `[photons/s]` (no-op if `NULL`)
+ * @tel_diam_m: Primary mirror outer diameter `[m]` (`<= 0.01f` -> `8.0 m` default)
+ * @obs_frac:   Linear central obscuration ratio `[0..0.99)`
+ * @star_mag:   Apparent Vega V-band magnitude `m_V`
+ * @teff_k:     Effective stellar temperature `[K]`
+ * @tput:       End-to-end pre-bench throughput `[0..1]` (`< 0` -> `1.0`)
+ *
+ * Role:
+ *   Cold-path (`MILK_COLD`) stellar source generator populating the initial `cacaosim_spec_t`
+ *   vector at the entrance of an optical bench.
+ *
+ * Rationale:
+ *   Combines annular collecting area `pi/4 * D^2 * (1 - obs^2)`, Pogson magnitude scaling
+ *   `10^(-0.4 * m_V)` anchored to Vega's `1.0e11 ph / (s * m^2 * um)` V-band zero-point, bin width
+ *   `CACAOSIM_SPEC_DL_UM`, and `planck_photon_rel()` so every bin stores directly usable
+ *   integrated `[photons / second]`.
+ */
 void MILK_COLD cacaosim_spec_star(
     cacaosim_spec_t *out,
     float            tel_diam_m,
@@ -64,6 +141,7 @@ void MILK_COLD cacaosim_spec_star(
     }
     float diam = (tel_diam_m > 0.01f) ? tel_diam_m : 8.0f;
     float obs  = (obs_frac > 0.0f && obs_frac < 0.99f) ? obs_frac : 0.0f;
+    /* Annular telescope collecting area [m^2] */
     float area = 0.25f * CACAOSIM_PI_F * diam * diam * (1.0f - obs * obs);
     float tp   = (tput >= 0.0f) ? tput : 1.0f;
 
@@ -78,6 +156,18 @@ void MILK_COLD cacaosim_spec_star(
     }
 }
 
+/**
+ * cacaosim_spec_scale() - Scale all 32 spectral bins by an achromatic scalar throughput
+ * @in:   Source photon-rate spectrum (no-op if `NULL`)
+ * @tput: Scalar transmission factor (clamped to `[0.0f, 1.0f]`)
+ * @out:  Destination photon-rate spectrum (may alias `@in`; no-op if `NULL`)
+ *
+ * Role:
+ *   Applies gray transmission efficiency across all spectral channels (e.g., reflective/coro loss).
+ *
+ * Rationale:
+ *   Enforces passive optical bounds `0 <= g <= 1` and supports safe in-place updates (`out == in`).
+ */
 void cacaosim_spec_scale(
     const cacaosim_spec_t *in,
     float                  tput,
@@ -94,6 +184,18 @@ void cacaosim_spec_scale(
     }
 }
 
+/**
+ * cacaosim_spec_total() - Compute integrated broadband photon rate across `0.40..2.40 um`
+ * @spec: Source 32-bin photon spectrum (`NULL` returns `0.0f`)
+ *
+ * Role:
+ *   Aggregates total `[photons/s]` in a beam for telemetry (`CSIM_FLX`) and TUI bench inspection.
+ *
+ * Rationale:
+ *   Direct linear summation over the 32 pre-integrated `0.0625 um` photon-rate bins.
+ *
+ * Return: Total photon arrival rate `[photons/s]`.
+ */
 float cacaosim_spec_total(const cacaosim_spec_t *spec)
 {
     if (spec == NULL)
@@ -108,6 +210,23 @@ float cacaosim_spec_total(const cacaosim_spec_t *spec)
     return sum;
 }
 
+/**
+ * smooth_step_lo() - Smooth logistic short-wavelength pass profile `1 / (1 + exp(4*(lam - cut)/w))`
+ * @lam:  Evaluation wavelength `[um]`
+ * @cut:  50% transition cutoff wavelength `[um]`
+ * @roll: Characteristic transition edge width `[um]` (`<= 1e-4f` defaults to `0.02 um`)
+ *
+ * Role:
+ *   Internal spectral edge primitive composed by `cacaosim_spec_split()` to build LP, SP, and BP
+ *   dichroic reflectance/transmittance curves.
+ *
+ * Rationale:
+ *   With slope factor `4 / w`, the logistic curve drops from `~0.88` at `cut - w/2` to `~0.12` at
+ *   `cut + w/2`, closely matching multi-layer dielectric dichroic transition slopes while remaining
+ *   infinitely differentiable and clamped for `|z| > 40` to avoid `expf` overflow/underflow.
+ *
+ * Return: Smooth short-wavelength weight in `[0.0f, 1.0f]` (`1` for `lam << cut`, `0` for `>>`).
+ */
 static float smooth_step_lo(
     float lam,
     float cut,
@@ -126,6 +245,24 @@ static float smooth_step_lo(
     return 1.0f / (1.0f + expf(z));
 }
 
+/**
+ * cacaosim_spec_split() - Split an input photon spectrum into reflected and transmitted arms
+ * @in:        Incident 32-bin photon spectrum (no-op if `NULL`)
+ * @cfg:       Beamsplitter / dichroic coating configuration (no-op if `NULL`)
+ * @out_refl:  Optional output reflected-arm spectrum (may alias `@in`)
+ * @out_trans: Optional output transmitted-arm spectrum (may alias `@in`)
+ *
+ * Role:
+ *   Evaluates per-bin reflectance `r(lam)` and transmittance `t(lam)` for gray, LP, SP, or BP
+ *   beamsplitters in `cacaosim.beamsplit`, `htsim`, and `.bench` photometry analysis.
+ *
+ * Rationale:
+ *   Snapshots `*in` into `src` first so callers may overwrite `@in` in place with either output
+ *   arm. For band-reflect (`BP`), multiplies complementary rising and falling logistic edges
+ *   `s1 * s2` around `[lambda_cut - hw, lambda_cut + hw]`. Finally enforces `r + t <= 1.0f` via
+ *   proportional renormalization so misconfigured user gray values (e.g., `0.6 + 0.6`) can never
+ *   create unphysical photons out of nothing.
+ */
 void cacaosim_spec_split(
     const cacaosim_spec_t      *in,
     const cacaosim_split_cfg_t *cfg,
@@ -136,6 +273,7 @@ void cacaosim_spec_split(
     {
         return;
     }
+    /* Copy input upfront so out_refl or out_trans may safely alias `in` */
     cacaosim_spec_t src = *in;
 
     float er = (cfg->eff_refl > 0.0f) ? ((cfg->eff_refl <= 1.0f) ? cfg->eff_refl : 1.0f) : 0.0f;
@@ -154,18 +292,21 @@ void cacaosim_spec_split(
         }
         else if (cfg->mode == CACAOSIM_SPLIT_DICHROIC_LP)
         {
+            /* Long-pass: short wavelengths reflect, long wavelengths transmit */
             float s = smooth_step_lo(lam, cfg->lambda_cut, cfg->roll_um);
             r       = er * s;
             t       = et * (1.0f - s);
         }
         else if (cfg->mode == CACAOSIM_SPLIT_DICHROIC_SP)
         {
+            /* Short-pass: long wavelengths reflect, short wavelengths transmit */
             float s = smooth_step_lo(lam, cfg->lambda_cut, cfg->roll_um);
             r       = er * (1.0f - s);
             t       = et * s;
         }
         else
         {
+            /* Band-reflect: product of rising edge at (cut - hw) and falling edge at (cut + hw) */
             float hw = 0.5f * ((cfg->band_width > 0.01f) ? cfg->band_width : 0.20f);
             float s1 = 1.0f - smooth_step_lo(lam, cfg->lambda_cut - hw, cfg->roll_um);
             float s2 = smooth_step_lo(lam, cfg->lambda_cut + hw, cfg->roll_um);
@@ -174,6 +315,7 @@ void cacaosim_spec_split(
             t        = et * (1.0f - bp);
         }
 
+        /* Guarantee strict per-bin passive energy conservation: r + t <= 1 */
         if (r + t > 1.0f)
         {
             float inv = 1.0f / (r + t);
@@ -192,6 +334,26 @@ void cacaosim_spec_split(
     }
 }
 
+/**
+ * cacaosim_spec_band_flux() - Integrate detected photoevents and centroid wavelength in a bandpass
+ * @spec:       Incident 32-bin photon-rate spectrum `[photons/s]` (`NULL` returns `0.0f`)
+ * @lambda0_um: Filter central wavelength `[um]`
+ * @bw_frac:    Fractional filter width `dlambda / lambda0` (`<= 1e-3f` defaults to `0.15`)
+ * @dt_exp_s:   Exposure duration `[s]` (`<= 0` defaults to `0.0005 s` = 2 kHz)
+ * @qe:         Detector quantum efficiency `[0..1]` (`<= 0` defaults to `1.0`)
+ * @eff_lambda: Optional output receiving flux-weighted effective wavelength `[um]`
+ *
+ * Role:
+ *   Computes per-frame camera `flux_ph` and `eff_lambda` for WFS and science sensors fed by a
+ *   spectral beam, as well as photon-per-frame tables in `.bench` TUI/CLI diagnostics.
+ *
+ * Rationale:
+ *   Intersects `[lmin, lmax]` continuously with each bin `[b0, b1]` (`frac = (hi - lo) / dl`) and
+ *   weights each sub-interval by its exact midpoint `0.5 * (lo + hi)`, preventing quantization
+ *   steps when sweeping narrowband filters across the `0.0625 um` spectral grid.
+ *
+ * Return: Integrated photoevents (`sum_rate * dt_exp_s * qe`) over the exposure.
+ */
 float cacaosim_spec_band_flux(
     const cacaosim_spec_t *spec,
     float                  lambda0_um,
@@ -217,6 +379,7 @@ float cacaosim_spec_band_flux(
     float sum_rate = 0.0f;
     float sum_wlam = 0.0f;
 
+    /* Accumulate fractional bin overlap and first wavelength moment across all 32 bins */
     for (int b = 0; b < CACAOSIM_NSPEC; b++)
     {
         float b0 = CACAOSIM_SPEC_L0_UM + (float) b * CACAOSIM_SPEC_DL_UM;
@@ -239,6 +402,24 @@ float cacaosim_spec_band_flux(
     return sum_rate * dt * q;
 }
 
+/**
+ * cacaosim_beam_init_cpu() - Assemble initial `[OPD, Amp]` pupil beam on CPU with OpenMP + SIMD
+ * @pup_amp:   Static telescope pupil amplitude `[nwf * nwf]` (`NULL` -> `1.0f`)
+ * @atm_amp:   Optional scintillation amplitude `[nwf * nwf]` (`NULL` -> `1.0f`)
+ * @wf_in:     Optional input turbulence map `[nwf * nwf]` (`NULL` -> `0.0f`)
+ * @ncpa_opd:  Optional static entrance NCPA OPD `[nwf * nwf]` in `[um]` (`NULL` -> `0.0f`)
+ * @wf_to_opd: Scale converting `@wf_in` to `[um]` OPD
+ * @nwf:       Pupil grid dimension `[pixels]`
+ * @out_opd:   Destination OPD array `[nwf * nwf]` in `[um]` (`restrict`-qualified)
+ * @out_amp:   Destination amplitude array `[nwf * nwf]` (`restrict`-qualified)
+ *
+ * Role:
+ *   Hot-path (`MILK_HOT`) CPU beam synthesizer invoked per frame in `mkbeam` and `htsim`.
+ *
+ * Rationale:
+ *   Gating OpenMP parallelization on `npix >= 8192` (`> 64x64`) avoids thread-barrier overhead on
+ *   small test grids while saturating memory bandwidth via SIMD vectorization on ELT-scale grids.
+ */
 void MILK_HOT cacaosim_beam_init_cpu(
     const float *__restrict pup_amp,
     const float *__restrict atm_amp,
@@ -269,6 +450,23 @@ void MILK_HOT cacaosim_beam_init_cpu(
     }
 }
 
+/**
+ * cacaosim_beam_apply_dm_cpu() - Subtract rendered DM OPD surface from a pupil beam on CPU
+ * @in_opd:  Input beam OPD `[nwf * nwf]` in `[um]` (`NULL` -> `0.0f`)
+ * @in_amp:  Input beam amplitude `[nwf * nwf]` (`NULL` -> `1.0f`)
+ * @dm_opd:  DM surface OPD `[nwf * nwf]` in `[um]` (`NULL` -> `0.0f`)
+ * @nwf:     Pupil grid dimension `[pixels]`
+ * @out_opd: Output residual OPD `[nwf * nwf]` in `[um]` (may alias `@in_opd`)
+ * @out_amp: Output amplitude `[nwf * nwf]` (skipped if `NULL` or aliasing `@in_amp`)
+ *
+ * Role:
+ *   Hot-path (`MILK_HOT`) CPU wavefront correction step in `cacaosim.dmsim` and fused `htsim`.
+ *
+ * Rationale:
+ *   Applies negative-feedback subtraction `out_opd = in_opd - dm_opd` in a single OpenMP SIMD
+ *   sweep and elides redundant amplitude memory traffic when operating in-place (`out_amp ==
+ *   in_amp`).
+ */
 void MILK_HOT cacaosim_beam_apply_dm_cpu(
     const float *__restrict in_opd,
     const float *__restrict in_amp,
@@ -292,6 +490,29 @@ void MILK_HOT cacaosim_beam_apply_dm_cpu(
     }
 }
 
+/**
+ * cacaosim_beam_relay_cpu() - Propagate a pupil beam across an arm with registration, NCPA, & mask
+ * @in_opd:   Input pupil OPD `[nwf * nwf]` in `[um]` (`NULL` -> `0.0f`)
+ * @in_amp:   Input pupil amplitude `[nwf * nwf]` (`NULL` -> `1.0f`)
+ * @ncpa_opd: Optional post-relay static arm NCPA OPD `[nwf * nwf]` in `[um]` (`NULL` -> `0.0f`)
+ * @pup_mask: Optional post-relay arm pupil stop mask `[nwf * nwf]` (`NULL` -> `1.0f`)
+ * @reg:      Optional 2D affine pupil misregistration (`NULL` -> identity)
+ * @nwf:      Pupil grid dimension `[pixels]`
+ * @out_opd:  Destination pupil OPD `[nwf * nwf]` in `[um]` (aliasing-safe)
+ * @out_amp:  Destination pupil amplitude `[nwf * nwf]` (aliasing-safe)
+ *
+ * Role:
+ *   Hot-path (`MILK_HOT`) CPU arm relay used by `cacaosim.beamsplit` and `htsim` to apply per-arm
+ *   alignment shifts/rotations/magnification, differential NCPA, and cold-stop vignetting.
+ *
+ * Rationale:
+ *   When `@reg` is non-identity, evaluates the exact inverse similarity transform around grid
+ *   center `ctr = 0.5 * (nwf - 1)`:
+ *     `v = dst - ctr - shift`,  `src = ctr + (1 / scale) * R(-rot_deg) * v`
+ *   followed by 4-point bilinear interpolation with zero-padding outside `[0, nwf - 1]^2` (cold
+ *   field stop) and post-warp addition/multiplication of downstream `ncpa_opd` and `pup_mask`
+ *   fixed in the destination arm's coordinate frame.
+ */
 void MILK_HOT cacaosim_beam_relay_cpu(
     const float          *in_opd,
     const float          *in_amp,
@@ -304,6 +525,7 @@ void MILK_HOT cacaosim_beam_relay_cpu(
 {
     const uint64_t npix = (uint64_t) nwf * nwf;
 
+    /* Fast path: aligned pupil grids execute a single coalesced SIMD pass */
     if (cacaosim_reg_is_identity(reg))
     {
 #pragma omp parallel for simd schedule(static) if (npix >= 8192)
@@ -325,6 +547,7 @@ void MILK_HOT cacaosim_beam_relay_cpu(
         return;
     }
 
+    /* Precompute inverse rotation + inverse magnification matrix around pupil grid midpoint */
     float sc   = (reg->scale > 1e-4f) ? reg->scale : 1.0f;
     float invs = 1.0f / sc;
     float rad  = -reg->rot_deg * (CACAOSIM_PI_F / 180.0f);
@@ -334,6 +557,7 @@ void MILK_HOT cacaosim_beam_relay_cpu(
     float dx   = reg->shift_x;
     float dy   = reg->shift_y;
 
+    /* Allocate temporary bounce buffers only if caller requested in-place warping */
     float *tmp_opd = NULL;
     float *tmp_amp = NULL;
     if (out_opd == in_opd || out_amp == in_amp)
@@ -350,6 +574,7 @@ void MILK_HOT cacaosim_beam_relay_cpu(
         float vy = (float) iy - ctr - dy;
         for (uint32_t ix = 0; ix < nwf; ix++)
         {
+            /* Map destination pixel (ix, iy) back into upstream source coordinates (sx, sy) */
             float    vx = (float) ix - ctr - dx;
             float    sx = ctr + c * vx - s * vy;
             float    sy = ctr + s * vx + c * vy;
@@ -359,6 +584,7 @@ void MILK_HOT cacaosim_beam_relay_cpu(
             float a = 0.0f;
             if (sx >= 0.0f && sy >= 0.0f && sx <= (float) (nwf - 1u) && sy <= (float) (nwf - 1u))
             {
+                /* 2x2 bilinear interpolation weights within source pupil bounds */
                 uint32_t x0 = (uint32_t) sx;
                 uint32_t y0 = (uint32_t) sy;
                 uint32_t x1 = (x0 + 1u < nwf) ? (x0 + 1u) : x0;
@@ -390,6 +616,7 @@ void MILK_HOT cacaosim_beam_relay_cpu(
                     a = 1.0f;
                 }
             }
+            /* Apply downstream arm's static NCPA and pupil stop in destination coordinates */
             if (ncpa_opd != NULL)
             {
                 o += ncpa_opd[p];
@@ -412,6 +639,27 @@ void MILK_HOT cacaosim_beam_relay_cpu(
     }
 }
 
+/**
+ * cacaosim_beam_apply_wfe_cpu() - Add scaled static WFE OPD (+ optional 2D registration) on CPU
+ * @in_opd:    Input beam OPD `[nwf * nwf]` in `[um]` (`NULL` -> `0.0f`)
+ * @in_amp:    Input beam amplitude `[nwf * nwf]` (`NULL` -> `1.0f`)
+ * @wfe_opd:   Static wavefront error map `[nwf * nwf]` (`NULL` -> `0.0f`)
+ * @wfe_to_um: Scale factor converting `@wfe_opd` units (e.g., `[meter]`) + gain into `[um]`
+ * @reg:       Optional 2D affine pupil registration (`NULL` = identity)
+ * @nwf:       Pupil grid dimension `[pixels]`
+ * @out_opd:   Output beam OPD `[nwf * nwf]` in `[um]` (non-NULL)
+ * @out_amp:   Optional output beam amplitude `[nwf * nwf]`
+ *
+ * Role:
+ *   Hot-path (`MILK_HOT`) CPU wavefront error injector backing `cacaosim.wfe` and `htsim` `[wfe]`
+ *   inline optical elements.
+ *
+ * Rationale:
+ *   Separates the common registered case (`cacaosim_reg_is_identity(reg)`) into a pure OpenMP SIMD
+ *   FMA pass (`o + wfe_to_um * wfe_opd[p]`) that avoids rewriting `out_amp` when `out_amp ==
+ *   in_amp`, while supporting full inverse-affine bilinear resampling of the incoming beam onto
+ *   the WFE optic's coordinate grid when misregistered.
+ */
 void MILK_HOT cacaosim_beam_apply_wfe_cpu(
     const float          *in_opd,
     const float          *in_amp,
@@ -424,6 +672,7 @@ void MILK_HOT cacaosim_beam_apply_wfe_cpu(
 {
     const uint64_t npix = (uint64_t) nwf * nwf;
 
+    /* Identity registration fast path: pure OpenMP SIMD elementwise accumulation */
     if (cacaosim_reg_is_identity(reg))
     {
 #pragma omp parallel for simd schedule(static) if (npix >= 8192)
@@ -441,6 +690,7 @@ void MILK_HOT cacaosim_beam_apply_wfe_cpu(
         return;
     }
 
+    /* Inverse similarity transform from WFE element grid back to upstream beam coordinates */
     float sc   = (reg->scale > 1e-4f) ? reg->scale : 1.0f;
     float invs = 1.0f / sc;
     float rad  = -reg->rot_deg * (CACAOSIM_PI_F / 180.0f);
@@ -491,6 +741,7 @@ void MILK_HOT cacaosim_beam_apply_wfe_cpu(
                            w11 * in_amp[i11])
                         : 1.0f;
             }
+            /* Superimpose scaled WFE map defined in the optical element's local pupil frame */
             if (wfe_opd != NULL)
             {
                 o += wfe_to_um * wfe_opd[p];
@@ -504,6 +755,23 @@ void MILK_HOT cacaosim_beam_apply_wfe_cpu(
     }
 }
 
+/**
+ * cacaosim_beam_shm_init_kw() - Populate fixed-slot `CSIM_*` keyword headers in a 3D SHM image
+ * @im: Target `ImageStreamIO` beam image with `NBkw >= 36` (no-op if `NULL` or fewer keywords)
+ *
+ * Role:
+ *   Cold-path (`MILK_COLD`) SHM header formatter laying out slots `kw[0..35]`:
+ *     - `kw[0]`    : `CSIM_BM`  (`int64` `'L'` = `1`, magic marker identifying a cacaosim beam)
+ *     - `kw[1]`    : `CSIM_L0`  (`double` `'D'` = `0.40`, minimum spectral wavelength `[um]`)
+ *     - `kw[2]`    : `CSIM_L1`  (`double` `'D'` = `2.40`, maximum spectral wavelength `[um]`)
+ *     - `kw[3]`    : `CSIM_FLX` (`double` `'D'`, integrated broadband photon rate `[ph/s]`)
+ *     - `kw[4..35]`: `CSIM_S00`..`CSIM_S31` (`double` `'D'`, per-bin photon rates `[ph/s]`)
+ *
+ * Rationale:
+ *   Establishing deterministic slot indices once at stream initialization lets per-frame writers
+ *   and readers index `im->kw[4 + b]` in `O(1)` time without string formatting or linear scans,
+ *   while remaining human-readable in `milk-shmim-info` / FITS exports.
+ */
 void MILK_COLD cacaosim_beam_shm_init_kw(IMAGE *im)
 {
     if (im == NULL || im->md == NULL || im->kw == NULL || im->md->NBkw < 4 + CACAOSIM_NSPEC)
@@ -541,6 +809,19 @@ void MILK_COLD cacaosim_beam_shm_init_kw(IMAGE *im)
     }
 }
 
+/**
+ * cacaosim_beam_shm_write_spec() - Write 32-bin photon spectrum into fixed SHM keyword slots
+ * @im:   Target SHM beam `IMAGE` (`NBkw >= 36`; no-op if `NULL` or undersized)
+ * @spec: Source 32-bin photon arrival rate spectrum `[photons/s]` (no-op if `NULL`)
+ *
+ * Role:
+ *   Hot-path (`MILK_HOT`) per-frame serializer updating `CSIM_S00..S31` and `CSIM_FLX` in SHM.
+ *
+ * Rationale:
+ *   Auto-initializes keyword headers on the first call if `kw[0]` is not yet marked `CSIM_BM = 1`,
+ *   then performs 32 direct double-precision stores and accumulates `tot` in `double` to preserve
+ *   precision across wide dynamic-range spectra.
+ */
 void MILK_HOT cacaosim_beam_shm_write_spec(
     IMAGE                 *im,
     const cacaosim_spec_t *spec)
@@ -550,6 +831,7 @@ void MILK_HOT cacaosim_beam_shm_write_spec(
     {
         return;
     }
+    /* Self-heal keyword table if stream was recreated without cacaosim_beam_shm_init_kw */
     if (im->kw[0].type != 'L' || im->kw[0].value.numl != 1)
     {
         cacaosim_beam_shm_init_kw(im);
@@ -564,6 +846,20 @@ void MILK_HOT cacaosim_beam_shm_write_spec(
     im->kw[3].value.numf = tot;
 }
 
+/**
+ * cacaosim_beam_shm_read_spec() - Extract 32-bin photon spectrum from SHM beam keywords
+ * @im:   Source SHM `IMAGE` to inspect
+ * @spec: Destination spectrum populated when `CSIM_BM == 1`
+ *
+ * Role:
+ *   Reads upstream spectral radiometry from an attached input beam SHM stream in `O(1)` time.
+ *
+ * Rationale:
+ *   Checks both keyword capacity (`NBkw >= 36`) and the `kw[0]` `CSIM_BM == 1` tag before copying
+ *   `kw[4..35]`, preventing uninitialized or unrelated SHM keywords from corrupting sensor flux.
+ *
+ * Return: `1` if valid beam spectral keywords were found and copied, `0` otherwise.
+ */
 int cacaosim_beam_shm_read_spec(
     const IMAGE     *im,
     cacaosim_spec_t *spec)
@@ -584,6 +880,20 @@ int cacaosim_beam_shm_read_spec(
     return 1;
 }
 
+/**
+ * cacaosim_beam_shm_is_valid() - Check whether `@im` is a valid `[nwf x nwf x >=2]` float32 beam
+ * @im:  Candidate SHM `IMAGE` (`NULL` returns `0`)
+ * @nwf: Required pupil spatial dimension `[pixels]` on axes 0 and 1
+ *
+ * Role:
+ *   Fast structural validator guarding SHM pointer arithmetic on `[OPD, Amp]` beam cubes.
+ *
+ * Rationale:
+ *   Accepts `size[2] >= 2` so both standard 2-slice beams (`[OPD, Amp]`) and `2 * N_lambda`-slice
+ *   polychromatic beams pass spatial/datatype validation uniformly.
+ *
+ * Return: `1` if `@im` is a valid 3D `_DATATYPE_FLOAT` beam matching `@nwf`, `0` otherwise.
+ */
 int cacaosim_beam_shm_is_valid(
     const IMAGE *im,
     uint32_t     nwf)
@@ -598,6 +908,22 @@ int cacaosim_beam_shm_is_valid(
                : 0;
 }
 
+/**
+ * cacaosim_beam_shm_write_poly_kw() - Serialize polychromatic channel count and bounds to SHM
+ * @im:     Target SHM beam `IMAGE` (`NBkw >= 39`; no-op if `NULL` or fewer keywords)
+ * @nwl:    Number of `[OPD_c, Amp_c]` wavelength channel pairs (`< 1` clamped to `1`)
+ * @wl0_um: Shortest / channel-0 wavelength `[um]`
+ * @wl1_um: Longest / channel-`(nwl - 1)` wavelength `[um]`
+ *
+ * Role:
+ *   Records `CSIM_NWL`, `CSIM_WL0`, and `CSIM_WL1` at slots `kw[36..38]` immediately following the
+ *   32 spectral photometry bins (`kw[4..35]`).
+ *
+ * Rationale:
+ *   Keeping polychromatic cube geometry at fixed offset `base = 4 + CACAOSIM_NSPEC` (`36`) avoids
+ *   colliding with `CSIM_S00..S31` while maintaining `O(1)` lookup in
+ *   `cacaosim_beam_shm_read_poly_kw()`.
+ */
 void cacaosim_beam_shm_write_poly_kw(
     IMAGE   *im,
     uint32_t nwl,
@@ -625,6 +951,25 @@ void cacaosim_beam_shm_write_poly_kw(
     snprintf(im->kw[base + 2].comment, KEYWORD_MAX_COMMENT, "Last channel wavelength [um]");
 }
 
+/**
+ * cacaosim_beam_shm_read_poly_kw() - Read polychromatic channel count and wavelength span from SHM
+ * @im:      Source 3D SHM beam `IMAGE`
+ * @nwl_out: Optional output receiving resolved channel count (`>= 1`)
+ * @wl0_out: Optional output receiving channel-0 wavelength `[um]` (`0.0f` if unavailable)
+ * @wl1_out: Optional output receiving last-channel wavelength `[um]` (`0.0f` if unavailable)
+ *
+ * Role:
+ *   Inspects an input SHM beam stream (`cacaosim.coro`, `cacaosim.fpcam`) to determine whether it
+ *   encodes multiple coherent wavelength slices `[OPD_c, Amp_c]` (`size[2] >= 4`) and extracts
+ *   `CSIM_NWL`, `CSIM_WL0`, and `CSIM_WL1`.
+ *
+ * Rationale:
+ *   Initializes outputs to safe monochromatic defaults (`1, 0, 0`) before checking `size[2] >= 4`,
+ *   derives a hard upper bound `z_nwl = size[2] / 2` from actual allocated SHM cube depth, and
+ *   only trusts `CSIM_NWL` when `kn <= z_nwl` so malformed keywords cannot trigger buffer overruns.
+ *
+ * Return: `1` when resolved channel count `> 1`, `0` when monochromatic or invalid.
+ */
 int cacaosim_beam_shm_read_poly_kw(
     const IMAGE *im,
     uint32_t    *nwl_out,
@@ -643,6 +988,7 @@ int cacaosim_beam_shm_read_poly_kw(
     {
         *wl1_out = 0.0f;
     }
+    /* Need at least 4 Z-slices (2 [OPD, Amp] pairs) to carry > 1 wavelength channel */
     if (im == NULL || im->md == NULL || im->md->naxis != 3 || im->md->size[2] < 4u)
     {
         return 0;

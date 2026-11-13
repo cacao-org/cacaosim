@@ -4,7 +4,53 @@
 
 /**
  * @file    cacaosim_tui_render.c
- * @brief   milk-CTRL chrome, 2D interactive optical schematic, F2:BUILDER, modals, and tooltips
+ * @brief   2D topological schematic router, optical scale engine, F2:BUILDER, chrome, and modals
+ *
+ * Architectural Role in `cacaosim-CTRL`:
+ *   Implements the core visual compositor and optical layout engine for `cacaosim-CTRL`, turning
+ *   declarative `cacaosim_bench_cfg_t` topologies and live `MILK_SHM_DIR` telemetry into an
+ *   interactive `milk-CTRL`-style terminal workspace:
+ *     1. Physical Pupil & Focal-Plane Scale Engine (`node_focal_scale()`,
+ *        `cs_tui_compute_scales()`): Computes pupil spatial sampling (`d_beam_px`, `m/pix`) and
+ *        per-instrument focal-plane angular sampling (`lambda/D/pix` and `arcsec/pix` on sky,
+ *        where `1 arcsec = 1000 mas`), covering padded FFTs, Soummer Matrix-DFTs (FPCAM, Lyot /
+ *        dimple / custom coronagraphs, ZWFS), and Shack-Hartmann subaperture lenslet arrays.
+ *     2. Interactive 2D Topological DAG Auto-Layout & Orthogonal Beam Router (`dag_draw_t`,
+ *        `dc_put()`, `dc_draw_node_chip()`, `dc_draw_harrow()`, `dc_draw_vbranch()`,
+ *        `dc_trace_beam()`, `cs_render_dag_canvas()`): Places the `[TEL]` entrance source and
+ *        traces named optical beams recursively onto a 2D logical character grid, keeping inline
+ *        and transmitted paths colinear on horizontal rails while dropping reflective splitter
+ *        arms (`out_refl`), coronagraphic LOWFS pickoffs (`out_lowfs`), and secondary fan-out
+ *        consumers onto vertical branches, terminating each sensor with a 32-bin polychromatic
+ *        (`0.40 .. 2.40 um`) spectrum sparkline and `ph/fr -> out_cam` flux readout.
+ *     3. `F2:BUILDER` 3-Pane Configurator (`render_view_builder()`): Renders the resizable left
+ *        `ELEMENTS & ARRANGER` list (with splicing toolbar, live SHM status dots, and docked
+ *        16x16 anti-aliased pupil + physical scale summary), top-right `2D OPTICAL SCHEMATIC`,
+ *        and bottom-right categorized `INSPECTOR` (`1:OPTICS`, `2:DYN/DET`, `3:SHM/WIRING`).
+ *     4. Global Chrome, Floating Modals & Hover Tooltips (`render_header_and_tabs()`,
+ *        `render_bottom_bars()`, `render_modal()`, `render_hover_tooltip()`,
+ *        `cs_tui_render_frame()`): Draws the `milk-CTRL` header/tab/status bars, all 8 modal
+ *        overlays (Add/Splice wizard, Beam Wire picker, Preset gallery, Theme selector, Save/Open
+ *        file prompt, Unsaved confirmation, Help cheatsheet), and mouse hover tooltips.
+ *
+ * Design Rationale & Motivation:
+ *   - Physical Optical-Table Layout Convention: Real AO benches propagate transmitted relays
+ *     (`out_beam`, `out_trans`) colinearly along horizontal optical rails while folding dichroic
+ *     reflections (`out_refl`) and focal/Lyot LOWFS pickoffs (`out_lowfs`) onto perpendicular
+ *     arms. Encoding that exact convention in `dc_trace_beam()` yields deterministic, crossing-free
+ *     schematics for complex multi-stage coronagraphic benches without iterative graph-layout
+ *     oscillations.
+ *   - Two-Pass `measure_only` Viewport Tracking: Running a zero-draw `measure_only = 1` layout
+ *     pass before rendering automatically pans `(schem_scroll_x, schem_scroll_y)` to keep the
+ *     selected element card and its output spectrum visible while navigating `ELEMENTS` or
+ *     `INSPECTOR`, yet yields full manual panning when focus enters `CS_FOCUS_SCHEM`.
+ *   - Design-Time Nyquist & Plate-Scale Verification: Surfacing `d_beam_px`, `m/pix`,
+ *     `lambda/D/pix`, and `arcsec/pix` live alongside the 16x16 pupil preview lets engineers catch
+ *     FFT Nyquist undersampling (`pup_diam * pad < 2`), coarse DM actuator sampling, or mismatched
+ *     WFS/coronagraph/camera fields of view before launching heavy GPU/CPU simulations.
+ *   - Immediate-Mode Hit-Box Registration (`cs_tui_add_hit()`): Recording viewport-clipped click
+ *     and tooltip rectangles at draw time eliminates brittle inverse coordinate formulas across
+ *     terminal resizes, draggable pane dividers, and scrolled 2D schematics.
  */
 
 #include <libgen.h>
@@ -17,6 +63,22 @@
 
 /* ── Compact Formatting & Node Metadata Helpers ───────────────────────────── */
 
+/**
+ * fmt_flux_compact() - Format a photon count or photon rate into a short human-readable string
+ * @ph:  Photon count (`[ph/fr]`) or photon flux (`[ph/s]`; `<= 0` formats as `"0 ph"`)
+ * @out: Destination character buffer (non-NULL)
+ * @cap: Capacity of @out in bytes
+ *
+ * Role:
+ *   Formats stellar entrance flux and per-sensor integrated photon counts into compact strings
+ *   (`"0 ph"`, `"850"`, `"12.4k"`, `"3.45M"`, `"1.20e9"`) for 2D schematic sensor tails, pupil
+ *   dock readouts, and the `CS_MODAL_WIRE` beam picker.
+ *
+ * Rationale:
+ *   Schematic sensor annotations share horizontal space with node cards and 32-bin sparklines;
+ *   4-6 character SI-scaled strings preserve 2-3 significant digits across 10 orders of magnitude
+ *   without widening the schematic canvas.
+ */
 static void fmt_flux_compact(float ph, char *out, size_t cap)
 {
     if (ph <= 0.0f)
@@ -41,6 +103,22 @@ static void fmt_flux_compact(float ph, char *out, size_t cap)
     }
 }
 
+/**
+ * node_badge() - Return a short 2-to-4 character hardware category tag for an optical node
+ * @nd: Optical element configuration descriptor (non-NULL)
+ *
+ * Role:
+ *   Provides the uppercase type badge (`"DM"`, `"TTM"`, `"BS"`, `"CORO"`, `"PYR"`, `"SH"`,
+ *   `"ZWFS"`, `"CAM"`, `"WFE"`) rendered in `ELEMENTS & ARRANGER` rows, 2D schematic chip headers,
+ *   and hover tooltips.
+ *
+ * Rationale:
+ *   Distinguishing `"TTM"` (`dm_mode == 1`) from zonal `"DM"` (`dm_mode == 0`) at the badge level
+ *   reflects their distinct control roles (2-axis tip-tilt vs. high-order wavefront correction)
+ *   even though both share `CACAOSIM_NODE_DM` (`cacaosim.dmsim`) underneath.
+ *
+ * Return: Pointer to a static NUL-terminated uppercase tag literal.
+ */
 static const char *node_badge(const cacaosim_node_cfg_t *nd)
 {
     switch (nd->kind)
@@ -65,6 +143,24 @@ static const char *node_badge(const cacaosim_node_cfg_t *nd)
     return "NODE";
 }
 
+/**
+ * node_color() - Select the semantic theme accent color for an optical element's category
+ * @nd:  Optical element configuration descriptor (non-NULL)
+ * @pal: Active `milk-CTRL` RGB theme palette (non-NULL)
+ *
+ * Role:
+ *   Maps each subsystem family onto a consistent semantic color from @pal: active correctors
+ *   (`DM`/`TTM` -> `fg_accent`), beamsplitters (`BS` -> `fg_proc`), phase/coronagraphic masks
+ *   (`CORO`/`WFE` -> `fg_warn`), wavefront sensors (`PYR`/`SH`/`ZWFS` -> `fg_stream`), and focal
+ *   science cameras (`CAM` -> `fg_active`).
+ *
+ * Rationale:
+ *   Color-coding by physical role lets the eye immediately separate active mirrors, dichroic
+ *   routing optics, WFS control sensors, and science cameras in both the 1D arranger list and the
+ *   2D schematic across all five color themes (including colorblind-safe `accessible`).
+ *
+ * Return: RGB color value from @pal for borders and badge text.
+ */
 static cs_tui_rgb_t node_color(const cacaosim_node_cfg_t *nd, const cs_tui_pal_t *pal)
 {
     switch (nd->kind)
@@ -86,6 +182,25 @@ static cs_tui_rgb_t node_color(const cacaosim_node_cfg_t *nd, const cs_tui_pal_t
     return pal->fg_text;
 }
 
+/**
+ * node_short_spec() - Format a one-line hardware specification subtitle for an optical node
+ * @cfg: Parent bench configuration supplying fallback `master_hz` (non-NULL)
+ * @nd:  Optical element configuration to summarize (non-NULL)
+ * @out: Destination character buffer (non-NULL)
+ * @cap: Capacity of @out in bytes
+ *
+ * Role:
+ *   Generates the concise (< 22 char) subtitle displayed on line 2 of each 2D schematic node chip
+ *   and in the right column of `ELEMENTS & ARRANGER` rows (e.g., `"32x32 +/-5u"`, `"LP 0.95u"`,
+ *   `"Vortex l=2+M"`, `"128px 0.75u 2000Hz"`, `"50nm [OPD m]"`).
+ *
+ * Rationale:
+ *   Surfacing each element's defining physical quantities (actuator pitch/stroke, dichroic mode &
+ *   cutoff wavelength, coronagraph mask/charge + `+M` custom mask indicator, sensor pixel count +
+ *   wavelength + effective frame rate `rate_hz` or `master_hz / navg`, and scaled WFE RMS) allows
+ *   operators to audit the entire bench directly from the schematic without clicking into every
+ *   node's inspector.
+ */
 static void node_short_spec(
     const cacaosim_bench_cfg_t *cfg,
     const cacaosim_node_cfg_t  *nd,
@@ -124,6 +239,7 @@ static void node_short_spec(
         break;
     case CACAOSIM_NODE_CORO:
     {
+        /* Append "+M" whenever one or more custom FITS/SHM pupil, FPM, or Lyot masks are bound */
         int has_cmask = (nd->in_pup_amp[0] != '\0' || nd->in_pup_pha[0] != '\0' ||
                          nd->in_fpm_amp[0] != '\0' || nd->in_fpm_pha[0] != '\0' ||
                          nd->in_lyot[0] != '\0' || nd->in_lyot_pha[0] != '\0');
@@ -198,6 +314,38 @@ static void node_short_spec(
     }
 }
 
+/**
+ * node_focal_scale() - Compute the focal-plane angular sampling (`lambda/D` per pixel) of a node
+ * @cfg:        Parent bench configuration providing normalized pupil diameter `pup_diam` (non-NULL)
+ * @nd:         Candidate optical element configuration (non-NULL)
+ * @out_ld_pix: Output focal-plane plate scale in units of full-aperture `lambda/D` per pixel
+ * @out_lam_um: Output reference central wavelength `[um]` at which @out_ld_pix is defined
+ *
+ * Role:
+ *   Evaluates the exact numerical diffraction-propagator focal sampling for elements that form an
+ *   internal or detector focal plane (`FPCAM`, `CORO`, `SHWFS`, `PYRWFS`, `ZWFS`), returning `0`
+ *   for purely pupil-plane elements (`DM`, `SPLITTER`, `WFE`).
+ *
+ * Rationale:
+ *   Each `cacaosim` propagator parameterizes its focal grid differently:
+ *     - Padded full-pupil FFT (`FPCAM` FFT mode, `PYRWFS`, and `CORO` vortex/4QPM/custom_fft):
+ *       A beam of diameter `D_px = pup_diam * N` zero-padded to `N_fft = pad_factor * N` yields
+ *       `Delta_foc = 1 / (pup_diam * pad_factor)` `lambda/D` per pixel (Nyquist-sampled at `<= 0.5`
+ *       `lambda/D/pix` whenever `pup_diam * pad_factor >= 2`).
+ *     - Soummer Matrix-DFT (`FPCAM` MFT & `CORO` `custom_mft`): Configured directly in pixels per
+ *       `lambda/D` (`pixscale_ld`), so `Delta_foc = 1 / pixscale_ld` `lambda/D/pix`.
+ *     - Analytic Babinet MFT masks (`CORO` Lyot spot / phase dimple & `ZWFS`): Sample a compact
+ *       focal box spanning `2.4 * fpm_rad_ld` (or `1.2 * dimple_ld` diameter) across `n_mft`
+ *       pixels, giving `(2.4 * fpm_rad_ld) / n_mft` (or `(1.2 * dimple_ld) / n_mft`) in
+ *       `lambda/D/pix`.
+ *     - Shack-Hartmann lenslet FFT (`SHWFS`): Each subaperture has diameter `d_sub = D / n_sub`,
+ *       so `1 / pad_factor` in subaperture `(lambda / d_sub)/pix` equals `n_sub / pad_factor` in
+ *       full-telescope `(lambda / D)/pix`.
+ *   Unifying all five conventions into full-telescope `lambda/D/pix` lets `cs_tui_compute_scales()`
+ *   convert any selected instrument directly into on-sky arcseconds/milliarcseconds per pixel.
+ *
+ * Return: 1 if @nd defines a focal plane (@out_ld_pix and @out_lam_um written), 0 otherwise.
+ */
 static int node_focal_scale(
     const cacaosim_bench_cfg_t *cfg,
     const cacaosim_node_cfg_t  *nd,
@@ -211,11 +359,13 @@ static int node_focal_scale(
         *out_lam_um = (nd->fpcam.lambda_um > 0.1f) ? nd->fpcam.lambda_um : 1.65f;
         if (nd->fpcam.prop_mode == CACAOSIM_FPCAM_PROP_FFT)
         {
+            /* Padded FFT: 1 / (pup_diam * pad_factor) lambda/D per detector pixel */
             float pad   = (nd->fpcam.pad_factor >= 2u) ? (float) nd->fpcam.pad_factor : 2.0f;
             *out_ld_pix = 1.0f / (pdia * pad);
         }
         else
         {
+            /* Matrix-DFT: user specifies pixels per lambda/D, invert to lambda/D per pixel */
             float px    = (nd->fpcam.pixscale_ld > 0.05f) ? nd->fpcam.pixscale_ld : 3.0f;
             *out_ld_pix = 1.0f / px;
         }
@@ -235,6 +385,7 @@ static int node_focal_scale(
         }
         else
         {
+            /* Analytic Babinet spot/dimple MFT grid spans 2.4 * fpm_rad_ld across n_mft pixels */
             float r_ld  = (nd->coro.fpm_rad_ld > 0.1f) ? nd->coro.fpm_rad_ld : 2.5f;
             float nmft  = (nd->coro.n_mft >= 8u) ? (float) nd->coro.n_mft : 32.0f;
             *out_ld_pix = (2.4f * r_ld) / nmft;
@@ -242,6 +393,7 @@ static int node_focal_scale(
         return 1;
     case CACAOSIM_NODE_SHWFS:
     {
+        /* Lenslet d_sub = D / n_sub -> (1 / pad) (lambda / d_sub) = (n_sub / pad) (lambda / D) */
         float nsub  = (nd->shwfs.n_sub >= 1u) ? (float) nd->shwfs.n_sub : 16.0f;
         float pad   = (nd->shwfs.pad_factor >= 1u) ? (float) nd->shwfs.pad_factor : 2.0f;
         *out_lam_um = (nd->shwfs.lambda_um > 0.1f) ? nd->shwfs.lambda_um : 0.75f;
@@ -257,6 +409,7 @@ static int node_focal_scale(
     }
     case CACAOSIM_NODE_ZWFS:
     {
+        /* Babinet ZWFS MFT grid spans 1.2 * dimple_ld diameter across n_mft focal pixels */
         float d_ld  = (nd->zwfs.dimple_ld > 0.1f) ? nd->zwfs.dimple_ld : 1.06f;
         float nmft  = (nd->zwfs.n_mft >= 8u) ? (float) nd->zwfs.n_mft : 32.0f;
         *out_lam_um = (nd->zwfs.lambda_um > 0.1f) ? nd->zwfs.lambda_um : 0.85f;
@@ -268,6 +421,26 @@ static int node_focal_scale(
     }
 }
 
+/**
+ * cs_tui_compute_scales() - Compute pupil spatial and focal angular pixel scales for UI display
+ * @cfg:      Bench configuration supplying `nwf`, `pup_diam`, `tel_diam_m`, and nodes (nullable)
+ * @sel_item: Currently selected element (`0` = `[bench]`, `1..n_nodes` = `cfg->nodes[sel_item-1]`)
+ * @out:      Destination `cs_optical_scales_t` struct receiving computed scales (no-op if NULL)
+ *
+ * Role:
+ *   Populates `d_beam_px` (`[pix]` across primary diameter), `pup_m_pix` (`[m/pix]` in the entrance
+ *   pupil), `foc_ld_pix` (`[lambda/D/pix]`), `ref_lam_um` (`[um]`), `foc_src` (source node ID or
+ *   `"2xFFT"`), and `foc_arcsec_pix` (`[arcsec/pix]` on sky, i.e., `1e-3 * mas/pix`) for both the
+ *   `F2:BUILDER` pupil dock and the `F3:SCHEMATIC` bottom deck.
+ *
+ * Rationale:
+ *   When the user clicks a focal-plane node (`FPCAM`, `CORO`, `SHWFS`, `PYRWFS`, `ZWFS`), the
+ *   readout dynamically tracks that specific node's focal plate scale (`foc_src = nd->id`) so the
+ *   user can verify Nyquist sampling and detector FoV immediately while stepping `pad_factor`,
+ *   `pixscale_ld`, or `n_sub`. When `[bench]` or a pure pupil-plane optic (`DM`, `BS`, `WFE`) is
+ *   selected, a deterministic priority search (`FPCAM -> CORO -> SHWFS -> PYRWFS -> ZWFS -> 2xFFT`)
+ *   anchors the focal readout to the bench's primary science camera or wavefront sensor.
+ */
 void cs_tui_compute_scales(
     const cacaosim_bench_cfg_t *cfg,
     int                         sel_item,
@@ -283,6 +456,7 @@ void cs_tui_compute_scales(
         return;
     }
 
+    /* Pupil-plane geometry: beam diameter in pixels and physical meters per wavefront pixel */
     float nwf_f     = (cfg->nwf > 0u) ? (float) cfg->nwf : 128.0f;
     float pdia      = (cfg->pup_diam > 0.05f) ? cfg->pup_diam : 1.0f;
     float tel_d     = (cfg->tel_diam_m > 0.05f) ? cfg->tel_diam_m : 8.2f;
@@ -292,6 +466,7 @@ void cs_tui_compute_scales(
     out->ref_lam_um = (cfg->ref_lambda > 0.1f) ? cfg->ref_lambda : 1.65f;
     snprintf(out->foc_src, sizeof(out->foc_src), "2xFFT");
 
+    /* 1. Prefer the actively selected element if it forms an internal or detector focal plane */
     int found = 0;
     if (sel_item > 0 && (uint32_t) (sel_item - 1) < cfg->n_nodes)
     {
@@ -303,6 +478,7 @@ void cs_tui_compute_scales(
         }
     }
 
+    /* 2. Otherwise fall back to the highest-priority focal element in the bench (SciCam first) */
     if (!found)
     {
         static const cacaosim_node_kind_t prio[5] = {
@@ -324,10 +500,28 @@ void cs_tui_compute_scales(
         }
     }
 
+    /* Convert diffraction units (lambda/D) to sky arcseconds (1 rad = 206264.8062 arcsec) */
     float ld_arcsec     = (out->ref_lam_um * 1.0e-6f / tel_d) * 206264.8062f;
     out->foc_arcsec_pix = out->foc_ld_pix * ld_arcsec;
 }
 
+/**
+ * find_analyzed_node() - Look up a node's precomputed zero-FFT telemetry record by section ID
+ * @app:     Master TUI application state holding `app->ctx` (non-NULL)
+ * @node_id: Node identifier string to match (nullable)
+ *
+ * Role:
+ *   Retrieves the `cacaosim_bench_node_t` produced by `cacaosim_bench_analyze()` so schematic
+ *   sensor annotations can display `eff_flux_ph` (`[ph/fr]`) even though topological sort order in
+ *   `app->ctx.nodes[]` may differ from user declaration order in `app->cfg.nodes[]`.
+ *
+ * Rationale:
+ *   `app->cfg.nodes[]` preserves the user's editable arranger order, whereas `app->ctx.nodes[]`
+ *   stores topologically sorted execution stages; matching by `node_id` bridges the two cleanly
+ *   whenever `app->dag_valid` holds.
+ *
+ * Return: Pointer to the analyzed node in `app->ctx.nodes[]`, or NULL if invalid/not found.
+ */
 static const cacaosim_bench_node_t *find_analyzed_node(
     const cs_tui_app_t *app,
     const char         *node_id)
@@ -346,6 +540,23 @@ static const cacaosim_bench_node_t *find_analyzed_node(
     return NULL;
 }
 
+/**
+ * find_beam_spec() - Look up the 32-bin polychromatic photon spectrum of a named optical beam
+ * @app:       Master TUI application state holding `app->ctx.beams[]` (non-NULL)
+ * @beam_name: Optical beam identifier (e.g., `"b_pup"`, `"b_sci"`, nullable)
+ *
+ * Role:
+ *   Fetches the `cacaosim_spec_t` (`0.40 .. 2.40 um` photon-rate histogram) propagated to
+ *   @beam_name so terminal sensors in the 2D schematic and rows in `CS_MODAL_WIRE` can draw
+ *   accurate wavelength-colored spectral sparklines.
+ *
+ * Rationale:
+ *   Reading directly from the cached zero-FFT `app->ctx.beams[]` table lets both schematic
+ *   rendering and interactive beam-wiring modals display instant spectral passbands with zero
+ *   per-frame recomputation.
+ *
+ * Return: Pointer to the beam's `cacaosim_spec_t`, or NULL if the DAG is invalid or unmatched.
+ */
 static const cacaosim_spec_t *find_beam_spec(const cs_tui_app_t *app, const char *beam_name)
 {
     if (!app->dag_valid || beam_name == NULL || beam_name[0] == '\0')
@@ -362,6 +573,24 @@ static const cacaosim_spec_t *find_beam_spec(const cs_tui_app_t *app, const char
     return NULL;
 }
 
+/**
+ * node_primary_shm_live() - Query the live `MILK_SHM_DIR` status of an element's primary stream
+ * @app: Master TUI application state containing scanned `app->shm` entries (non-NULL)
+ * @nd:  Optical element configuration to inspect (non-NULL)
+ *
+ * Role:
+ *   Maps hardware elements that bind a primary external `ImageStreamIO` stream (`DM` -> `in_cmd`,
+ *   `WFE` -> `in_wfe`, `PYRWFS`/`SHWFS`/`ZWFS`/`FPCAM` -> `out_cam`) to a tri-state liveness code
+ *   rendered as a status dot (`●` / `○`) in `ELEMENTS & ARRANGER`.
+ *
+ * Rationale:
+ *   Giving each mirror and detector a live indicator dot directly inside `F2:BUILDER` lets the
+ *   operator verify at a glance whether `InitSHM` or `Deploy` has created and started streaming
+ *   each element's SHM endpoint without leaving the builder tab.
+ *
+ * Return: `-1` if the node has no primary external SHM stream (`BS`, `CORO`), `0` if offline /
+ *         missing, `1` if present on disk but static, or `2` if actively written (`alive`).
+ */
 static int node_primary_shm_live(const cs_tui_app_t *app, const cacaosim_node_cfg_t *nd)
 {
     const char *s = NULL;
@@ -392,6 +621,28 @@ static int node_primary_shm_live(const cs_tui_app_t *app, const cacaosim_node_cf
 
 /* ── Interactive 2D Optical Schematic Canvas ──────────────────────────────── */
 
+/**
+ * struct dag_draw_t - Ephemeral layout and viewport-clipping context for 2D schematic rendering
+ * @app:          Master TUI application state (provides scroll offsets, selection, and cell buffer)
+ * @pal:          Active `milk-CTRL` RGB theme palette
+ * @vx:           Viewport left screen column (0-based)
+ * @vy:           Viewport top screen row (0-based)
+ * @vw:           Viewport width in screen columns
+ * @vh:           Viewport height in screen rows
+ * @wide_spec:    Non-zero to render 24-column terminal sensor sparklines; 0 for compact 14-column
+ * @measure_only: Non-zero during pass 1 to compute `(sel_lx, sel_ly, sel_bw)` without writing cells
+ * @sel_found:    Set to 1 during traversal when `app->sel_item` is located on the logical canvas
+ * @sel_lx:       Logical X column of the selected element chip
+ * @sel_ly:       Logical Y row of the selected element chip
+ * @sel_bw:       Width in columns of the selected element chip
+ * @visited:      Per-node visited bitmap preventing duplicate placement or infinite loop cycles
+ * @next_row:     Monotonically increasing logical optical-rail slot (`ly = row_slot * 5`) allocated
+ *                whenever a beamsplitter reflection, LOWFS pickoff, or fan-out drops a new branch
+ *
+ * Role:
+ *   Carries all coordinate transforms, cycle-guard bitmaps, vertical rail allocation counters, and
+ *   pass-1 measurement outputs across the recursive `dc_trace_beam()` schematic layout traversal.
+ */
 typedef struct
 {
     cs_tui_app_t       *app;
@@ -410,6 +661,27 @@ typedef struct
     int                 next_row;
 } dag_draw_t;
 
+/**
+ * dc_put() - Clip and blit a UTF-8 string from logical DAG coordinates onto the screen viewport
+ * @d:     Active schematic drawing context (no-op when `d->measure_only` is non-zero)
+ * @lx:    Logical canvas column (0-based, relative to schematic origin before scroll)
+ * @ly:    Logical canvas row (0-based, relative to schematic origin before scroll)
+ * @str:   UTF-8 / ASCII string to plot cell-by-cell (non-NULL)
+ * @fg:    Foreground RGB color
+ * @bg:    Background RGB fill color
+ * @attrs: Cell attribute bitmask (`CS_ATTR_BOLD`, `CS_ATTR_DIM`, etc.)
+ *
+ * Role:
+ *   Translates unbounded logical schematic coordinates `(lx, ly)` by `(-schem_scroll_x,
+ *   -schem_scroll_y)` into screen cells inside `[vx .. vx+vw-1] x [vy .. vy+vh-1]`, decoding
+ *   multi-byte UTF-8 sequences so each glyph occupies exactly one `cs_cell_t`.
+ *
+ * Rationale:
+ *   Centralizing scroll translation and per-cell viewport clipping here lets all higher-level
+ *   schematic primitives (`dc_draw_node_chip()`, `dc_draw_harrow()`, `dc_draw_vbranch()`) draw in
+ *   clean, scroll-independent logical optical-rail coordinates without worrying about partial box
+ *   clipping at pane borders.
+ */
 static void dc_put(
     dag_draw_t  *d,
     int          lx,
@@ -432,6 +704,7 @@ static void dc_put(
     const char *p   = str;
     while (*p != '\0')
     {
+        /* Decode UTF-8 lead byte length (1..4 bytes) so box/arrow glyphs land in single cells */
         unsigned char b    = (unsigned char) *p;
         size_t        clen = ((b & 0x80u) == 0u)
                                  ? 1u
@@ -452,6 +725,33 @@ static void dc_put(
     }
 }
 
+/**
+ * dc_draw_node_chip() - Measure, draw, and hit-register a 4-row hardware card on the DAG canvas
+ * @d:        Active schematic drawing context (non-NULL)
+ * @lx:       Logical left column of the card on the schematic canvas
+ * @ly:       Logical top row of the card (`row_slot * 5`)
+ * @item_idx: Selectable item index (`0` = `[bench]` telescope, `1..N` = `cfg.nodes[item_idx-1]`)
+ * @tag:      Short hardware badge (`"TEL"`, `"DM"`, `"BS"`, `"CORO"`, etc., non-NULL)
+ * @title:    Element section ID or bench name (non-NULL)
+ * @sub:      One-line optical specification subtitle from `node_short_spec()` (non-NULL)
+ * @accent:   Category border/title RGB color when unselected
+ * @tip:      Hover tooltip registered on the card's visible rectangle (nullable)
+ *
+ * Role:
+ *   Computes the auto-sized width (`bw` in `[15..28]` columns) of a 4-row optical component box,
+ *   records its coordinates if selected (`sel_found`), and -- when not in `measure_only` mode --
+ *   draws rounded (`╭─╮`) or double-line (`╔═╗` when selected) borders, `[TAG] id` header,
+ *   hardware spec subtitle, and a viewport-clipped `CS_HIT_SCHEM_NODE` mouse hit region.
+ *
+ * Rationale:
+ *   Switching from single rounded corners to bold double-line borders + highlighted fill on the
+ *   active element makes keyboard/mouse selection unmistakable even on monochrome (`--text`) or
+ *   7-bit ASCII (`--ascii`, `+===+` vs `+---+`) terminals, while clipping the registered hit box
+ *   to `[vx..vx+vw, vy..vy+vh]` prevents partially scrolled-off chips from stealing clicks on
+ *   neighboring panes.
+ *
+ * Return: Total outer width `bw` of the rendered card in logical columns.
+ */
 static int dc_draw_node_chip(
     dag_draw_t         *d,
     int                 lx,
@@ -473,6 +773,7 @@ static int dc_draw_node_chip(
     snprintf(top_line, sizeof(top_line), "[%s] %s", tag, title);
     snprintf(bot_line, sizeof(bot_line), "%s", sub);
 
+    /* Clamp inner content width to [11..24] cols so cards stay compact yet readable */
     int inner = (int) strlen(top_line);
     int slen  = (int) strlen(bot_line);
     if (slen > inner)
@@ -544,6 +845,23 @@ static int dc_draw_node_chip(
     return bw;
 }
 
+/**
+ * dc_draw_harrow() - Draw a 6-column horizontal colinear optical beam arrow with overhead label
+ * @d:     Active schematic drawing context (non-NULL)
+ * @lx:    Logical start column immediately to the right of the upstream node chip
+ * @ly:    Logical top row of the current horizontal optical rail (`row_slot * 5`)
+ * @label: Beam name or arm code (`"T"`, `"b_dm0"`, etc., nullable) drawn above the shaft
+ * @fg:    Connector RGB color
+ *
+ * Role:
+ *   Renders `─────▶` (or `----->` in `--ascii` mode) along row `ly + 1` to represent an inline
+ *   or transmitted optical relay continuing along the same horizontal bench axis, placing an
+ *   abbreviated 6-char beam/arm tag on row `ly`.
+ *
+ * Rationale:
+ *   Stripping redundant `"b_"` prefixes on long beam identifiers (`strlen > 6`) keeps the 6-column
+ *   inter-chip gap legible without pushing downstream optics unnecessarily far to the right.
+ */
 static void dc_draw_harrow(dag_draw_t *d, int lx, int ly, const char *label, cs_tui_rgb_t fg)
 {
     const char *dash = d->app->scr.ascii_only ? "-" : "\xe2\x94\x80";
@@ -564,6 +882,23 @@ static void dc_draw_harrow(dag_draw_t *d, int lx, int ly, const char *label, cs_
     dc_put(d, lx + 5, ly + 1, arr, fg, d->pal->bg_panel, CS_ATTR_BOLD);
 }
 
+/**
+ * dc_draw_vbranch() - Draw an orthogonal vertical fold/pickoff drop-arm into a lower optical rail
+ * @d:       Active schematic drawing context (non-NULL)
+ * @lx:      Logical column of the vertical drop shaft (typically centered beneath a BS/CORO card)
+ * @ly0:     Logical starting row where the folded beam exits the parent optic (`ly + 4`)
+ * @ly1:     Logical top row of the newly allocated child rail (`child_row_slot * 5`)
+ * @arm_lbl: Optional branch annotation (`"R"`, `"FPM(1.00D)"`, `"lowfs:Lyot"`, or fan-out beam)
+ *
+ * Role:
+ *   Draws a vertical stem `│` from `ly0` down to `ly1 + 1`, turns `90 deg` rightward via
+ *   `╰──▶` (or `` `--> `` in `--ascii` mode), and labels the elbow with @arm_lbl.
+ *
+ * Rationale:
+ *   Dropping reflected (`out_refl`), coronagraphic LOWFS (`out_lowfs`), and multi-consumer fan-out
+ *   beams vertically onto dedicated `5`-row-spaced horizontal rails guarantees that arbitrarily
+ *   deep sub-branches never collide or cross existing horizontal arms above them.
+ */
 static void dc_draw_vbranch(dag_draw_t *d, int lx, int ly0, int ly1, const char *arm_lbl)
 {
     const char *vt  = d->app->scr.ascii_only ? "|" : "\xe2\x94\x82";
@@ -586,6 +921,33 @@ static void dc_draw_vbranch(dag_draw_t *d, int lx, int ly0, int ly1, const char 
     }
 }
 
+/**
+ * dc_trace_beam() - Recursively lay out and render all downstream optical stages fed by @beam
+ * @d:        Active schematic drawing context (updates `visited[]` and `next_row`, non-NULL)
+ * @beam:     Upstream optical beam name to trace (nullable / empty returns immediately)
+ * @lx:       Logical column at which the first consumer of @beam should be placed
+ * @row_slot: Logical horizontal rail index (`ly = row_slot * 5`) for the primary colinear consumer
+ * @depth:    Recursion depth guard (capped at `24` against malformed cyclic `.bench` files)
+ *
+ * Role:
+ *   Finds every unvisited node whose `in_beam` matches @beam, places the primary consumer
+ *   (`ci == 0`) colinearly on `row_slot` and any parallel fan-out consumers (`ci > 0`) on freshly
+ *   allocated vertical drop rails (`d->next_row++`), and dispatches downstream recursion by class:
+ *     - Inline pupil relays (`DM`, `TTM`, `WFE`): Continue colinearly along `use_row`.
+ *     - Coronagraph (`CORO`): Science Lyot output (`out_beam`) continues colinearly right; optional
+ *       reflective FPM or Lyot-stop pickoff (`out_lowfs`) drops vertically onto a child rail.
+ *     - Beamsplitter (`SPLITTER`): Transmitted arm (`out_trans`, `"T"`) continues colinearly right;
+ *       reflected arm (`out_refl`, `"R"`) drops vertically from the splitter's midpoint.
+ *     - Terminal detectors (`PYRWFS`, `SHWFS`, `ZWFS`, `FPCAM`): Render a 32-bin polychromatic
+ *       spectrum sparkline (`cs_draw_spectrum32()`) and `"<flux> ph/fr -> <out_cam>"` telemetry.
+ *     - Unconsumed beams (`n_cons == 0`): Render a dimmed `"(beam_name)"` open-port stub.
+ *
+ * Rationale:
+ *   Pre-order depth-first traversal (tracing the horizontal transmitted rail to completion before
+ *   allocating `d->next_row++` for reflected/LOWFS arms, or vice versa in tree order) guarantees
+ *   monotonic non-overlapping vertical rail indices in `O(N^2)` over `N <= 32` nodes with zero
+ *   heap allocation.
+ */
 static void dc_trace_beam(dag_draw_t *d, const char *beam, int lx, int row_slot, int depth)
 {
     if (beam == NULL || beam[0] == '\0' || depth > 24)
@@ -603,6 +965,7 @@ static void dc_trace_beam(dag_draw_t *d, const char *beam, int lx, int row_slot,
         }
     }
 
+    /* Dangling optical beam with no downstream consumer: draw dimmed open-arm label */
     if (n_cons == 0)
     {
         int ly = row_slot * 5;
@@ -621,6 +984,7 @@ static void dc_trace_beam(dag_draw_t *d, const char *beam, int lx, int row_slot,
         }
         d->visited[idx] = 1u;
 
+        /* Primary consumer stays colinear on row_slot; additional consumers drop onto new rails */
         int use_row = (ci == 0) ? row_slot : d->next_row++;
         int ly      = use_row * 5;
         int cur_x   = lx;
@@ -649,6 +1013,7 @@ static void dc_trace_beam(dag_draw_t *d, const char *beam, int lx, int row_slot,
         }
         else if (nd->kind == CACAOSIM_NODE_CORO)
         {
+            /* Coronagraph: transmitted post-Lyot science beam right, reflective LOWFS arm down */
             dc_draw_harrow(d, nx, ly, nd->out_beam, d->pal->fg_conn);
             dc_trace_beam(d, nd->out_beam, nx + 6, use_row, depth + 1);
             if (nd->out_lowfs[0] != '\0')
@@ -670,6 +1035,7 @@ static void dc_trace_beam(dag_draw_t *d, const char *beam, int lx, int row_slot,
         }
         else if (nd->kind == CACAOSIM_NODE_SPLITTER)
         {
+            /* Beamsplitter: transmitted (T) arm continues right, reflected (R) arm folds down */
             if (nd->out_trans[0] != '\0')
             {
                 dc_draw_harrow(d, nx, ly, "T", d->pal->fg_conn);
@@ -708,6 +1074,35 @@ static void dc_trace_beam(dag_draw_t *d, const char *beam, int lx, int row_slot,
     }
 }
 
+/**
+ * cs_render_dag_canvas() - Auto-scroll and render the interactive 2D optical bench schematic
+ * @app:          Master TUI application state (non-NULL)
+ * @x:            Canvas left terminal column (0-based, inside pane border)
+ * @y:            Canvas top terminal row (0-based, inside pane border)
+ * @w:            Canvas width in columns (`< 8` returns early)
+ * @h:            Canvas height in rows (`< 4` returns early)
+ * @wide_spectra: Non-zero to draw 24-column spectral sparklines (used in wide panes / `F3`);
+ *                0 for compact 14-column sparklines
+ *
+ * Role:
+ *   Renders the complete 2D optical DAG inside both `F2:BUILDER` (top-right pane) and
+ *   `F3:SCHEMATIC` (full-width upper pane):
+ *     1. Displays a prominent red `[!] DAG WIRING WARNING` banner at the top of the canvas if
+ *        `!app->dag_valid`.
+ *     2. When keyboard focus is outside `CS_FOCUS_SCHEM`, executes a dry-run `measure_only = 1`
+ *        pass to locate the selected node's logical coordinates and adjusts `schem_scroll_x` /
+ *        `schem_scroll_y` with trailing lookahead (`+28` cols, `+9` rows) so both the chip and its
+ *        downstream arrow/spectrum remain framed.
+ *     3. Executes the live draw pass from `[TEL]` root beam (`b_pup`) through `dc_trace_beam()`,
+ *        then renders any disconnected/unwired nodes (`!d.visited[i]`) below the main tree in
+ *        `fg_error` red so broken elements never vanish and can be clicked and rewired via `w`.
+ *
+ * Rationale:
+ *   Sharing a single parameterized canvas engine across `F2:BUILDER` and `F3:SCHEMATIC` guarantees
+ *   identical topology visualization and mouse hit-testing everywhere, while rendering orphaned
+ *   nodes explicitly at the bottom prevents hand-edited `.bench` typos from hiding elements from
+ *   the GUI.
+ */
 void cs_render_dag_canvas(
     cs_tui_app_t *app,
     int           x,
@@ -765,6 +1160,7 @@ void cs_render_dag_canvas(
         }
         if (md.sel_found)
         {
+            /* Keep +28 cols horizontal and +9 rows vertical lookahead around selected card */
             int rx_need = md.sel_lx + md.sel_bw + 28;
             if (md.sel_lx < app->schem_scroll_x)
             {
@@ -828,6 +1224,28 @@ void cs_render_dag_canvas(
 
 /* ── F2:BUILDER 3-Pane View (Elements + 2D Schematic + Inspector) ─────────── */
 
+/**
+ * draw_btn() - Render a bold clickable pill button and register its hit-test box
+ * @app: Active TUI application state owning the screen backbuffer and hit table (non-NULL)
+ * @x:   Left terminal column of the button in 0-based screen coordinates
+ * @y:   Terminal row of the button in 0-based screen coordinates
+ * @lbl: NUL-terminated button caption string (clamped to 24 columns)
+ * @hk:  Semantic hit-box action kind dispatched on mouse click
+ * @arg: Integer payload associated with @hk (e.g. tab index or 0)
+ * @fg:  Foreground RGB color for the button label
+ * @bg:  Background RGB color for the button pill
+ * @tip: Optional NUL-terminated hover tooltip message (may be NULL)
+ *
+ * Role: Paints a single-row bold button widget onto the backbuffer and atomically records
+ * its exact rendered width in `app->hits` for mouse click and hover-tooltip dispatch.
+ *
+ * Rationale: Co-locating `cs_put_str()` and `cs_tui_add_hit()` in one immediate-mode helper
+ * guarantees that button click regions always match the true rendered glyph width across
+ * dynamic label changes (e.g. `[T:dark]` vs. `[T:milk]`) and terminal resizes, eliminating
+ * manual coordinate arithmetic bugs.
+ *
+ * Return: Number of terminal columns occupied by the rendered button label.
+ */
 static int draw_btn(
     cs_tui_app_t       *app,
     int                 x,
@@ -844,9 +1262,41 @@ static int draw_btn(
     return len;
 }
 
+/**
+ * render_view_builder() - Render the primary 3-pane F2:BUILDER interactive workspace
+ * @app: Active TUI application state (non-NULL)
+ * @x:   Left column of the workspace body area in screen coordinates
+ * @y:   Top row of the workspace body area in screen coordinates
+ * @w:   Available workspace width in terminal columns
+ * @h:   Available workspace height in terminal rows
+ *
+ * Role: Lays out and renders the primary `F2:BUILDER` configurator screen comprising three
+ * synchronized, mouse-resizable panes:
+ *   1. Left `ELEMENTS & ARRANGER` pane: topological toolbar (`+Add`, `Dup`, `Up`, `Dn`,
+ *      `Swp`, `Del`), scrollable element list (`[0] TEL` entrance source plus all hardware
+ *      nodes with live SHM activity dots), and an adaptive 16x16 pupil preview & physical
+ *      optical scale dock (`m/pix`, `lambda/D/pix`, `arcsec/pix`, `[g:InitSHM]`).
+ *   2. Top-right `2D OPTICAL SCHEMATIC & PHOTOMETRY` pane: interactive DAG canvas showing
+ *      beams, splitters, coronagraph arms, and `[+]` optical splice targets.
+ *   3. Bottom-right `INSPECTOR` pane: 3-subtab (`1:OPTICS`, `2:DYN/DET`, `3:SHM/WIRING`)
+ *      declarative parameter table with inline text editing, `< enum >` stepper badges, and
+ *      smart `.../basename` path truncation.
+ *
+ * Rationale: Combining the linear hardware list, 2D optical table schematic, physical
+ * sampling dock, and categorized parameter inspector in a single split view gives AO
+ * engineers immediate visual feedback whenever they splice a node or tweak an optical
+ * parameter. Clamping `lw` and `sh` to safe minimum dimensions and switching the pupil dock
+ * between compact (`h >= 24`) and tall (`h >= 28`) layouts keeps all three panes legible
+ * from compact 80x24 SSH sessions up to ultrawide control-room monitors.
+ */
 static void render_view_builder(cs_tui_app_t *app, int x, int y, int w, int h)
 {
     const cs_tui_pal_t *pal = cs_tui_get_palette(app->opts.theme);
+    /*
+     * Compute resizable split geometry: clamp the left Elements pane width so both the
+     * element list (>= 28 cols when possible) and right Schematic/Inspector (>= 42 cols)
+     * remain usable, and derive the Schematic height from `schem_h_pct` with safe bounds.
+     */
     int                 lw  = app->left_w;
     if (lw < 28)
     {
@@ -874,7 +1324,7 @@ static void render_view_builder(cs_tui_app_t *app, int x, int y, int w, int h)
     }
     int ih = h - sh;
 
-    /* 1. Left Pane: Optical Elements & Arranger */
+    /* 1. Left Pane: Optical Elements & Arranger + draggable vertical splitter handle */
     int f_el = (app->focus == CS_FOCUS_ELEMS);
     char nbadge[32];
     snprintf(nbadge, sizeof(nbadge), "%u nodes", app->cfg.n_nodes);
@@ -884,7 +1334,7 @@ static void render_view_builder(cs_tui_app_t *app, int x, int y, int w, int h)
     cs_tui_add_hit(app, CS_HIT_SPLIT_LEFT, 0, x + lw - 1, y, 2, h,
                    "Drag vertical divider to resize Elements pane");
 
-    /* Action toolbar inside Elements pane */
+    /* Action toolbar inside Elements pane (progressively elides right pills on narrow panes) */
     int bx = x + 2;
     int by = y + 1;
     bx += draw_btn(app, bx, by, "[+Add]", CS_HIT_ACT_ADD, 0, pal->fg_active, pal->bg_panel_alt,
@@ -911,6 +1361,7 @@ static void render_view_builder(cs_tui_app_t *app, int x, int y, int w, int h)
                  "Remove selected element [d / Del]");
     }
 
+    /* Reserve bottom rows of the left pane for the 16x16 pupil & optical scale dock */
     int show_pup_dock = (h >= 24 && lw >= 30);
     int tall_pup_dock = (h >= 28 && lw >= 30);
     int dock_rows     = tall_pup_dock ? 15 : 10;
@@ -919,6 +1370,7 @@ static void render_view_builder(cs_tui_app_t *app, int x, int y, int w, int h)
     int list_rows     = list_bot - list_top;
     int total_items   = 1 + (int) app->cfg.n_nodes;
 
+    /* Auto-scroll element list viewport to keep `sel_item` visible */
     if (app->sel_item < app->elem_scroll)
     {
         app->elem_scroll = app->sel_item;
@@ -948,6 +1400,7 @@ static void render_view_builder(cs_tui_app_t *app, int x, int y, int w, int h)
 
         if (item == 0)
         {
+            /* Item 0 always represents the `[bench]` telescope pupil & stellar source */
             cs_printf_at(&app->scr, x + 3, ry, lw - 5, sel ? pal->fg_bright : pal->fg_title, row_bg,
                          CS_ATTR_BOLD, 1, "[0] TEL   %-10.10s %.1fm mV=%.1f",
                          app->cfg.name[0] ? app->cfg.name : "bench", app->cfg.tel_diam_m,
@@ -966,6 +1419,7 @@ static void render_view_builder(cs_tui_app_t *app, int x, int y, int w, int h)
             cs_printf_at(&app->scr, x + 12, ry, lw - 15, sel ? pal->fg_bright : pal->fg_text,
                          row_bg, sel ? CS_ATTR_BOLD : 0u, 1, "%-10.10s %s", nd->id, spec);
 
+            /* Trailing SHM liveness indicator: active green (2), present cyan (1), missing (0) */
             int live = node_primary_shm_live(app, nd);
             if (live >= 0 && lw >= 28)
             {
@@ -982,6 +1436,12 @@ static void render_view_builder(cs_tui_app_t *app, int x, int y, int w, int h)
         }
     }
 
+    /*
+     * Render the 16x16 anti-aliased pupil preview and physical optical scale dock.
+     * In tall terminals (`h >= 28`), pupil/source summary lines sit beside the 16x8 half-block
+     * aperture while full-width physical sampling (`m/pix`, `l/D/pix`, `arcsec/pix`) renders
+     * underneath; in compact terminals (`24 <= h < 28`), sampling metrics pack beside the pupil.
+     */
     if (show_pup_dock)
     {
         cs_optical_scales_t sc;
@@ -1054,7 +1514,7 @@ static void render_view_builder(cs_tui_app_t *app, int x, int y, int w, int h)
         }
     }
 
-    /* 2. Top-Right Pane: 2D Interactive Optical Schematic */
+    /* 2. Top-Right Pane: 2D Interactive Optical Schematic (compact mode if width < 88 cols) */
     int f_sc = (app->focus == CS_FOCUS_SCHEM);
     cs_draw_box(&app->scr, rx, y, rw, sh, f_sc, "2D OPTICAL SCHEMATIC & PHOTOMETRY",
                 app->dag_valid ? "CLICK NODE TO INSPECT" : "CHECK WIRING",
@@ -1062,7 +1522,7 @@ static void render_view_builder(cs_tui_app_t *app, int x, int y, int w, int h)
                 app->dag_valid ? pal->fg_muted : pal->fg_error, pal->bg_panel);
     cs_render_dag_canvas(app, rx + 1, y + 1, rw - 2, sh - 2, rw >= 88);
 
-    /* 3. Bottom-Right Pane: Declarative Parameter Inspector */
+    /* 3. Bottom-Right Pane: Declarative Parameter Inspector + horizontal resize handle */
     int iy   = y + sh;
     int f_pa = (app->focus == CS_FOCUS_PARAMS);
     char ititle[96];
@@ -1110,7 +1570,7 @@ static void render_view_builder(cs_tui_app_t *app, int x, int y, int w, int h)
     cs_tui_add_hit(app, CS_HIT_SPLIT_SCHEM, 0, rx, iy, rw, 1,
                    "Drag horizontal divider to resize Schematic / Inspector");
 
-    /* Inspector subtabs */
+    /* Inspector category subtabs (`1:OPTICS`, `2:DYN/DET`, `3:SHM/WIRING`) + Wire shortcut */
     static const char *const st_names[3] = { " 1:OPTICS ", " 2:DYN/DET ", " 3:SHM/WIRING " };
     int                      stx         = rx + 2;
     for (int st = 0; st < 3; st++)
@@ -1135,6 +1595,7 @@ static void render_view_builder(cs_tui_app_t *app, int x, int y, int w, int h)
     cs_printf_at(&app->scr, rx + 2, iy + 2, rw - 4, pal->fg_dim, pal->bg_panel, 0u, 1,
                  "%-14s %-18s %-18s %-6s %s", "KEY", "PARAMETER", "VALUE", "UNIT", "NOTES");
 
+    /* Clamp and auto-scroll parameter selection when switching nodes or subtabs */
     if (app->param_sel >= app->n_params && app->n_params > 0)
     {
         app->param_sel = app->n_params - 1;
@@ -1172,6 +1633,7 @@ static void render_view_builder(cs_tui_app_t *app, int x, int y, int w, int h)
         cs_printf_at(&app->scr, rx + 17, py, 18, sel ? pal->fg_bright : pal->fg_text, rbg,
                      sel ? CS_ATTR_BOLD : 0u, 1, "%-18.18s", pd->label);
 
+        /* Render value cell as live input cursor, `< discrete >` stepper, or scalar/path */
         if (sel && app->editing)
         {
             cs_fill_rect(&app->scr, rx + 36, py, 18, 1, pal->fg_bright, pal->bg_input);
@@ -1190,6 +1652,7 @@ static void render_view_builder(cs_tui_app_t *app, int x, int y, int w, int h)
         }
         else
         {
+            /* Preserve FITS/SHM filename suffix (`.../basename`) when long paths exceed 18 cols */
             char        pdisp[32];
             const char *vshow = vbuf[0] ? vbuf : "\"\"";
             if (strlen(vbuf) > 18u && strchr(vbuf, '/') != NULL)
@@ -1213,12 +1676,31 @@ static void render_view_builder(cs_tui_app_t *app, int x, int y, int w, int h)
 
 /* ── Top Header, Tab Bar, Bottom Status Bar, Modals & Tooltips ────────────── */
 
+/**
+ * render_header_and_tabs() - Render the 2-row milk-CTRL top telemetry header and tab bar
+ * @app: Active TUI application state (non-NULL)
+ *
+ * Role: Paints Rows 0 and 1 of the full-screen terminal frame:
+ *   - Row 0 (`milk-CTRL` banner): alternating heartbeat diamond, application badge, active
+ *     `[bench]` name and `.bench` filename, `[*MODIFIED]` unsaved-edits indicator, and
+ *     right-aligned live telemetry (`DAG:OK|ERR`, `SHM:live/total`, `FPS:running`, science
+ *     `SR` Strehl ratio when available, and differential terminal I/O `tx_kbps`).
+ *   - Row 1 (navigation & quick actions): clickable `F2:BUILDER` .. `F6:SOURCE` workspace
+ *     tabs on the left and `[P:Presets]`, `[s:Save]`, `[f:Run]`, `[S:Stop]`, `[h:HELP]`
+ *     action pills on the right.
+ *
+ * Rationale: Keeping DAG health, SHM/FPS liveness, science Strehl, and serial bandwidth pinned
+ * to Row 0 across all five workspace tabs mirrors `milk-CTRL` operational ergonomics so the
+ * user can spot broken wiring or stalled simulation processes while editing parameters or
+ * reading `.bench` source, while the oscillating heartbeat confirms the TUI event loop itself
+ * has not hung over a slow SSH link.
+ */
 static void render_header_and_tabs(cs_tui_app_t *app)
 {
     const cs_tui_pal_t *pal = cs_tui_get_palette(app->opts.theme);
     int                 W   = app->scr.cols;
 
-    /* Row 0: milk-CTRL Header Bar */
+    /* Row 0: milk-CTRL Header Bar with frame-tick heartbeat glyph */
     cs_fill_rect(&app->scr, 0, 0, W, 1, pal->fg_text, pal->bg_bar);
     const char *hb = ((app->frame_tick % 2u) == 0u)
                          ? (app->scr.ascii_only ? "*" : "\xe2\x97\x86")
@@ -1240,7 +1722,7 @@ static void render_header_and_tabs(cs_tui_app_t *app)
               1;
     }
 
-    /* Right-aligned status pills on Row 0 */
+    /* Right-aligned status pills on Row 0 (omitted if terminal is too narrow) */
     char rstat[128];
     if (app->shm.has_strehl)
     {
@@ -1310,6 +1792,24 @@ static void render_header_and_tabs(cs_tui_app_t *app)
     }
 }
 
+/**
+ * render_bottom_bars() - Render the 2-row bottom notification banner and shortcut footer
+ * @app: Active TUI application state (non-NULL)
+ *
+ * Role: Paints the final two terminal rows (`rows - 2` and `rows - 1`):
+ *   - Row `rows - 2`: priority-cascaded context line displaying (1) severity-colored transient
+ *     toast notifications while `now < toast_until_s`, else (2) the full description of the
+ *     currently highlighted parameter in `F2:BUILDER`, else (3) the most recent session log
+ *     entry.
+ *   - Row `rows - 1`: mode-sensitive keyboard cheat-sheet (`editing` vs. normal navigation),
+ *     clickable `[m:tips|off]`, `[T:<theme>]`, and `[q:exit]` pills, and a local `HH:MM:SS`
+ *     wall-clock readout.
+ *
+ * Rationale: Dedicating a persistent single-line banner to toast alerts and full parameter
+ * descriptions avoids disruptive modal popups for routine actions (saves, undo steps, stepping
+ * bounds) and ensures long parameter documentation remains readable even when the Inspector's
+ * inline `NOTES` column is clipped on narrow 80-column terminals.
+ */
 static void render_bottom_bars(cs_tui_app_t *app)
 {
     const cs_tui_pal_t *pal = cs_tui_get_palette(app->opts.theme);
@@ -1317,7 +1817,7 @@ static void render_bottom_bars(cs_tui_app_t *app)
     int                 ty  = app->scr.rows - 2;
     int                 sy  = app->scr.rows - 1;
 
-    /* Row rows-2: Toast / Active hint line */
+    /* Row rows-2: Priority cascade (1: active toast -> 2: selected param tip -> 3: last log) */
     cs_fill_rect(&app->scr, 0, ty, W, 1, pal->fg_muted, pal->bg_panel_alt);
     double now = cs_tui_now_sec();
     if (app->toast[0] != '\0' && now < app->toast_until_s)
@@ -1343,7 +1843,7 @@ static void render_bottom_bars(cs_tui_app_t *app)
                      app->logs[app->n_logs - 1]);
     }
 
-    /* Row rows-1: milk-CTRL Status Bar */
+    /* Row rows-1: milk-CTRL Status Bar with mode-aware key hints and utility toggles */
     cs_fill_rect(&app->scr, 0, sy, W, 1, pal->fg_text, pal->bg_bar);
     const char *hints =
         (app->editing)
@@ -1380,6 +1880,30 @@ static void render_bottom_bars(cs_tui_app_t *app)
     }
 }
 
+/**
+ * render_modal() - Render the active centered modal dialog overlay onto the backbuffer
+ * @app: Active TUI application state inspecting `app->modal` (non-NULL)
+ *
+ * Role: Draws a drop-shadowed centered popup dialog and registers modal hit-test boxes when
+ * `app->modal != CS_MODAL_NONE`:
+ *   - `CS_MODAL_ADD`: 9-kind optical hardware catalog with `Tab`-cyclable target input beam
+ *     (`AUTO` smart splice vs. explicit upstream beam).
+ *   - `CS_MODAL_WIRE`: upstream optical beam picker displaying photon flux, flux-weighted mean
+ *     wavelength, and an inline 32-bin polychromatic spectrum bar per beam.
+ *   - `CS_MODAL_PRESET`: built-in `.bench` hardware template gallery with summary blurbs.
+ *   - `CS_MODAL_THEME`: `milk-CTRL` color palette selector with live RGB swatch blocks and
+ *     7-bit ASCII border toggle status.
+ *   - `CS_MODAL_SAVE` / `CS_MODAL_OPEN`: `.bench` file path text prompt.
+ *   - `CS_MODAL_CONFIRM`: unsaved-changes guard dialog before destructive reload/preset/quit.
+ *   - `CS_MODAL_HELP`: categorized keyboard and mouse reference card.
+ *
+ * Rationale: Rendering modals after the main workspace onto the same cell backbuffer preserves
+ * the live schematic context visually dimmed behind a drop shadow, and because hit-test boxes
+ * are scanned in reverse registration order (`n_hits - 1` down to `0`), modal rows and buttons
+ * automatically capture clicks ahead of underlying workspace widgets while `handle_mouse_event`
+ * blocks clicks outside the dialog. Showing live 32-bin spectra inside `CS_MODAL_WIRE` prevents
+ * accidentally wiring an infrared sensor onto a visible-only reflected arm.
+ */
 static void render_modal(cs_tui_app_t *app)
 {
     if (app->modal == CS_MODAL_NONE)
@@ -1390,6 +1914,7 @@ static void render_modal(cs_tui_app_t *app)
     int                 W   = app->scr.cols;
     int                 H   = app->scr.rows;
 
+    /* 1. Add-Element & Splice Wizard (`a` / `+` or clicking `[+]` on a schematic beam) */
     if (app->modal == CS_MODAL_ADD)
     {
         static const char *const names[9] = {
@@ -1453,6 +1978,7 @@ static void render_modal(cs_tui_app_t *app)
         return;
     }
 
+    /* 2. Upstream Optical Beam Rewiring Picker (`w`) with inline 32-bin spectra */
     if (app->modal == CS_MODAL_WIRE)
     {
         char     beams[CACAOSIM_BENCH_MAX_BEAMS][CACAOSIM_BENCH_NAME_LEN];
@@ -1501,6 +2027,7 @@ static void render_modal(cs_tui_app_t *app)
         return;
     }
 
+    /* 3. Built-in Optical Bench Preset Gallery (`P`) */
     if (app->modal == CS_MODAL_PRESET)
     {
         int mw = (W > 84) ? 80 : (W - 4);
@@ -1527,6 +2054,7 @@ static void render_modal(cs_tui_app_t *app)
         return;
     }
 
+    /* 4. Color Theme & 7-bit ASCII Selector (`T`) */
     if (app->modal == CS_MODAL_THEME)
     {
         int mw = 58;
@@ -1545,6 +2073,7 @@ static void render_modal(cs_tui_app_t *app)
             cs_fill_rect(&app->scr, mx + 1, my + 2 + i, mw - 2, 1, pal->fg_text, bg);
             cs_printf_at(&app->scr, mx + 2, my + 2 + i, 38, sel ? pal->fg_bright : pal->fg_text, bg,
                          sel ? CS_ATTR_BOLD : 0u, 1, "%d. %-33s", i + 1, tp->label);
+            /* Preview title, stream, active, and accent swatches against each theme's panel bg */
             cs_put_str(&app->scr, mx + 42, my + 2 + i, 3, "###", tp->fg_title, tp->bg_panel,
                        CS_ATTR_BOLD, 1);
             cs_put_str(&app->scr, mx + 45, my + 2 + i, 3, "###", tp->fg_stream, tp->bg_panel,
@@ -1560,6 +2089,7 @@ static void render_modal(cs_tui_app_t *app)
         return;
     }
 
+    /* 5. File Path Prompt for Save As (`A` / first `s`) and Open (`o`) */
     if (app->modal == CS_MODAL_SAVE || app->modal == CS_MODAL_OPEN)
     {
         int mw = (W > 72) ? 68 : (W - 4);
@@ -1582,6 +2112,7 @@ static void render_modal(cs_tui_app_t *app)
         return;
     }
 
+    /* 6. Unsaved Changes Confirmation Guard (`q`, `P`, `o` when `app->dirty != 0`) */
     if (app->modal == CS_MODAL_CONFIRM)
     {
         int mw = 56;
@@ -1601,6 +2132,7 @@ static void render_modal(cs_tui_app_t *app)
         return;
     }
 
+    /* 7. Interactive Keyboard & Mouse Reference Overlay (`h` / `?` / `F1`) */
     if (app->modal == CS_MODAL_HELP)
     {
         static const char *const hlines[] = {
@@ -1648,12 +2180,27 @@ static void render_modal(cs_tui_app_t *app)
     }
 }
 
+/**
+ * render_hover_tooltip() - Render a floating mouse-hover tooltip callout near the cursor
+ * @app: Active TUI application state holding mouse coordinates and `app->hits` (non-NULL)
+ *
+ * Role: Scans `app->hits` from front to back (`n_hits - 1` down to `0`) for the topmost
+ * interactive widget under `(mouse_x, mouse_y)` carrying a non-empty `tip` string, and paints
+ * a screen-clamped single-line callout pill just above (or below, near Row 0..3) the cursor.
+ *
+ * Rationale: Reusing the exact immediate-mode hit-test boxes registered during widget drawing
+ * provides zero-maintenance hover discovery for abbreviated schematic badges (`[LP 0.95]`,
+ * `[+]`, SHM dots) and toolbar pills without maintaining parallel tooltip geometry tables.
+ * Suppressing tooltips while a modal is open (`app->modal != CS_MODAL_NONE`) prevents background
+ * callouts from bleeding over modal overlays.
+ */
 static void render_hover_tooltip(cs_tui_app_t *app)
 {
     if (!app->show_tooltips || app->modal != CS_MODAL_NONE || app->mouse_x < 0 || app->mouse_y < 0)
     {
         return;
     }
+    /* Reverse scan matches the topmost overlapping hit-box painted latest in the frame */
     const char *tip = NULL;
     for (int i = app->n_hits - 1; i >= 0; i--)
     {
@@ -1675,6 +2222,7 @@ static void render_hover_tooltip(cs_tui_app_t *app)
     {
         tlen = app->scr.cols - 4;
     }
+    /* Flip below the cursor near the top header rows and clamp horizontally inside screen edges */
     int tx = app->mouse_x + 2;
     int ty = (app->mouse_y > 3) ? (app->mouse_y - 1) : (app->mouse_y + 1);
     if (tx + tlen >= app->scr.cols)
@@ -1689,6 +2237,25 @@ static void render_hover_tooltip(cs_tui_app_t *app)
     cs_printf_at(&app->scr, tx + 1, ty, tlen - 2, pal->fg_accent, pal->bg_popup, 0u, 1, "%s", tip);
 }
 
+/**
+ * cs_tui_render_frame() - Execute one complete immediate-mode TUI frame into the backbuffer
+ * @app: Active TUI application state (safe no-op if NULL)
+ *
+ * Role: Master per-frame rendering entry point shared by both the interactive `cacaosim_tui_run()`
+ * event loop and headless `cacaosim_tui_render_headless()` snapshots:
+ *   1. Lazily refreshes zero-FFT spectral/DAG analysis and the 16x16 pupil mask if dirty.
+ *   2. Rebuilds the active node/category `cs_param_desc_t` descriptor table (`app->params`).
+ *   3. Resets the immediate-mode hit-test table (`app->n_hits = 0`) and clears `app->scr`.
+ *   4. Paints top chrome (`render_header_and_tabs`), the active `F2..F6` workspace body,
+ *      bottom status bars (`render_bottom_bars`), any active modal (`render_modal`), and the
+ *      floating mouse tooltip (`render_hover_tooltip`).
+ *
+ * Rationale: Rebuilding parameter descriptors and hit-test rectangles unconditionally at the
+ * start of every frame enforces strict immediate-mode UI invariants: the screen backbuffer,
+ * mouse click targets, and keyboard parameter indices can never drift out of sync after undo,
+ * hot-reload, terminal `SIGWINCH` resizes, or headless `--dump` captures, while `cs_scr_flush()`
+ * subsequently diffs `cells` against `prev` so unchanged terminal cells emit zero ANSI bytes.
+ */
 void cs_tui_render_frame(cs_tui_app_t *app)
 {
     if (app == NULL)

@@ -5,6 +5,28 @@
 /**
  * @file    cacaosim_beamsplit_FPS.c
  * @brief   MILK_RUNNABLE dichroic / gray beamsplitter with per-arm NCPA, masks, & 2D registration
+ *
+ * Architectural Role:
+ *   Implements `cacaosim.beamsplit` (`milk-fpsexec-cacaosim-beamsplit`), a zero-FFT
+ *   pupil-plane branching unit that splits an upstream 3D `[nwf x nwf x 2]`
+ *   optical beam (`.in_beam`) into two independent downstream SHM optical beams
+ *   (`.out_refl` and `.out_trans`). Supports four coating laws via
+ *   `cacaosim_spec_split()`: achromatic gray (`0`), long-pass dichroic (`1`),
+ *   short-pass dichroic (`2`), and band-reflect notch/filter dichroic (`3`).
+ *
+ * Design Rationale & Motivation:
+ *   - Smooth thin-film transition modeling: Real multi-layer dielectric dichroics
+ *     exhibit finite spectral transition edges (`roll_um`, default `30 nm`) and
+ *     sub-unity peak efficiencies (`eff_refl`, `eff_trans`). Modeling smooth
+ *     logistic roll-offs over the 32-bin spectrum (`0.40..2.40 um`) while clamping
+ *     `R(lambda) + T(lambda) <= 1` guarantees photon conservation and realistic
+ *     chromatic cross-bleed when sensor bandpasses straddle `.lambda_cut`.
+ *   - Co-located differential relay physics: In real AO instruments, non-common
+ *     path aberrations (`ncpa_refl`, `ncpa_trans`), cold stops (`pup_refl`,
+ *     `pup_trans`), and pupil misregistrations (`dx, dy, rot, scale`) arise
+ *     immediately downstream of the WFS/science pickoff. Folding them into
+ *     `cacaosim_beam_relay_cpu()` inside `beamsplit` avoids spawning extra SHM
+ *     relay processes per optical arm.
  */
 
 #include <stdint.h>
@@ -15,6 +37,11 @@
 #include "beam/cacaosim_beamsplit_FPS.h"
 #include "common/cacaosim_beam.h"
 
+/*
+ * Module-static FPS parameter backing storage for cacaosim.beamsplit.
+ * Defaults configure a 0.95 um long-pass dichroic (reflecting visible < 0.95 um to WFS and
+ * transmitting NIR > 0.95 um to science/coronagraph) with 95% peak arm efficiencies.
+ */
 static char     param_in_beam[FUNCTION_PARAMETER_STRMAXLEN]   = "csim_beam0";
 static char     param_out_refl[FUNCTION_PARAMETER_STRMAXLEN]  = "csim_beam_refl";
 static char     param_out_trans[FUNCTION_PARAMETER_STRMAXLEN] = "csim_beam_trans";
@@ -40,6 +67,34 @@ static float    param_tran_dy                                 = 0.0f;
 static float    param_tran_rot                                = 0.0f;
 static float    param_tran_scale                              = 1.0f;
 
+/**
+ * CACAOSIM_BEAMSPLIT_PARAMS(X) - X-macro FPS parameter table for `cacaosim.beamsplit`
+ *
+ * Parameters:
+ *   - `.in_beam`     (STREAMNAME, trigger): Upstream `[nwf x nwf x 2]` `FLOAT32` optical beam.
+ *   - `.out_refl`    (STREAMNAME): Reflected arm `[nwf x nwf x 2]` `FLOAT32` beam (empty = skip).
+ *   - `.out_trans`   (STREAMNAME): Transmitted arm `[nwf x nwf x 2]` `FLOAT32` beam (empty = skip).
+ *   - `.nwf`         (UINT32): Fallback grid dimension [pixels] if `.in_beam` is auto-created.
+ *   - `.split_mode`  (INT32, WRITERUN): `0` = achromatic gray, `1` = long-pass (`refl < cut`),
+ *                    `2` = short-pass (`refl > cut`), `3` = band-reflect (`[cut-w/2, cut+w/2]`).
+ *   - `.r_gray`      (FLOAT32, WRITERUN): Gray reflectance `[0..1]` when `.split_mode == 0`.
+ *   - `.t_gray`      (FLOAT32, WRITERUN): Gray transmittance `[0..1]` when `.split_mode == 0`.
+ *   - `.lambda_cut`  (FLOAT32, WRITERUN): Dichroic transition or band-center wavelength [um].
+ *   - `.band_width`  (FLOAT32, WRITERUN): Full reflection bandwidth [um] when `.split_mode == 3`.
+ *   - `.roll_um`     (FLOAT32): Logistic transition width (`10%..90%`-scale) [um] (default `0.03`).
+ *   - `.eff_refl`    (FLOAT32, WRITERUN): Peak in-band reflectance efficiency `[0..1]`.
+ *   - `.eff_trans`   (FLOAT32, WRITERUN): Peak in-band transmittance efficiency `[0..1]`.
+ *   - `.ncpa_refl`   (STRING): Optional `[nwf x nwf]` `FLOAT32` static NCPA OPD [um] on refl arm.
+ *   - `.ncpa_trans`  (STRING): Optional `[nwf x nwf]` `FLOAT32` static NCPA OPD [um] on trans arm.
+ *   - `.pup_refl`    (STRING): Optional `[nwf x nwf]` `FLOAT32` pupil/Lyot mask on refl arm.
+ *   - `.pup_trans`   (STRING): Optional `[nwf x nwf]` `FLOAT32` pupil/Lyot mask on trans arm.
+ *   - `.refl_dx`, `.refl_dy`   (FLOAT32): Reflected arm lateral pupil shift [pixels].
+ *   - `.refl_rot`    (FLOAT32): Reflected arm counter-clockwise pupil rotation [degrees].
+ *   - `.refl_scale`  (FLOAT32): Reflected arm isotropic pupil magnification (`1.0` = unity).
+ *   - `.trans_dx`, `.trans_dy` (FLOAT32): Transmitted arm lateral pupil shift [pixels].
+ *   - `.trans_rot`   (FLOAT32): Transmitted arm counter-clockwise pupil rotation [degrees].
+ *   - `.trans_scale` (FLOAT32): Transmitted arm isotropic pupil magnification (`1.0` = unity).
+ */
 #define CACAOSIM_BEAMSPLIT_PARAMS(X)                                                    \
     X(".in_beam", param_in_beam, FPTYPE_STREAMNAME, 1,                                  \
       FPFLAG_DEFAULT_INPUT | FPFLAG_TRIGGER_STREAM,                                     \
@@ -100,6 +155,21 @@ static float    param_tran_scale                              = 1.0f;
 
 MILK_PARAMS_DEFINE(cacaosim_beamsplit, CACAOSIM_BEAMSPLIT_PARAMS);
 
+/**
+ * beamsplit_confcheck() - Enforce `FPFLAG_WRITERUN` on live spectral beamsplitter parameters
+ *
+ * Role:
+ *   FPS `confcheck` hook invoked during parameter validation so coating mode,
+ *   cutoff wavelength, bandwidth, and arm efficiencies remain live-tunable while
+ *   `beamsplit_compute()` is running.
+ *
+ * Rationale:
+ *   Allows operators and automated trade-study scripts to sweep dichroic cutoffs
+ *   or switch between gray and dichroic splitting in real time without restarting
+ *   the optical pipeline or breaking downstream SHM semaphores.
+ *
+ * Return: Always `RETURN_SUCCESS`.
+ */
 static MILK_COLD errno_t beamsplit_confcheck(void)
 {
     if (dcfpsptr != NULL)
@@ -120,8 +190,32 @@ static MILK_COLD errno_t beamsplit_confcheck(void)
     return RETURN_SUCCESS;
 }
 
+/**
+ * beamsplit_compute() - Main real-time loop splitting `.in_beam` into `.out_refl` & `.out_trans`
+ * @self: Pointer to `runnable_cacaosim_beamsplit` descriptor
+ *
+ * Role:
+ *   Connects to `.in_beam` (auto-creating a `[nwf x nwf x 2]` placeholder stream
+ *   if launched before upstream `mkbeam`/`dmsim`), allocates `.out_refl` and
+ *   `.out_trans` with `CSIM_BM` spectral keywords, and on every trigger frame
+ *   splits the 32-bin photon spectrum and relays `[OPD_um, Amplitude]` through
+ *   each arm's NCPA, pupil stop, and 2D affine registration transform.
+ *
+ * Rationale:
+ *   - Uses `cacaosim_reg_is_identity()` fast-path inside `cacaosim_beam_relay_cpu()`
+ *     when an arm's registration is `(0, 0, 0, 1)`, reducing aligned relay to a
+ *     streaming OpenMP SIMD pass, while seamlessly switching to bilinear 2D
+ *     inverse-mapped interpolation when sub-pixel misregistration is configured.
+ *   - Supplies a default `m_V = 8.0` G2V fallback spectrum if `.in_beam` lacks
+ *     `CSIM_BM` keywords so standalone tests with raw OPD cubes still yield
+ *     physically sensible downstream photon fluxes.
+ *
+ * Return: `RETURN_SUCCESS` on clean termination, or `RETURN_FAILURE` if `.in_beam`
+ *         cannot be connected or created.
+ */
 static MILK_HOT errno_t beamsplit_compute(const MILK_RUNNABLE *self)
 {
+    /* Connect to upstream beam or create a placeholder cube to avoid startup ordering races */
     IMGID img_in = stream_connect(param_in_beam);
     if (img_in.ID == -1)
     {
@@ -137,6 +231,7 @@ static MILK_HOT errno_t beamsplit_compute(const MILK_RUNNABLE *self)
     uint32_t nwf  = img_in.md->size[0];
     uint64_t npix = (uint64_t) nwf * nwf;
 
+    /* Create reflected and transmitted output beam cubes (either arm may be omitted if empty) */
     IMGID img_refl  = { 0 };
     IMGID img_trans = { 0 };
     img_refl.ID     = -1;
@@ -159,6 +254,7 @@ static MILK_HOT errno_t beamsplit_compute(const MILK_RUNNABLE *self)
         }
     }
 
+    /* Connect optional per-arm static NCPA OPD [um] and pupil/Lyot amplitude mask streams */
     IMGID img_nr = { 0 };
     IMGID img_nt = { 0 };
     IMGID img_pr = { 0 };
@@ -185,6 +281,7 @@ static MILK_HOT errno_t beamsplit_compute(const MILK_RUNNABLE *self)
         img_pt = stream_connect(param_pup_tran);
     }
 
+    /* Precompute fallback G2V m_V = 8.0 spectrum for raw upstream cubes without CSIM_BM kw */
     cacaosim_spec_t fallback_spec;
     cacaosim_spec_star(&fallback_spec, 8.2f, 0.30f, 8.0f, 5778.0f, 0.75f);
 
@@ -202,6 +299,7 @@ static MILK_HOT errno_t beamsplit_compute(const MILK_RUNNABLE *self)
             in_spec = fallback_spec;
         }
 
+        /* Partition 32-bin photon spectrum between reflected and transmitted arms */
         cacaosim_split_cfg_t scfg = {
             .mode       = param_split_mode,
             .r_gray     = param_r_gray,
@@ -225,6 +323,7 @@ static MILK_HOT errno_t beamsplit_compute(const MILK_RUNNABLE *self)
         const float *pt = (img_pt.ID != -1 && img_pt.md->size[0] == nwf) ? img_pt.im->array.F
                                                                          : NULL;
 
+        /* Relay reflected arm: 2D affine registration + reflected NCPA + reflected pupil stop */
         if (img_refl.ID != -1)
         {
             cacaosim_reg_t reg_r = {
@@ -240,6 +339,7 @@ static MILK_HOT errno_t beamsplit_compute(const MILK_RUNNABLE *self)
             processinfo_update_output_stream(processinfo, img_refl.im, img_in.im);
         }
 
+        /* Relay transmitted arm: 2D affine registration + trans NCPA + trans pupil stop */
         if (img_trans.ID != -1)
         {
             cacaosim_reg_t reg_t = {
@@ -285,6 +385,7 @@ static MILK_HOT errno_t beamsplit_compute(const MILK_RUNNABLE *self)
     return RETURN_SUCCESS;
 }
 
+/* Public MILK_RUNNABLE registration and standalone milk-fpsexec-cacaosim-beamsplit export */
 const MILK_RUNNABLE runnable_cacaosim_beamsplit = {
     .kind = MILK_RUNNABLE_FPS,
     .app  = { .fps_name    = "csim_beamsplit",

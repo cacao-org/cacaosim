@@ -5,6 +5,33 @@
 /**
  * @file    cacaosim_pyrwfs_cuda.cu
  * @brief   CUDA cuFFT + CUDA Graph Pyramid WFS propagation and multi-subframe integration kernels
+ *
+ * Architectural Role in cacaosim:
+ *   Provides the high-throughput GPU accelerator backend (`ctx->cuda_priv`) for `cacaosim.pyrwfs`,
+ *   executing pupil complex-field synthesis, 2D cuFFT focal propagation, batched modulated pyramid
+ *   inverse cuFFTs, area-conserving detector binning, multi-subframe (`navg`) accumulation, and
+ *   parallel Philox Poisson/readout detector noise entirely on the GPU.
+ *
+ * Design Rationale & Physics / Algorithmic Motivation:
+ *   1. Fourier-Shift (1 + N_mod) Batched GPU FFT Reduction:
+ *      Instead of running `2 * N_mod` sequential 2D FFTs for `N_mod` pupil tip-tilt positions, a
+ *      single `cufftPlan2d` transforms the zero-padded pupil field to the focal plane once per
+ *      subframe (`d_foc_cplx`). `kernel_pyrwfs_mod_mul` then broadcasts `d_foc_cplx` across all
+ *      `eff_npts` precomputed shifted complex pyramid masks in one L2-cached read pass, and a
+ *      single `cufftPlanMany` (`plan_inv_batch`) executes all `eff_npts` 2D inverse FFTs
+ *      simultaneously across GPU SMs—maximizing occupancy even on large GPUs.
+ *   2. Fused Modulation Intensity Summation & Spatial Binning:
+ *      Rather than materializing an intermediate `[nfft x nfft]` summed intensity buffer in global
+ *      VRAM, `kernel_pyrwfs_accum_bin_int` and `kernel_pyrwfs_accum_bin_frac` fuse squared-modulus
+ *      reduction across the `eff_npts` modulation planes directly with `[nfft x nfft] -> [ncam x
+ *      ncam]` area-conserving box integration, halving global memory write/read traffic.
+ *   3. Steady-State CUDA Graph Capture (`cudaStreamBeginCapture`):
+ *      At multi-kHz AO loop rates (`2-5 kHz`), launching 5+ small kernels and internal cuFFT
+ *      sub-kernels per subframe incurs tens of microseconds of CPU driver overhead. After a single
+ *      warmup pass binds cuFFT workspaces, `cacaosim_pyrwfs_cuda_accum()` records the entire
+ *      optical DAG into an executable `cudaGraphExec_t` and replays it with a single
+ *      `cudaGraphLaunch()`, automatically invalidating and recapturing if device input pointers,
+ *      wavefront unit scaling, or pyramid modulation masks change.
  */
 
 #include <cuda_runtime.h>
@@ -16,42 +43,67 @@
 #include "common/cacaosim_cuda.h"
 #include "pyrwfs/cacaosim_pyrwfs.h"
 
+/**
+ * @brief Private GPU execution state (`ctx->cuda_priv`) for the CUDA Pyramid WFS backend.
+ *
+ * Owns (or borrows) the execution `cudaStream_t`, forward and batched-inverse cuFFT plans,
+ * persistent device buffers for static/dynamic pupil inputs and modulated complex planes, and the
+ * cached `cudaGraphExec_t` along with the exact device pointer/scalar signature for which the
+ * graph was recorded.
+ */
 typedef struct
 {
-    cudaStream_t     stream;
-    int              owns_stream;
-    cufftHandle      plan_fwd;
-    cufftHandle      plan_inv_batch;
-    int              has_fwd;
-    int              has_inv;
+    cudaStream_t     stream;         /**< Execution CUDA stream (private or shared `htsim`) */
+    int              owns_stream;    /**< 1 if `stream` was created here and must be destroyed */
+    cufftHandle      plan_fwd;       /**< Single 2D C2C forward FFT plan `[nfft x nfft]` */
+    cufftHandle      plan_inv_batch; /**< Batched 2D C2C inverse FFT plan `[eff_npts*nfft^2]` */
+    int              has_fwd;        /**< Non-zero once `plan_fwd` is valid */
+    int              has_inv;        /**< Non-zero once `plan_inv_batch` is valid */
 
-    float           *d_pup_amp;
-    float           *d_dyn_pup;
-    float           *d_ncpa_opd;
-    float           *d_atm_amp;
-    float           *d_wf_in;
-    float           *d_dm_opd;
-    cuFloatComplex  *d_masks;
-    cuFloatComplex  *d_pup_cplx;
-    cuFloatComplex  *d_foc_cplx;
-    cuFloatComplex  *d_mod_batch;
-    float           *d_cam_int;
-    float           *d_accum_int;
-    uint16_t        *d_out_u16;
-    float           *d_out_f32;
+    float           *d_pup_amp;      /**< Static uploaded 2D pupil amplitude `[npix_wf]` */
+    float           *d_dyn_pup;      /**< Staging buffer for dynamic host beam amplitude */
+    float           *d_ncpa_opd;     /**< Optional static WFS-arm NCPA OPD `[npix_wf]` [um] */
+    float           *d_atm_amp;      /**< Staging buffer for host atmospheric amplitude */
+    float           *d_wf_in;        /**< Staging buffer for host wavefront/beam OPD */
+    float           *d_dm_opd;       /**< Staging buffer for host DM OPD `[npix_wf]` [um] */
+    cuFloatComplex  *d_masks;        /**< Shifted complex focal pyramid masks `[npts*npix_fft]` */
+    cuFloatComplex  *d_pup_cplx;     /**< Zero-padded complex pupil field `[npix_fft]` */
+    cuFloatComplex  *d_foc_cplx;     /**< Unmodulated focal-plane complex field `[npix_fft]` */
+    cuFloatComplex  *d_mod_batch;    /**< Modulated focal/detector batch `[npts*npix_fft]` */
+    float           *d_cam_int;      /**< Single-subframe binned camera intensity `[npix_cam]` */
+    float           *d_accum_int;    /**< Multi-subframe (`navg > 1`) intensity accumulator */
+    uint16_t        *d_out_u16;      /**< Device uint16 ADU readout buffer `[npix_cam]` */
+    float           *d_out_f32;      /**< Device float32 readout buffer `[npix_cam]` */
 
     /* CUDA Graph cached for steady-state optical propagation */
-    cudaGraph_t      graph;
-    cudaGraphExec_t  graph_exec;
-    int              graph_valid;
-    int              graph_tried;
-    const float     *graph_pup_ptr;
-    const float     *graph_amp_ptr;
-    const float     *graph_wf_ptr;
-    const float     *graph_dm_ptr;
-    float            graph_wf_scale;
+    cudaGraph_t      graph;          /**< Captured optical kernel + cuFFT dependency graph */
+    cudaGraphExec_t  graph_exec;     /**< Instantiated executable CUDA Graph handle */
+    int              graph_valid;    /**< 1 when `graph_exec` matches current pointer signature */
+    int              graph_tried;    /**< 1 once capture has been attempted for current config */
+    const float     *graph_pup_ptr;  /**< Bound pupil amplitude device pointer in `graph_exec` */
+    const float     *graph_amp_ptr;  /**< Bound atmospheric amplitude device pointer in graph */
+    const float     *graph_wf_ptr;   /**< Bound wavefront OPD device pointer in `graph_exec` */
+    const float     *graph_dm_ptr;   /**< Bound DM OPD device pointer in `graph_exec` */
+    float            graph_wf_scale; /**< Bound `wf_to_opd` scalar baked into `graph_exec` */
 } pyrwfs_cuda_state_t;
 
+/**
+ * kernel_pyrwfs_mod_mul() - Broadcast-multiply focal field against all N_mod shifted pyramid masks
+ * @foc:       Input 2D focal-plane complex amplitude `[npix_fft]`
+ * @masks:     Precomputed shifted complex pyramid masks `[npts * npix_fft]`
+ * @npix_fft:  Number of complex pixels per 2D FFT plane (`nfft * nfft`)
+ * @npts:      Number of active modulation steps (`eff_npts`)
+ * @batch_out: Output modulated focal complex batch `[npts * npix_fft]`
+ *
+ * Role:
+ *   GPU focal-plane modulation kernel bridging the single forward cuFFT and the batched `npts`
+ *   inverse cuFFT.
+ *
+ * Rationale:
+ *   Mapping one GPU thread to each spatial frequency `p` loads `foc[p]` into registers once and
+ *   loops over the `npts` strided mask planes, saving `(npts - 1) * npix_fft` global reads of the
+ *   focal field while maintaining fully coalesced 8-byte `cuFloatComplex` accesses across warps.
+ */
 __global__ void kernel_pyrwfs_mod_mul(
     const cuFloatComplex *__restrict__ foc,
     const cuFloatComplex *__restrict__ masks,
@@ -65,6 +117,7 @@ __global__ void kernel_pyrwfs_mod_mul(
         return;
     }
 
+    /* Load stationary PSF complex frequency once; broadcast across all shifted prism masks */
     cuFloatComplex e = foc[p];
     for (int32_t k = 0; k < npts; k++)
     {
@@ -74,6 +127,23 @@ __global__ void kernel_pyrwfs_mod_mul(
     }
 }
 
+/**
+ * kernel_pyrwfs_accum_bin_int() - Fused modulation intensity sum + exact integer box binning
+ * @batch_det: Inverse-FFT complex detector batch `[npts * nfft * nfft]`
+ * @nfft:      Optical FFT grid dimension [pixels]
+ * @ncam:      Target WFS camera dimension [pixels] (`nfft % ncam == 0`)
+ * @bin:       Exact integer binning factor (`nfft / ncam`)
+ * @npts:      Number of modulation planes (`eff_npts`)
+ * @cam_int:   Output binned single-subframe camera intensity `[ncam * ncam]`
+ *
+ * Role:
+ *   Fast-path GPU reduction kernel computing `|batch_det|^2` summed over `npts` modulation steps
+ *   and `bin x bin` spatial subpixels per WFS camera pixel.
+ *
+ * Rationale:
+ *   Assigning one thread per output camera pixel eliminates atomic operations completely and
+ *   avoids writing an intermediate `[nfft x nfft]` float intensity buffer to VRAM.
+ */
 __global__ void kernel_pyrwfs_accum_bin_int(
     const cuFloatComplex *__restrict__ batch_det,
     uint32_t                           nfft,
@@ -96,6 +166,7 @@ __global__ void kernel_pyrwfs_accum_bin_int(
     uint64_t npix_fft = (uint64_t) nfft * nfft;
     float    acc      = 0.0f;
 
+    /* Sum incoherent intensity over bin x bin optical pixels and all npts modulation positions */
     for (uint32_t by = 0; by < bin; by++)
     {
         uint64_t row_off = (uint64_t) (y0 + by) * nfft + x0;
@@ -112,6 +183,23 @@ __global__ void kernel_pyrwfs_accum_bin_int(
     cam_int[cid] = acc;
 }
 
+/**
+ * kernel_pyrwfs_accum_bin_frac() - Fused modulation intensity sum + fractional area-overlap binning
+ * @batch_det: Inverse-FFT complex detector batch `[npts * nfft * nfft]`
+ * @nfft:      Optical FFT grid dimension [pixels]
+ * @ncam:      Target WFS camera dimension [pixels] (arbitrary `nfft / ncam` ratio)
+ * @npts:      Number of modulation planes (`eff_npts`)
+ * @cam_int:   Output binned single-subframe camera intensity `[ncam * ncam]`
+ *
+ * Role:
+ *   General GPU flux-conserving resampler used whenever `nfft` is not an integer multiple of
+ *   `ncam`.
+ *
+ * Rationale:
+ *   Computes exact 2D geometric overlap weights `wx * wy` between each camera pixel footprint and
+ *   the underlying `nfft x nfft` optical grid, matching `pyrwfs_bin_image_cpu()` bit-for-bit up to
+ *   floating-point associativity while preserving total photon flux.
+ */
 __global__ void kernel_pyrwfs_accum_bin_frac(
     const cuFloatComplex *__restrict__ batch_det,
     uint32_t                           nfft,
@@ -178,6 +266,19 @@ __global__ void kernel_pyrwfs_accum_bin_frac(
     cam_int[cid] = acc;
 }
 
+/**
+ * kernel_pyrwfs_add_accum() - Accumulate single-subframe camera intensity into exposure buffer
+ * @cam_int:   Current subframe binned intensity `[npix]`
+ * @npix:      Total camera pixels (`ncam * ncam`)
+ * @accum_int: In-place multi-subframe accumulator `[npix]`
+ *
+ * Role:
+ *   Hot-loop multi-subframe (`navg > 1`) incoherent intensity summation kernel.
+ *
+ * Rationale:
+ *   Kept outside the captured steady-state optical CUDA Graph so subframe 0 (`navg == 1`) skips
+ *   accumulation entirely without needing two separate graph instantiations.
+ */
 __global__ void kernel_pyrwfs_add_accum(
     const float *__restrict__ cam_int,
     uint64_t                  npix,
@@ -190,6 +291,20 @@ __global__ void kernel_pyrwfs_add_accum(
     }
 }
 
+/**
+ * kernel_pyrwfs_scale_accum() - Normalize multi-subframe exposure sum by `1 / subframe_cnt`
+ * @accum_int: Summed multi-subframe camera intensity `[npix]`
+ * @inv_n:     Reciprocal subframe count (`1.0f / subframe_cnt`)
+ * @npix:      Total camera pixels (`ncam * ncam`)
+ * @cam_int:   Normalized output camera intensity `[npix]` ready for detector readout
+ *
+ * Role:
+ *   Normalizes accumulated `navg > 1` optical intensity prior to `cacaosim_cuda_detector_readout`.
+ *
+ * Rationale:
+ *   Preserves the invariant that `det_live->flux_ph` specifies total photo-events per WFS camera
+ *   readout independent of how many atmospheric subframes were averaged during the exposure.
+ */
 __global__ void kernel_pyrwfs_scale_accum(
     const float *__restrict__ accum_int,
     float                     inv_n,
@@ -203,6 +318,18 @@ __global__ void kernel_pyrwfs_scale_accum(
     }
 }
 
+/**
+ * pyrwfs_cuda_invalidate_graph() - Destroy cached CUDA Graph so next frame recaptures cleanly
+ * @cs: Private CUDA Pyramid WFS state (non-NULL)
+ *
+ * Role:
+ *   Invalidates `cs->graph_exec` and resets `cs->graph_tried` whenever bound device pointers,
+ *   wavefront scale, or pyramid masks change, or during teardown.
+ *
+ * Rationale:
+ *   CUDA Graphs bake kernel pointer arguments and scalar parameters at capture time; explicit
+ *   invalidation guarantees correctness across dynamic stream connections or `turb_gain` toggles.
+ */
 static void pyrwfs_cuda_invalidate_graph(pyrwfs_cuda_state_t *cs)
 {
     if (cs->graph_valid)
@@ -214,6 +341,25 @@ static void pyrwfs_cuda_invalidate_graph(pyrwfs_cuda_state_t *cs)
     cs->graph_tried = 0;
 }
 
+/**
+ * pyrwfs_cuda_launch_optics() - Enqueue 5-stage GPU Pyramid WFS optical pipeline on `cs->stream`
+ * @ctx:           Parent Pyramid WFS context (non-NULL)
+ * @cs:            Private CUDA state (non-NULL)
+ * @d_pup_ptr:     Device pupil/beam amplitude `[npix_wf]`
+ * @d_atm_amp_ptr: Optional device atmospheric amplitude `[npix_wf]` (NULL -> 1.0)
+ * @d_wf_ptr:      Optional device wavefront/beam OPD `[npix_wf]` (NULL -> 0.0)
+ * @d_dm_ptr:      Optional device DM OPD `[npix_wf]` in microns (NULL -> 0.0)
+ * @wf_to_opd:     Scale converting `@d_wf_ptr` to microns OPD
+ *
+ * Role:
+ *   Enqueues (or records during stream capture) the complete single-subframe optical sequence:
+ *   padded pupil phasor synthesis -> 2D forward cuFFT -> shifted mask broadcast multiply ->
+ *   batched 2D inverse cuFFT -> fused intensity sum & camera binning.
+ *
+ * Rationale:
+ *   Factoring the pure device-to-device optical pipeline into one helper allows identical code to
+ *   serve initialization warmup, `cudaStreamBeginCapture` recording, and un-graphed fallback.
+ */
 static void pyrwfs_cuda_launch_optics(
     cacaosim_pyrwfs_ctx_t *ctx,
     pyrwfs_cuda_state_t   *cs,
@@ -256,6 +402,24 @@ static void pyrwfs_cuda_launch_optics(
     }
 }
 
+/**
+ * cacaosim_pyrwfs_cuda_init() - Allocate GPU buffers, upload static maps/masks, and plan cuFFTs
+ * @ctx:        Host Pyramid WFS context with dimensions and `masks_cplx` populated
+ * @pup_amp:    Static host 2D pupil amplitude `[npix_wf]`
+ * @ncpa_opd:   Optional static host 2D NCPA OPD `[npix_wf]` in microns (NULL -> none)
+ * @ext_stream: Optional external `cudaStream_t` to share in fused benches (NULL creates private)
+ *
+ * Role:
+ *   Cold-path GPU backend constructor allocating all VRAM buffers, uploading static maps/masks,
+ *   planning single forward + batched inverse 2D cuFFTs, and warming up cuFFT workspaces.
+ *
+ * Rationale:
+ *   Executing one synchronous warmup pass at the end of `init` forces cuFFT lazy internal device
+ *   allocations to complete outside stream capture, preventing `cudaErrorStreamCaptureUnsupported`
+ *   when `cacaosim_pyrwfs_cuda_accum()` later records its CUDA Graph.
+ *
+ * Return: 0 on success, -1 on CUDA/cuFFT allocation or planning failure.
+ */
 extern "C" int cacaosim_pyrwfs_cuda_init(
     cacaosim_pyrwfs_ctx_t *ctx,
     const float           *pup_amp,
@@ -349,6 +513,17 @@ extern "C" int cacaosim_pyrwfs_cuda_init(
     return 0;
 }
 
+/**
+ * cacaosim_pyrwfs_cuda_upload_masks() - Copy rebuilt host pyramid mask stack to GPU memory
+ * @ctx: Pyramid WFS context with updated `ctx->masks_cplx`
+ *
+ * Role:
+ *   Uploads `ctx->masks_cplx` to `cs->d_masks` and invalidates any cached CUDA Graph.
+ *
+ * Rationale:
+ *   Called only when `mod_rad` changes at runtime; synchronizing the stream ensures host `masks`
+ *   memory is safe to reuse or inspect immediately upon return.
+ */
 extern "C" void cacaosim_pyrwfs_cuda_upload_masks(cacaosim_pyrwfs_ctx_t *ctx)
 {
     pyrwfs_cuda_state_t *cs = (pyrwfs_cuda_state_t *) ctx->cuda_priv;
@@ -362,6 +537,17 @@ extern "C" void cacaosim_pyrwfs_cuda_upload_masks(cacaosim_pyrwfs_ctx_t *ctx)
     cudaStreamSynchronize(cs->stream);
 }
 
+/**
+ * cacaosim_pyrwfs_cuda_free() - Release all GPU plans, CUDA Graphs, device buffers, and streams
+ * @ctx: Pyramid WFS context whose `cuda_priv` state will be destroyed
+ *
+ * Role:
+ *   Cold-path GPU teardown routine freeing all CUDA resources owned by `@ctx`.
+ *
+ * Rationale:
+ *   Destroys `cs->stream` only when `cs->owns_stream == 1` so shared streams managed by the fused
+ *   `cacaosim.htsim` engine remain valid for sibling compute units.
+ */
 extern "C" void cacaosim_pyrwfs_cuda_free(cacaosim_pyrwfs_ctx_t *ctx)
 {
     pyrwfs_cuda_state_t *cs = (pyrwfs_cuda_state_t *) ctx->cuda_priv;
@@ -400,6 +586,31 @@ extern "C" void cacaosim_pyrwfs_cuda_free(cacaosim_pyrwfs_ctx_t *ctx)
     ctx->cuda_priv = NULL;
 }
 
+/**
+ * cacaosim_pyrwfs_cuda_accum() - Execute or replay GPU Pyramid WFS subframe propagation
+ * @ctx:           Active Pyramid WFS context (`use_cuda == 1`)
+ * @dyn_pup_amp:   Optional dynamic host pupil/beam amplitude `[npix_wf]`
+ * @atm_amp:       Optional host atmospheric scintillation amplitude `[npix_wf]`
+ * @wf_in:         Optional host wavefront or beam OPD `[npix_wf]`
+ * @dm_opd:        Optional host DM OPD `[npix_wf]` in microns
+ * @d_pup_amp_ext: Optional resident device pupil/beam amplitude pointer `[npix_wf]`
+ * @d_wf_opd_ext:  Optional resident device wavefront/beam OPD pointer `[npix_wf]`
+ * @d_dm_opd_ext:  Optional resident device DM OPD pointer `[npix_wf]`
+ * @wf_to_opd:     Scale converting `@wf_in` / `@d_wf_opd_ext` to microns OPD
+ *
+ * Role:
+ *   Hot-loop GPU subframe dispatcher handling optional H2D input staging, lazy `navg > 1`
+ *   accumulator seeding, CUDA Graph capture/replay of the 5-stage optical pipeline, and multi-
+ *   subframe intensity summation.
+ *
+ * Rationale:
+ *   When external device pointers (`d_*_ext`) are supplied by `cacaosim.htsim`, zero H2D copies
+ *   occur and the entire optical propagation executes via a single `cudaGraphLaunch()`. Even in
+ *   standalone SHM mode, H2D staging into fixed `cs->d_*` buffers preserves constant device
+ *   addresses across frames, allowing `cs->graph_exec` to remain valid indefinitely. If stream
+ *   capture is rejected by a driver/profiler configuration, `cs->graph_tried` prevents repeated
+ *   capture attempts and falls back cleanly to direct stream launches.
+ */
 extern "C" void cacaosim_pyrwfs_cuda_accum(
     cacaosim_pyrwfs_ctx_t *ctx,
     const float           *dyn_pup_amp,
@@ -454,6 +665,7 @@ extern "C" void cacaosim_pyrwfs_cuda_accum(
         d_dm_ptr = cs->d_dm_opd;
     }
 
+    /* Lazily seed multi-subframe accumulator only when a second subframe arrives (navg > 1) */
     if (ctx->subframe_cnt == 1u)
     {
         cudaMemcpyAsync(cs->d_accum_int, cs->d_cam_int, (size_t) ctx->npix_cam * sizeof(float),
@@ -523,6 +735,21 @@ extern "C" void cacaosim_pyrwfs_cuda_accum(
     }
 }
 
+/**
+ * cacaosim_pyrwfs_cuda_readout() - Normalize GPU exposure, apply detector noise, and copy to host
+ * @ctx:      Active Pyramid WFS context (`use_cuda == 1`)
+ * @det_live: Active detector readout parameters (non-NULL)
+ * @out_u16:  Destination host `uint16_t` camera buffer `[npix_cam]` when `out_dtype == 0`
+ * @out_f32:  Destination host `float` camera buffer `[npix_cam]` when `out_dtype != 0`
+ *
+ * Role:
+ *   Finalizes a GPU WFS camera exposure by averaging `subframe_cnt` accumulated subframes,
+ *   synthesizing noisy ADU pixels on-device, and synchronizing the D2H copy into SHM/host memory.
+ *
+ * Rationale:
+ *   Synchronizing `cs->stream` only once at camera readout allows multiple `navg` subframes to
+ *   pipeline asynchronously back-to-back on the GPU without host stalls between subframes.
+ */
 extern "C" void cacaosim_pyrwfs_cuda_readout(
     cacaosim_pyrwfs_ctx_t    *ctx,
     const cacaosim_det_cfg_t *det_live,

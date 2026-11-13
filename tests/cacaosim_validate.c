@@ -5,6 +5,46 @@
 /**
  * @file    cacaosim_validate.c
  * @brief   Physical, statistical, CPU/CUDA parity, and closed-loop validation suite for cacaosim
+ *
+ * Verification Philosophy & Four-Pillar Methodology
+ * -------------------------------------------------
+ * High-contrast Adaptive Optics simulation is uniquely vulnerable to subtle numerical bugs --
+ * half-pixel FFT centering shifts, missing `2 * pi / lambda` vs `1e6` unit factors, inaccurate
+ * Euler vs Zero-Order-Hold (ZOH) actuator discretization, non-conservative dichroic splitting, or
+ * divergent CPU/GPU floating-point kernels -- that do not crash the program yet silently invalidate
+ * closed-loop stability margins, Strehl ratios, or coronagraphic raw contrast.
+ *
+ * To guarantee end-to-end physical and software fidelity, `cacaosim_validate` combines four
+ * orthogonal verification pillars inside a single deterministic test executable:
+ *
+ *   1. Exact Analytical Physics Invariants:
+ *      Every optical and dynamical engine is checked against closed-form continuum theory:
+ *      sub-pixel annular area `pi * (R^2 - r^2)`, zero-mean Zernike/PSD RMS wavefront
+ *      normalization, ZOH step response `1 - exp(-dt / tau)` and underdamped resonance overshoot
+ *      `1 + exp(-pi * zeta / sqrt(1 - zeta^2))`, Maréchal Strehl degradation `exp(-sigma_phi^2)`,
+ *      Pogson's `100x` per `5 mag` photometric scaling, Pyramid/SHWFS linear slope response,
+ *      Babinet Zernike phase-contrast antisymmetry, Lyot/Vortex stellar suppression, and two-port
+ *      coronagraphic LOWFS energy conservation `|A_sci|^2 + |A_lowfs|^2 = |A_in|^2`.
+ *
+ *   2. Large-Sample Statistical Noise Laws:
+ *      Detector readout physics (`cacaosim_detector_readout_cpu`) is tested over `N = 262,144`
+ *      pixels so Monte Carlo standard errors shrink below `0.3%`, verifying closed-shutter dark
+ *      isolation (`sigma_ADU = ron_e / gain`) and open-shutter compound Poisson + dark + readout
+ *      variance `Var(ADU) = (flux_e + dark_e + ron_e^2) / gain^2`.
+ *
+ *   3. CPU vs CUDA Numerical Parity:
+ *      Whenever a CUDA GPU is present (`cacaosim_cuda_available()`), every compute unit—DM gather
+ *      stencil, Pyramid CUDA Graph replay, 5-wavelength strided-batched cuBLAS FPcam, affine pupil
+ *      relay, batched cuFFT SHWFS, cuBLAS ZWFS, MFT/FFT Coronagraph + dual LOWFS pickoffs, 3D
+ *      polychromatic FITS mask cubes, and SI `[meter]` WFE nodes—is compared directly against the
+ *      CPU reference to `1e-6 .. 5e-5` pointwise or relative `L_2` tolerance.
+ *
+ *   4. Closed-Loop AO Convergence & Declarative Bench Tooling:
+ *      Calibrates push-pull interaction matrices, computes Tikhonov-regularized reconstructors,
+ *      and closes leaky-integrator feedback loops under 1-frame delay + ZOH lag + photon/readout
+ *      noise on both single-stage and 2-stage cascaded (Woofer + Tweeter) benches, while also
+ *      verifying `.bench` cycle rejection, lossless INI/TOML round-trips, topological node
+ *      splicing, and headless UTF-8 / 7-bit ASCII `cacaosim-CTRL` & `cacaosim-bench-view` renders.
  */
 
 #include <cblas.h>
@@ -16,9 +56,29 @@
 
 #include "milkcacaosim.h"
 
+/** Cumulative count of passing validation assertions across all test sections. */
 static int g_pass = 0;
+
+/** Cumulative count of failing validation assertions across all test sections. */
 static int g_fail = 0;
 
+/**
+ * @brief Record and print the outcome of a single quantitative validation assertion.
+ *
+ * Role:
+ *   Formats a standardized `[PASS]` or `[FAIL]` line displaying both the invariant description
+ *   (`label`) and measured vs theoretical telemetry (`detail`), updating `g_pass` or `g_fail`.
+ *
+ * Rationale:
+ *   Accumulating failures rather than calling `abort()` on the first mismatch allows the entire
+ *   14-section suite to run in one shot so engineers can immediately see whether a regression is
+ *   isolated to one optical mode or systemic across CPU/CUDA backends, while `main()` still returns
+ *   exit code `1` to CTest if `g_fail > 0`.
+ *
+ * @param[in] ok      Non-zero if the physical/numerical invariant passed; `0` on failure.
+ * @param[in] label   Short description of the tested invariant (`<= 46` chars for alignment).
+ * @param[in] detail  Formatted quantitative telemetry string (measured vs reference values).
+ */
 static void check_cond(int ok, const char *label, const char *detail)
 {
     if (ok)
@@ -33,7 +93,21 @@ static void check_cond(int ok, const char *label, const char *detail)
     }
 }
 
-/* 1. Pupil geometry & NCPA RMS validation */
+/**
+ * @brief Section 1: Validate anti-aliased annular pupil geometry and static NCPA RMS calibration.
+ *
+ * Role:
+ *   Verifies `cacaosim_make_pupil()` grayscale aperture integration against exact continuum annulus
+ *   area `pi * R_out^2 * (1 - cobs^2)` and checks `cacaosim_make_ncpa()` pupil-weighted mean and
+ *   RMS wavefront amplitude (`target_rms = 0.085 um`).
+ *
+ * Rationale:
+ *   Binary (non-anti-aliased) pupil masks suffer `O(1 / N_wf)` perimeter staircase errors (~1..2%
+ *   area bias at `N_wf = 128`) and inject spurious high-spatial-frequency diffraction ripples into
+ *   coronagraphic Lyot planes and Zernike/Pyramid WFS pupils. Requiring `< 0.4%` area error proves
+ *   sub-pixel edge supersampling is active, while `< 1e-6 um` piston residual and `< 1e-4 um` RMS
+ *   error guarantee exact wavefront scaling for downstream Maréchal Strehl tests.
+ */
 static void test_pupil_and_ncpa(void)
 {
     printf("\n=== 1. Pupil Anti-Aliasing & Static NCPA ===\n");
@@ -87,7 +161,24 @@ static void test_pupil_and_ncpa(void)
     free(pup);
 }
 
-/* 2. Detector readout statistics (shutter darks, Poisson + RON variance) */
+/**
+ * @brief Section 2: Validate detector readout noise statistics (shutter darks, Poisson + RON).
+ *
+ * Role:
+ *   Tests `cacaosim_detector_readout_cpu()` across `262,144` uniform pixels in two physical modes:
+ *     1. Closed shutter (`shutter = 0`): verifies optical flux isolation, pedestal `bias_adu`, and
+ *        Gaussian readout standard deviation `sigma_ADU = ron_e / gain_eadu`.
+ *     2. Open shutter (`shutter = 1`): verifies compound Poisson photo-electron + dark current +
+ *        Gaussian read-noise mean `bias + (flux + dark) / gain` and variance
+ *        `Var(ADU) = (flux + dark + ron_e^2) / gain^2`.
+ *
+ * Rationale:
+ *   WFS thresholded center-of-gravity and optimal linear reconstructor weighting depend directly on
+ *   accurate photon-to-ADU gain scaling and uncorrelated Poisson + Gaussian variance addition.
+ *   Sampling `N = 2^18 = 262,144` pixels reduces 1-sigma Monte Carlo uncertainty on the sample
+ *   mean to `sigma / sqrt(N) < 0.01 ADU` and on sample variance to `sqrt(2 / N) ~ 0.28%`, enabling
+ *   tight deterministic tolerances (`0.05..0.35`) with a fixed PRNG seed (`77777ULL`).
+ */
 static void test_detector_stats(void)
 {
     printf("\n=== 2. Detector Readout Physics (Poisson + RON + Shutter) ===\n");
@@ -167,7 +258,26 @@ static void test_detector_stats(void)
     free(opt);
 }
 
-/* 3. DM hardware kinematics, delay, piston normalization, and CPU/CUDA parity */
+/**
+ * @brief Section 3: Validate DM fractional delay, piston normalization, ZOH dynamics & GPU parity.
+ *
+ * Role:
+ *   Validates five hardware invariants of `cacaosim_dm_*`:
+ *     1. Fractional `2.5`-frame command ring-buffer interpolation (`[0, 0, 0.5, 1.0]` step).
+ *     2. Gather-stencil partition-of-unity interior piston (`1.0 um` stroke -> `2.0 um` OPD).
+ *     3. Exact 1st-order Zero-Order-Hold (ZOH) exponential step `1 - exp(-dt / tau)` at `dt = tau`.
+ *     4. Exact 2nd-order ZOH underdamped resonance peak overshoot `1 + exp(-pi*zeta/sqrt(1-z^2))`.
+ *     5. Pointwise CPU vs CUDA OPD surface agreement (`max |CPU - CUDA| < 1e-6 um`).
+ *
+ * Rationale:
+ *   - Fractional frame delays (`delay_frames = 2.5`) occur whenever RTC compute + camera transfer
+ *     time is not an integer multiple of `1 / master_hz`; linear ring interpolation reproduces the
+ *     exact phase margin degradation in Bode stability tests.
+ *   - Partition-of-unity normalization ensures uniform actuator commands produce pure optical
+ *     piston without artificial actuator-pitch print-through ripples.
+ *   - Exact matrix-exponential ZOH state updates remain unconditionally stable and exact even when
+ *     `dt >= tau` or near resonance `f_0`, where forward-Euler integration diverges or distorts Q.
+ */
 static void test_dm_physics(void)
 {
     printf("\n=== 3. DM Hardware Simulator (Delay, ZOH Dynamics, Gather IF) ===\n");
@@ -288,7 +398,26 @@ static void test_dm_physics(void)
     free(cmd);
 }
 
-/* 4. Pyramid WFS symmetry, tip-tilt slope linearity, modulation gain, CPU/CUDA parity */
+/**
+ * @brief Section 4: Validate 4-sided Pyramid WFS symmetry, slope linearity, gain & CUDA Graphs.
+ *
+ * Role:
+ *   Verifies four physical and algorithmic properties of `cacaosim_pyrwfs_*`:
+ *     1. Flat-wavefront total photon flux conservation (`100,000 ph`) and 4-quadrant symmetry
+ *        (`quad_asym < 1e-5`).
+ *     2. Small-signal tip slope linearity (`S(+0.2) / S(+0.1) == 2.0`) and antisymmetry
+ *        (`S(-0.2) + S(+0.2) == 0`).
+ *     3. Optical sensitivity gain boost in unmodulated (`mod = 0`) vs modulated (`mod = 3 l/D`)
+ *        operation (`g_0 > 1.8 * g_3`).
+ *     4. CPU vs CUDA Graph execution parity (`rel_L2 < 1e-5` after graph capture and replay).
+ *
+ * Rationale:
+ *   Even a 0.5-pixel misalignment between the discrete FFT origin and the pyramid apex splits a
+ *   flat-wavefront PSF unequally across quadrants (`asym >> 1e-2`), injecting a huge false tip-tilt
+ *   offset in closed loop. Testing both modulation regimes confirms that `mod_rad_ld` properly
+ *   trades sensitivity against linear range, while stepping the CUDA context twice verifies that
+ *   cached `cudaGraphExec_t` replay produces identical pixels to the initial stream-capture pass.
+ */
 static void test_pyrwfs_physics(void)
 {
     printf("\n=== 4. Pyramid WFS Optical & Detector Simulator ===\n");
@@ -475,7 +604,26 @@ static void test_pyrwfs_physics(void)
     free(pup);
 }
 
-/* 5. Focal plane camera MFT vs FFT, Strehl=1, Marechal law, broadband, CPU/CUDA parity */
+/**
+ * @brief Section 5: Validate focal-plane camera MFT vs FFT, Strehl, Maréchal & broadband PSFs.
+ *
+ * Role:
+ *   Validates four optical invariants of `cacaosim_fpcam_*`:
+ *     1. Exact numerical equivalence (`max_diff < 1e-5`) between Soummer Matrix-DFT and 2x-padded
+ *        FFT at matched focal sampling (`pixscale_ld = pad_factor / pup_diam = 2.5`), with exact
+ *        diffraction-limited flat-wavefront `Strehl = 1.000000`.
+ *     2. Absolute on-axis Strehl calibration against Maréchal's extended approximation
+ *        `S ~ exp(-sigma_phi^2) = 0.8847` for `sigma_phi = 0.35 rad` RMS NCPA at `1.65 um`.
+ *     3. Polychromatic radial speckle dispersion (`20%` bandwidth across `5` spectral channels)
+ *        attenuating a `10`-cycle/pupil cosine satellite speckle peak by `> 1.35x` relative to
+ *        monochromatic illumination.
+ *     4. Pointwise parity (`< 1e-5`) between CPU OpenMP/CBLAS MFT and GPU strided-batched cuBLAS.
+ *
+ * Rationale:
+ *   Science PSF Strehl telemetry and post-coronagraphic speckle morphology require exact energy
+ *   and spatial-scale consistency between MFT and FFT propagators, accurate `OPD -> rad` phase
+ *   conversion (`2 * pi / lambda_c`), and physical `1 / lambda_c` angular scaling per channel.
+ */
 static void test_fpcam_physics(void)
 {
     printf("\n=== 5. Focal Plane Camera (Soummer MFT, FFT, Broadband, Marechal) ===\n");
@@ -619,7 +767,25 @@ static void test_fpcam_physics(void)
     free(pup);
 }
 
-/* 6. End-to-end closed-loop AO calibration + control test (DM + PyWFS + FPcam) */
+/**
+ * @brief Section 6: Validate end-to-end single-stage closed-loop AO calibration and control.
+ *
+ * Role:
+ *   Couples `cacaosim_dm` (`8x8`), `cacaosim_pyrwfs` (`32x32`, `3 lambda/D` modulation), and
+ *   `cacaosim_fpcam` (`64x64` H-band) through a complete AO calibration + real-time control cycle:
+ *     1. Push-pull (`+/- 0.02 um`) interaction matrix `I` measurement in noiseless static mode.
+ *     2. `2%`-trace Tikhonov-regularized Gauss-Jordan reconstructor
+ *        `C = (I^T I + reg * Id)^(-1) I^T`.
+ *     3. `120`-frame closed-loop leaky-integrator (`g = 0.35`, leak `0.998`, piston projection)
+ *        under `1.0`-frame hardware delay, `100 us` ZOH lag, photon shot noise, and read noise on
+ *        a drifting `0.35 um` RMS aberration.
+ *
+ * Rationale:
+ *   Component-level tests cannot detect subtle coordinate-transpose, sign-convention, or scaling
+ *   mismatches between DM commands and WFS intensities. Demonstrating H-band Strehl improvement
+ *   from degraded open-loop (`< 0.40`) to diffraction-limited closed-loop (`> 0.85`) proves full
+ *   physical closed-loop compatibility with `cacao`-style linear matrix reconstruction.
+ */
 static void test_closed_loop_ao(void)
 {
     printf("\n=== 6. Closed-Loop AO Calibration & Turbulence Rejection ===\n");
@@ -839,6 +1005,24 @@ static void test_closed_loop_ao(void)
     free(pup);
 }
 
+/**
+ * @brief Compute scale-invariant relative Euclidean (`L_2`) error between two float32 buffers.
+ *
+ * Role:
+ *   Evaluates `||a - b||_2 / ||a||_2` (or `||a - b||_2` when `||a||_2 == 0`) over `n` elements
+ *   using `double` accumulators.
+ *
+ * Rationale:
+ *   Single-precision CPU (`FFTW3f` / `cblas_cgemm`) and GPU (`cuFFT` / `cublasCgemm`) reductions
+ *   differ slightly in summation order (`~1e-7..1e-5` relative error). Normalizing by `||a||_2` in
+ *   `double` provides a flux-invariant parity metric across unit-amplitude pupil masks and `10^5`-
+ *   photon WFS detector frames alike without accumulator rounding drift.
+ *
+ * @param[in] a  Reference `float` array (typically CPU golden output) of length `n`.
+ * @param[in] b  Candidate `float` array (typically CUDA output) of length `n`.
+ * @param[in] n  Number of elements to compare.
+ * @return Relative `L_2` difference `sqrt(sum((a - b)^2) / sum(a^2))`.
+ */
 static double rel_l2_f32(const float *a, const float *b, uint64_t n)
 {
     double num = 0.0;
@@ -852,7 +1036,24 @@ static double rel_l2_f32(const float *a, const float *b, uint64_t n)
     return (den > 0.0) ? sqrt(num / den) : sqrt(num);
 }
 
-/* 7. Spectral photometry, beamsplitters/dichroics, 2-axis TTM & 2D registration */
+/**
+ * @brief Section 7: Validate stellar photometry, dichroic splitters, 2-axis TTM & 2D registration.
+ *
+ * Role:
+ *   Verifies four common-optics and beam-routing subsystems:
+ *     1. 32-bin (`0.40..2.40 um`) blackbody/Vega photometry (`cacaosim_spec_star()`): exact `100x`
+ *        photon rate ratio across a `5.0`-magnitude step (`m_V = 8` vs `m_V = 13`).
+ *     2. Spectral photon conservation (`R + T <= 1`, `R, T >= 0`) across gray, LP, SP, and J-notch
+ *        band-reflect (`dichroic_bp` at `1.22 um`) splitters (`> 85%` J refl, `> 90%` V & H trans).
+ *     3. 2-axis Tip-Tilt mirror (`dm_mode = 1`): exact planar `X/Y` OPD slopes `2 * stroke / R`.
+ *     4. 2D affine pupil relay (`cacaosim_beam_relay_*`): exact sub-pixel translation shift and
+ *        rotated/scaled bilinear interpolation parity (`rel_L2 < 1e-5`) between CPU and CUDA.
+ *
+ * Rationale:
+ *   Multi-arm AO benches rely on radiometrically consistent dichroic photon budgets across Visible,
+ *   J, and H bands to model realistic WFS SNR limits, and require accurate sub-pixel shift,
+ *   rotation, and magnification relays to simulate DM-to-WFS misregistration effects.
+ */
 static void test_beam_photometry_and_ttm(void)
 {
     printf("\n=== 7. Spectral Photometry, Beamsplitters, TTM & Registration ===\n");
@@ -991,6 +1192,26 @@ static void test_beam_photometry_and_ttm(void)
     cacaosim_dm_free(&ttm);
 }
 
+/**
+ * @brief Compute mean subaperture Center-of-Gravity (CoG) spot offset on a Shack-Hartmann frame.
+ *
+ * Role:
+ *   Iterates over an `n_sub x n_sub` grid of `pps x pps`-pixel subapertures, selects well-lit
+ *   lenslets exceeding `65%` of the brightest subaperture's integrated flux, and averages their
+ *   intensity-weighted `(x, y)` centroids relative to geometric subaperture center `(pps - 1) / 2`.
+ *
+ * Rationale:
+ *   Obstructed annular pupils with spiders partially vignette perimeter, central, and vane-crossing
+ *   lenslets, skewing their diffraction spots radially/azimuthally even on a flat wavefront. Flux-
+ *   gating at `0.65 * max_sf` isolates unobstructed full-flux lenslets so optical centering and
+ *   tilt linearity can be verified to `< 1e-4` pixel precision.
+ *
+ * @param[in]  img     Full Shack-Hartmann detector image of size `(n_sub * pps)^2`.
+ * @param[in]  n_sub   Number of subapertures along each pupil axis.
+ * @param[in]  pps     Detector pixels per subaperture axis.
+ * @param[out] out_cx  Mean X spot centroid offset [pixels] across illuminated subapertures.
+ * @param[out] out_cy  Mean Y spot centroid offset [pixels] across illuminated subapertures.
+ */
 static void shwfs_mean_cog(
     const float *img,
     uint32_t     n_sub,
@@ -1052,7 +1273,22 @@ static void shwfs_mean_cog(
     *out_cy = (n_val > 0) ? (sum_cy / (double) n_val) : 0.0;
 }
 
-/* 8. Diffractive Shack-Hartmann WFS symmetry, slope linearity & CPU/CUDA parity */
+/**
+ * @brief Section 8: Validate diffractive Shack-Hartmann WFS centering, tilt linearity & GPU parity.
+ *
+ * Role:
+ *   Validates `cacaosim_shwfs_*` (`16x16` lenslets, `8x8` px/subap, `2x` FFT padding) across:
+ *     1. Flat-wavefront total photon conservation (`100,000 ph`) and sub-pixel spot centering
+ *        symmetry (`|<cx>|, |<cy>| < 1e-4 px`).
+ *     2. Pure X-tilt spot displacement `2:1` linearity (`cx(2x) / cx(1x) = 2.0 +/- 0.02`) with
+ *        zero orthogonal Y cross-talk (`|<cy>| < 1e-4 px`).
+ *     3. Numerical parity (`rel_L2 < 1e-5`) between OpenMP `FFTW3f` and batched `cufftPlanMany`.
+ *
+ * Rationale:
+ *   Diffractive lenslet propagation onto an even-sized (`8x8`) pixel grid requires an exact half-
+ *   pixel focal-plane shift so un-tilted spots straddle the central `2x2` quad-cell symmetrically;
+ *   any sign or phase-ramp error breaks CoG nulling and introduces static centroid bias.
+ */
 static void test_shwfs_physics(void)
 {
     printf("\n=== 8. Diffractive Shack-Hartmann WFS Simulator ===\n");
@@ -1151,7 +1387,27 @@ static void test_shwfs_physics(void)
     free(pup);
 }
 
-/* 9. Zernike phase-contrast WFS & Coronagraph (Lyot spot + Vortex + LOWFS pickoff) */
+/**
+ * @brief Section 9: Validate Babinet Zernike WFS & analytic Lyot/Vortex coronagraphs + GPU parity.
+ *
+ * Role:
+ *   Validates two complementary phase-contrast / starlight-suppression subsystems:
+ *     1. Zernike WFS (`cacaosim_zwfs_*`): verifies small-phase (`5 nm` RMS) Babinet MFT linear
+ *        antisymmetry (`corr(dI(+phi), -dI(-phi)) > 0.995`) for a `1.06 lambda/D`, `pi/2` dimple,
+ *        plus CPU vs cuBLAS MFT parity (`rel_L2 < 1e-5`).
+ *     2. Coronagraph (`cacaosim_coro_*`):
+ *        - `3 lambda/D` Lyot spot: verifies `> 500x` on-axis raw peak suppression (`< 2e-3`),
+ *          high off-axis companion throughput at `6 lambda/D` (`Strehl > 0.85`), and `> 40%` core
+ *          energy reflection into `out_lowfs`.
+ *        - Charge-2 Optical Vortex on an unobscured circular pupil: verifies `> 98%` total
+ *          starlight rejection inside the post-Lyot pupil (`< 0.02` on 4x-padded FFT grid).
+ *        - CPU vs CUDA parity (`< 1e-5 .. 5e-5`) across Lyot, LOWFS, and Vortex propagators.
+ *
+ * Rationale:
+ *   Zernike LOWFS closed-loop convergence requires odd-symmetric linear intensity response around
+ *   the flat-wavefront reference, while exoplanet coronagraph simulation must simultaneously reject
+ *   on-axis starlight, preserve off-axis planet Strehl, and conserve reflected LOWFS core photons.
+ */
 static void test_zwfs_and_coro_physics(void)
 {
     printf("\n=== 9. Zernike WFS & Coronagraphic Starlight Suppression ===\n");
@@ -1397,6 +1653,26 @@ static void test_zwfs_and_coro_physics(void)
     free(pup);
 }
 
+/**
+ * @brief Compute a Tikhonov-regularized linear AO control matrix via Gauss-Jordan inversion.
+ *
+ * Role:
+ *   Forms the normal matrix `A = I * I^T + reg * Id` (for actuator-major `imat` of shape
+ *   `[nacts x npix]` where `reg = reg_frac * max_diag(I * I^T)`), inverts `A` in-place via
+ *   row-normalized Gauss-Jordan elimination, and computes `cmat_out = A^(-1) * I`
+ *   (`[nacts x npix]`) using single-precision BLAS (`cblas_sgemm`).
+ *
+ * Rationale:
+ *   Provides a self-contained, LAPACK-free regularized pseudo-inverse suitable for calibrating
+ *   arbitrary actuator counts (`12x12 = 144` Woofer and `24x24 = 576` Tweeter) while damping
+ *   weakly illuminated edge/obscured actuators and null-space piston/waffle modes.
+ *
+ * @param[in]  imat      Actuator-major interaction matrix `[nacts x npix]`.
+ * @param[in]  nacts     Number of DM actuators (rows of `imat` and `cmat_out`).
+ * @param[in]  npix      Number of WFS detector pixels (columns of `imat` and `cmat_out`).
+ * @param[in]  reg_frac  Dimensionless Tikhonov ridge fraction relative to `max_diag(I * I^T)`.
+ * @param[out] cmat_out  Output regularized reconstructor matrix `[nacts x npix]`.
+ */
 static void build_tikhonov_cmat(
     const float *imat,
     uint32_t     nacts,
@@ -1458,7 +1734,31 @@ static void build_tikhonov_cmat(
     free(ata);
 }
 
-/* 10. Multi-stage .bench DAG validation, optical causality, multi-rate & 2-stage cascaded AO */
+/**
+ * @brief Sections 10 & 11: Validate multi-stage .bench DAG, 2-stage AO & schematic visualizer.
+ *
+ * Role:
+ *   Exercises the declarative `.bench` engine (`cacaosim_bench_*`) and schematic renderer
+ *   (`cacaosim_bench_render_*`) across five end-to-end tests:
+ *     - 10a (Topological Guardrails): Rejects cyclic/duplicate optical beam graphs (`b1->b2->b1`).
+ *     - 10b (Multi-Rate Cadence): Verifies exact `navg` decimation ratios (`30` Vis @ `3 kHz`,
+ *       `10` NIR @ `1 kHz`, `1` H-band science @ `100 Hz` over `30` master ticks).
+ *     - 10c (Optical Causality & 2-Stage Cascaded AO): Verifies downstream Tweeter pokes produce
+ *       zero upstream NIR WFS crosstalk (`< 1e-7`), calibrates both stages, and demonstrates
+ *       monotonic H-band Strehl gain (`open < 0.35 -> Woofer > 0.55 -> Woofer+Tweeter > 0.88`) on
+ *       composite low-order + `(7, 4)`-cycle/D high-spatial-frequency turbulence.
+ *     - 10d (ExAO Coronagraphic Bench): Steps `examples/exao_coro_lowfs.bench` verifying `2 kHz`
+ *       SHWFS, `500 Hz` Z-LOWFS, `100 Hz` CoroCam cadence, and `< 2e-3` raw stellar core peak.
+ *     - 11 (Zero-FFT Analyzer & ANSI/ASCII Visualizer): Verifies `cacaosim_bench_analyze()` matches
+ *       full-init sensor fluxes without FFT allocation, and tests TrueColor ANSI, pure 7-bit ASCII
+ *       (zero bytes `> 0x7F` or `ESC`), and diagnostic `INVALID CONFIG` error panels.
+ *
+ * Rationale:
+ *   Injecting `(7, 4)` cycles/D ripple exceeds the `12x12` Woofer's `6`-cycle/D Nyquist limit, so
+ *   Stage 1 alone is physically fitting-error limited while Stage 2 (`24x24`, `12` cycles/D) locks
+ *   onto the residual and recovers diffraction-limited Strehl—proving physical multi-rate, multi-
+ *   stage DAG scheduling end-to-end.
+ */
 static void test_multistage_bench_dag(void)
 {
     printf("\n=== 10. Multi-Stage .bench DAG & 2-Stage Cascaded Closed-Loop AO ===\n");
@@ -1906,7 +2206,26 @@ static void test_multistage_bench_dag(void)
     check_cond(er_ok, "Diagnostic error panel on invalid .bench", buf);
 }
 
-/* 12. Declarative .bench presets, topological editor & cacaosim-CTRL headless TUI */
+/**
+ * @brief Section 12: Validate .bench presets, topological splicing editor & headless TUI renderer.
+ *
+ * Role:
+ *   Validates the interactive bench-building backend (`cacaosim_bench_*` & `cacaosim_tui_*`):
+ *     - 12a: Formats and re-parses all `CACAOSIM_PRESET_COUNT` built-in presets, checking lossless
+ *       node/beam/sensor topology and `< 0.1%` photometric flux agreement.
+ *     - 12b: Constructs a 7-node ExAO bench (`TTM -> DM -> Splitter -> PyWFS + Coro -> ZWFS + FP`)
+ *       via smart auto-wiring (`cacaosim_bench_add_node`), then exercises upstream/downstream node
+ *       moves across both inline elements and branch splitters, branch swapping, cloning, renaming,
+ *       and bridge-healing node deletion (`cacaosim_bench_remove_node`).
+ *     - 12c: Renders `cacaosim-CTRL` headlessly into memory (`cacaosim_tui_render_headless`),
+ *       verifying UTF-8 box-drawing 3-pane Builder layout and pure 7-bit ASCII across all 5 views.
+ *
+ * Rationale:
+ *   Interactive optical splicing rewrites upstream/downstream beam names across splitters and
+ *   coronagraphs; automated invariants ensure no sequence of GUI edits can orphan a sensor or
+ *   corrupt `.bench` serialization, and headless rendering tests TUI layout geometry in CI without
+ *   requiring an interactive terminal.
+ */
 static void test_bench_configurator_and_tui(void)
 {
     printf("\n=== 12. Hardware Configurator, Optical Splicing & cacaosim-CTRL TUI ===\n");
@@ -2042,7 +2361,29 @@ static void test_bench_configurator_and_tui(void)
     check_cond(tui_ascii_ok, "cacaosim-CTRL 5 views 7-bit ASCII render", detail);
 }
 
-/* 13. Custom 2D & 3D polychromatic pupil/focal/Lyot amplitude & phase masks (CPU + CUDA + FITS) */
+/**
+ * @brief Section 13: Validate custom 2D & 3D polychromatic pupil/focal/Lyot amplitude/phase masks.
+ *
+ * Role:
+ *   Validates user-supplied FITS/memory coronagraphic masks (`cacaosim_mask_*` & `CUSTOM_MFT/FFT`):
+ *     - 13a: 3D `[32 x 32 x 5]` FITS cube writer/reader round-trip including spectral WCS axis-3
+ *       cards (`CRPIX3`, `CRVAL3`, `CDELT3`, `CUNIT3 = 'um'`).
+ *     - 13b: Exact equivalence (`rel_L2 < 1e-5`) between 2D `CUSTOM_MFT` (`8x8` supersampled
+ *       complex dimple) and analytic `PHASE_DIMPLE`, and between `CUSTOM_FFT` and analytic `4QPM`.
+ *     - 13c: Pupil-only + Lyot-only complex `[amp, OPD_um]` apodizer relay (`skip_fpm == 1`),
+ *       checking multiplicative amplitude `pup * p_amp * l_amp` and additive OPD
+ *       `wf + p_opd + l_opd`.
+ *     - 13d: Broadband (`20%` BW, `5` channels) stellar core suppression comparing an achromatic
+ *       3D half-wave 4QPM OPD cube (`0.5 * lambda_c` per slice) against a chromatic 2D half-wave
+ *       plate (`0.5 * lambda_0`), verifying `> 25x` core leakage reduction.
+ *     - 13e: 3D polychromatic `coro + fpcam` CPU vs CUDA parity (`rel_L2 < 5e-5`) for both FFT/MFT.
+ *
+ * Rationale:
+ *   Modern coronagraph designs (shaped-pupil/APLC apodizers, scalar/vector vortex or multi-zone
+ *   masks) exhibit wavelength-dependent amplitude/OPD responses stored as 3D FITS cubes; comparing
+ *   achromatic 3D OPD slices against chromatic 2D OPD physically proves per-wavelength slice
+ *   indexing and phase conversion (`2 * pi * OPD / lambda_c`).
+ */
 static void test_custom_coro_masks_and_poly_cube(void)
 {
     printf("\n=== 13. Custom Pupil/Focal Amplitude & Phase Masks + 3D Polychromatic Cubes ===\n");
@@ -2475,7 +2816,31 @@ static void test_custom_coro_masks_and_poly_cube(void)
     free(pup);
 }
 
-/* 14. CORO+LOWFS dual pickoff options, static WFE [OPD m] & cacaosim-CTRL optical scale panel */
+/**
+ * @brief Section 14: Validate dual LOWFS pickoffs, SI [meter] static WFE & TUI pixel scales.
+ *
+ * Role:
+ *   Validates three ExAO hardware/UI subsystems:
+ *     - 14a (`CACAOSIM_LOWFS_LYOT_REFL`): Confirms pure-phase Vortex FPM reflects zero focal light
+ *       (`< 1e-8`) under `fpm_refl` while `lyot_refl` captures `> 25%` of total pupil energy from
+ *       the rejected outer Lyot ring, and verifies exact two-port power conservation
+ *       `|A_sci|^2 + |A_lowfs|^2 == |A_in|^2` (`rmse < 1e-6`).
+ *     - 14b (`CACAOSIM_LOWFS_FPM_REFL` + `lowfs_pup_diam`): Confirms monotonic energy filtering
+ *       (`E(1.00D) > E(0.75D) > E(0.45D)`) and zero exterior leakage (`< 1e-12`) when stopping down
+ *       the LOWFS relay pupil stop on a partially transmitting (`fpm_amp = 0.20`) Lyot spot.
+ *     - 14c: CPU vs CUDA parity (`rel_L2 < 5e-5`) across MFT `fpm_refl`, FFT `fpm_refl`, and FFT
+ *       `lyot_refl` modes.
+ *     - 14d (`cacaosim_make_wfe_m` & `[wfe.<id>]`): Verifies SI `[meter]` power-law WFE synthesis
+ *       (`80 nm = 8.0e-8 m` RMS), `.bench` round-trip serialization, Maréchal Strehl agreement
+ *       (`exp(-(2*pi*0.080/1.65)^2) = 0.911` vs `1.000` at `wfe_gain = 0`), CUDA parity, and
+ *       topological add/clone/move/remove editing.
+ *     - 14e: Verifies `cacaosim-CTRL` pupil `[m/pix]` and focal `[l/D/pix]` & `[arcsec/pix]` panel.
+ *
+ * Rationale:
+ *   Supports both reflective-spot LOWFS benches (SCExAO Lyot/alc) and reflective-Lyot-stop vortex
+ *   benches (KPIC/MagAO-X/SCExAO VVC), ensures error-free SI `[meter]` WFE interoperability with
+ *   external optical modeling tools, and locks down physical plate-scale readouts in the TUI.
+ */
 static void test_coro_lowfs_wfe_and_scales(void)
 {
     printf("\n=== 14. CORO+LOWFS Dual Pickoff, Static WFE [OPD m] & TUI Pixel Scales ===\n");
@@ -2897,6 +3262,20 @@ static void test_coro_lowfs_wfe_and_scales(void)
     free(pup);
 }
 
+/**
+ * @brief Entry point executing all 14 cacaosim physical, statistical, and closed-loop test suites.
+ *
+ * Role:
+ *   Reports runtime CUDA availability, invokes every `test_*()` verification stage in logical
+ *   bottom-up order (primitives -> sensors -> single-stage closed loop -> multi-stage DAGs -> TUI
+ *   & custom 3D masks), prints aggregate pass/fail totals, and returns CTest-compatible status.
+ *
+ * Rationale:
+ *   Ordering tests from low-level aperture/detector/DM primitives up to full multi-stage cascaded
+ *   closed-loop AO makes root-cause localization immediate whenever any assertion fails.
+ *
+ * @return `0` if every assertion passed (`g_fail == 0`); `1` if one or more assertions failed.
+ */
 int main(void)
 {
     printf("======================================================================\n");

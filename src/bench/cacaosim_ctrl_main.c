@@ -4,7 +4,34 @@
 
 /**
  * @file    cacaosim_ctrl_main.c
- * @brief   cacaosim-CTRL standalone milk-CTRL-style AO hardware configurator and status TUI
+ * @brief   Standalone CLI front-end (`cacaosim-CTRL`) for the interactive AO bench TUI
+ *
+ * Architectural Role in `cacaosim-CTRL`:
+ *   Provides the standalone executable entry point (`cacaosim-CTRL`, also invoked via
+ *   `cacaosim-bench gui`) for configuring, wiring, inspecting, deploying, and monitoring
+ *   multi-stage Adaptive Optics `.bench` simulations. Specifically, this front-end:
+ *     1. Initializes the C locale (`LC_CTYPE`) for UTF-8 box-drawing and spectral block glyphs.
+ *     2. Integrates with `milk_help.h` so `milk` tooling can query `-h`, `-h1`, `-h2`, and `-hm`
+ *        standardized help banners consistently across all `milk` executables.
+ *     3. Parses workspace, deployment, atmospheric turbulence, palette theme, color depth, and
+ *        7-bit ASCII terminal override flags into `cacaosim_tui_opts_t`.
+ *     4. Discovers the executable directory (`opts.exe_dir`) and resolves shorthand `.bench`
+ *        arguments against active `MILK_SHM_DIR` state and example search paths before handing
+ *        control to `cacaosim_tui_run()`.
+ *
+ * Design Rationale & Motivation:
+ *   - Decoupling CLI argument parsing from the core TUI state machine (`cacaosim_tui.c`) keeps
+ *     the configurator embeddable inside `libmilkcacaosim.so`, enabling headless plain-text
+ *     frame snapshots (`cacaosim_tui_render_headless()`) in `ctest` suites without spawning a
+ *     pseudo-terminal or linking `CLIcore`.
+ *   - Resolving `opts.exe_dir` via `/proc/self/exe` at startup guarantees that interactive
+ *     deployment commands (`[f:Deploy Fused]`, `[M:Deploy Modular]`, `[g:InitSHM]`) find their
+ *     matching `milk-fpsexec-cacaosim-...` binaries in both local `_build/` trees and installed
+ *     prefixes even when the build directory is not on `$PATH`.
+ *   - Multi-tier `.bench` path resolution allows zero-argument `cacaosim-CTRL` invocations on an
+ *     active RTC host to automatically attach to `$MILK_SHM_DIR/csim_active.bench`, while also
+ *     allowing bare template filenames (e.g., `two_stage_coro.bench`) to resolve seamlessly from
+ *     any current working directory.
  */
 
 #include <libgen.h>
@@ -19,6 +46,7 @@
 #include "milk_help.h"
 #include "bench/cacaosim_tui.h"
 
+/* Standardized one-line and multi-line descriptions queried by milk_help (-h1 / -h2) */
 static const char g_desc_short[] =
     "Interactive milk-CTRL-style AO hardware bench configurator and status GUI";
 
@@ -30,6 +58,23 @@ static const char g_desc_long[] =
     "wavefront sensors, focal-plane science cameras, SGR mouse, and live MILK_SHM_DIR\n"
     "telemetry.";
 
+/**
+ * print_opt_line() - Format and print a single CLI flag entry in the help screen
+ * @c:    Non-zero to emit ANSI color escapes (`MH_OPT`, `MH_ARG`, `MH_RST`); 0 for monochrome
+ * @opt:  Short/long flag string (non-NULL, e.g., `"-c, --config"`)
+ * @arg:  Optional argument placeholder (e.g., `"<file.bench>"`), or NULL / empty for boolean flags
+ * @desc: Human-readable summary printed inline or indented on the following line (non-NULL)
+ *
+ * Role:
+ *   Renders one aligned CLI option row inside `print_help_full()`, switching between single-line
+ *   aligned columns for parameterless flags and two-line indented descriptions for flags taking
+ *   value arguments.
+ *
+ * Rationale:
+ *   Factoring ANSI color vs. monochrome (`-hm` / `NO_COLOR`) formatting and two-line wrapping for
+ *   parameterized flags into one helper keeps help output under 80 columns on narrow SSH terminals
+ *   while matching `milk-CTRL` visual conventions.
+ */
 static void print_opt_line(int c, const char *opt, const char *arg, const char *desc)
 {
     if (c)
@@ -56,6 +101,21 @@ static void print_opt_line(int c, const char *opt, const char *arg, const char *
     }
 }
 
+/**
+ * print_help_full() - Render the complete categorized CLI reference banner to stdout
+ * @prog:  Invoking program path or name (`argv[0]`, non-NULL)
+ * @color: Non-zero for ANSI-colored output (`-h` / `--help`); 0 for plain text (`-hm`)
+ *
+ * Role:
+ *   Emits the `milk_help` banner, synopsis, categorized option groups (Workspace & File, Display
+ *   & Theme, Help), and cross-references (`cacaosim-bench-view`, `cacaosim-bench`, `milk-CTRL`).
+ *
+ * Rationale:
+ *   Grouping options by workflow task (file/deployment vs. terminal rendering vs. help queries)
+ *   and surfacing companion CLI tools in `See Also` lets users discover both one-shot schematic
+ *   rendering (`cacaosim-bench-view`) and scripted bench orchestration (`cacaosim-bench`) directly
+ *   from `-h`.
+ */
 static void print_help_full(const char *prog, int color)
 {
     milk_help_banner(prog, g_desc_short, color);
@@ -110,8 +170,26 @@ static void print_help_full(const char *prog, int color)
     milk_help_see_also(see_also, 3, color);
 }
 
+/**
+ * get_exe_dir() - Determine the directory containing the running `cacaosim-CTRL` executable
+ * @argv0:   Fallback `argv[0]` string if `/proc/self/exe` is unavailable (nullable)
+ * @out_dir: Destination buffer receiving the parent directory path (non-NULL)
+ * @cap:     Capacity of @out_dir in bytes
+ *
+ * Role:
+ *   Populates `cacaosim_tui_opts_t.exe_dir` so the TUI and CLI path resolver can locate sibling
+ *   helper executables (`milk-fpsexec-cacaosim-htsim`, `milk-fpsexec-cacaosim-mkpupil`, etc.) and
+ *   relative `examples/` directories.
+ *
+ * Rationale:
+ *   Developers frequently run `./_build/cacaosim-CTRL` directly from a CMake build directory
+ *   without installing or adding `_build` to `$PATH`. Querying Linux `/proc/self/exe` resolves
+ *   symlinks and `$PATH` lookups to the true binary directory, falling back cleanly to
+ *   `dirname(argv0)` on non-procfs environments.
+ */
 static void get_exe_dir(const char *argv0, char *out_dir, size_t cap)
 {
+    /* Prefer Linux /proc/self/exe so symlinks and bare PATH invocations resolve accurately */
     char    link_buf[PATH_MAX];
     ssize_t n = readlink("/proc/self/exe", link_buf, sizeof(link_buf) - 1);
     if (n > 0)
@@ -120,13 +198,38 @@ static void get_exe_dir(const char *argv0, char *out_dir, size_t cap)
         snprintf(out_dir, cap, "%s", dirname(link_buf));
         return;
     }
+    /* Fallback to dirname(argv[0]) when /proc is not mounted */
     char tmp[PATH_MAX];
     snprintf(tmp, sizeof(tmp), "%s", (argv0 != NULL) ? argv0 : ".");
     snprintf(out_dir, cap, "%s", dirname(tmp));
 }
 
+/**
+ * resolve_bench_arg() - Resolve an optional CLI `.bench` specifier into a concrete file path
+ * @spec:    User-supplied `.bench` path or bare filename, or NULL / empty when omitted
+ * @exe_dir: Directory containing `cacaosim-CTRL` (from `get_exe_dir()`, non-NULL)
+ * @out:     Destination buffer receiving resolved path, or `""` when starting from a built-in
+ *           in-memory preset (non-NULL)
+ * @cap:     Capacity of @out in bytes
+ *
+ * Role:
+ *   Maps optional CLI arguments to the exact `.bench` file that `cacaosim_tui_run()` should load
+ *   or create on save.
+ *
+ * Rationale:
+ *   Supports three distinct operator workflows without extra flags:
+ *     1. Live RTC inspection (`spec == NULL`): checks `$MILK_SHM_DIR/csim_active.bench` (written
+ *        whenever a bench is deployed) so running `cacaosim-CTRL` attaches automatically to the
+ *        currently active hardware simulation, or returns `""` to open a clean in-memory preset.
+ *     2. Explicit file editing: returns `spec` verbatim if it is already readable in CWD or starts
+ *        with `/` (allowing creation of new absolute paths).
+ *     3. Quick example browsing: searches `$CACAOSIM_SRC_DIR/examples/`, installed
+ *        `<prefix>/share/cacaosim/examples/`, and build-tree `<build>/../examples/` before
+ *        treating a non-existent relative name as a new `.bench` file to create in CWD.
+ */
 static void resolve_bench_arg(const char *spec, const char *exe_dir, char *out, size_t cap)
 {
+    /* Tier 1: No file specified -> attach to active deployed SHM bench if present */
     if (spec == NULL || spec[0] == '\0')
     {
         const char *sd = getenv("MILK_SHM_DIR");
@@ -144,12 +247,14 @@ static void resolve_bench_arg(const char *spec, const char *exe_dir, char *out, 
         return;
     }
 
+    /* Tier 2: Existing local path or explicit absolute target path */
     if (access(spec, R_OK) == 0 || spec[0] == '/')
     {
         snprintf(out, cap, "%s", spec);
         return;
     }
 
+    /* Tier 3: Search source, installed share/, and build-tree example directories */
     char cand[PATH_MAX];
     const char *src_env = getenv("CACAOSIM_SRC_DIR");
     if (src_env != NULL && src_env[0] != '\0')
@@ -173,11 +278,33 @@ static void resolve_bench_arg(const char *spec, const char *exe_dir, char *out, 
         snprintf(out, cap, "%s", cand);
         return;
     }
+
+    /* Tier 4: Treat unmatched relative name as a new .bench file to create on save */
     snprintf(out, cap, "%s", spec);
 }
 
+/**
+ * main() - CLI entry point for the `cacaosim-CTRL` interactive AO hardware configurator
+ * @argc: Argument count
+ * @argv: Argument vector
+ *
+ * Role:
+ *   Configures UTF-8 locale handling, intercepts standardized `milk_help` flags, parses CLI
+ *   options into `cacaosim_tui_opts_t`, resolves any `.bench` target path, and runs the
+ *   interactive terminal session via `cacaosim_tui_run()`.
+ *
+ * Rationale:
+ *   Calling `setlocale(LC_CTYPE, "")` first ensures standard C character classification and
+ *   terminal locale detection reflect the user's UTF-8 environment before `milk_help` or ANSI
+ *   capability detection runs. Accepting the `.bench` path either via `-c/--config` or as a
+ *   positional argument matches both `cacaosim-bench` and `milk-CTRL` CLI ergonomics.
+ *
+ * Return: 0 on clean exit or help display, 1 on invalid CLI flag/theme, or non-zero if
+ *         `cacaosim_tui_run()` encounters a fatal terminal initialization error.
+ */
 int main(int argc, char **argv)
 {
+    /* Activate environment UTF-8 locale before help and terminal capability checks */
     setlocale(LC_CTYPE, "");
     int hact = milk_help_init(argc, argv, g_desc_short, g_desc_long);
     if (hact == MH_ACTION_H1 || hact == MH_ACTION_H2)
@@ -196,6 +323,7 @@ int main(int argc, char **argv)
 
     const char *bench_arg = NULL;
 
+    /* Parse workspace, deployment, theme, and color-mode CLI overrides */
     for (int i = 1; i < argc; i++)
     {
         const char *a = argv[i];

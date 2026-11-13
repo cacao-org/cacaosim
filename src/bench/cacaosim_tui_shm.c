@@ -5,6 +5,33 @@
 /**
  * @file    cacaosim_tui_shm.c
  * @brief   Non-intrusive MILK_SHM_DIR stream/FPS scanner and bench deployment actions
+ *
+ * Architectural Role in cacaosim-CTRL:
+ *   Implements the live runtime telemetry inspector and hardware lifecycle bridge between the
+ *   declarative `.bench` configurator and running `milk` / `cacao` real-time processes:
+ *   1. Non-blocking `ImageStreamIO` Shared Memory (`.im.shm`) & Function Parameter Structure
+ *      (`.fps.shm`) directory scanner (`cs_shm_scan()`), reconciling streams expected by the
+ *      current `.bench` topology with extra AO/RTC streams discovered in `MILK_SHM_DIR`.
+ *   2. Monotonic `cnt0`-delta frame-rate estimator (`probe_one_im_shm()`) and process-table PID
+ *      liveness checker (`pid_alive()`), plus live science Strehl ratio (`strehl_inst`,
+ *      `strehl_ave`) extractor (`probe_fps_file()`) feeding header badges and `F5:STATUS`.
+ *   3. One-keystroke bench deployment (`cs_tui_exec_deploy()`), graceful shutdown
+ *      (`cs_tui_exec_stop()`), and static calibration stream synthesis (`cs_tui_exec_mkpupil()`
+ *      for anti-aliased pupils and `[wfe.<id>]` OPD maps).
+ *
+ * Design Rationale & Motivation:
+ *   Observatory real-time control loops (`cacao`, `cacaosim.htsim`, WFS cameras, DM servos) update
+ *   shared-memory streams at `1..10 kHz`. Attaching via full `ImageStreamIO` client routines or
+ *   spinning on `md->write` from a `10..30 Hz` monitoring GUI risks semaphore side effects, page
+ *   table churn on multi-megabyte 3D cubes, or stalls if a writer crashed mid-frame. Instead,
+ *   `cacaosim_tui_shm.c`:
+ *   - Opens `.im.shm` files `O_RDONLY` and `mmap`s strictly `sizeof(IMAGE_METADATA)` bytes
+ *     (`PROT_READ`), reading `naxis`, `size[0..2]`, `datatype`, `cnt0`, and `ownerPID`/`creatorPID`
+ *     with zero `md->write` spin loops, zero semaphore mutations, and immediate `munmap()`.
+ *   - Bounds-checks `.fps.shm` `NBparamMAX` against actual `fstat()` byte size before scanning
+ *     active `FPS_PARAM` slots, preventing out-of-bounds reads on partially initialized FPS files.
+ *   - Stages dirty in-memory `.bench` edits to `<MILK_SHM_DIR>/csim_ctrl_staged.bench` on deploy
+ *     so operators can audition optical or servo tweaks live without overwriting their saved file.
  */
 
 #include <dirent.h>
@@ -23,12 +50,40 @@
 #include "bench/cacaosim_tui_internal.h"
 #include "common/cacaosim_mask.h"
 
+/**
+ * shm_dir_path() - Resolve the active `milk` shared-memory directory path
+ * @out: Destination path buffer (must not be NULL)
+ * @cap: Capacity of @out in bytes
+ *
+ * Role:
+ *   Reads `MILK_SHM_DIR` from the process environment, falling back to the standard `/milk/shm`
+ *   root when unset or empty.
+ *
+ * Rationale:
+ *   Matches `ImageStreamIO`'s exact directory resolution rule so `cacaosim-CTRL` seamlessly tracks
+ *   isolated per-user / per-test `MILK_SHM_DIR` sandboxes as well as system-wide `/milk/shm`.
+ */
 static void shm_dir_path(char *out, size_t cap)
 {
     const char *sd = getenv("MILK_SHM_DIR");
     snprintf(out, cap, "%s", (sd != NULL && sd[0] != '\0') ? sd : "/milk/shm");
 }
 
+/**
+ * pid_alive() - Check whether OS process @p currently exists without sending a signal
+ * @p: Process ID read from `IMAGE_METADATA` or `FUNCTION_PARAMETER_STRUCT_MD` (`<= 0` -> dead)
+ *
+ * Role:
+ *   Distinguishes actively owned SHM streams and running FPS processes from stale leftover files in
+ *   `/milk/shm` after a process exit or kill.
+ *
+ * Rationale:
+ *   POSIX `kill(p, 0)` performs kernel PID existence validation with zero signal delivery; treating
+ *   `errno == EPERM` as alive handles multi-user observatory setups where RTC processes run under a
+ *   dedicated real-time UID distinct from the TUI operator.
+ *
+ * Return: 1 if process @p exists in the kernel process table, 0 if `p <= 0` or `ESRCH`.
+ */
 static int pid_alive(pid_t p)
 {
     if (p <= 0)
@@ -38,6 +93,21 @@ static int pid_alive(pid_t p)
     return (kill(p, 0) == 0 || errno == EPERM);
 }
 
+/**
+ * cs_shm_find_stream() - Locate a monitored stream entry in `mon->streams[]` by stem name
+ * @mon:  Populated SHM monitor snapshot (safe if NULL)
+ * @name: Stream stem name without `.im.shm` extension (safe if NULL or empty)
+ *
+ * Role:
+ *   Provides fast lookup for deduplicating stream registrations during `cs_shm_scan()` and for
+ *   coloring live/missing SHM badges in `F2:BUILDER`, `F3:SCHEMATIC`, and `F4:TABLES`.
+ *
+ * Rationale:
+ *   Bounded linear search across at most `CS_MAX_MON_STREAMS` (`48`) contiguous structs requires
+ *   zero dynamic memory or auxiliary index maintenance.
+ *
+ * Return: Matching index `[0..mon->n_streams-1]`, or `-1` if absent.
+ */
 int cs_shm_find_stream(const cs_shm_mon_t *mon, const char *name)
 {
     if (mon == NULL || name == NULL || name[0] == '\0')
@@ -54,6 +124,23 @@ int cs_shm_find_stream(const cs_shm_mon_t *mon, const char *name)
     return -1;
 }
 
+/**
+ * register_stream() - Insert or promote a stream stem in `mon->streams[]` prior to SHM probing
+ * @mon:      Target SHM monitor state
+ * @name:     Stream stem name (ignored if NULL/empty)
+ * @role:     Human-readable functional tag (e.g., `"pupil"`, `"dm_cmd"`, `"sci_psf"`)
+ * @owner:    Owning `.bench` section identifier (e.g., `"[bench]"`, `"dm0"`, or `"shm"`)
+ * @expected: 1 if explicitly wired in the active `.bench` config, 0 if discovered on disk
+ *
+ * Role:
+ *   Builds the deduplicated candidate list of streams to inspect on each `cs_shm_scan()` cycle.
+ *
+ * Rationale:
+ *   Registering `.bench`-wired streams first (`expected = 1`) ensures missing required inputs
+ *   (such as an ungenerated `in_pup` pupil) appear prominently in `F5:STATUS` even before their
+ *   `.im.shm` file exists on disk, while deduplication prevents double-listing when the file is
+ *   subsequently seen by `readdir()`.
+ */
 static void register_stream(
     cs_shm_mon_t *mon,
     const char   *name,
@@ -82,6 +169,28 @@ static void register_stream(
     s->expected = expected;
 }
 
+/**
+ * probe_one_im_shm() - Non-blockingly inspect one `.im.shm` header and estimate its frame rate
+ * @shm_dir:  Directory path containing `.im.shm` files
+ * @s:        Stream descriptor updated in-place with dimensions, `cnt0`, liveness, and `hz`
+ * @prev_arr: Snapshot of `mon->streams[]` from the preceding scan for `cnt0` delta calculation
+ * @n_prev:   Number of valid entries in @prev_arr
+ * @now_s:    Current monotonic timestamp `[s]`
+ *
+ * Role:
+ *   Reads `IMAGE_METADATA` fields (`naxis`, `size[0..2]`, `datatype`, `cnt0`, `ownerPID`,
+ *   `creatorPID`) from `<shm_dir>/<s->name>.im.shm` and computes an exponentially smoothed update
+ *   frequency `s->hz`.
+ *
+ * Rationale:
+ *   1. Maps ONLY `sizeof(IMAGE_METADATA)` bytes with `O_RDONLY` / `PROT_READ` and never spins on
+ *      `md->write` or touches `ImageStreamIO` semaphores: scalar header reads are benign even
+ *      during concurrent kHz real-time writes and cannot block the TUI if a writer froze with
+ *      `md->write == 1`.
+ *   2. Blends `0.45 * prev_hz + 0.55 * inst_hz` over windows `dt >= 0.08 s` to suppress polling
+ *      jitter while snapping to `0.0 Hz` after `0.6 s` of zero `cnt0` increments so stopped loops
+ *      report `0 Hz` promptly.
+ */
 static void probe_one_im_shm(
     const char            *shm_dir,
     cs_mon_stream_t       *s,
@@ -107,6 +216,7 @@ static void probe_one_im_shm(
         return;
     }
 
+    /* Map strictly the IMAGE_METADATA header read-only; skip pixel data & md->write spin-locks */
     void *addr = mmap(NULL, sizeof(IMAGE_METADATA), PROT_READ, MAP_SHARED, fd, 0);
     close(fd);
     if (addr == MAP_FAILED)
@@ -127,7 +237,7 @@ static void probe_one_im_shm(
     s->alive                 = pid_alive(md->ownerPID) || pid_alive(md->creatorPID);
     munmap(addr, sizeof(IMAGE_METADATA));
 
-    /* Compute frame rate from previous scan snapshot */
+    /* Compute exponentially smoothed frame rate from previous scan's (prev_cnt0, prev_t_sec) */
     for (int i = 0; i < n_prev; i++)
     {
         if (strcmp(prev_arr[i].name, s->name) == 0 && prev_arr[i].exists && prev_arr[i].has_prev)
@@ -135,6 +245,7 @@ static void probe_one_im_shm(
             double dt = now_s - prev_arr[i].prev_t_sec;
             if (dt >= 0.08)
             {
+                /* Guard against cnt0 reset if stream was recreated between scans */
                 uint64_t dc = (s->cnt0 >= prev_arr[i].prev_cnt0)
                                   ? (s->cnt0 - prev_arr[i].prev_cnt0)
                                   : 0u;
@@ -169,6 +280,21 @@ static void probe_one_im_shm(
     s->has_prev   = 1;
 }
 
+/**
+ * probe_fps_file() - Read-only inspect a `.fps.shm` file for `conf`/`run` PIDs and Strehl ratios
+ * @mon:      Monitor context receiving the new `cs_mon_fps_t` record and aggregate Strehl telemetry
+ * @shm_dir:  Directory path containing `.fps.shm` files
+ * @fps_name: Stem name of the FPS file without `.fps.shm` suffix
+ *
+ * Role:
+ *   Populates `mon->fps[]` with FPS description, `confpid`/`runpid` process health, and optional
+ *   `strehl_inst` / `strehl_ave` float32 telemetry exported by `fpcam` or `cacaosim.htsim`.
+ *
+ * Rationale:
+ *   Reads the raw `.fps.shm` memory map directly (`O_RDONLY`, `PROT_READ`) instead of calling
+ *   `function_parameter_struct_connect()` so monitoring never registers client locks or alters
+ *   FPS state, while validating `NBparamMAX` against `st.st_size` protects against truncated files.
+ */
 static void probe_fps_file(cs_shm_mon_t *mon, const char *shm_dir, const char *fps_name)
 {
     if (mon->n_fps >= CS_MAX_MON_FPS)
@@ -197,6 +323,7 @@ static void probe_fps_file(cs_shm_mon_t *mon, const char *shm_dir, const char *f
         return;
     }
 
+    /* Sanity-check parameter array count against actual mapped file size before dereferencing */
     const FUNCTION_PARAMETER_STRUCT_MD *md = (const FUNCTION_PARAMETER_STRUCT_MD *) addr;
     long max_fit = (long) ((map_len - sizeof(*md)) / sizeof(FPS_PARAM));
     if (md->NBparamMAX < 0 || md->NBparamMAX > max_fit + 64)
@@ -218,6 +345,7 @@ static void probe_fps_file(cs_shm_mon_t *mon, const char *shm_dir, const char *f
         mon->n_running_fps++;
     }
 
+    /* Scan active FPS_PARAM entries immediately following header for live Strehl telemetry */
     long             np   = (md->NBparamMAX < max_fit) ? md->NBparamMAX : max_fit;
     const FPS_PARAM *parr = (const FPS_PARAM *) (md + 1);
     if (np > 512)
@@ -246,6 +374,7 @@ static void probe_fps_file(cs_shm_mon_t *mon, const char *shm_dir, const char *f
         }
     }
 
+    /* Prefer Strehl telemetry from an actively running FPS over stale stopped FPS records */
     if (fe->has_strehl && (fe->run_alive || !mon->has_strehl))
     {
         mon->strehl_inst = fe->strehl_inst;
@@ -256,6 +385,22 @@ static void probe_fps_file(cs_shm_mon_t *mon, const char *shm_dir, const char *f
     munmap(addr, map_len);
 }
 
+/**
+ * register_mask_shm() - Conditionally register a coronagraph mask specifier if backed by SHM
+ * @mon:   Target SHM monitor state
+ * @spec:  Coronagraph mask string (either a `.fits` file path or an SHM stream stem)
+ * @role:  Short mask role label (e.g., `"pup_amp"`, `"fpm_pha"`, `"lyot_amp"`)
+ * @owner: Owning coronagraph node identifier
+ *
+ * Role:
+ *   Ensures SHM-backed coronagraph masks appear in the monitored stream table while ignoring disk
+ *   `.fits` / `.fit` / `.fts` file paths.
+ *
+ * Rationale:
+ *   Coronagraph mask fields (`in_pup_amp`, `in_fpm_pha`, etc.) accept either FITS files on disk or
+ *   live SHM stream names via `cacaosim_mask`; filtering through `!cacaosim_mask_is_fits_path()`
+ *   prevents false "missing SHM stream" warnings for valid FITS file paths.
+ */
 static void register_mask_shm(
     cs_shm_mon_t *mon,
     const char   *spec,
@@ -268,6 +413,20 @@ static void register_mask_shm(
     }
 }
 
+/**
+ * is_relevant_extra_shm() - Filter unreferenced `.im.shm` stems for AO/simulation relevance
+ * @stem: Filename stem stripped of `.im.shm`
+ *
+ * Role:
+ *   Selects auxiliary `cacaosim`, `cacao` (`aol*`, `dm*`, `ttm*`, `lowfs*`), beam (`b_*`), mask,
+ *   and `atmturb` (`outarraypha`) streams for display in `F5:STATUS`.
+ *
+ * Rationale:
+ *   Shared `/milk/shm` directories on full RTC machines can hold hundreds of housekeeping streams;
+ *   prefix filtering surfaces AO-relevant streams without overflowing `CS_MAX_MON_STREAMS`.
+ *
+ * Return: Non-zero if @stem matches AO / `cacaosim` naming conventions, else 0.
+ */
 static int is_relevant_extra_shm(const char *stem)
 {
     return (strncmp(stem, "csim_", 5) == 0 || strncmp(stem, "aol", 3) == 0 ||
@@ -278,6 +437,19 @@ static int is_relevant_extra_shm(const char *stem)
             strncmp(stem, "lyot", 4) == 0 || strcmp(stem, "outarraypha") == 0);
 }
 
+/**
+ * is_relevant_fps() - Filter `.fps.shm` stems belonging to `cacaosim`, `atmturb`, or `cacao` loops
+ * @stem: Filename stem stripped of `.fps.shm`
+ *
+ * Role:
+ *   Selects relevant FPS modules during `readdir()` directory enumeration in `cs_shm_scan()`.
+ *
+ * Rationale:
+ *   Keeps `mon->fps[]` focused on optical simulation, turbulence generation, and AO loop control
+ *   units so `F5:STATUS` remains concise and bounded.
+ *
+ * Return: Non-zero if @stem should be probed via `probe_fps_file()`, else 0.
+ */
 static int is_relevant_fps(const char *stem)
 {
     return (strncmp(stem, "csim_", 5) == 0 || strncmp(stem, "cacaosim", 8) == 0 ||
@@ -285,6 +457,22 @@ static int is_relevant_fps(const char *stem)
             strncmp(stem, "aol", 3) == 0);
 }
 
+/**
+ * cs_shm_scan() - Refresh live `MILK_SHM_DIR` image-stream and FPS process telemetry in @mon
+ * @mon:   Destination telemetry state (safe no-op if NULL)
+ * @cfg:   Optional active `.bench` configuration supplying expected stream wiring
+ * @force: Non-zero to bypass the `0.25 s` (`4 Hz`) minimum scan interval
+ *
+ * Role:
+ *   Snapshots previous stream counters, registers all streams wired in @cfg, walks `MILK_SHM_DIR`
+ *   for extra `.im.shm` and `.fps.shm` files, probes every registered stream header, and tallies
+ *   live stream and running FPS counts.
+ *
+ * Rationale:
+ *   Throttling background scans to `4 Hz` (`0.25 s`) keeps syscall overhead negligible during fast
+ *   keyboard/mouse interaction while `force = 1` gives instant visual confirmation right after
+ *   `Deploy`, `Stop`, or `mkpupil` actions.
+ */
 void cs_shm_scan(cs_shm_mon_t *mon, const cacaosim_bench_cfg_t *cfg, int force)
 {
     if (mon == NULL)
@@ -312,6 +500,7 @@ void cs_shm_scan(cs_shm_mon_t *mon, const cacaosim_bench_cfg_t *cfg, int force)
     mon->n_running_fps  = 0;
     mon->has_strehl     = 0;
 
+    /* 1. Register streams explicitly declared by [bench] and optical nodes first (expected = 1) */
     if (cfg != NULL)
     {
         register_stream(mon, cfg->in_pup, "pupil", "[bench]", 1);
@@ -355,6 +544,7 @@ void cs_shm_scan(cs_shm_mon_t *mon, const cacaosim_bench_cfg_t *cfg, int force)
         }
     }
 
+    /* 2. Walk MILK_SHM_DIR to discover extra AO streams and active .fps.shm modules */
     DIR *dp = opendir(mon->shm_dir);
     if (dp != NULL)
     {
@@ -394,6 +584,7 @@ void cs_shm_scan(cs_shm_mon_t *mon, const cacaosim_bench_cfg_t *cfg, int force)
         closedir(dp);
     }
 
+    /* 3. Probe IMAGE_METADATA headers and compute smoothed cnt0 frame rates */
     for (int i = 0; i < mon->n_streams; i++)
     {
         probe_one_im_shm(mon->shm_dir, &mon->streams[i], prev_streams, n_prev, now_s);
@@ -406,6 +597,22 @@ void cs_shm_scan(cs_shm_mon_t *mon, const cacaosim_bench_cfg_t *cfg, int force)
 
 /* ── Helper Binary Lookup & Bench Action Execution ────────────────────────── */
 
+/**
+ * locate_tool() - Resolve path to a sibling `cacaosim` executable or helper script
+ * @exe_dir: Directory containing the running `cacaosim-CTRL` binary (`app->opts.exe_dir`)
+ * @tool:    Target binary or script basename (e.g., `"cacaosim-bench"`, `"milk-fpsexec-..."`)
+ * @out:     Destination resolved path or bare command name
+ * @cap:     Capacity of @out in bytes
+ *
+ * Role:
+ *   Finds companion `cacaosim` binaries/scripts whether running from an uninstalled `_build/` tree,
+ *   an installed `_install/bin/` prefix, a `CACAOSIM_SRC_DIR` test environment, or system `PATH`.
+ *
+ * Rationale:
+ *   Checking `<exe_dir>/<tool>`, `<exe_dir>/../scripts/<tool>`, and `$CACAOSIM_SRC_DIR/scripts/`
+ *   with `access(..., X_OK)` before falling back to `PATH` ensures developer `_build/cacaosim-CTRL`
+ *   invocations always launch matching local binaries rather than stale system-installed copies.
+ */
 static void locate_tool(const char *exe_dir, const char *tool, char *out, size_t cap)
 {
     if (exe_dir != NULL && exe_dir[0] != '\0')
@@ -433,6 +640,24 @@ static void locate_tool(const char *exe_dir, const char *tool, char *out, size_t
     snprintf(out, cap, "%s", tool);
 }
 
+/**
+ * run_logged_cmd() - Execute a shell command via `popen()` and stream output into `cs_tui_log()`
+ * @app:       Active TUI state receiving each trimmed output line
+ * @cmd:       Shell command string (typically suffixed with `2>&1`)
+ * @last_line: Optional buffer capturing the final non-empty output line for error summaries
+ * @last_cap:  Capacity of @last_line in bytes
+ *
+ * Role:
+ *   Runs deployment, stop, and pupil-generation helper commands without leaving alternate-screen
+ *   TUI mode, capturing all diagnostic lines cleanly into the `F5:STATUS` log.
+ *
+ * Rationale:
+ *   Using `popen(cmd, "r")` keeps the TUI terminal state intact and captures child `stdout` and
+ *   `stderr` line-by-line so failures surface as concise toast banners (`last_line`) with full
+ *   history in `app->logs[]`.
+ *
+ * Return: 0 if the child command exited with status 0, -1 on `popen()` or non-zero exit failure.
+ */
 static int run_logged_cmd(cs_tui_app_t *app, const char *cmd, char *last_line, size_t last_cap)
 {
     if (last_line != NULL && last_cap > 0u)
@@ -467,6 +692,25 @@ static int run_logged_cmd(cs_tui_app_t *app, const char *cmd, char *last_line, s
     return (st == 0) ? 0 : -1;
 }
 
+/**
+ * cs_tui_exec_deploy() - Validate, stage, and deploy the active optical bench configuration
+ * @app:  Active TUI state (must not be NULL)
+ * @mode: Execution mode passed to `cacaosim-bench start` (`"fused"` or `"modular"`)
+ *
+ * Role:
+ *   Launches or restarts the configured optical bench hardware simulation (plus optional `atmturb`
+ *   turbulence screen generator when `app->opts.with_atmturb != 0`) and immediately refreshes live
+ *   `MILK_SHM_DIR` status.
+ *
+ * Rationale:
+ *   1. Blocks deployment upfront if `app->dag_valid == 0` so broken topologies fail fast with a
+ *      clear toast message instead of partial process spawns.
+ *   2. Writes unsaved or untitled configurations to `<MILK_SHM_DIR>/csim_ctrl_staged.bench` rather
+ *      than mutating `app->file_path`, preserving user save semantics while supporting instant
+ *      what-if hardware testing.
+ *
+ * Return: 0 on successful deployment, -1 on validation, staging, or launch failure.
+ */
 int cs_tui_exec_deploy(cs_tui_app_t *app, const char *mode)
 {
     if (app == NULL)
@@ -484,6 +728,7 @@ int cs_tui_exec_deploy(cs_tui_app_t *app, const char *mode)
     shm_dir_path(shm_dir, sizeof(shm_dir));
     mkdir(shm_dir, 0775);
 
+    /* Use saved disk file directly when clean; otherwise stage into MILK_SHM_DIR */
     char stage_path[512];
     if (app->file_path[0] != '\0' && !app->dirty && access(app->file_path, R_OK) == 0)
     {
@@ -528,6 +773,20 @@ int cs_tui_exec_deploy(cs_tui_app_t *app, const char *mode)
     return rc;
 }
 
+/**
+ * cs_tui_exec_stop() - Stop all running `cacaosim` and `atmturb` FPS processes
+ * @app: Active TUI state (must not be NULL)
+ *
+ * Role:
+ *   Executes `cacaosim-bench stop --no-view` and triggers an immediate `cs_shm_scan()` refresh so
+ *   `F5:STATUS` reflects stopped FPS PIDs and decaying stream rates right away.
+ *
+ * Rationale:
+ *   Reuses the canonical `cacaosim-bench stop` orchestration script so TUI and CLI process
+ *   lifecycle management stay strictly consistent.
+ *
+ * Return: 0 on clean shutdown, -1 if `cacaosim-bench stop` reported a non-zero exit code.
+ */
 int cs_tui_exec_stop(cs_tui_app_t *app)
 {
     if (app == NULL)
@@ -553,6 +812,22 @@ int cs_tui_exec_stop(cs_tui_app_t *app)
     return rc;
 }
 
+/**
+ * cs_tui_exec_mkpupil() - Generate entrance pupil SHM and static `[wfe.<id>]` OPD maps in SHM
+ * @app: Active TUI state (must not be NULL)
+ *
+ * Role:
+ *   Synthesizes the anti-aliased `[bench]` telescope pupil stream (`in_pup`) via
+ *   `milk-fpsexec-cacaosim-mkpupil` and initializes every `[wfe.<id>]` static `[meter]` OPD map
+ *   via `milk-fpsexec-cacaosim-wfe .init_only=ON`.
+ *
+ * Rationale:
+ *   Running `mkpupil` first guarantees the newly created `pup_name` SHM stream is present when
+ *   each `cacaosim.wfe` call computes pupil-weighted RMS normalization (`rms_nm`), allowing full
+ *   static optical calibration setup in a single button click or shortcut.
+ *
+ * Return: 0 on success, -1 if `milk-fpsexec-cacaosim-mkpupil` failed.
+ */
 int cs_tui_exec_mkpupil(cs_tui_app_t *app)
 {
     if (app == NULL)
@@ -574,6 +849,7 @@ int cs_tui_exec_mkpupil(cs_tui_app_t *app)
     int  rc    = run_logged_cmd(app, cmd, last, sizeof(last));
     int  n_wfe = 0;
 
+    /* Once pupil SHM exists, synthesize pupil-normalized [meter] OPD maps for all [wfe] nodes */
     if (rc == 0)
     {
         char wfe_bin[512];

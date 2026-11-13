@@ -1,11 +1,54 @@
 # SPDX-FileCopyrightText: 2026 Olivier Guyon et al
 # SPDX-License-Identifier: LGPL-3.0-or-later
 #
-# Two-Stage Cascaded Adaptive Optics Bench:
+# =================================================================================================
+# Two-Stage Cascaded Adaptive Optics Bench (two_stage_ao.bench)
+# =================================================================================================
+#
+# Optical Architecture Overview:
 #   Stage 1: 12x12 Woofer DM (dm01disp) + J-band (1.22 um) Pyramid WFS @ 1 kHz (navg = 3)
 #   Stage 2: 24x24 Tweeter DM (dm02disp) + Visible (0.75 um) Pyramid WFS @ 3 kHz (navg = 1)
 #   Science: H-band (1.65 um) Focal-Plane PSF Camera @ 100 Hz (navg = 30)
+#
+# Optical Signal Flow (DAG):
+#   outarraypha + csim_pup -> [bench] -> b_pup -> [dm.woofer] -> b_post_dm1
+#     -> [splitter.dichroic_stg1]
+#          |-- refl (J-band 1.07..1.37 um) -----> b_nir_wfs -> [pyrwfs.wfs_nir] -> aol1_wfsim
+#          +-- trans (Vis <1.05 & H/K >1.40 um) -> b_stg2_in -> [dm.tweeter] -> b_post_dm2
+#                -> [splitter.dichroic_stg2]
+#                     |-- refl (Vis <1.00 um) --> b_vis_wfs -> [pyrwfs.wfs_vis] -> aol2_wfsim
+#                     +-- trans (H/K >1.00 um) -> b_sci     -> [fpcam.sci_h]    -> csim_fpcam/long
+#
+# Physical Motivation:
+#   Single-stage AO systems face a fundamental hardware trade-off between actuator stroke (needed
+#   for multi-micron atmospheric tip-tilt/low-order turbulence) and actuator pitch + temporal
+#   response (needed to suppress fast wind-driven servo-lag speckles near the inner working angle).
+#   Cascading a high-stroke 1 kHz Woofer ahead of a fast 3 kHz high-order Tweeter mirrors modern
+#   ExAO upgrades (e.g., Subaru AO188/AO3k + SCExAO, VLT SAXO+) and exercises multi-rate cacaosim
+#   DAG scheduling alongside cacao multi-loop (aol1 + aol2) control.
+# =================================================================================================
 
+# -------------------------------------------------------------------------------------------------
+# [bench] — Entrance Telescope Aperture, Stellar Photometry & Master Simulation Clock
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Defines the 8.2 m Subaru/VLT-class entrance pupil, guide-star spectral irradiance across all
+#   32 cacaosim wavelength bins (0.40..2.40 um), incoming turbulence phase stream binding, and
+#   the 3.0 kHz master simulation tick (dt = 333.3 us) driving every downstream optical element.
+#
+# Parameter Rationale:
+#   - nwf = 128, pup_diam = 0.9375: Maps the 8.2 m primary onto 120.0 pixels (6.83 cm/pix) while
+#     preserving a 4-pixel zero guard band around the perimeter for sub-pixel anti-aliasing and
+#     pupil-registration shifts without array wrap-around.
+#   - cobs = 0.30, nspider = 4, spider_w = 0.012, spider_deg = 45.0: Realistic secondary-mirror
+#     central obscuration (30% linear) and diagonal support vanes that generate spider diffraction
+#     spikes and fragmented pupil islands.
+#   - star_mag = 8.0, star_teff = 5778.0, tput_tel = 0.75: Solar-type G2V natural guide star
+#     delivering realistic moderate-flux photon shot noise across Visible, J, and H bands.
+#   - master_hz = 3000.0: Matches the fastest sensor rate (Stage-2 Visible PyWFS at 3 kHz) so all
+#     slower sensors (1 kHz Stage-1 WFS, 100 Hz H-band camera) decimate cleanly via integer navg.
+#   - wf_unit = 1, ref_lambda = 0.50: Interprets incoming outarraypha turbulence screens in OPD
+#     [um] (or 0.50 um reference scaling) when synthesizing root optical beam b_pup.
 [bench]
 name       = "two_stage_cascaded_ao"
 nwf        = 128
@@ -25,6 +68,22 @@ out_beam   = "b_pup"
 wf_unit    = 1
 ref_lambda = 0.50
 
+# -------------------------------------------------------------------------------------------------
+# [dm.woofer] — Stage-1 High-Stroke Low-Order Deformable Mirror
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Applies large-amplitude low- and mid-spatial-frequency wavefront correction (12x12 actuators,
+#   ~0.68 m projected spacing, Nyquist control radius 6 lambda/D) from cacao command stream
+#   dm01disp onto b_pup -> b_post_dm1.
+#
+# Parameter Rationale:
+#   - max_stroke = 8.0 [um mechanical, 16.0 um OPD in reflection]: Absorbs multi-micron Kolmogorov
+#     tip-tilt and low-order atmospheric excursions without actuator clipping.
+#   - if_coupling = 0.20, tput = 0.98, dac_bits = 16: Models a continuous facesheet bimorph or
+#     voice-coil/piezo mirror with protected metallic/dielectric coating and 16-bit drive DACs.
+#   - dyn_mode = 1, tau_us = 250.0, delay_frames = 1.0: Exact 1st-order ZOH lag with a 250 us RC
+#     settling constant (0.75 master ticks) and 1-frame electronics delay appropriate for a heavy
+#     high-stroke first-stage mirror closed at 1 kHz.
 [dm.woofer]
 in           = "b_pup"
 out          = "b_post_dm1"
@@ -39,8 +98,20 @@ dyn_mode     = 1
 tau_us       = 250.0
 delay_frames = 1.0
 
-# Notch / band-reflect dichroic: reflects J-band (1.07..1.37 um) to Stage-1 NIR PyWFS,
-# transmits both Visible (<1.05 um) and H/K-band (>1.40 um) into Stage 2.
+# -------------------------------------------------------------------------------------------------
+# [splitter.dichroic_stg1] — Inter-Stage J-Band Band-Reflect (Notch) Dichroic
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Notch / band-reflect dichroic: reflects J-band (1.07..1.37 um) to Stage-1 NIR PyWFS,
+#   transmits both Visible (<1.05 um) and H/K-band (>1.40 um) into Stage 2.
+#
+# Parameter Rationale:
+#   - Placing this pickoff *between* dm.woofer and dm.tweeter decouples Stage-1 sensing from
+#     downstream Tweeter commands (strictly triangular optical interaction matrix), preventing
+#     loop-to-loop fighting unless explicitly offloaded.
+#   - mode = "dichroic_bp", lambda_cut = 1.22, band_width = 0.30, roll_um = 0.03: Carves out only
+#     the 1.22 +/- 0.15 um J-band window for Stage-1 sensing while preserving both high-resolution
+#     Visible photons (<1.00 um) for Stage-2 PyWFS and H-band photons (1.65 um) for science.
 [splitter.dichroic_stg1]
 in         = "b_post_dm1"
 out_refl   = "b_nir_wfs"
@@ -52,6 +123,20 @@ roll_um    = 0.03
 eff_refl   = 0.95
 eff_trans  = 0.95
 
+# -------------------------------------------------------------------------------------------------
+# [pyrwfs.wfs_nir] — Stage-1 J-Band Modulated Pyramid Wavefront Sensor (1.0 kHz)
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Senses post-Woofer J-band wavefront residuals on b_nir_wfs and publishes 64x64 uint16 detector
+#   frames to SHM stream aol1_wfsim at 1.0 kHz (navg = 3 subframes of the 3.0 kHz master clock).
+#
+# Parameter Rationale:
+#   - lambda_um = 1.22, bw_frac = 0.20, mod_rad = 3.0, mod_npts = 16: Longer J-band sensing
+#     wavelength combined with 3 lambda/D circular modulation provides a wide linear capture range
+#     (~3.7 um PtV tilt) so Stage 1 locks robustly from raw open-loop seeing without phase wrap.
+#   - navg = 3, qe = 0.80, ron_e = 0.8, use_beam_flux = 1: Co-adds 3 master subframes (1.0 ms
+#     integration) to boost photon SNR per readout against 0.8 e- high-speed NIR eAPD/SAPHIRA
+#     detector noise while matching the 1 kHz Woofer control cadence.
 [pyrwfs.wfs_nir]
 in            = "b_nir_wfs"
 out_cam       = "aol1_wfsim"
@@ -66,6 +151,20 @@ mod_npts      = 16
 ron_e         = 0.8
 out_dtype     = "uint16"
 
+# -------------------------------------------------------------------------------------------------
+# [dm.tweeter] — Stage-2 Fast High-Order Deformable Mirror
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Corrects fast, fine-scale post-Woofer residual wavefront errors (24x24 actuators, ~0.34 m
+#   projected pitch, Nyquist control radius 12 lambda/D) driven by cacao stream dm02disp along
+#   optical path b_stg2_in -> b_post_dm2.
+#
+# Parameter Rationale:
+#   - max_stroke = 3.0, if_coupling = 0.15: Because dm.woofer removes bulk low-order stroke
+#     upstream, a compact 3.0 um MEMS/piezo actuator stroke with tight 15% mechanical coupling
+#     cleanly corrects high-spatial-frequency fitting residuals without saturation.
+#   - dyn_mode = 1, tau_us = 80.0, delay_frames = 1.0: Fast 80 us RC time constant (< 0.25 master
+#     ticks at 3 kHz) minimizes servo phase lag for kilohertz wind-driven speckle suppression.
 [dm.tweeter]
 in           = "b_stg2_in"
 out          = "b_post_dm2"
@@ -80,7 +179,17 @@ dyn_mode     = 1
 tau_us       = 80.0
 delay_frames = 1.0
 
-# Long-pass dichroic: reflects Visible (<1.00 um) to Stage-2 PyWFS, transmits H-band to science.
+# -------------------------------------------------------------------------------------------------
+# [splitter.dichroic_stg2] — Stage-2 Visible / Near-IR Long-Pass Dichroic
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Long-pass dichroic: reflects Visible (<1.00 um) to Stage-2 PyWFS, transmits H-band to science.
+#
+# Parameter Rationale:
+#   - mode = "dichroic_lp", lambda_cut = 1.00, roll_um = 0.03: Routes all remaining optical
+#     photons (< 1.00 um) into the high-speed Stage-2 WFS arm (b_vis_wfs) while transmitting
+#     unattenuated H/K-band light (> 1.40 um, since J-band was notched out at Stage 1) directly
+#     into the science camera arm (b_sci) with 95% optical efficiency.
 [splitter.dichroic_stg2]
 in         = "b_post_dm2"
 out_refl   = "b_vis_wfs"
@@ -91,6 +200,19 @@ roll_um    = 0.03
 eff_refl   = 0.95
 eff_trans  = 0.95
 
+# -------------------------------------------------------------------------------------------------
+# [pyrwfs.wfs_vis] — Stage-2 High-Speed Visible Pyramid Wavefront Sensor (3.0 kHz)
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Measures residual high-order phase errors at I/R-band (0.75 um) on b_vis_wfs at the full
+#   3.0 kHz master frame rate (navg = 1), publishing 64x64 frames to aol2_wfsim.
+#
+# Parameter Rationale:
+#   - lambda_um = 0.75, bw_frac = 0.22, mod_rad = 2.0, mod_npts = 16: Operating on pre-flattened
+#     post-Woofer wavefronts allows a smaller 2.0 lambda/D modulation radius at shorter 0.75 um
+#     wavelength, boosting small-phase Pyramid sensitivity to fine spatial modes near 12 lambda/D.
+#   - navg = 1, qe = 0.85, ron_e = 0.3: Deep-depletion EMCCD / low-noise sCMOS readout every
+#     333.3 us minimizes WFS servo lag on fast atmospheric layers.
 [pyrwfs.wfs_vis]
 in            = "b_vis_wfs"
 out_cam       = "aol2_wfsim"
@@ -105,6 +227,21 @@ mod_npts      = 16
 ron_e         = 0.3
 out_dtype     = "uint16"
 
+# -------------------------------------------------------------------------------------------------
+# [fpcam.sci_h] — Polychromatic H-Band Focal-Plane Science Camera (100 Hz)
+# -------------------------------------------------------------------------------------------------
+# Role:
+#   Integrates broadband H-band (1.65 um, 18% BW) science PSFs from post-Tweeter beam b_sci,
+#   publishing 100 Hz exposures (navg = 30 subframes) to csim_fpcam and cumulative long-exposure
+#   PSFs to csim_fplong.
+#
+# Parameter Rationale:
+#   - prop_mode = "mft", ncam = 128, pixscale_ld = 3.0: Soummer Matrix-DFT evaluates exact
+#     0.333 lambda/D pixels (~13.8 mas/pix on 8.2 m @ 1.65 um, 1.5x Nyquist sampling) across a
+#     42.7 lambda/D field of view—spanning both the 6 lambda/D Woofer and 12 lambda/D Tweeter
+#     control radii without requiring huge zero-padded FFT arrays.
+#   - navg = 30, qe = 0.85, ron_e = 1.0: Co-adds all 30 evolving 3 kHz subframes per 10 ms frame
+#     so fast residual speckle halo averaging and Strehl ratio degradation are physically captured.
 [fpcam.sci_h]
 in            = "b_sci"
 out_cam       = "csim_fpcam"

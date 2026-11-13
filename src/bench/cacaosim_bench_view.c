@@ -4,7 +4,53 @@
 
 /**
  * @file    cacaosim_bench_view.c
- * @brief   milk-styled ANSI / UTF-8 / ASCII graphical visualizer for .bench AO configurations
+ * @brief   Stream-oriented ANSI/UTF-8/ASCII graphical optical bench schematic renderer
+ *
+ * Architectural Role in cacaosim:
+ *   Implements the one-shot, non-interactive optical bench schematic renderer declared in
+ *   cacaosim_bench_view.h as part of libmilkcacaosim.so. Consuming a validated and photometrically
+ *   propagated cacaosim_bench_ctx_t (from cacaosim_bench_analyze() or cacaosim_bench_init()), this
+ *   translation unit sequentially formats and writes a complete graphical hardware summary to any
+ *   standard C FILE* stream:
+ *     - Panel 1 (Bench Overview, Scales, Pupil Thumbnail & Stellar Spectrum): Synthesizes a 16x16
+ *       anti-aliased telescope entrance pupil via cacaosim_make_pupil() and packs two vertical
+ *       pupil pixels per terminal row using Unicode upper-half blocks ("▀") with independent
+ *       foreground/background RGB alpha-blending. Alongside the 8-row pupil thumbnail, displays
+ *       DAG validity and live MILK_SHM_DIR readiness pills, compute backend (CUDA GPU vs CPU
+ *       SIMD), physical pupil/focal plate scales (m/pix, lambda/D per pix, sky arcsec/pix), master
+ *       clock cadence, stellar magnitude and spectral type, total photon flux, and a 32-bin
+ *       (0.40..2.40 um) wavelength-colored blackbody spectrum bar chart.
+ *     - Panel 2 (2D Optical Path & Light-Splitting Schematic): Performs a depth-first recursive
+ *       traversal of the optical DAG starting from beams[0]. Inline wavefront elements (DMs, TTMs,
+ *       static WFE maps) remain aligned on the vertical optical axis, whereas gray/dichroic
+ *       beamsplitters and coronagraphic focal/Lyot pickoffs branch laterally with tree connectors,
+ *       per-arm photon-share percentages, 24-bin spectral sparklines, custom FITS/SHM mask tags,
+ *       2D affine registration badges, and terminal multi-rate WFS / science camera readouts.
+ *     - Panel 3 (Hardware & Photon-Budget Tables): Summarizes Active Mirrors (actuator grid,
+ *       stroke, DAC bit depth, discrete ZOH/2nd-order dynamics, fractional frame delay), WFS &
+ *       Science Cameras (passband, decimated frame rate master_hz/navg, integrated photons/frame,
+ *       shot-noise vs RON regime classification), and Beamsplitters / Coronagraphs / Static WFE.
+ *     - Error Diagnostic Panel (cacaosim_bench_render_error()): Formats syntax or DAG wiring
+ *       errors with a section-by-section dump of partially parsed beam connections.
+ *
+ * Design Rationale & Motivation:
+ *   1. Stream-oriented line emission vs full-screen cell framebuffer:
+ *      While cacaosim-CTRL (cacaosim_tui.c) drives an interactive alternate-screen TUI (and can
+ *      synthesize a live view from active MILK_SHM_DIR streams/FPS entries when no .bench file is
+ *      given), operators and automation scripts (cacaosim-bench start/status, SSH sessions, CI
+ *      logs, git/PR attachments, less -R) need schematics that persist in normal scrollback
+ *      buffers without seizing a TTY. Emitting width-bounded, self-contained lines to a FILE*
+ *      stream satisfies both interactive previews and headless memory-stream capture.
+ *   2. Exact display-column accounting across CSI escapes and multi-byte UTF-8:
+ *      A single 32-bin TrueColor spectrum bar contains > 600 bytes of ANSI CSI sequences for 34
+ *      visible columns. Composing lines in a fixed stack buffer (sbuf_t) and measuring visible
+ *      codepoint columns while skipping CSI sequences (vis_cols(), emit_truncated()) guarantees
+ *      razor-sharp right-hand panel borders across TrueColor, 256-color, 16-color, monochrome,
+ *      UTF-8, and 7-bit ASCII modes with zero heap allocations in the renderer.
+ *   3. Non-intrusive live SHM binding:
+ *      Checking <MILK_SHM_DIR>/<stream>.im.shm via access(..., F_OK) overlays real-time deployment
+ *      status onto declarative .bench schematics without mapping shared memory, acquiring locks,
+ *      or perturbing running CACAO real-time control processes.
  */
 
 #include <ctype.h>
@@ -21,6 +67,15 @@
 #include "common/cacaosim_mask.h"
 #include "pupil/cacaosim_pupil.h"
 
+/**
+ * struct cs_rgb_t - 24-bit sRGB color triplet used throughout palette and spectral rendering
+ * @r: Red channel intensity in [0..255]
+ * @g: Green channel intensity in [0..255]
+ * @b: Blue channel intensity in [0..255]
+ *
+ * Role: Canonical internal color representation prior to terminal capability quantization
+ * (TrueColor 24-bit CSI, xterm-256 index, ANSI-16 SGR code, or monochrome suppression).
+ */
 typedef struct
 {
     uint8_t r;
@@ -28,6 +83,35 @@ typedef struct
     uint8_t b;
 } cs_rgb_t;
 
+/**
+ * struct cs_palette_t - Semantic 15-color theme palette synchronized with milk's overview TUI
+ * @name:      Canonical lowercase CLI identifier ("dark", "night", "accessible", "light",
+ *             "nordic")
+ * @bg_panel:  Nominal panel interior background used as the zero-amplitude blend endpoint for
+ *             anti-aliased 2D pupil half-block rendering and soft pill tinting
+ * @bg_header: Elevated header/banner background color matching milk TUI title bars
+ * @fg_title:  Primary panel border and banner badge accent color
+ * @fg_text:   Standard body text color for hardware parameters and numeric scales
+ * @fg_bright: High-emphasis foreground for node IDs, file paths, and peak photon rates
+ * @fg_dim:    Low-contrast structural foreground for separators, empty spectrum bins, and axes
+ * @fg_muted:  Secondary label foreground for parameter keys, units, and auxiliary notes
+ * @fg_stream: Highlight color for ImageStreamIO SHM stream names and illuminated pupil amplitude
+ * @fg_fps:    Accent color for deformable mirrors, FPS compute badges, and schematic headers
+ * @fg_proc:   Accent color for Tip-Tilt mirrors, coronagraphs, and Zernike WFS phase-contrast
+ *             nodes
+ * @fg_active: Positive status color for valid DAG pills, live SHM indicators, WFS pills, and
+ *             shot-noise-limited sensor regimes
+ * @fg_warn:   Advisory color for beamsplitters, static WFE nodes, non-identity 2D registrations,
+ *             and RON/mixed noise regimes
+ * @fg_error:  High-salience alert color for invalid .bench configuration diagnostic panels
+ * @fg_accent: Warm highlight color for named optical beams, focal-plane science cameras, and
+ *             master clock rates
+ * @fg_conn:   Optical axis, tree branch connector, and secondary panel border color
+ *
+ * Role: Decouples optical schematic semantics (beams, streams, DMs, sensors, warnings, errors)
+ * from raw RGB values so switching themes re-colors every panel, badge, and pupil preview
+ * coherently.
+ */
 typedef struct
 {
     const char *name;
@@ -48,7 +132,19 @@ typedef struct
     cs_rgb_t    fg_conn;
 } cs_palette_t;
 
-/* Exact RGB palettes matching milk's src/cli/overview/render/overview_theme_palettes.c */
+/**
+ * g_palettes - Static lookup table of built-in semantic color palettes
+ *
+ * Exact RGB triplets match milk's src/cli/overview/render/overview_theme_palettes.c so cacaosim
+ * schematics blend seamlessly alongside milk-stream-graph and milk overview dashboards:
+ *   - dark:       High-contrast cool slate with cyan streams, periwinkle DMs, and gold beams.
+ *   - night:      Long-wavelength red/amber ramp minimizing blue/green scotopic rhodopsin
+ *                 bleaching in darkened observatory control rooms.
+ *   - accessible: Wong / Okabe-Ito colorblind-safe hues with distinct luminance steps.
+ *   - light:      Saturated dark ink tones legible against white/paper terminal backgrounds.
+ *   - nordic:     Polar-night slate with muted frost cyan and aurora accents for reduced eye
+ *                 strain during extended loop monitoring.
+ */
 static const cs_palette_t g_palettes[CACAOSIM_THEME_COUNT] = {
     /* CACAOSIM_THEME_DARK (default milk dark slate) */
     {
@@ -147,6 +243,17 @@ static const cs_palette_t g_palettes[CACAOSIM_THEME_COUNT] = {
     },
 };
 
+/**
+ * cacaosim_view_opts_defaults() - Populate default milk-styled visualization options
+ * @opts: Destination rendering options structure (safe no-op if NULL)
+ *
+ * Role: Initializes @opts with standard auto-detection sentinels (color_level = -1, width = 0)
+ * and enables full rich output (dark theme, UTF-8 box-drawing, live SHM checks, hardware tables,
+ * and workflow hints footer).
+ *
+ * Rationale: Providing a single canonical defaults initializer lets callers override one or two
+ * fields (e.g. disabling footer in watch mode) without enumerating every rendering knob.
+ */
 void cacaosim_view_opts_defaults(cacaosim_view_opts_t *opts)
 {
     if (opts == NULL)
@@ -162,6 +269,17 @@ void cacaosim_view_opts_defaults(cacaosim_view_opts_t *opts)
     opts->width       = 0;
 }
 
+/**
+ * cacaosim_view_theme_name() - Return human-readable canonical name for a theme index
+ * @theme: Palette index from enum cacaosim_view_theme_t
+ *
+ * Role: Resolves a theme enum value to its lowercase string label in g_palettes[].
+ *
+ * Rationale: Safely clamps out-of-range indices to "dark" so UI status bars never dereference
+ * invalid memory even if an unvalidated integer is passed.
+ *
+ * Return: Static NUL-terminated theme name ("dark" if @theme < 0 or >= CACAOSIM_THEME_COUNT).
+ */
 const char *cacaosim_view_theme_name(int theme)
 {
     if (theme < 0 || theme >= CACAOSIM_THEME_COUNT)
@@ -171,6 +289,19 @@ const char *cacaosim_view_theme_name(int theme)
     return g_palettes[theme].name;
 }
 
+/**
+ * cacaosim_view_theme_from_name() - Parse a case-insensitive theme name or alias
+ * @name: Candidate theme string (e.g. "dark", "night", "red", "accessible", "light", "nordic",
+ *        "nord"); may be NULL
+ *
+ * Role: Converts CLI --theme strings into validated cacaosim_view_theme_t indices.
+ *
+ * Rationale: Accepts ergonomic observatory/community aliases ("red" for night-vision mode and
+ * "nord" for nordic) while returning -1 on unknown strings so CLI argument parsers can report
+ * explicit valid choices.
+ *
+ * Return: Theme index in [0..CACAOSIM_THEME_COUNT-1], or -1 if @name is NULL or unrecognized.
+ */
 int cacaosim_view_theme_from_name(const char *name)
 {
     if (name == NULL)
@@ -195,7 +326,24 @@ int cacaosim_view_theme_from_name(const char *name)
     return -1;
 }
 
-/* Detect ANSI color level identically to milk's ov_detect_color_level() */
+/**
+ * resolve_color_level() - Determine effective ANSI color capability for destination stream @fp
+ * @opts: Caller rendering options (NULL or opts->color_level < 0 triggers auto-detection)
+ * @fp:   Target output FILE stream (inspected via fileno() + isatty(); may be NULL or memstream)
+ *
+ * Role: Resolves the effective SGR color emission tier:
+ *   0 = monochrome (no CSI color/bold escapes),
+ *   1 = 16-color standard ANSI SGR (30..37, 90..97, 40..47),
+ *   2 = xterm-256 indexed palette (38;5;N / 48;5;N),
+ *   3 = 24-bit TrueColor RGB (38;2;R;G;B / 48;2;R;G;B).
+ *
+ * Rationale: Mirrors milk's ov_detect_color_level() rules verbatim: explicit caller overrides
+ * (--pretty / --text) win first; otherwise any non-empty NO_COLOR environment variable
+ * (https://no-color.org), non-TTY output stream (pipes, files, open_memstream with fileno == -1),
+ * or TERM=dumb drops cleanly to monochrome so redirected logs never contain raw escape garbage.
+ *
+ * Return: Effective color level integer in [0..3].
+ */
 static int resolve_color_level(const cacaosim_view_opts_t *opts, FILE *fp)
 {
     if (opts != NULL && opts->color_level >= 0)
@@ -230,6 +378,20 @@ static int resolve_color_level(const cacaosim_view_opts_t *opts, FILE *fp)
     return 1;
 }
 
+/**
+ * resolve_ascii_mode() - Decide whether to restrict glyphs to pure 7-bit ASCII
+ * @opts: Caller rendering options (NULL-safe)
+ *
+ * Role: Selects between rich UTF-8 rounded box-drawing / block sparklines (0) and 7-bit ASCII
+ * fallback glyphs (1).
+ *
+ * Rationale: Minimal container environments, CI runners, and legacy serial/SSH sessions often run
+ * under LC_ALL=C or POSIX locales where multi-byte UTF-8 box characters render as mojibake ("???").
+ * Checking LC_ALL -> LC_CTYPE -> LANG hierarchy automatically degrades to crisp 7-bit ASCII
+ * whenever UTF-8 locale support is absent.
+ *
+ * Return: 1 for pure 7-bit ASCII output, 0 for UTF-8 box-drawing and block glyphs.
+ */
 static int resolve_ascii_mode(const cacaosim_view_opts_t *opts)
 {
     if (opts != NULL && opts->ascii_only)
@@ -252,6 +414,22 @@ static int resolve_ascii_mode(const cacaosim_view_opts_t *opts)
     return 0;
 }
 
+/**
+ * resolve_panel_width() - Compute bounded outer panel width in terminal columns
+ * @opts: Caller rendering options (explicit opts->width >= 76 overrides auto-sizing)
+ * @fp:   Destination FILE stream queried via TIOCGWINSZ when backed by a TTY
+ *
+ * Role: Determines the exact outer frame width (including left/right border glyphs) used by
+ * panel_top(), panel_sep(), panel_bot(), and panel_row().
+ *
+ * Rationale: Unbounded wide terminals (e.g. 240+ col ultrawide monitors) stretch schematic tables
+ * into hard-to-scan whitespace, while narrow windows (< 98 cols) clip sensor columns prematurely.
+ * Auto-detection subtracts a 2-column right margin from TIOCGWINSZ and clamps within [98..114]
+ * columns (defaulting to 104 columns on non-TTYs), while honoring explicit -W overrides in
+ * [76..128] columns.
+ *
+ * Return: Target outer panel width in display columns.
+ */
 static int resolve_panel_width(const cacaosim_view_opts_t *opts, FILE *fp)
 {
     if (opts != NULL && opts->width >= 76)
@@ -279,7 +457,20 @@ static int resolve_panel_width(const cacaosim_view_opts_t *opts, FILE *fp)
     return cols;
 }
 
-/* Exact xterm-256 and ANSI-16 color quantizers matching milk overview_theme_draw.h */
+/**
+ * rgb_to_256() - Quantize a 24-bit sRGB color into the closest xterm-256 palette index
+ * @c: Input 24-bit RGB color triplet
+ *
+ * Role: Maps arbitrary theme and spectral colors onto xterm's 256-color table (indices 16..255)
+ * when rendering on color_level == 2 terminals (e.g. TERM=xterm-256color without COLORTERM).
+ *
+ * Rationale: Matches milk's overview_theme_draw.h quantizer. Near-neutral grays (|R-G| < 10 and
+ * |G-B| < 10) are routed to the 24-step grayscale ramp (indices 232..255, plus pure black 16 and
+ * white 231) so slate borders and muted text never acquire unwanted color casts from the coarse
+ * 6x6x6 color cube (indices 16..231).
+ *
+ * Return: xterm-256 palette index in [16..255].
+ */
 static int rgb_to_256(cs_rgb_t c)
 {
     int dr = (int) c.r - (int) c.g;
@@ -292,6 +483,7 @@ static int rgb_to_256(cs_rgb_t c)
     {
         dg = -dg;
     }
+    /* Route achromatic / near-neutral slate tones onto the 24-step grayscale ramp */
     if (dr < 10 && dg < 10)
     {
         if (c.r < 8)
@@ -304,12 +496,26 @@ static int rgb_to_256(cs_rgb_t c)
         }
         return 232 + (((int) c.r - 8) * 24) / 247;
     }
+    /* Quantize chromatic colors onto the 6x6x6 xterm RGB cube */
     int r6 = ((int) c.r * 5 + 127) / 255;
     int g6 = ((int) c.g * 5 + 127) / 255;
     int b6 = ((int) c.b * 5 + 127) / 255;
     return 16 + 36 * r6 + 6 * g6 + b6;
 }
 
+/**
+ * rgb_to_16() - Quantize a 24-bit sRGB color into a 4-bit ANSI-16 color index
+ * @c: Input 24-bit RGB color triplet
+ *
+ * Role: Maps RGB colors onto standard 16-color ANSI indices [0..15] (0..7 normal, 8..15 bright)
+ * for legacy color_level == 1 terminals.
+ *
+ * Rationale: Uses ITU-R BT.601 perceived luminance (0.299*R + 0.587*G + 0.114*B) to select the
+ * high-intensity bit (+8) and lifts dim grays (base == 0, lum > 55) to bright-black / dark-gray
+ * (index 8) so dimmed borders and muted labels remain legible instead of collapsing to black (0).
+ *
+ * Return: ANSI-16 color index in [0..15].
+ */
 static int rgb_to_16(cs_rgb_t c)
 {
     int lum    = (299 * (int) c.r + 587 * (int) c.g + 114 * (int) c.b) / 1000;
@@ -322,6 +528,18 @@ static int rgb_to_16(cs_rgb_t c)
     return base + bright;
 }
 
+/**
+ * rgb_on() - Choose a high-contrast dark or light foreground ink for solid pill background @bg
+ * @bg: Solid badge background color
+ *
+ * Role: Computes readable text foreground color for inverted solid pills (sb_pill()).
+ *
+ * Rationale: Comparing BT.601 weighted luma (299*R + 587*G + 114*B) against a mid-perceptual
+ * threshold (140000 out of 255000) automatically switches between near-black ink on bright/warm
+ * pills (e.g. gold/cyan/green) and crisp off-white ink on deep red/blue pills across all 5 themes.
+ *
+ * Return: High-contrast foreground cs_rgb_t triplet.
+ */
 static cs_rgb_t rgb_on(cs_rgb_t bg)
 {
     int lum = 299 * (int) bg.r + 587 * (int) bg.g + 114 * (int) bg.b;
@@ -334,6 +552,20 @@ static cs_rgb_t rgb_on(cs_rgb_t bg)
     return light;
 }
 
+/**
+ * rgb_lerp() - Linearly interpolate between two 24-bit sRGB colors with clamping
+ * @a: Start color (returned when @t <= 0.0f)
+ * @b: End color (returned when @t >= 1.0f)
+ * @t: Blend fraction clamped to [0.0f..1.0f]
+ *
+ * Role: Core color-blending primitive used for anti-aliased pupil amplitude shading, soft-tinted
+ * badge backgrounds, and continuous piecewise-linear spectral wavelength color ramps.
+ *
+ * Rationale: Clamping @t in-place guards against out-of-band wavelengths (< 0.40 um or > 2.40 um)
+ * or numerical overshoot in pupil anti-aliasing without requiring callers to pre-clamp.
+ *
+ * Return: Interpolated and rounded cs_rgb_t color triplet.
+ */
 static cs_rgb_t rgb_lerp(cs_rgb_t a, cs_rgb_t b, float t)
 {
     if (t < 0.0f)
@@ -352,19 +584,50 @@ static cs_rgb_t rgb_lerp(cs_rgb_t a, cs_rgb_t b, float t)
     return out;
 }
 
-/* Append-only line buffer for composing styled rows safely */
+/**
+ * struct sbuf_t - Fixed-capacity stack-allocated append-only line composition buffer
+ * @data: NUL-terminated UTF-8 + ANSI CSI byte buffer (4096 bytes)
+ * @len:  Current byte length in @data (excluding trailing NUL; always < sizeof(data))
+ *
+ * Role: Accumulates styled text, multi-byte UTF-8 glyphs, and SGR escape sequences for a single
+ * panel row before panel_row() measures, truncates, pads, and flushes it to the output stream.
+ *
+ * Rationale: A single ~110-column TrueColor schematic row (containing pills, stream tags, and a
+ * 24- or 32-bin wavelength-colored spectrum bar) easily expands to 800..1500 raw bytes due to
+ * "\033[38;2;R;G;Bm" sequences. Using a 4 KiB stack buffer eliminates all heap allocations while
+ * guaranteeing truncation-safe formatting.
+ */
 typedef struct
 {
     char   data[4096];
     size_t len;
 } sbuf_t;
 
+/**
+ * sb_init() - Reset an sbuf_t line accumulator to the empty NUL-terminated state
+ * @sb: Target stack string buffer (non-NULL)
+ *
+ * Role: Prepares @sb at the start of composing each schematic or table row.
+ *
+ * Rationale: O(1) initialization writing only the leading NUL byte rather than zeroing all 4096
+ * bytes on every row.
+ */
 static void sb_init(sbuf_t *sb)
 {
     sb->data[0] = '\0';
     sb->len     = 0;
 }
 
+/**
+ * sb_puts() - Append a literal NUL-terminated string to @sb with bounds clamping
+ * @sb: Target stack string buffer (non-NULL)
+ * @s:  Source C string to append (safe no-op if NULL)
+ *
+ * Role: Fast literal string and UTF-8 glyph appender for sbuf_t.
+ *
+ * Rationale: Avoids printf format-string parsing overhead for fixed box-drawing glyphs, spaces,
+ * and stream identifiers while strictly preserving NUL termination if capacity is reached.
+ */
 static void sb_puts(sbuf_t *sb, const char *s)
 {
     if (s == NULL)
@@ -384,6 +647,16 @@ static void sb_puts(sbuf_t *sb, const char *s)
     }
 }
 
+/**
+ * sb_printf() - Append printf-formatted text to @sb with overflow clamping
+ * @sb:  Target stack string buffer (non-NULL)
+ * @fmt: Standard printf format string followed by variadic arguments
+ *
+ * Role: Appends formatted numbers, optical scales, and ANSI CSI sequences into @sb.
+ *
+ * Rationale: vsnprintf() returns the would-be length on truncation rather than the bytes written;
+ * clamping @sb->len against remaining capacity prevents buffer over-advance on long rows.
+ */
 static void sb_printf(sbuf_t *sb, const char *fmt, ...)
 {
     if (sb->len + 1 >= sizeof(sb->data))
@@ -401,6 +674,18 @@ static void sb_printf(sbuf_t *sb, const char *fmt, ...)
     }
 }
 
+/**
+ * sb_fg() - Append an SGR foreground color sequence to @sb matching terminal color tier @lvl
+ * @sb:  Target stack string buffer (non-NULL)
+ * @lvl: Effective color capability level (0=mono no-op, 1=16c, 2=256c, >=3=24-bit TrueColor)
+ * @c:   Desired 24-bit sRGB foreground color
+ *
+ * Role: Emits the appropriate ANSI foreground escape sequence (or nothing in monochrome mode).
+ *
+ * Rationale: Funneling all foreground color changes through one tier-aware helper keeps high-level
+ * schematic layout code completely agnostic to whether output targets TrueColor, xterm-256,
+ * ANSI-16, or plain monochrome text.
+ */
 static void sb_fg(sbuf_t *sb, int lvl, cs_rgb_t c)
 {
     if (lvl <= 0)
@@ -422,6 +707,18 @@ static void sb_fg(sbuf_t *sb, int lvl, cs_rgb_t c)
     }
 }
 
+/**
+ * sb_bg() - Append an SGR background color sequence to @sb matching terminal color tier @lvl
+ * @sb:  Target stack string buffer (non-NULL)
+ * @lvl: Effective color capability level (0=mono no-op, 1=16c, 2=256c, >=3=24-bit TrueColor)
+ * @c:   Desired 24-bit sRGB background color
+ *
+ * Role: Emits background fill escapes for solid/soft pills and lower-half-pixel blending in the
+ * 16x16 anti-aliased pupil thumbnail.
+ *
+ * Rationale: On 16-color terminals (lvl == 1), masks out the bright bit (& 7 -> SGR 40..47) to
+ * avoid non-portable blink/bright-background SGR 100..107 behavior on older emulators.
+ */
 static void sb_bg(sbuf_t *sb, int lvl, cs_rgb_t c)
 {
     if (lvl <= 0)
@@ -443,6 +740,16 @@ static void sb_bg(sbuf_t *sb, int lvl, cs_rgb_t c)
     }
 }
 
+/**
+ * sb_bold() - Append SGR bold attribute ("\033[1m") when ANSI styling is active
+ * @sb:  Target stack string buffer (non-NULL)
+ * @lvl: Effective color capability level (> 0 emits bold, <= 0 is a no-op)
+ *
+ * Role: Emphasizes node identifiers, SHM stream names, pills, and key optical plate scales.
+ *
+ * Rationale: Suppressing SGR bold when @lvl <= 0 ensures --text and NO_COLOR outputs remain
+ * 100% free of any control characters.
+ */
 static void sb_bold(sbuf_t *sb, int lvl)
 {
     if (lvl > 0)
@@ -451,6 +758,16 @@ static void sb_bold(sbuf_t *sb, int lvl)
     }
 }
 
+/**
+ * sb_rst() - Append SGR full attribute reset ("\033[0m") when ANSI styling is active
+ * @sb:  Target stack string buffer (non-NULL)
+ * @lvl: Effective color capability level (> 0 emits reset, <= 0 is a no-op)
+ *
+ * Role: Terminates active foreground, background, and bold attributes in @sb.
+ *
+ * Rationale: Explicit per-token resets prevent background pill fills or pupil half-block colors
+ * from bleeding into trailing row padding.
+ */
 static void sb_rst(sbuf_t *sb, int lvl)
 {
     if (lvl > 0)
@@ -459,6 +776,19 @@ static void sb_rst(sbuf_t *sb, int lvl)
     }
 }
 
+/**
+ * sb_pill() - Append a high-contrast solid-background badge (" LABEL " or "[LABEL]")
+ * @sb:    Target stack string buffer (non-NULL)
+ * @lvl:   Effective color capability level
+ * @bg:    Solid pill fill color (foreground contrast ink is chosen automatically via rgb_on())
+ * @label: Badge text (non-NULL)
+ *
+ * Role: Renders top-level panel title badges and primary status pills ("VALID DAG", "SHM LIVE",
+ * "INVALID CONFIG").
+ *
+ * Rationale: In monochrome mode (@lvl <= 0), background color disappears; substituting bracket
+ * delimiters "[LABEL]" preserves visual badge boundaries without relying on color.
+ */
 static void sb_pill(sbuf_t *sb, int lvl, cs_rgb_t bg, const char *label)
 {
     if (lvl <= 0)
@@ -473,6 +803,21 @@ static void sb_pill(sbuf_t *sb, int lvl, cs_rgb_t bg, const char *label)
     sb_rst(sb, lvl);
 }
 
+/**
+ * sb_soft_pill() - Append a subtle tinted-background optical element badge
+ * @sb:       Target stack string buffer (non-NULL)
+ * @lvl:      Effective color capability level
+ * @bg_panel: Theme panel background color blended at 76% weight
+ * @fg:       Semantic element accent color used for text and 24% background tint
+ * @label:    Element kind tag (e.g. "DM", "TTM", "SPLITTER", "CORO", "PYRWFS", "FPCAM")
+ *
+ * Role: Renders inline hardware node pills throughout the 2D optical path schematic without
+ * overwhelming primary alert/status pills.
+ *
+ * Rationale: Solid inverted pills on every optical node create excessive visual glare in dense
+ * multi-stage benches; tinting @bg_panel toward @fg by 24% produces a modern, milk-CTRL-aligned
+ * translucent chip effect on TrueColor/256c terminals while falling back to "[LABEL]" in mono.
+ */
 static void sb_soft_pill(sbuf_t *sb, int lvl, cs_rgb_t bg_panel, cs_rgb_t fg, const char *label)
 {
     if (lvl <= 0)
@@ -488,13 +833,29 @@ static void sb_soft_pill(sbuf_t *sb, int lvl, cs_rgb_t bg_panel, cs_rgb_t fg, co
     sb_rst(sb, lvl);
 }
 
-/* Count visible display columns skipping CSI escape codes; 1 col per UTF-8 codepoint */
+/**
+ * vis_cols() - Count visible terminal columns in a mixed ANSI CSI + UTF-8 string
+ * @s: NUL-terminated UTF-8 string potentially containing SGR escape sequences (non-NULL)
+ *
+ * Role: Computes the exact display-column width occupied on screen by @s so table columns and
+ * right-hand panel borders align vertically regardless of embedded escape sequences or multi-byte
+ * box-drawing glyphs.
+ *
+ * Rationale: strlen() overcounts both zero-width CSI sequences ("\033[...m") and 2/3-byte UTF-8
+ * box/block/math glyphs (e.g. U+2502, U+2588, U+03BB). All non-ASCII glyphs emitted by this module
+ * are narrow single-cell Unicode symbols (East Asian Width N/Na/A = 1 column), so skipping ECMA-48
+ * CSI sequences (ESC '[' ... 0x40..0x7E) and counting UTF-8 codepoints yields exact column widths
+ * without pulling in locale-dependent wcwidth().
+ *
+ * Return: Number of visible terminal columns >= 0.
+ */
 static int vis_cols(const char *s)
 {
     int                  cols = 0;
     const unsigned char *p    = (const unsigned char *) s;
     while (*p != '\0')
     {
+        /* Skip zero-width ECMA-48 CSI escape sequences: ESC '[' <params> <final 0x40..0x7E> */
         if (*p == 0x1B && p[1] == '[')
         {
             p += 2;
@@ -508,6 +869,7 @@ static int vis_cols(const char *s)
             }
             continue;
         }
+        /* Advance across 1-, 2-, 3-, or 4-byte UTF-8 codepoint sequences as 1 display column */
         if ((*p & 0x80u) == 0)
         {
             p += 1;
@@ -533,6 +895,18 @@ static int vis_cols(const char *s)
     return cols;
 }
 
+/**
+ * emit_fg_fp() - Write an SGR foreground color escape sequence directly to @fp
+ * @fp:  Destination output stream (non-NULL)
+ * @lvl: Effective color capability level [0..3]
+ * @c:   Target 24-bit sRGB border or frame color
+ *
+ * Role: Stream-level wrapper around sb_fg() used when drawing outer panel borders in panel_top(),
+ * panel_sep(), panel_bot(), and panel_row().
+ *
+ * Rationale: Reuses sb_fg()'s exact tier quantization logic via a tiny stack buffer rather than
+ * duplicating TrueColor / 256c / 16c SGR formatting for direct FILE* writes.
+ */
 static void emit_fg_fp(FILE *fp, int lvl, cs_rgb_t c)
 {
     sbuf_t tmp;
@@ -541,6 +915,16 @@ static void emit_fg_fp(FILE *fp, int lvl, cs_rgb_t c)
     fputs(tmp.data, fp);
 }
 
+/**
+ * emit_rst_fp() - Write an SGR attribute reset ("\033[0m") directly to @fp when color is active
+ * @fp:  Destination output stream (non-NULL)
+ * @lvl: Effective color capability level (> 0 emits reset, <= 0 is a no-op)
+ *
+ * Role: Resets terminal attributes around panel border glyphs and after truncated row bodies.
+ *
+ * Rationale: Prevents unclosed foreground/background SGR states inside a clipped row from
+ * discoloring the right-hand vertical border or subsequent terminal prompt.
+ */
 static void emit_rst_fp(FILE *fp, int lvl)
 {
     if (lvl > 0)
@@ -549,6 +933,19 @@ static void emit_rst_fp(FILE *fp, int lvl)
     }
 }
 
+/**
+ * sb_pad_col() - Append string @s followed by trailing spaces to reach at least @col_w columns
+ * @sb:    Target stack string buffer (non-NULL)
+ * @s:     Cell text (may contain UTF-8 or CSI sequences; non-NULL)
+ * @col_w: Target column stride including at least 1 trailing space separator
+ *
+ * Role: Left-aligns fixed-width columns inside Panel 3 hardware summary tables.
+ *
+ * Rationale: printf("%-Ns", s) pads by byte count rather than visible glyph count, misaligning
+ * columns whenever @s contains multi-byte UTF-8 symbols or ANSI color codes. Measuring @s with
+ * vis_cols() guarantees exact visual column alignment and always leaves >= 1 space between
+ * adjacent columns even when an identifier overflows @col_w.
+ */
 static void sb_pad_col(sbuf_t *sb, const char *s, int col_w)
 {
     sb_puts(sb, s);
@@ -560,7 +957,25 @@ static void sb_pad_col(sbuf_t *sb, const char *s, int col_w)
     }
 }
 
-/* Emit at most max_cols visible columns from an ANSI+UTF-8 string */
+/**
+ * emit_truncated() - Write at most @max_cols visible columns of @s to @fp with ellipsis clipping
+ * @fp:       Destination output stream (non-NULL)
+ * @s:        Styled UTF-8 + ANSI CSI line body (non-NULL)
+ * @max_cols: Maximum visible interior columns available inside the panel frame
+ * @ascii:    1 to use "~" as the truncation marker, 0 to use UTF-8 horizontal ellipsis "…"
+ *
+ * Role: Safely clips overlong schematic rows (e.g. deeply nested splitter trees or long file
+ * paths on narrow 76-col terminals) at clean UTF-8 codepoint boundaries while passing through
+ * preceding CSI color escapes intact.
+ *
+ * Rationale: Byte-slicing a styled UTF-8 string can split a 3-byte UTF-8 character in half
+ * (producing invalid UTF-8 replacement diamonds) or slice mid-CSI escape (printing raw ";255m"
+ * fragments and breaking the right-hand border). Stepping codepoint-by-codepoint and reserving 1
+ * column for "…"/"~" when total > max_cols guarantees intact escapes, valid UTF-8, and exact
+ * column accounting.
+ *
+ * Return: Exact number of visible columns written to @fp (<= @max_cols).
+ */
 static int emit_truncated(FILE *fp, const char *s, int max_cols, int ascii)
 {
     int                  total = vis_cols(s);
@@ -570,6 +985,7 @@ static int emit_truncated(FILE *fp, const char *s, int max_cols, int ascii)
 
     while (*p != '\0' && shown < limit)
     {
+        /* Pass zero-width CSI color sequences straight through without incrementing @shown */
         if (*p == 0x1B && p[1] == '[')
         {
             const unsigned char *start = p;
@@ -585,6 +1001,7 @@ static int emit_truncated(FILE *fp, const char *s, int max_cols, int ascii)
             fwrite(start, 1, (size_t) (p - start), fp);
             continue;
         }
+        /* Emit one complete UTF-8 codepoint as a single visible column */
         size_t clen = 1;
         if ((*p & 0x80u) == 0)
         {
@@ -614,6 +1031,24 @@ static int emit_truncated(FILE *fp, const char *s, int max_cols, int ascii)
     return shown;
 }
 
+/**
+ * struct view_env_t - Resolved per-render terminal, theme, geometry, and SHM environment state
+ * @fp:        Destination output FILE stream
+ * @pal:       Active semantic color palette pointer into g_palettes[]
+ * @theme_idx: Validated palette index in [0..CACAOSIM_THEME_COUNT-1]
+ * @lvl:       Resolved SGR color tier in [0..3]
+ * @ascii:     1 for pure 7-bit ASCII glyphs, 0 for UTF-8 box-drawing & blocks
+ * @check_shm: 1 to probe @shm_dir for live <stream>.im.shm files, 0 to skip filesystem probes
+ * @width:     Resolved outer panel frame width in terminal columns
+ * @shm_dir:   Resolved ImageStreamIO shared-memory directory (MILK_SHM_DIR or "/milk/shm")
+ *
+ * Role: Immutable rendering context initialized once per cacaosim_bench_render*() invocation by
+ * init_view_env() and threaded by const pointer through all panel, tree, and badge helpers.
+ *
+ * Rationale: Resolving getenv(), isatty(), and ioctl(TIOCGWINSZ) once upfront avoids repeated
+ * syscalls across dozens of rows and guarantees that every panel in a snapshot shares identical
+ * width and color/glyph rules even if the terminal resizes mid-frame.
+ */
 typedef struct
 {
     FILE               *fp;
@@ -626,6 +1061,19 @@ typedef struct
     char                shm_dir[512];
 } view_env_t;
 
+/**
+ * panel_top() - Emit the top rounded/ASCII border of a framed schematic panel with optional badge
+ * @ev:       Active rendering environment (non-NULL)
+ * @title:    Optional panel header title rendered inside an inverted pill (NULL or "" omits badge)
+ * @border_c: RGB color for the horizontal rule and corner box-drawing glyphs
+ * @badge_c:  Solid fill RGB color for the @title pill
+ *
+ * Role: Opens a visual section card (rounded UTF-8 corners or "+- [TITLE] ----+" in ASCII)
+ * spanning exactly @ev->width display columns.
+ *
+ * Rationale: Measuring the formatted pill with vis_cols() ensures the trailing horizontal border
+ * fills the exact remaining width in both colored (" TITLE ") and monochrome ("[TITLE]") modes.
+ */
 static void panel_top(const view_env_t *ev, const char *title, cs_rgb_t border_c, cs_rgb_t badge_c)
 {
     const char *tl = ev->ascii ? "+" : "╭";
@@ -659,6 +1107,17 @@ static void panel_top(const view_env_t *ev, const char *title, cs_rgb_t border_c
     fputc('\n', ev->fp);
 }
 
+/**
+ * panel_sep() - Emit an interior horizontal divider rule spanning @ev->width columns
+ * @ev:       Active rendering environment (non-NULL)
+ * @border_c: RGB color for T-junctions ("├"/"┤" or "+") and horizontal rule
+ *
+ * Role: Separates column headers from data rows in Panel 3 hardware tables and divides summary
+ * banners from diagnostic details in error panels.
+ *
+ * Rationale: Dedicated T-junction glyphs visually bind multi-column hardware tables into the outer
+ * card frame without breaking vertical border continuity.
+ */
 static void panel_sep(const view_env_t *ev, cs_rgb_t border_c)
 {
     const char *lt = ev->ascii ? "+" : "├";
@@ -676,6 +1135,16 @@ static void panel_sep(const view_env_t *ev, cs_rgb_t border_c)
     fputc('\n', ev->fp);
 }
 
+/**
+ * panel_bot() - Emit the bottom rounded/ASCII border closing a framed schematic panel
+ * @ev:       Active rendering environment (non-NULL)
+ * @border_c: RGB color for bottom corners ("╰"/"╯" or "+") and horizontal rule
+ *
+ * Role: Closes a framed visual card spanning @ev->width columns.
+ *
+ * Rationale: Pairing rounded UTF-8 corners (U+256D..U+2570) with milk's slate palette matches
+ * milk-CTRL card aesthetics while degrading cleanly to "+---+" in 7-bit ASCII mode.
+ */
 static void panel_bot(const view_env_t *ev, cs_rgb_t border_c)
 {
     const char *bl = ev->ascii ? "+" : "╰";
@@ -693,6 +1162,20 @@ static void panel_bot(const view_env_t *ev, cs_rgb_t border_c)
     fputc('\n', ev->fp);
 }
 
+/**
+ * panel_row() - Emit one left/right-bordered content row clipped and padded to @ev->width columns
+ * @ev:       Active rendering environment (non-NULL)
+ * @border_c: RGB color for the left and right vertical border glyphs ("│" or "|")
+ * @line:     Styled row content string (NULL is treated as an empty row)
+ *
+ * Role: Wraps any composed sbuf_t line inside "| <inner_w cols> |", truncating with an ellipsis
+ * if wider than (ev->width - 4) or right-padding with spaces so the right border always lands on
+ * column ev->width.
+ *
+ * Rationale: Centralizing left/right framing, SGR state reset, UTF-8-safe clipping, and trailing
+ * whitespace padding inside a single bottleneck makes vertical border misalignment impossible
+ * regardless of what upstream node/table formatters place in @line.
+ */
 static void panel_row(const view_env_t *ev, cs_rgb_t border_c, const char *line)
 {
     const char *vt      = ev->ascii ? "|" : "│";
@@ -717,7 +1200,21 @@ static void panel_row(const view_env_t *ev, cs_rgb_t border_c, const char *line)
     fputc('\n', ev->fp);
 }
 
-/* Non-intrusive check whether <stream>.im.shm exists in MILK_SHM_DIR */
+/**
+ * shm_stream_exists() - Non-intrusively probe whether an ImageStreamIO SHM file exists on disk
+ * @ev:          Active rendering environment supplying @check_shm and @shm_dir (non-NULL)
+ * @stream_name: Logical milk stream name without directory or ".im.shm" suffix (NULL-safe)
+ *
+ * Role: Checks whether "<ev->shm_dir>/<stream_name>.im.shm" is currently materialized in shared
+ * memory so schematic nodes and tables can light up live deployment badges.
+ *
+ * Rationale: Calling ImageStreamIO_read_sharedmem_image_toIMAGE() during a passive CLI preview
+ * would map POSIX SHM pages, allocate file descriptors, and risk permission failures on another
+ * user's loop. A pure access(..., F_OK) metadata probe completes in microseconds with zero side
+ * effects on running real-time CACAO processes.
+ *
+ * Return: 1 if @ev->check_shm is enabled and the .im.shm file exists, 0 otherwise.
+ */
 static int shm_stream_exists(const view_env_t *ev, const char *stream_name)
 {
     if (!ev->check_shm || stream_name == NULL || stream_name[0] == '\0')
@@ -729,6 +1226,19 @@ static int shm_stream_exists(const view_env_t *ev, const char *stream_name)
     return (access(path, F_OK) == 0) ? 1 : 0;
 }
 
+/**
+ * sb_stream_tag() - Append a formatted SHM stream identifier with optional live/standby glyph
+ * @sb:   Target stack string buffer (non-NULL)
+ * @ev:   Active rendering environment (non-NULL)
+ * @name: Stream name string (NULL or "" emits a dimmed "-" placeholder)
+ *
+ * Role: Renders every SHM endpoint (entrance wf/pup/ncpa, DM in_cmd, WFE map, coronagraph SHM
+ * masks, and WFS/camera out_cam) consistently across Overview, Schematic, and Hardware Tables.
+ *
+ * Rationale: Pairing a green filled dot ("●" / "*") for active streams vs a dimmed hollow ring
+ * ("○" / "o") for uncreated streams lets operators verify at a glance which hardware endpoints
+ * are already live in MILK_SHM_DIR and which remain offline.
+ */
 static void sb_stream_tag(sbuf_t *sb, const view_env_t *ev, const char *name)
 {
     if (name == NULL || name[0] == '\0')
@@ -751,9 +1261,25 @@ static void sb_stream_tag(sbuf_t *sb, const view_env_t *ev, const char *name)
     sb_rst(sb, ev->lvl);
 }
 
-/* Physical / theme-aware RGB color for optical/NIR wavelength lambda_um in [0.40..2.40] */
+/**
+ * lambda_color() - Map an optical/NIR wavelength [0.40..2.40 um] to a theme-aware RGB color
+ * @ev:     Active rendering environment (controls Night and Accessible overrides; non-NULL)
+ * @lam_um: Wavelength in micrometers [um]
+ *
+ * Role: Assigns physically intuitive false-color hues to spectral sparkline bins, sensor central
+ * wavelengths, and passband columns across the visible-to-K-band AO operating range.
+ *
+ * Rationale: Standard themes interpolate smoothly across 7 chromaticity knots spanning visible
+ * blue/cyan/green/orange-red (0.40..0.70 um) into distinct far-red/rose/violet-magenta NIR bands
+ * (Y, J/H, K up to 2.40 um) so dichroic splits are immediately legible. Under Night theme, blue
+ * and green wavelengths are suppressed in favor of a bright-to-deep red ramp to protect dark
+ * adaptation; under Accessible theme, 5 discrete Okabe-Ito bands guarantee colorblind separation.
+ *
+ * Return: Theme-appropriate 24-bit cs_rgb_t color for @lam_um.
+ */
 static cs_rgb_t lambda_color(const view_env_t *ev, float lam_um)
 {
+    /* Night-vision override: monotonic amber-red to deep-crimson ramp across 0.40..2.40 um */
     if (ev->theme_idx == CACAOSIM_THEME_NIGHT)
     {
         float    t  = (lam_um - 0.40f) / 2.00f;
@@ -761,6 +1287,7 @@ static cs_rgb_t lambda_color(const view_env_t *ev, float lam_um)
         cs_rgb_t c1 = { 165, 35, 30 };
         return rgb_lerp(c0, c1, t);
     }
+    /* Accessible override: quantized Okabe-Ito astronomical passband colors (Vis, I/Y, J, H, K) */
     if (ev->theme_idx == CACAOSIM_THEME_ACCESSIBLE)
     {
         if (lam_um < 0.70f)
@@ -787,6 +1314,7 @@ static cs_rgb_t lambda_color(const view_env_t *ev, float lam_um)
         return c;
     }
 
+    /* Continuous 7-knot visible + false-color NIR chromaticity ramp */
     cs_rgb_t stops[7] = {
         { 115, 115, 255 }, /* 0.40 um Violet-Blue */
         { 65, 205, 235 },  /* 0.50 um Cyan-Green  */
@@ -813,7 +1341,25 @@ static cs_rgb_t lambda_color(const view_env_t *ev, float lam_um)
     return stops[6];
 }
 
-/* Render a nbins (16, 24, or 32) spectral bar across 0.40..2.40 um with sqrt gamma scaling */
+/**
+ * sb_spectrum_bar() - Append a wavelength-colored spectral photon-rate sparkline across 0.40..2.40u
+ * @sb:       Target stack string buffer (non-NULL)
+ * @ev:       Active rendering environment (non-NULL)
+ * @spec:     32-bin photon spectral density [ph/s/bin] for the optical beam (non-NULL)
+ * @ref_peak: Reference peak bin flux [ph/s/bin] (typically entrance beams[0] peak) used for
+ *            consistent vertical normalization across downstream split arms
+ * @nbins:    Number of display columns to resample into (e.g. 32 in Overview, 24 on splitter arms)
+ *
+ * Role: Visualizes spectral energy distribution and dichroic cutoffs inline on every optical arm
+ * using 8-step Unicode vertical blocks ("▁".."█") or 7-bit ASCII density chars ('.'..'@').
+ *
+ * Rationale: Normalizing every downstream arm against the entrance @ref_peak (rather than each
+ * arm's local peak) makes gray attenuation, coronagraphic Lyot losses, and complementary LP/SP/BP
+ * dichroic notches directly comparable down the entire DAG. Applying a square-root gamma curve
+ * (g = sqrtf(rel)) compresses dynamic range so Rayleigh-Jeans K-band tails and ~5% out-of-band
+ * dichroic leakage remain visible alongside peak stellar emission, while bins < 0.2% drop to a
+ * baseline dot ("·" / ' ') to clearly show rejected stopbands.
+ */
 static void sb_spectrum_bar(
     sbuf_t                *sb,
     const view_env_t      *ev,
@@ -834,6 +1380,7 @@ static void sb_spectrum_bar(
 
     for (int i = 0; i < nbins; i++)
     {
+        /* Box-average the underlying 32-bin spectrum onto @nbins display columns */
         int   b0  = (i * CACAOSIM_NSPEC) / nbins;
         int   b1  = ((i + 1) * CACAOSIM_NSPEC) / nbins;
         float acc = 0.0f;
@@ -847,6 +1394,7 @@ static void sb_spectrum_bar(
         float rel = val / ref_peak;
         float lam = CACAOSIM_SPEC_L0_UM + ((float) i + 0.5f) * (2.00f / (float) nbins);
 
+        /* Render rejected dichroic stopbands (< 0.2% of entrance peak) as a dim baseline marker */
         if (rel < 0.002f)
         {
             sb_fg(sb, ev->lvl, ev->pal->fg_dim);
@@ -854,6 +1402,7 @@ static void sb_spectrum_bar(
         }
         else
         {
+            /* Apply sqrt gamma compression to map [0.002..1.0] onto 8 vertical bar heights */
             float g   = sqrtf(rel > 1.0f ? 1.0f : rel);
             int   idx = (int) (g * 7.99f);
             if (idx < 0)
@@ -882,13 +1431,31 @@ static void sb_spectrum_bar(
     sb_rst(sb, ev->lvl);
 }
 
-/* Render row r [0..7] of a 16x16 anti-aliased telescope pupil using Unicode half-blocks */
+/**
+ * sb_pupil_mini_row() - Render one terminal row of a 16x16 anti-aliased telescope pupil thumbnail
+ * @sb:    Target stack string buffer receiving 16 display columns (non-NULL)
+ * @ev:    Active rendering environment (non-NULL)
+ * @pup16: Row-major 16x16 float pupil amplitude array in [0.0..1.0] from cacaosim_make_pupil()
+ * @r:     Terminal row index in [0..7] (0 = top edge of pupil, 7 = bottom edge)
+ *
+ * Role: Packs two vertical rows of the 16x16 telescope pupil (outer diameter, central obscuration,
+ * and secondary support spiders) into a single 16-column terminal row so the 8x16 thumbnail
+ * displays with a ~1:1 circular aspect ratio on standard ~1:2 aspect terminal fonts.
+ *
+ * Rationale: Terminal character cells are roughly twice as tall as they are wide. By pairing
+ * y_top = 15 - 2*r (foreground of Unicode upper-half block U+2580) with y_bot = 14 - 2*r
+ * (background of U+2580) in +Y-up astronomical coordinates and blending both colors between
+ * bg_panel and fg_stream on 256c/TrueColor terminals, central obstructions and angled spiders
+ * appear crisp and anti-aliased. On 16c/mono/ASCII terminals, dual-threshold glyph quantization
+ * preserves sub-row geometric fidelity without requiring RGB backgrounds.
+ */
 static void sb_pupil_mini_row(
     sbuf_t           *sb,
     const view_env_t *ev,
     const float      *pup16,
     int               r)
 {
+    /* Map terminal row r [0..7] top-down onto +Y-up astronomical pupil rows [15..0] */
     int y_top = 15 - 2 * r;
     int y_bot = 14 - 2 * r;
 
@@ -899,6 +1466,7 @@ static void sb_pupil_mini_row(
 
         if (ev->ascii)
         {
+            /* 7-bit ASCII sub-row fallback distinguishing upper/lower/full/edge illumination */
             char ch = ' ';
             if (at >= 0.45f && ab >= 0.45f)
             {
@@ -922,6 +1490,7 @@ static void sb_pupil_mini_row(
         }
         else if (ev->lvl >= 2)
         {
+            /* TrueColor / 256c: continuous alpha blend on upper (FG) & lower (BG) half-pixels */
             cs_rgb_t ct = rgb_lerp(ev->pal->bg_panel, ev->pal->fg_stream, at);
             cs_rgb_t cb = rgb_lerp(ev->pal->bg_panel, ev->pal->fg_stream, ab);
             sb_fg(sb, ev->lvl, ct);
@@ -930,6 +1499,7 @@ static void sb_pupil_mini_row(
         }
         else
         {
+            /* Monochrome / 16c UTF-8 fallback using thresholded block-element glyphs */
             const char *gl = " ";
             if (at >= 0.45f && ab >= 0.45f)
             {
@@ -954,6 +1524,18 @@ static void sb_pupil_mini_row(
     sb_rst(sb, ev->lvl);
 }
 
+/**
+ * spectral_type_hint() - Return approximate Morgan-Keenan stellar spectral class for @teff_k
+ * @teff_k: Stellar effective blackbody temperature in Kelvin [K]
+ *
+ * Role: Annotates the Panel 1 stellar parameter line (e.g. "Teff=5778 K (G-type)") so operators
+ * immediately associate numeric blackbody temperature with familiar AO guide-star color classes.
+ *
+ * Rationale: Extreme-AO and multi-stage Visible/NIR WFS photon splits depend strongly on whether
+ * the target is a red M-dwarf (< 3700 K, NIR-rich / Vis-starved) vs a solar G-star or hot A-star.
+ *
+ * Return: Static short spectral class string ("A/B", "F", "G", "K", or "M").
+ */
 static const char *spectral_type_hint(float teff_k)
 {
     if (teff_k >= 9500.0f)
@@ -975,6 +1557,19 @@ static const char *spectral_type_hint(float teff_k)
     return "M";
 }
 
+/**
+ * sb_reg_badge() - Append a warning-colored 2D pupil misregistration badge when non-identity
+ * @sb:  Target stack string buffer (non-NULL)
+ * @ev:  Active rendering environment (non-NULL)
+ * @reg: 2D affine pupil registration parameters (shift_x, shift_y [pix], rot_deg, scale)
+ *
+ * Role: Highlights intentional or calibrated DM, WFE, splitter-arm, and WFS pupil shifts,
+ * rotations, and magnifications directly on the 2D schematic row.
+ *
+ * Rationale: Suppresses clutter when registration is exact identity (the common nominal case),
+ * while surfacing non-zero shifts/rotations/magnifications in warning amber because uncalibrated
+ * pupil misregistration is a primary driver of AO loop instability.
+ */
 static void sb_reg_badge(sbuf_t *sb, const view_env_t *ev, const cacaosim_reg_t *reg)
 {
     if (cacaosim_reg_is_identity(reg))
@@ -997,6 +1592,20 @@ static void sb_reg_badge(sbuf_t *sb, const view_env_t *ev, const cacaosim_reg_t 
     sb_rst(sb, ev->lvl);
 }
 
+/**
+ * format_splitter_desc() - Format a concise optical specification string for a beamsplitter node
+ * @sp:    Beamsplitter configuration (gray, dichroic_lp, dichroic_sp, or dichroic_bp; non-NULL)
+ * @ascii: 1 to emit "+/-" for bandpass tolerances, 0 to emit UTF-8 "±"
+ * @out:   Destination character buffer (non-NULL)
+ * @cap:   Capacity of @out in bytes
+ *
+ * Role: Summarizes reflectance/transmittance or cutoff wavelength semantics on SPLITTER headers
+ * in Panel 2.
+ *
+ * Rationale: Explicitly spelling out which wavelengths reflect vs transmit (e.g. "refl < 1.00,
+ * trans > 1.00" for a long-pass dichroic) prevents sign-convention confusion between long-pass,
+ * short-pass, and notch band-reflect splitters.
+ */
 static void format_splitter_desc(const cacaosim_split_cfg_t *sp, int ascii, char *out, size_t cap)
 {
     const char *pm = ascii ? "+/-" : "±";
@@ -1021,6 +1630,24 @@ static void format_splitter_desc(const cacaosim_split_cfg_t *sp, int ascii, char
     }
 }
 
+/**
+ * sb_mask_spec_tag() - Append a coronagraph custom mask key=value tag for FITS or SHM specifiers
+ * @sb:      Target stack string buffer (non-NULL)
+ * @ev:      Active rendering environment (non-NULL)
+ * @key:     Plane/component label (e.g. "pup_amp", "fpm_pha", "lyot_amp")
+ * @spec:    Configured FITS path or SHM stream name (empty/NULL returns 0 without emitting text)
+ * @need_sp: Non-zero to prepend a two-space separator when prior mask tags were already emitted
+ *
+ * Role: Renders custom coronagraphic pupil, focal-plane, and Lyot amplitude/phase mask bindings
+ * beneath CORO headers in Panel 2.
+ *
+ * Rationale: Coronagraph masks in cacaosim can be either static disk FITS cubes (.fits / .fit /
+ * path containing '/') or live ImageStreamIO SHM streams. Stripping directory prefixes on FITS
+ * files keeps the schematic row compact, whereas delegating SHM specifiers to sb_stream_tag()
+ * provides live MILK_SHM_DIR existence badges on dynamic masks.
+ *
+ * Return: 1 if @spec was non-empty and a tag was appended, 0 otherwise.
+ */
 static int sb_mask_spec_tag(
     sbuf_t           *sb,
     const view_env_t *ev,
@@ -1053,6 +1680,18 @@ static int sb_mask_spec_tag(
     return 1;
 }
 
+/**
+ * coro_mode_label() - Return uppercase display label for coronagraph optical architecture @mode
+ * @mode: Coronagraph architecture enum value (cacaosim_coro_mode_t: 0..5)
+ *
+ * Role: Converts numeric coronagraph mode codes into concise schematic and table labels.
+ *
+ * Rationale: Distinguishes analytic focal masks (classical Lyot spot, phase dimple, optical
+ * vortex, 4QPM) from user-supplied focal masks propagated via Matrix-DFT ("CUSTOM MFT") or padded
+ * FFT ("CUSTOM FFT").
+ *
+ * Return: Static uppercase C string describing the coronagraph mode.
+ */
 static const char *coro_mode_label(int mode)
 {
     switch (mode)
@@ -1074,6 +1713,22 @@ static const char *coro_mode_label(int mode)
     }
 }
 
+/**
+ * render_sensor_inline() - Format a terminal WFS or science camera leaf node onto @sb
+ * @sb:  Target stack string buffer (non-NULL)
+ * @ev:  Active rendering environment (non-NULL)
+ * @ctx: Analyzed optical bench context providing master_hz (non-NULL)
+ * @nd:  Sensor node instance (PYRWFS, SHWFS, ZWFS, or FPCAM; non-NULL)
+ *
+ * Role: Composes the compact single-line summary for leaf detector nodes at the end of optical
+ * branches in Panel 2: icon + soft pill + node ID + geometry (NxNsub or NxN pix) + wavelength +
+ * decimated frame rate ("Hz(/navg)") + integrated photons/frame + output SHM stream + reg badge.
+ *
+ * Rationale: Placing geometry, wavelength color, frame-rate decimation factor (/navg), integrated
+ * photon count per exposure, and live output stream name inline at each branch tip lets the reader
+ * trace an entire multi-rate photon budget directly on the 2D schematic without cross-referencing
+ * Panel 3 tables.
+ */
 static void render_sensor_inline(
     sbuf_t                      *sb,
     const view_env_t            *ev,
@@ -1084,6 +1739,8 @@ static void render_sensor_inline(
     const char *arr = ev->ascii ? " --> " : " ──▶ ";
     float       hz  = (nd->eff_navg > 0) ? (ctx->cfg.master_hz / (float) nd->eff_navg) : 0.0f;
 
+    /* Select sensor-class glyph and semantic accent color (green=zonal/slope WFS, purple=ZWFS,
+     * gold=focal-plane science camera) */
     if (nd->cfg.kind == CACAOSIM_NODE_PYRWFS)
     {
         sb_fg(sb, ev->lvl, ev->pal->fg_active);
@@ -1150,7 +1807,40 @@ static void render_sensor_inline(
     sb_reg_badge(sb, ev, &nd->cfg.reg);
 }
 
-/* Recursively render the optical beam & light-splitting tree starting from beam b_idx */
+/**
+ * render_beam_subtree() - Recursively render the 2D optical path & light-splitting tree from @b_idx
+ * @ev:           Active rendering environment (non-NULL)
+ * @ctx:          Analyzed optical bench context containing beams[] and sorted nodes[] (non-NULL)
+ * @b_idx:        Current optical beam index in ctx->beams[] ([0..ctx->n_beams-1])
+ * @prefix:       Accumulated left-margin indentation and vertical tree guide bars ("|     ")
+ * @src_tot:      Entrance beam integrated photon flux [ph/s] for throughput percentage scaling
+ * @src_peak:     Entrance beam peak spectral bin flux [ph/s/bin] for sparkline vertical scaling
+ * @visited_beam: Per-beam recursion guard bitmap [CACAOSIM_BENCH_MAX_BEAMS] preventing cycles
+ * @depth:        Current recursion depth (hard-capped at 24 levels as a defensive bound)
+ *
+ * Role: Core layout algorithm for Panel 2 ("OPTICAL PATH & LIGHT-SPLITTING SCHEMATIC"). Discovers
+ * all downstream nodes consuming @b_idx and dispatches across four optical topology idioms:
+ *   - Unterminated beam (0 consumers): emits a dimmed leaf warning so dangling beams stand out.
+ *   - Case 1 / 1b (Single inline DM, TTM, or static WFE): renders the element directly along the
+ *     current vertical optical axis WITHOUT adding horizontal indentation, then recurses onto
+ *     nd->out_idx using the unchanged @prefix.
+ *   - Case 2 (Single Beamsplitter): renders the SPLITTER header, then branches laterally into
+ *     reflected ("refl") and transmitted ("trans") arms with photon-share %, 24-bin spectral
+ *     sparklines, and child continuation prefixes (vertical bar for non-last arms, spaces for
+ *     last).
+ *   - Case 3 (Single Coronagraph): renders the CORO header and optional custom FITS/SHM mask row,
+ *     then branches into the optional reflective LOWFS pickoff arm ("lowfs(FPM)" or "lowfs(Lyot)")
+ *     and the post-Lyot science arm ("lyot").
+ *   - Case 4 (Leaf WFS/FPCAM sensors or multi-consumer fanout): emits terminal sensor summaries
+ *     via render_sensor_inline() or general fanout branches.
+ *
+ * Rationale: Naive generic tree printers indent on every hop, causing a 4-element serial optical
+ * train (TTM -> Woofer -> WFE -> Tweeter) to Stair-Step diagonally across the screen and exhaust
+ * terminal width before reaching the first dichroic. Keeping 1-in/1-out pupil-plane relays
+ * collinear on the vertical optical axis while indenting strictly at physical beam-splitting
+ * junctions mirrors how optical engineers draw bench schematics and preserves horizontal room for
+ * multi-stage cascaded AO branches.
+ */
 static void render_beam_subtree(
     const view_env_t           *ev,
     const cacaosim_bench_ctx_t *ctx,
@@ -1161,12 +1851,15 @@ static void render_beam_subtree(
     uint8_t                    *visited_beam,
     int                         depth)
 {
+    /* Defensive bounds & cycle guard (cacaosim_bench_analyze() enforces DAG acyclicity, but
+     * guarding visited_beam[] and depth <= 24 makes the renderer safe on synthetic contexts) */
     if (b_idx < 0 || (uint32_t) b_idx >= ctx->n_beams || depth > 24 || visited_beam[b_idx])
     {
         return;
     }
     visited_beam[b_idx] = 1;
 
+    /* Collect all optical nodes whose primary input is connected to beam @b_idx */
     int consumers[CACAOSIM_BENCH_MAX_NODES];
     int n_cons = 0;
     for (uint32_t i = 0; i < ctx->n_nodes; i++)
@@ -1181,6 +1874,7 @@ static void render_beam_subtree(
     const char *darr = ev->ascii ? "v" : "▼";
     const char *larr = ev->ascii ? "<-- " : "◀── ";
 
+    /* Dangling optical arm with no downstream WFS, camera, or relay element */
     if (n_cons == 0)
     {
         sbuf_t row;
@@ -1194,7 +1888,8 @@ static void render_beam_subtree(
         return;
     }
 
-    /* Case 1: Single inline DM or TTM -> keep vertical optical axis unindented */
+    /* Case 1: Single inline DM or TTM -> keep vertical optical axis unindented so serial
+     * TTM + Woofer + Tweeter chains flow straight down the same column */
     if (n_cons == 1 && ctx->nodes[consumers[0]].cfg.kind == CACAOSIM_NODE_DM)
     {
         const cacaosim_bench_node_t *nd    = &ctx->nodes[consumers[0]];
@@ -1253,6 +1948,7 @@ static void render_beam_subtree(
             sb_printf(&line, "instant d=%.1ffr", nd->cfg.dm.delay_frames);
         }
 
+        /* Show closed-loop actuator command stream injection from the right ("<-- dmXXdisp") */
         sb_puts(&line, "  ");
         sb_fg(&line, ev->lvl, ev->pal->fg_conn);
         sb_puts(&line, larr);
@@ -1387,6 +2083,7 @@ static void render_beam_subtree(
         const cacaosim_reg_t *areg[2] = { NULL, NULL };
         int         n_arms    = 0;
 
+        /* Render reflected arm first (typically WFS pickoff) and transmitted arm second */
         if (nd->refl_idx >= 0)
         {
             arms[n_arms]   = nd->refl_idx;
@@ -1429,6 +2126,7 @@ static void render_beam_subtree(
             sb_reg_badge(&arm, ev, areg[a]);
             panel_row(ev, ev->pal->fg_conn, arm.data);
 
+            /* Propagate vertical continuation bar "│     " while sibling arm(s) remain below */
             char child_pfx[256];
             snprintf(child_pfx, sizeof(child_pfx), "%s%s", prefix,
                      is_last ? "      " : (ev->ascii ? "|     " : "│     "));
@@ -1447,7 +2145,7 @@ static void render_beam_subtree(
         return;
     }
 
-    /* Case 3: Single Coronagraph -> optional FPM LOWFS pickoff + post-Lyot science beam */
+    /* Case 3: Single Coronagraph -> optional FPM/Lyot LOWFS pickoff + post-Lyot science beam */
     if (n_cons == 1 && ctx->nodes[consumers[0]].cfg.kind == CACAOSIM_NODE_CORO)
     {
         const cacaosim_bench_node_t *nd = &ctx->nodes[consumers[0]];
@@ -1500,6 +2198,7 @@ static void render_beam_subtree(
         }
         panel_row(ev, ev->pal->fg_conn, hdr.data);
 
+        /* Emit optional auxiliary mask line when custom FITS or SHM masks are attached */
         if (nd->cfg.in_pup_amp[0] != '\0' || nd->cfg.in_pup_pha[0] != '\0' ||
             nd->cfg.in_fpm_amp[0] != '\0' || nd->cfg.in_fpm_pha[0] != '\0' ||
             nd->cfg.in_lyot[0] != '\0' || nd->cfg.in_lyot_pha[0] != '\0')
@@ -1533,6 +2232,7 @@ static void render_beam_subtree(
         int         is_lowfs[2] = { 0, 0 };
         int         n_arms      = 0;
 
+        /* Order rejected starlight LOWFS pickoff arm ahead of post-Lyot science arm */
         if (nd->lowfs_idx >= 0)
         {
             arms[n_arms]     = nd->lowfs_idx;
@@ -1600,7 +2300,7 @@ static void render_beam_subtree(
         return;
     }
 
-    /* Case 4: Sensor(s) or general multi-consumer fanout on b_idx */
+    /* Case 4: Terminal sensor(s) or general multi-consumer fanout sharing beam @b_idx */
     for (int c = 0; c < n_cons; c++)
     {
         int                          is_last = (c == n_cons - 1);
@@ -1634,7 +2334,21 @@ static void render_beam_subtree(
     }
 }
 
-/* Count expected vs currently live SHM streams for the bench */
+/**
+ * count_shm_streams() - Tally expected vs currently materialized SHM streams for a bench DAG
+ * @ev:        Active rendering environment supplying @check_shm and @shm_dir (non-NULL)
+ * @ctx:       Analyzed optical bench context (non-NULL)
+ * @out_live:  Output count of configured SHM endpoints currently present in MILK_SHM_DIR (non-NULL)
+ * @out_total: Output count of all primary SHM endpoints referenced by @ctx (non-NULL)
+ *
+ * Role: Computes the aggregate "N/M SHM LIVE" vs "STANDBY" summary pill rendered at the top of
+ * Panel 1.
+ *
+ * Rationale: Counts primary hardware-facing SHM interfaces (entrance pupil stream, DM actuator
+ * command streams, static WFE SHM maps, non-FITS coronagraph SHM masks, and sensor camera output
+ * streams) while excluding disk FITS mask paths (cacaosim_mask_is_fits_path()) and optional
+ * external turbulence streams (in_wf, which may legitimately be absent in static calibration runs).
+ */
 static void count_shm_streams(
     const view_env_t           *ev,
     const cacaosim_bench_ctx_t *ctx,
@@ -1664,6 +2378,7 @@ static void count_shm_streams(
         }
         else if (nd->cfg.kind == CACAOSIM_NODE_CORO)
         {
+            /* Only count coronagraph mask specifiers backed by SHM streams, skipping FITS files */
             const char *ms[6] = {
                 nd->cfg.in_pup_amp, nd->cfg.in_pup_pha, nd->cfg.in_fpm_amp,
                 nd->cfg.in_fpm_pha, nd->cfg.in_lyot,    nd->cfg.in_lyot_pha
@@ -1688,6 +2403,20 @@ static void count_shm_streams(
     *out_total = total;
 }
 
+/**
+ * init_view_env() - Resolve all terminal capabilities, theme pointers, width, and MILK_SHM_DIR
+ * @ev:   Output per-render environment struct to populate (non-NULL)
+ * @opts: Optional caller rendering options (NULL falls back to cacaosim_view_opts_defaults())
+ * @fp:   Destination output stream (non-NULL)
+ *
+ * Role: Populates @ev in a single pass before any panel formatting begins, shared between normal
+ * schematic rendering (cacaosim_bench_render()) and diagnostic error panels
+ * (cacaosim_bench_render_error()).
+ *
+ * Rationale: Centralizing option normalization, theme bounds clamping, TTY/locale probing, and
+ * MILK_SHM_DIR fallback ("/milk/shm") guarantees identical visual behavior across success and
+ * failure code paths.
+ */
 static void init_view_env(
     view_env_t                 *ev,
     const cacaosim_view_opts_t *opts,
@@ -1718,6 +2447,32 @@ static void init_view_env(
              (sd != NULL && sd[0] != '\0') ? sd : "/milk/shm");
 }
 
+/**
+ * compute_bench_scales() - Derive pupil-plane and representative focal-plane physical plate scales
+ * @ctx:                Analyzed optical bench context (non-NULL)
+ * @out_beam_px:        Output clear pupil diameter across the nwf grid [pixels] (non-NULL)
+ * @out_pup_m_pix:      Output pupil spatial sampling [meters / pixel] (non-NULL)
+ * @out_foc_ld_pix:     Output focal-plane angular sampling [lambda/D per pixel] (non-NULL)
+ * @out_foc_arcsec_pix: Output on-sky focal plate scale [arcseconds / pixel] (non-NULL)
+ * @out_ref_lam_um:     Output reference wavelength used for focal plate scale [um] (non-NULL)
+ * @out_src:            Output short label naming the optical node that defined focal scale
+ * @src_cap:            Capacity of @out_src in bytes
+ *
+ * Role: Computes the physical pupil and focal sampling metrics displayed in Panel 1 rows 3-4
+ * ("Pupil Sc" and "Focal Sc").
+ *
+ * Rationale: Different optical propagators in cacaosim parameterize focal sampling differently:
+ *   - Padded FFT modes (FPCAM FFT, Vortex/4QPM/Custom-FFT CORO, PYRWFS): 1 / (pup_diam * pad)
+ *     lambda/D per pixel.
+ *   - Soummer Matrix-DFT modes (FPCAM MFT, Custom-MFT CORO): 1 / pixscale_ld lambda/D per pixel.
+ *   - Analytic Lyot/dimple MFT modes (CORO spot/dimple, ZWFS): focal mask diameter in lambda/D
+ *     divided by n_mft grid samples.
+ *   - Diffractive lenslet SHWFS: n_sub / pad_factor full-aperture lambda/D per pixel (= 1 / pad
+ *     subaperture lambda/d_sub per pixel).
+ * Scanning nodes in priority order (FPCAM -> CORO -> SHWFS -> PYRWFS -> ZWFS, with a 2x-padded FFT
+ * fallback for mirror-only benches) surfaces the primary science or WFS plate scale and converts
+ * lambda/D to sky arcseconds via (lambda / D_tel) * (180 * 3600 / pi = 206264.8062 arcsec/rad).
+ */
 static void compute_bench_scales(
     const cacaosim_bench_ctx_t *ctx,
     float                      *out_beam_px,
@@ -1737,6 +2492,7 @@ static void compute_bench_scales(
     *out_ref_lam_um = (ctx->cfg.ref_lambda > 0.1f) ? ctx->cfg.ref_lambda : 1.65f;
     snprintf(out_src, src_cap, "2xFFT");
 
+    /* Select highest-priority focal-plane instrument present on the bench */
     static const cacaosim_node_kind_t prio[5] = {
         CACAOSIM_NODE_FPCAM, CACAOSIM_NODE_CORO,   CACAOSIM_NODE_SHWFS,
         CACAOSIM_NODE_PYRWFS, CACAOSIM_NODE_ZWFS
@@ -1824,9 +2580,29 @@ static void compute_bench_scales(
             }
         }
     }
+    /* Convert diffraction units [lambda/D] to sky angle [arcsec] via 206264.8062 arcsec/radian */
     *out_foc_arcsec_pix = *out_foc_ld_pix * (*out_ref_lam_um * 1.0e-6f / tel_d) * 206264.8062f;
 }
 
+/**
+ * cacaosim_bench_render() - Render an analyzed or initialized optical bench DAG to a FILE stream
+ * @ctx:         Analyzed or initialized optical bench context (safe no-op if NULL)
+ * @source_path: Optional .bench configuration file path displayed in Panel 1 and workflow footer
+ * @opts:        Optional rendering options (NULL uses cacaosim_view_opts_defaults())
+ * @fp:          Destination output stream (safe no-op if NULL)
+ *
+ * Role: Top-level layout orchestrator emitting up to four sequential visual blocks to @fp:
+ *   1. Panel 1 (Bench Overview, 16x16 Pupil Thumbnail, Physical Scales & 32-bin Star Spectrum).
+ *   2. Panel 2 (2D Branching Optical Path & Light-Splitting Schematic via render_beam_subtree()).
+ *   3. Panel 3 (Optional Hardware & Photon-Budget Tables for DMs/TTMs, Sensors, and Splitters/
+ *      Coronagraphs/Static WFE when opts->show_tables != 0).
+ *   4. Workflow Footer (Optional one-line CLI edit/deploy hint when opts->show_footer != 0).
+ *
+ * Rationale: Structuring the output into vertically stacked, self-contained cards -- overview
+ * physics at the top, spatial/spectral signal flow in the middle, and dense tabular parameters at
+ * the bottom -- lets operators grasp topology in 2 seconds (--compact) or audit full DAC/ZOH/RON
+ * hardware budgets without horizontal scrolling.
+ */
 void cacaosim_bench_render(
     const cacaosim_bench_ctx_t *ctx,
     const char                 *source_path,
@@ -1848,7 +2624,8 @@ void cacaosim_bench_render(
     view_env_t ev;
     init_view_env(&ev, opts, fp);
 
-    /* Generate 16x16 anti-aliased pupil miniature for Panel 1 */
+    /* Generate a 16x16 anti-aliased pupil miniature for Panel 1; clamp thin spider widths
+     * (< 4% of pupil diameter) up to 0.04 so ~1%-wide spiders remain visible at 16x16 sampling */
     float                pup16[256] = { 0 };
     cacaosim_pupil_cfg_t pcfg       = {
         .nwf        = 16,
@@ -1862,6 +2639,7 @@ void cacaosim_bench_render(
     };
     cacaosim_make_pupil(&pcfg, pup16);
 
+    /* Compute entrance total flux [ph/s] and peak bin density for downstream normalization */
     float src_tot  = cacaosim_spec_total(&ctx->beams[0].spec);
     float src_peak = 0.0f;
     for (int b = 0; b < CACAOSIM_NSPEC; b++)
@@ -1882,7 +2660,7 @@ void cacaosim_bench_render(
     compute_bench_scales(ctx, &beam_px, &pup_m_pix, &foc_ld_pix, &foc_arcsec_pix, &foc_lam_um,
                          foc_src, sizeof(foc_src));
 
-    /* ── Panel 1: Optical Bench Overview + 2D Pupil Preview + Star Spectrum ── */
+    /* -- Panel 1: Optical Bench Overview + 2D Pupil Preview + Star Spectrum -- */
     char hdr_title[128];
     snprintf(hdr_title, sizeof(hdr_title), "CACAOSIM OPTICAL BENCH : %s", ctx->cfg.name);
     panel_top(&ev, hdr_title, ev.pal->fg_title, ev.pal->fg_title);
@@ -1893,6 +2671,7 @@ void cacaosim_bench_render(
         sbuf_t ln;
         sb_init(&ln);
         sb_puts(&ln, " ");
+        /* Left 16-col pane: rows 0..7 show 16x16 pupil half-blocks; rows 8..9 show grid/beam px */
         if (r < 8)
         {
             sb_pupil_mini_row(&ln, &ev, pup16, r);
@@ -1915,6 +2694,7 @@ void cacaosim_bench_render(
         sb_puts(&ln, ev.ascii ? " | " : " │ ");
         sb_rst(&ln, ev.lvl);
 
+        /* Right metadata pane: status pills, scales, clock, photometry & 32-bin spectrum */
         if (r == 0)
         {
             sb_pill(&ln, ev.lvl, ev.pal->fg_active,
@@ -2037,10 +2817,11 @@ void cacaosim_bench_render(
     }
     panel_bot(&ev, ev.pal->fg_title);
 
-    /* ── Panel 2: 2D Branching Optical Path & Light-Splitting Schematic ────── */
+    /* -- Panel 2: 2D Branching Optical Path & Light-Splitting Schematic -- */
     panel_top(&ev, "OPTICAL PATH & LIGHT-SPLITTING SCHEMATIC", ev.pal->fg_conn, ev.pal->fg_fps);
 
     {
+        /* Entrance atmosphere + telescope aperture root node feeding beams[0] */
         sbuf_t ent;
         sb_init(&ent);
         sb_fg(&ent, ev.lvl, ev.pal->fg_conn);
@@ -2077,7 +2858,7 @@ void cacaosim_bench_render(
     }
     panel_bot(&ev, ev.pal->fg_conn);
 
-    /* ── Panel 3: Active Mirrors & Wavefront Sensors / Science Cameras ─────── */
+    /* -- Panel 3: Active Mirrors & Wavefront Sensors / Science Cameras -- */
     if (opts->show_tables)
     {
         if (ctx->n_dms > 0)
@@ -2145,6 +2926,7 @@ void cacaosim_bench_render(
                 sb_fg(&rline, ev.lvl, ev.pal->fg_accent);
                 sb_pad_col(&rline, bpath, 22);
 
+                /* Measure visible columns before/after sb_stream_tag() to pad exactly to col 15 */
                 int c0 = vis_cols(rline.data);
                 sb_stream_tag(&rline, &ev, nd->cfg.in_cmd);
                 int c1 = vis_cols(rline.data);
@@ -2210,6 +2992,8 @@ void cacaosim_bench_render(
                     kcol = ev.pal->fg_accent;
                 }
 
+                /* Classify detector SNR regime assuming ~25% effective illuminated pixel fill:
+                 * Shot-limited if Poisson noise > 2*RON, Mixed if N_ph > RON^2, else RON-limited */
                 float hz     = (nd->eff_navg > 0)
                                    ? (ctx->cfg.master_hz / (float) nd->eff_navg)
                                    : 0.0f;
@@ -2414,7 +3198,7 @@ void cacaosim_bench_render(
         }
     }
 
-    /* ── Workflow Footer ───────────────────────────────────────────────────── */
+    /* -- Workflow Footer -- */
     if (opts->show_footer)
     {
         const char *p = (source_path && source_path[0]) ? source_path : "<file.bench>";
@@ -2433,6 +3217,24 @@ void cacaosim_bench_render(
     }
 }
 
+/**
+ * cacaosim_bench_render_error() - Render a milk-styled .bench configuration error diagnostic panel
+ * @source_path: Optional path to the .bench file being parsed or validated (NULL/"" safe)
+ * @partial_cfg: Optional partially parsed bench configuration (NULL when file I/O or INI syntax
+ *               parsing failed before DAG analysis)
+ * @err_msg:     Syntax or topological DAG validation diagnostic message (NULL/"" safe)
+ * @opts:        Optional rendering options (NULL uses cacaosim_view_opts_defaults())
+ * @fp:          Destination output stream (safe no-op if NULL)
+ *
+ * Role: Emits a bordered error card showing the failed file path, specific parser/DAG error text,
+ * and (when INI parsing succeeded but topological analysis failed, @partial_cfg != NULL) a compact
+ * table of every parsed node's input/output beam identifiers.
+ *
+ * Rationale: In --watch live-reload workflows, saving a mid-edit .bench file temporarily breaks
+ * beam names. Displaying the partial beam wiring table inside a fixed-width panel keeps the
+ * screen visually stable and immediately shows which upstream/downstream beam identifier failed to
+ * match.
+ */
 void cacaosim_bench_render_error(
     const char                 *source_path,
     const cacaosim_bench_cfg_t *partial_cfg,
@@ -2470,6 +3272,7 @@ void cacaosim_bench_render_error(
     sb_rst(&r1, ev.lvl);
     panel_row(&ev, ev.pal->fg_error, r1.data);
 
+    /* If syntax parsing succeeded, list each section's beam endpoints to aid topology debugging */
     if (partial_cfg != NULL && partial_cfg->n_nodes > 0)
     {
         sbuf_t r2;
@@ -2509,6 +3312,23 @@ void cacaosim_bench_render_error(
     panel_bot(&ev, ev.pal->fg_error);
 }
 
+/**
+ * cacaosim_bench_render_file() - Load, analyze, and render a .bench file in one zero-FFT call
+ * @path: Filesystem path to the declarative .bench configuration file (non-NULL)
+ * @opts: Optional rendering options (NULL uses cacaosim_view_opts_defaults())
+ * @fp:   Destination output stream (non-NULL)
+ *
+ * Role: Executes the end-to-end file-to-schematic pipeline: parses @path into a stack
+ * cacaosim_bench_cfg_t, runs zero-allocation topological & spectral analysis into a stack
+ * cacaosim_bench_ctx_t, and renders either the full schematic or a structured error panel.
+ *
+ * Rationale: Keeping both cfg and ctx on the stack with cacaosim_bench_analyze() avoids any
+ * dynamic memory, FFTW/cuFFT planning, or SHM creation overhead, enabling sub-millisecond CLI
+ * invocations and flicker-free 150 ms --watch polling loops.
+ *
+ * Return: 0 if a valid .bench schematic was rendered, -1 on NULL arguments, file/parse error, or
+ *         DAG validation failure.
+ */
 int cacaosim_bench_render_file(
     const char                 *path,
     const cacaosim_view_opts_t *opts,

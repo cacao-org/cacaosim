@@ -5,6 +5,30 @@
 /**
  * @file    cacaosim_pyrwfs_FPS.c
  * @brief   MILK_RUNNABLE compute unit for 4-sided Pyramid WFS and detector readout simulation
+ *
+ * Architectural Role in cacaosim:
+ *   Implements the standalone MILK Function Parameter Structure (FPS) process (`csim_pyrwfs` /
+ *   `milk-fpsexec-cacaosim-pyrwfs`) wrapping `cacaosim_pyrwfs_ctx_t`. Connects to upstream CACAO /
+ *   `cacaosim` shared-memory streams (either a unified 3D `[OPD_um, Amplitude]` optical beam
+ *   `.in_beam` or split `.in_wf` + `.in_dm` + `.in_pup` streams), applies optional 2D pupil-plane
+ *   affine registration and spectral bandpass photometry, integrates `.navg` subframes, and
+ *   publishes noisy WFS camera frames to `.out_cam` (e.g. `aol0_wfsim`).
+ *
+ * Design Rationale & Physics / Algorithmic Motivation:
+ *   1. Dual Input Topology (Modular Beam vs Split Legacy Streams):
+ *      Supporting `.in_beam` enables plug-and-play multi-stage AO benches where dichroics, static
+ *      WFE maps, and upstream DMs propagate spectral photon budgets (`CSIM_BM` / `S00..S31` SHM
+ *      keywords) and dynamic pupil amplitudes automatically. When `.in_beam` is omitted, direct
+ *      `.in_wf` / `.in_dm` / `.in_pup` binding (with automatic VLT/Subaru-like spiders fallback if
+ *      `.in_pup` is absent) lets users drop `cacaosim.pyrwfs` into standard CACAO `milkatmturb`
+ *      loops with zero upstream glue.
+ *   2. Fourier-Shift `(1 + N_mod)` Optics + Live Runtime Tunability:
+ *      Delegates optical propagation to `cacaosim_pyrwfs.h`, where precomputed shifted focal-plane
+ *      pyramid masks reduce per-subframe FFT cost from `2 * N_mod` to `1 + N_mod` 2D FFTs (via
+ *      L2-cached OpenMP FFTW3f or batched cuFFT + CUDA Graphs). Marking `.mod_rad`, `.turb_gain`,
+ *      `.flux_ph`, `.ron_e`, `.gain_eadu`, `.shutter`, and `.navg` with `FPFLAG_WRITERUN` lets AO
+ *      operators acquire darks, measure interaction matrices (`turb_gain = 0`), and ramp modulation
+ *      or guide-star magnitude live without restarting the WFS process.
  */
 
 #include <stdint.h>
@@ -18,6 +42,11 @@
 #include "pyrwfs/cacaosim_pyrwfs.h"
 #include "pyrwfs/cacaosim_pyrwfs_FPS.h"
 
+/*
+ * File-scope FPS parameter backing variables bound by `CACAOSIM_PYRWFS_PARAMS(X)`.
+ * Parameters carrying `FPFLAG_WRITERUN` are re-sampled on every loop iteration so live `milk-fps`
+ * updates take effect on the very next subframe or camera readout without process restart.
+ */
 static char     param_out_cam[FUNCTION_PARAMETER_STRMAXLEN]  = "aol0_wfsim";
 static char     param_in_beam[FUNCTION_PARAMETER_STRMAXLEN]  = "";
 static char     param_in_wf[FUNCTION_PARAMETER_STRMAXLEN]    = "outarraypha";
@@ -59,6 +88,19 @@ static float    param_frame_rate                             = 0.0f;
 static uint64_t param_rng_seed                               = 12345;
 static int32_t  param_backend                                = 0;
 
+/**
+ * @brief X-macro FPS parameter table for `cacaosim.pyrwfs` (`csim_pyrwfs`).
+ *
+ * Groups parameters into:
+ *   - Stream bindings (`.out_cam`, `.in_dm` trigger, `.in_beam`, `.in_wf`, `.in_amp`, `.in_pup`,
+ *     `.in_ncpa`),
+ *   - Optical & pyramid prism geometry (`.nwf`, `.pad_factor`, `.ncam`, `.pup_diam`, `.lambda_um`,
+ *     `.mod_rad`, `.mod_npts`, `.pup_sep`, `.roof_ld`),
+ *   - Spectral bandpass photometry & subframe integration (`.bw_frac`, `.qe`, `.dt_exp`,
+ *     `.use_beam_flux`, `.navg`),
+ *   - 2D pupil-plane affine misregistration (`.shift_x`, `.shift_y`, `.rot_deg`, `.mag_scale`),
+ *   - Wavefront scaling, detector readout electronics, pacing, and compute backend selection.
+ */
 #define CACAOSIM_PYRWFS_PARAMS(X)                                                       \
     X(".out_cam", param_out_cam, FPTYPE_STREAMNAME, 1, FPFLAG_DEFAULT_INPUT,            \
       "Output 2D WFS camera stream (e.g. aol0_wfsim)")                                  \
@@ -158,6 +200,20 @@ static int32_t  param_backend                                = 0;
 
 MILK_PARAMS_DEFINE(cacaosim_pyrwfs, CACAOSIM_PYRWFS_PARAMS);
 
+/**
+ * pyrwfs_confcheck() - Validate FPS configuration and enforce live `FPFLAG_WRITERUN` mutability
+ *
+ * Role:
+ *   Cold-path FPS `confcheck` callback executed during `confstart` / parameter updates.
+ *
+ * Rationale:
+ *   Pre-existing FPS shared-memory files on disk may have been created by an older schema lacking
+ *   `FPFLAG_WRITERUN` on live-tunable keys; explicitly re-applying `FPFLAG_WRITERUN` guarantees
+ *   that runtime modulation, shutter, photometry, and noise adjustments always remain writable
+ *   while `run` is active.
+ *
+ * Return: `RETURN_SUCCESS`.
+ */
 static MILK_COLD errno_t pyrwfs_confcheck(void)
 {
     if (dcfpsptr != NULL)
@@ -179,6 +235,29 @@ static MILK_COLD errno_t pyrwfs_confcheck(void)
     return RETURN_SUCCESS;
 }
 
+/**
+ * pyrwfs_compute() - Main MILK `processinfo` real-time Pyramid WFS simulation loop
+ * @self: Pointer to `runnable_cacaosim_pyrwfs` descriptor (non-NULL)
+ *
+ * Role:
+ *   Connects/creates SHM input and output streams, initializes `cacaosim_pyrwfs_ctx_t`, executes
+ *   paced or stream-triggered optical subframe integrations and WFS camera readouts inside a
+ *   `MILK_PROCINFO` loop, and cleanly releases all host/GPU/SHM resources on stop.
+ *
+ * Rationale:
+ *   - Auto-synthesizes an anti-aliased obstructed 4-spider telescope pupil if `.in_pup` is missing,
+ *     allowing standalone WFS startup before upstream pupil generators run.
+ *   - Pre-creates `.in_beam` with initialized `CSIM_BM` spectral keywords if configured before
+ *     upstream `mkbeam`/`beamsplit` processes start, preventing race conditions in parallel bench
+ *     launches.
+ *   - Re-attempts `stream_connect()` lazily inside the loop for optional `.in_dm`, `.in_wf`, and
+ *     `.in_amp` streams so processes can start in arbitrary order.
+ *   - Honors the MILK SHM concurrency protocol (`img_cam.md->write = 1` before writing pixels,
+ *     finalized by `processinfo_update_output_stream()` only when `subframe_cnt >= navg`) so
+ *     downstream CACAO WFS acquisition sees atomic, tear-free camera frames.
+ *
+ * Return: `RETURN_SUCCESS` on normal loop exit, `RETURN_FAILURE` on invalid geometry or init error.
+ */
 static MILK_HOT errno_t pyrwfs_compute(const MILK_RUNNABLE *self)
 {
     if (param_out_cam[0] == '\0' || param_nwf < 8 || param_ncam < 4)
@@ -198,6 +277,7 @@ static MILK_HOT errno_t pyrwfs_compute(const MILK_RUNNABLE *self)
     float       *fallback_pup = NULL;
     const float *pup_ptr      = NULL;
 
+    /* Bind shared-memory pupil amplitude if available; otherwise synthesize default 4-spider pup */
     if (img_pup.ID != -1 && img_pup.md->datatype == _DATATYPE_FLOAT)
     {
         pup_ptr = img_pup.im->array.F;
@@ -232,6 +312,7 @@ static MILK_HOT errno_t pyrwfs_compute(const MILK_RUNNABLE *self)
     img_amp.ID     = -1;
     img_ncpa.ID    = -1;
 
+    /* Connect or pre-allocate 3D [OPD_um, Amp] input beam stream for race-free bench startup */
     if (param_in_beam[0] != '\0')
     {
         img_beam = stream_connect(param_in_beam);
@@ -312,6 +393,7 @@ static MILK_HOT errno_t pyrwfs_compute(const MILK_RUNNABLE *self)
         return RETURN_FAILURE;
     }
 
+    /* Pre-allocate pupil registration scratch buffer only when non-identity shift/rot/mag is set */
     cacaosim_reg_t reg = {
         .shift_x = param_shift_x,
         .shift_y = param_shift_y,
@@ -330,6 +412,7 @@ static MILK_HOT errno_t pyrwfs_compute(const MILK_RUNNABLE *self)
     MILK_PROCINFO_INIT(self)
     MILK_PROCINFO_LOOPSTART(self)
     {
+        /* Optional drift-free monotonic pacing when running without an external stream trigger */
         if (param_frame_rate > 0.1f)
         {
             uint64_t period_ns = (uint64_t) (1.0e9f / param_frame_rate);
@@ -337,6 +420,7 @@ static MILK_HOT errno_t pyrwfs_compute(const MILK_RUNNABLE *self)
             cacaosim_sleep_until(&deadline);
         }
 
+        /* Lazy stream discovery for late-starting DM or atmospheric turbulence producers */
         if (img_dm.ID == -1 && param_in_dm[0] != '\0')
         {
             img_dm = stream_connect(param_in_dm);
@@ -364,6 +448,7 @@ static MILK_HOT errno_t pyrwfs_compute(const MILK_RUNNABLE *self)
             }
             cacaosim_pyrwfs_accum_beam(&wfs_ctx, b_opd, b_amp, ncpa_ptr, NULL, NULL, param_mod_rad);
 
+            /* Integrate 32-bin beam photon spectrum across WFS filter bandpass and navg exposure */
             cacaosim_spec_t b_spec;
             if (param_use_beam_flux && param_flux_ph >= 0.0f &&
                 cacaosim_beam_shm_read_spec(img_beam.im, &b_spec))
@@ -395,6 +480,7 @@ static MILK_HOT errno_t pyrwfs_compute(const MILK_RUNNABLE *self)
                                            NULL, param_turb_gain, param_mod_rad);
         }
 
+        /* Read out noisy detector pixels and post SHM semaphore once `navg` subframes integrate */
         uint32_t target_navg = (param_navg >= 1u) ? param_navg : 1u;
         if (wfs_ctx.subframe_cnt >= target_navg)
         {
@@ -456,6 +542,9 @@ static MILK_HOT errno_t pyrwfs_compute(const MILK_RUNNABLE *self)
     return RETURN_SUCCESS;
 }
 
+/**
+ * @brief Registered MILK FPS runnable definition and standalone CLI export for `cacaosim.pyrwfs`.
+ */
 const MILK_RUNNABLE runnable_cacaosim_pyrwfs = {
     .kind = MILK_RUNNABLE_FPS,
     .app  = { .fps_name    = "csim_pyrwfs",

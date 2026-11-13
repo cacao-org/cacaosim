@@ -4,7 +4,48 @@
 
 /**
  * @file    cacaosim_fpcam_FPS.c
- * @brief   MILK_RUNNABLE compute unit for focal plane PSF & science camera simulation
+ * @brief   MILK_RUNNABLE FPS compute unit for focal-plane PSF & science camera simulation
+ *
+ * Architectural Role in `cacaosim`:
+ *   Wraps the `cacaosim_fpcam` polychromatic Fraunhofer diffraction and detector readout engine
+ *   (`cacaosim_fpcam_engine.c` / `cacaosim_fpcam_cuda.cu`) as a `milk` Function Parameter
+ *   Structure (FPS) runnable (`cacaosim.fpcam`, standalone CLI `milk-fpsexec-cacaosim-fpcam`,
+ *   default instance `csim_fpcam`). Connects `ImageStreamIO` shared-memory (SHM) streams in two
+ *   interchangeable optical configurations:
+ *     1. Beam-relayed / post-coronagraphic mode (`.in_beam` non-empty): Consumes dynamic 3D
+ *        `[nwf x nwf x 2*N]` `[OPD_um, Amplitude]` SHM cubes (such as `out_beam` from
+ *        `cacaosim.coro` or `cacaosim.beamsplit`), auto-discovers upstream spectral channel grids
+ *        via `CSIM_NWL`/`CSIM_WL0`/`CSIM_WL1` keywords, optionally applies 2D affine pupil
+ *        misregistration (`.shift_x`, `.shift_y`, `.rot_deg`, `.mag_scale`), and computes physical
+ *        incident photon flux from the upstream 32-bin `CSIM_BM` photon-rate spectrum.
+ *     2. Classical-AO stream mode (`.in_beam` empty): Combines static entrance pupil (`.in_pup`,
+ *        or an auto-synthesized 4-spider aperture if absent), atmospheric wavefront (`.in_wf`),
+ *        scintillation amplitude (`.in_amp`), deformable mirror OPD (`.in_dm`), and static
+ *        science-path NCPA (`.in_ncpa`).
+ *   Integrates `.navg` optical subframes per camera readout, publishes `uint16` or `float32`
+ *   detector frames to `.out_cam` (with `md->write = 1` fencing and `processinfo` stream triggers)
+ *   plus an optional cumulative Strehl-normalized long-exposure PSF to `.out_long`, and exports
+ *   live `.strehl_inst` and `.strehl_ave` FPS telemetry.
+ *
+ * Design Rationale & Motivation:
+ *   1. Clear-Pupil Reference Anchoring Downstream of Coronagraphs:
+ *      - Even when `.in_beam` carries a heavily apodized post-Lyot coronagraphic field,
+ *        `cacaosim_fpcam_init()` is initialized with the unocculted telescope pupil `.in_pup`.
+ *        Consequently, raw contrast values in `.out_long`, `.strehl_inst`, and Parseval photon
+ *        scaling (`inf_flux_norm`) remain rigorously normalized to the unocculted stellar peak and
+ *        incident clear-pupil photon flux.
+ *   2. Zero-Duplication Polychromatic & Radiometric Handshake:
+ *      - Auto-reading `CSIM_NWL`/`CSIM_WL0`/`CSIM_WL1` at startup synchronizes camera MFT/FFT
+ *        channels with upstream `cacaosim.coro` `poly_out` cubes automatically, while
+ *        `cacaosim_spec_band_flux()` integrates upstream `CSIM_BM` spectral throughput over
+ *        `(lambda_um, bw_frac, dts * navg, qe)` on every frame so dichroic losses, stellar
+ *        magnitudes, and exposure changes propagate end-to-end without manual `flux_ph` math.
+ *   3. Live `FPFLAG_WRITERUN` Camera Control & Monotonic Pacing:
+ *      - Marking `.navg`, `.reset_long`, `.shutter`, `.flux_ph`, `.qe`, `.ron_e`, `.dark_e`,
+ *        `.gain_eadu`, `.bias_adu`, `.photon_noise`, `.turb_gain`, and `.frame_rate` writable at
+ *        runtime lets observers take darks, change integration times, or reset long exposures on
+ *        the fly without tearing down precomputed MFT matrices or CUDA plans, while optional
+ *        `CLOCK_MONOTONIC` `TIMER_ABSTIME` pacing prevents cumulative timing drift.
  */
 
 #include <stdint.h>
@@ -18,6 +59,19 @@
 #include "fpcam/cacaosim_fpcam_FPS.h"
 #include "pupil/cacaosim_pupil.h"
 
+/*
+ * Static FPS parameter backing store bound by `CACAOSIM_FPCAM_PARAMS(X)`:
+ *   - SHM I/O stream names (`param_out_cam`, `param_out_long`, `param_in_beam`, `param_in_dm`,
+ *     `param_in_wf`, `param_in_amp`, `param_in_pup`, `param_in_ncpa`)
+ *   - Optical grid, propagator, and spectral bandpass (`param_nwf`, `param_ncam`,
+ *     `param_prop_mode`, `param_pad_factor`, `param_pup_diam`, `param_lambda_um`, `param_bw_frac`,
+ *     `param_nlambda`, `param_pixscale_ld`)
+ *   - Beam radiometry & 2D pupil affine registration (`param_qe`, `param_dt_exp`,
+ *     `param_use_beam_flux`, `param_shift_x`, `param_shift_y`, `param_rot_deg`, `param_mag_scale`)
+ *   - Classical-AO wavefront scaling, multi-subframe integration, detector electronics, monotonic
+ *     pacing, backend selection, and live Strehl telemetry (`param_strehl_inst`,
+ *     `param_strehl_ave`)
+ */
 static char     param_out_cam[FUNCTION_PARAMETER_STRMAXLEN]  = "csim_fpcam";
 static char     param_out_long[FUNCTION_PARAMETER_STRMAXLEN] = "csim_fplong";
 static char     param_in_beam[FUNCTION_PARAMETER_STRMAXLEN]  = "";
@@ -62,6 +116,14 @@ static int32_t  param_backend                                = 0;
 static float    param_strehl_inst                            = 0.0f;
 static float    param_strehl_ave                             = 0.0f;
 
+/**
+ * CACAOSIM_FPCAM_PARAMS() - X-macro FPS parameter table for `cacaosim.fpcam`
+ * @X: Visitor macro `(key, ptr, type, req, flags, desc)` expanded by `MILK_PARAMS_DEFINE`
+ *
+ * Declares all shared-memory stream endpoints, MFT/FFT optical propagation geometry, polychromatic
+ * bandpass and beam-spectrum radiometry settings, 2D pupil misregistration controls, detector
+ * noise/ADU electronics, pacing, and live Strehl output telemetry for `csim_fpcam`.
+ */
 #define CACAOSIM_FPCAM_PARAMS(X)                                                        \
     X(".out_cam", param_out_cam, FPTYPE_STREAMNAME, 1, FPFLAG_DEFAULT_INPUT,            \
       "Output 2D focal plane camera stream")                                            \
@@ -167,6 +229,19 @@ static float    param_strehl_ave                             = 0.0f;
 
 MILK_PARAMS_DEFINE(cacaosim_fpcam, CACAOSIM_FPCAM_PARAMS);
 
+/**
+ * fpcam_confcheck() - FPS configuration validation callback enforcing `FPFLAG_WRITERUN` flags
+ *
+ * Role: Invoked by the `milk` FPS state machine during `confstart` / `confcheck` transitions to
+ * ensure all live-tunable camera, exposure, shutter, radiometry, and turbulence keys remain
+ * writable while `fpcam_compute()` is running.
+ *
+ * Rationale: Re-asserting `FPFLAG_WRITERUN` on `dcfpsptr` guarantees live parameter mutability
+ * (`milk-fps-set` / `cacaosim-CTRL`) even when an FPS shared-memory table was restored from an
+ * older on-disk snapshot lacking runtime write flags.
+ *
+ * Return: `RETURN_SUCCESS`.
+ */
 static MILK_COLD errno_t fpcam_confcheck(void)
 {
     if (dcfpsptr != NULL)
@@ -188,6 +263,26 @@ static MILK_COLD errno_t fpcam_confcheck(void)
     return RETURN_SUCCESS;
 }
 
+/**
+ * fpcam_compute() - Main real-time FPS optical propagation and detector readout loop
+ * @self: Pointer to the active `MILK_RUNNABLE` descriptor (`runnable_cacaosim_fpcam`)
+ *
+ * Role: Connects or synthesizes the clear reference pupil (`.in_pup`), connects optional upstream
+ * optical beam (`.in_beam`) or classical-AO streams (`.in_dm`, `.in_wf`, `.in_amp`, `.in_ncpa`),
+ * creates `.out_cam` and optional `.out_long` SHM streams, auto-discovers upstream polychromatic
+ * wavelengths (`CSIM_NWL`), initializes `cacaosim_fpcam_ctx_t`, and executes the zero-allocation
+ * real-time subframe integration and camera readout loop until processinfo stop.
+ *
+ * Rationale: Lazily reconnecting optional `.in_dm`/`.in_wf`/`.in_amp` streams inside the loop
+ * eliminates process startup races across independent tmux/FPS daemons. Pre-allocating `reg_buf`
+ * outside the loop only when `.shift_x`/`.shift_y`/`.rot_deg`/`.mag_scale` is non-identity avoids
+ * dead memory and unnecessary copies in aligned benches while supporting sub-pixel bilinear pupil
+ * misregistration per spectral slice when needed. Setting `md->write = 1` before readout and
+ * finalizing via `processinfo_update_output_stream()` ensures race-free SHM semaphore delivery to
+ * downstream dark-hole estimators and telemetry viewers.
+ *
+ * Return: `RETURN_SUCCESS` on clean loop exit, `RETURN_FAILURE` on invalid geometry or SHM error.
+ */
 static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
 {
     if (param_out_cam[0] == '\0' || param_nwf < 8 || param_ncam < 4)
@@ -202,6 +297,7 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
         img_pup = stream_connect(param_in_pup);
     }
 
+    /* Reference clear entrance pupil anchors Strehl = 1.0 and Parseval `inf_flux_norm` */
     uint32_t     nwf          = (img_pup.ID != -1) ? img_pup.md->size[0] : param_nwf;
     uint64_t     npix         = (uint64_t) nwf * nwf;
     float       *fallback_pup = NULL;
@@ -213,6 +309,7 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
     }
     else
     {
+        /* Synthesize a default 30%-obscured 4-spider telescope pupil when `.in_pup` is absent */
         fallback_pup = (float *) cacaosim_aligned_calloc((size_t) npix, sizeof(float));
         if (fallback_pup == NULL)
         {
@@ -319,6 +416,10 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
         },
     };
 
+    /*
+     * Auto-discover polychromatic channel count and endpoints (`CSIM_NWL`, `CSIM_WL0`, `CSIM_WL1`)
+     * from upstream `cacaosim.coro` when `in_beam` is multi-slice and `.nlambda` was left at 1.
+     */
     if (img_beam.ID != -1 && cfg.nlambda <= 1)
     {
         uint32_t b_nwl = 1u;
@@ -358,6 +459,7 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
         return RETURN_FAILURE;
     }
 
+    /* Pre-allocate 2D affine pupil relay scratch buffer only when non-identity registration set */
     cacaosim_reg_t reg = {
         .shift_x = param_shift_x,
         .shift_y = param_shift_y,
@@ -390,6 +492,7 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
             param_reset_long = 0;
         }
 
+        /* Lazy stream reconnects tolerate asynchronous producer startup ordering */
         if (img_dm.ID == -1 && param_in_dm[0] != '\0')
         {
             img_dm = stream_connect(param_in_dm);
@@ -406,6 +509,10 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
         float eff_flux = param_flux_ph;
         if (img_beam.ID != -1 && cacaosim_beam_shm_is_valid(img_beam.im, nwf))
         {
+            /*
+             * Beam-relayed / post-coronagraphic path: SHM packs `b_nwl` interleaved `[OPD, Amp]`
+             * pairs with channel stride `b_stride = 2 * npix`.
+             */
             uint32_t b_nwl = (img_beam.md->size[2] >= 4u) ? (img_beam.md->size[2] / 2u) : 1u;
             if (b_nwl > CACAOSIM_FPCAM_MAX_LAMBDA)
             {
@@ -429,6 +536,7 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
             cacaosim_fpcam_accum_beam_poly(&fp_ctx, b_opd, b_amp, b_nwl, b_stride, ncpa_ptr, NULL,
                                            NULL);
 
+            /* Integrate upstream 32-bin photon spectrum over camera filter, `navg * dts`, and QE */
             cacaosim_spec_t b_spec;
             if (param_use_beam_flux && param_flux_ph >= 0.0f &&
                 cacaosim_beam_shm_read_spec(img_beam.im, &b_spec))
@@ -444,6 +552,7 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
         }
         else
         {
+            /* Classical-AO stream path (`in_pup` + `in_wf` + `in_amp` - `in_dm` + `in_ncpa`) */
             const float *dm_ptr  = (img_dm.ID != -1 && img_dm.md->datatype == _DATATYPE_FLOAT &&
                                     img_dm.md->size[0] == nwf)
                                        ? img_dm.im->array.F
@@ -461,6 +570,7 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
                                           NULL, param_turb_gain);
         }
 
+        /* Read out detector and publish SHM streams once `navg` subframes have been integrated */
         uint32_t target_navg = (param_navg >= 1u) ? param_navg : 1u;
         if (fp_ctx.subframe_cnt >= target_navg)
         {
@@ -538,6 +648,13 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
     return RETURN_SUCCESS;
 }
 
+/**
+ * runnable_cacaosim_fpcam - Exported `MILK_RUNNABLE` descriptor for `cacaosim.fpcam`
+ *
+ * Role: Registers the `fpcam` command key (`csim_fpcam` default FPS name) inside
+ * `libmilkcacaosim.so` and generates the standalone `milk-fpsexec-cacaosim-fpcam` binary via
+ * `EXPORT_FPSEXEC`.
+ */
 const MILK_RUNNABLE runnable_cacaosim_fpcam = {
     .kind = MILK_RUNNABLE_FPS,
     .app  = { .fps_name    = "csim_fpcam",

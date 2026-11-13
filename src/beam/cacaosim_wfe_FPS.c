@@ -5,6 +5,31 @@
 /**
  * @file    cacaosim_wfe_FPS.c
  * @brief   MILK_RUNNABLE inline static wavefront error optical element specified in OPD [meter]
+ *
+ * Architectural Role:
+ *   Implements `cacaosim.wfe` (`milk-fpsexec-cacaosim-wfe`, bench element
+ *   `[wfe.<id>]`), an inline optical aberration and pupil-registration relay.
+ *   Reads a persistent 2D `FLOAT32` wavefront error map `.in_wfe` stored in SI
+ *   meters `[m]` (auto-creating and populating it via `cacaosim_make_wfe_m()` if
+ *   absent), adds `1e6 * wfe_gain * in_wfe` `[um]` across all `[OPD_c, Amp_c]`
+ *   wavelength channels of `.in_beam`, scales the 32-bin photon spectrum by
+ *   `.tput`, and writes `.out_beam`.
+ *
+ * Design Rationale & Motivation:
+ *   - SI `[meter]` SHM convention with `[nm]` user ergonomics: Storing `.in_wfe`
+ *     in meters (`BUNIT = "m"`, `WFE_RMSM`) makes the SHM map directly compatible
+ *     with CACAO NCPA/calibration tools that inject or sense meter-scale OPD
+ *     offsets, while exposing `.rms_nm` in nanometers (`50 nm -> 5e-8 m`) keeps
+ *     interactive configuration intuitive and converting via `1.0e6f * wfe_gain`
+ *     fuses unit scaling and live gain modulation into one scalar multiplier.
+ *   - One-shot `.init_only` setup mode: When `.init_only` is enabled, `wfe`
+ *     creates, populates, and tags `.in_wfe` in SHM and exits immediately without
+ *     entering a real-time loop, allowing `cacaosim-bench` and `cacaosim.htsim`
+ *     to initialize persistent WFE maps cleanly at bench startup.
+ *   - Polychromatic cube transparency: Iterating over `nlam = size[2] / 2` slice
+ *     pairs and forwarding `CSIM_NWL`/`CSIM_WL0`/`CSIM_WL1` keywords allows
+ *     `cacaosim.wfe` to be spliced either upstream or downstream of polychromatic
+ *     coronagraph relays (`cacaosim.coro`).
  */
 
 #include <stdint.h>
@@ -17,6 +42,11 @@
 #include "common/cacaosim_beam.h"
 #include "pupil/cacaosim_pupil.h"
 
+/*
+ * Module-static FPS parameter backing storage for cacaosim.wfe.
+ * Defaults synthesize a 50 nm RMS (5.0e-8 m) Zernike + k^-1.6 polishing-ripple static WFE map
+ * with 98% optical surface throughput and identity 2D pupil registration.
+ */
 static char     param_in_beam[FUNCTION_PARAMETER_STRMAXLEN]  = "csim_beam0";
 static char     param_out_beam[FUNCTION_PARAMETER_STRMAXLEN] = "csim_beam_wfe";
 static char     param_in_wfe[FUNCTION_PARAMETER_STRMAXLEN]   = "csim_wfe";
@@ -34,6 +64,28 @@ static float    param_rot_deg                                = 0.0f;
 static float    param_mag_scale                              = 1.0f;
 static int64_t  param_init_only                              = 0;
 
+/**
+ * CACAOSIM_WFE_PARAMS(X) - X-macro FPS parameter table for `cacaosim.wfe`
+ *
+ * Parameters:
+ *   - `.in_beam`   (STREAMNAME, trigger): Upstream `[nwf x nwf x 2*N]` `FLOAT32` optical beam.
+ *   - `.out_beam`  (STREAMNAME, required): Downstream `[nwf x nwf x 2*N]` `FLOAT32` optical beam.
+ *   - `.in_wfe`    (STREAMNAME, required): 2D `[nwf x nwf]` `FLOAT32` static WFE OPD map in SI
+ *                  `[meter]`; auto-created and synthesized if absent or dimension-mismatched.
+ *   - `.in_pup`    (STRING): Optional 2D pupil mask stream weighting initial `.in_wfe` RMS.
+ *   - `.nwf`       (UINT32): Fallback grid size [pixels] when creating `.in_wfe` or `.in_beam`.
+ *   - `.pup_diam`  (FLOAT32): Clear pupil diameter fraction of `nwf` for initial WFE synthesis.
+ *   - `.rms_nm`    (FLOAT32): Target initial pupil-weighted WFE RMS [nm] (`1 nm = 1e-9 m`).
+ *   - `.psd_alpha` (FLOAT32): Mid-spatial-frequency amplitude slope `k^-alpha` (default `1.6`).
+ *   - `.wfe_seed`  (UINT64): Deterministic PRNG seed for initial `.in_wfe` synthesis.
+ *   - `.wfe_gain`  (FLOAT32, WRITERUN): Live dimensionless gain multiplying `.in_wfe` (`0` = off,
+ *                  `-1` = conjugate sign flip).
+ *   - `.tput`      (FLOAT32, WRITERUN): Optical power transmission/reflectivity `[0..1]`.
+ *   - `.shift_x`, `.shift_y` (FLOAT32, WRITERUN): Lateral beam shift before WFE addition [pixels].
+ *   - `.rot_deg`   (FLOAT32, WRITERUN): Counter-clockwise beam rotation [degrees].
+ *   - `.mag_scale` (FLOAT32, WRITERUN): Isotropic beam magnification (`1.0` = unity).
+ *   - `.init_only` (ONOFF): If ON, create & populate `.in_wfe` `[meter]` in SHM and exit cleanly.
+ */
 #define CACAOSIM_WFE_PARAMS(X)                                                          \
     X(".in_beam", param_in_beam, FPTYPE_STREAMNAME, 1,                                  \
       FPFLAG_DEFAULT_INPUT | FPFLAG_TRIGGER_STREAM,                                     \
@@ -77,6 +129,20 @@ static int64_t  param_init_only                              = 0;
 
 MILK_PARAMS_DEFINE(cacaosim_wfe, CACAOSIM_WFE_PARAMS);
 
+/**
+ * wfe_write_unit_kw() - Tag a 2D WFE SHM image with SI meter `BUNIT` and `WFE_RMSM` keywords
+ * @im:    Target `ImageStreamIO` 2D image pointer (gracefully ignored if NULL or `NBkw < 1`)
+ * @rms_m: Initial synthesized pupil-weighted RMS OPD in SI meters `[m]`
+ *
+ * Role:
+ *   Cold-path SHM metadata helper called by `wfe_populate_stream()` immediately
+ *   after synthesizing `.in_wfe`.
+ *
+ * Rationale:
+ *   Recording `BUNIT = "m"` and `WFE_RMSM` directly in SHM FITS-style keywords
+ *   makes the physical unit self-describing for `cacaosim-CTRL`, FITS archivers,
+ *   and external CACAO calibration scripts inspecting the stream.
+ */
 static void wfe_write_unit_kw(IMAGE *im, float rms_m)
 {
     if (im == NULL || im->md == NULL || im->kw == NULL || im->md->NBkw < 1)
@@ -97,6 +163,22 @@ static void wfe_write_unit_kw(IMAGE *im, float rms_m)
     }
 }
 
+/**
+ * wfe_populate_stream() - Synthesize and publish initial static WFE `[meter]` map into SHM
+ * @img_wfe: Connected 2D `[nwf x nwf]` `FLOAT32` SHM stream descriptor to populate
+ * @nwf:     Square grid dimension [pixels]
+ *
+ * Role:
+ *   Cold-path initializer invoked either in `.init_only` one-shot mode or when
+ *   `wfe_compute()` creates a missing/mismatched `.in_wfe` stream at startup.
+ *
+ * Rationale:
+ *   Optionally attaches to `.in_pup` so initial RMS normalization accounts for
+ *   the exact telescope central obstruction and spider vanes when available,
+ *   converts `.rms_nm` (`[nm]`) to SI `[m]` (`* 1.0e-9f`), synthesizes the map
+ *   via `cacaosim_make_wfe_m()`, writes `BUNIT` keywords, and posts SHM update
+ *   notifications via `ImageStreamIO_UpdateIm()`.
+ */
 static void wfe_populate_stream(IMGID *img_wfe, uint32_t nwf)
 {
     const float *pup_ptr = NULL;
@@ -126,6 +208,20 @@ static void wfe_populate_stream(IMGID *img_wfe, uint32_t nwf)
     }
 }
 
+/**
+ * wfe_confcheck() - Enforce `FPFLAG_WRITERUN` on live WFE gain, throughput, & registration keys
+ *
+ * Role:
+ *   FPS `confcheck` callback ensuring `.wfe_gain`, `.tput`, `.shift_x`,
+ *   `.shift_y`, `.rot_deg`, and `.mag_scale` remain modifiable during `RUN`.
+ *
+ * Rationale:
+ *   Permits live injection/removal of static aberrations (`wfe_gain`) and dynamic
+ *   pupil shear/rotation/magnification drift studies during closed-loop AO tests
+ *   without stopping or re-initializing the optical bench.
+ *
+ * Return: Always `RETURN_SUCCESS`.
+ */
 static MILK_COLD errno_t wfe_confcheck(void)
 {
     if (dcfpsptr != NULL)
@@ -145,6 +241,28 @@ static MILK_COLD errno_t wfe_confcheck(void)
     return RETURN_SUCCESS;
 }
 
+/**
+ * wfe_compute() - One-shot `.in_wfe` initializer or real-time inline WFE optical relay loop
+ * @self: Pointer to `runnable_cacaosim_wfe` descriptor
+ *
+ * Role:
+ *   When `.init_only` is ON, allocates and populates `.in_wfe` `[meter]` in SHM
+ *   and returns immediately. Otherwise, connects `.in_beam`, `.in_wfe` (preserving
+ *   any user/CACAO-supplied `[meter]` map already matching `[nwf x nwf]`), and
+ *   `.out_beam` (`[nwf x nwf x 2*N]`), applying 2D affine registration, meter-to-um
+ *   scaled WFE addition, and spectral throughput scaling on every trigger frame.
+ *
+ * Rationale:
+ *   - Preserves pre-existing `.in_wfe` SHM streams of matching `FLOAT32` `[nwf x nwf]`
+ *     shape so external FITS loaders or CACAO phase-diversity loops can overwrite
+ *     `.in_wfe` arbitrarily before or during execution.
+ *   - Loops across all `nlam` `[OPD_c, Amp_c]` channel pairs and forwards
+ *     `CSIM_NWL`/`CSIM_WL0`/`CSIM_WL1` keywords so polychromatic coronagraphic
+ *     beams pass through `cacaosim.wfe` without losing spectral channel metadata.
+ *
+ * Return: `RETURN_SUCCESS` on completion, or `RETURN_FAILURE` on invalid stream
+ *         names or SHM allocation failure.
+ */
 static MILK_HOT errno_t wfe_compute(const MILK_RUNNABLE *self)
 {
     if (param_in_wfe[0] == '\0')
@@ -152,6 +270,7 @@ static MILK_HOT errno_t wfe_compute(const MILK_RUNNABLE *self)
         return RETURN_FAILURE;
     }
 
+    /* One-shot setup mode: materialize the persistent .in_wfe [meter] SHM stream and exit */
     if (param_init_only)
     {
         uint32_t nwf = (param_nwf >= 8u) ? param_nwf : 128u;
@@ -165,6 +284,7 @@ static MILK_HOT errno_t wfe_compute(const MILK_RUNNABLE *self)
         return RETURN_SUCCESS;
     }
 
+    /* Connect upstream beam (or create a 2-slice fallback cube to avoid startup ordering races) */
     IMGID img_in = stream_connect(param_in_beam);
     if (img_in.ID == -1)
     {
@@ -185,6 +305,7 @@ static MILK_HOT errno_t wfe_compute(const MILK_RUNNABLE *self)
                          ? img_in.md->size[2]
                          : 2u;
 
+    /* Reuse existing [nwf x nwf] FLOAT32 .in_wfe [meter] stream if valid, else synthesize it */
     IMGID img_wfe = stream_connect(param_in_wfe);
     if (img_wfe.ID == -1 || img_wfe.md->datatype != _DATATYPE_FLOAT ||
         img_wfe.md->size[0] != nwf || img_wfe.md->size[1] != nwf)
@@ -202,6 +323,7 @@ static MILK_HOT errno_t wfe_compute(const MILK_RUNNABLE *self)
         wfe_populate_stream(&img_wfe, nwf);
     }
 
+    /* Match output beam Z depth (2 * nlam) to support both mono and polychromatic beams */
     IMGID img_out = stream_connect_create_3Df32(param_out_beam, nwf, nwf, in_nz);
     if (img_out.ID == -1)
     {
@@ -217,6 +339,7 @@ static MILK_HOT errno_t wfe_compute(const MILK_RUNNABLE *self)
     MILK_PROCINFO_INIT(self)
     MILK_PROCINFO_LOOPSTART(self)
     {
+        /* Determine active coherent wavelength channel count clamped to output slice capacity */
         uint32_t nlam = (img_in.md->naxis == 3 && img_in.md->size[2] >= 2u &&
                          (img_in.md->size[2] % 2u) == 0u)
                             ? (img_in.md->size[2] / 2u)
@@ -230,6 +353,7 @@ static MILK_HOT errno_t wfe_compute(const MILK_RUNNABLE *self)
             }
         }
 
+        /* Attenuate 32-bin photon arrival rate spectrum by optical element throughput */
         cacaosim_spec_t in_spec;
         if (!cacaosim_beam_shm_read_spec(img_in.im, &in_spec))
         {
@@ -238,6 +362,7 @@ static MILK_HOT errno_t wfe_compute(const MILK_RUNNABLE *self)
         cacaosim_spec_t out_spec;
         cacaosim_spec_scale(&in_spec, param_tput, &out_spec);
 
+        /* Convert SI [meter] WFE map to beam [um] with live gain: 1 m = 1e6 um */
         cacaosim_reg_t reg = {
             .shift_x = param_shift_x,
             .shift_y = param_shift_y,
@@ -246,6 +371,7 @@ static MILK_HOT errno_t wfe_compute(const MILK_RUNNABLE *self)
         };
         const float wfe_to_um = 1.0e6f * param_wfe_gain;
 
+        /* Apply registration and achromatic OPD error across every [OPD_c, Amp_c] channel */
         img_out.md->write = 1;
         for (uint32_t c = 0; c < nlam; c++)
         {
@@ -261,6 +387,7 @@ static MILK_HOT errno_t wfe_compute(const MILK_RUNNABLE *self)
                                         out_o, out_a);
         }
 
+        /* Propagate 32-bin spectrum and optional multi-wavelength channel metadata to out_beam */
         cacaosim_beam_shm_write_spec(img_out.im, &out_spec);
         uint32_t nwl_kw = 1u;
         float    wl0_kw = 0.0f;
@@ -279,6 +406,7 @@ static MILK_HOT errno_t wfe_compute(const MILK_RUNNABLE *self)
     return RETURN_SUCCESS;
 }
 
+/* Public MILK_RUNNABLE registration and standalone milk-fpsexec-cacaosim-wfe export */
 const MILK_RUNNABLE runnable_cacaosim_wfe = {
     .kind = MILK_RUNNABLE_FPS,
     .app  = { .fps_name    = "csim_wfe",

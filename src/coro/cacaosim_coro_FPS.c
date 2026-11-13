@@ -5,6 +5,32 @@
 /**
  * @file    cacaosim_coro_FPS.c
  * @brief   MILK_RUNNABLE compute unit for coronagraphic pupil/focal masks, Lyot, & LOWFS pickoff
+ *
+ * Architectural Role in cacaosim:
+ *   Implements the `milk` Function Parameter Structure (FPS) compute unit `cacaosim.coro`
+ *   (`milk-fpsexec-cacaosim-coro`). Connects to an upstream 3D `[nwf x nwf x (2 * N)]`
+ *   `ImageStreamIO` optical beam stream (`in_beam`), loads optional 2D or 3D `[Nx, Ny, Nlambda]`
+ *   pupil/focal/Lyot amplitude and phase/OPD masks from `.fits` files or shared-memory streams,
+ *   executes polychromatic Babinet Matrix-DFT or padded 2D FFT propagation on CPU or CUDA, and
+ *   publishes:
+ *     1. `out_beam`: 3D `[nwf x nwf x (2 * Nlambda)]` post-Lyot `[OPD_um, Amplitude]` cube tagged
+ *        with `CSIM_BM`, 32-bin stellar photon-rate spectrum `S00..S31`, and polychromatic channel
+ *        bounds (`CSIM_NWL`, `CSIM_WL0`, `CSIM_WL1`) for downstream `cacaosim.fpcam` / `zwfs`,
+ *     2. `out_lowfs` (optional): 3D `[nwf x nwf x 2]` central-channel LOWFS pupil beam extracted
+ *        via either `fpm_refl` (reflective FPM + `lowfs_pup_diam` stop) or `lyot_refl` (reflective
+ *        Lyot stop).
+ *
+ * Design Rationale:
+ *   - Zero-Allocation Real-Time Loop: All `.fits`/SHM mask cubes are loaded, validated, converted
+ *     into pre-normalized Fourier/complex arrays, and freed from temporary heap descriptors before
+ *     entering `MILK_PROCINFO_LOOPSTART`.
+ *   - Live Runtime Tunability: Non-structural optical parameters (`.lowfs_mode`, `.lowfs_refl`,
+ *     and `.tput`) carry `FPFLAG_WRITERUN` so operators can switch between FPM-reflective and
+ *     Lyot-reflective LOWFS sensing or adjust relay throughput while the AO loop is running.
+ *   - Photometric & Spectral Metadata Continuity: Propagates scaled 32-bin photon spectra (`S00`..
+ *     `S31`) and explicit multi-wavelength channel endpoints (`CSIM_NWL`/`WL0`/`WL1`) in O(1)
+ *     fixed-slot SHM keywords so downstream `fpcam` automatically matches wavelengths and photon
+ *     flux without manual duplicate configuration.
  */
 
 #include <stdint.h>
@@ -18,6 +44,17 @@
 #include "coro/cacaosim_coro.h"
 #include "coro/cacaosim_coro_FPS.h"
 
+/*
+ * File-scope FPS parameter backing variables bound by CACAOSIM_CORO_PARAMS(X):
+ *   - Stream & mask names: input/output 3D SHM beams and optional 2D/3D .fits or SHM masks.
+ *   - Grid & spectral setup: nwf, coro_mode, n_mft, pad_factor, pup_diam, lambda_um, bw_frac,
+ *     nlambda.
+ *   - Focal-plane mask parameters: fpm_rad_ld, fpm_amp, fpm_phase, fpm_pixscale, pha_unit,
+ *     vortex_l.
+ *   - LOWFS & relay photometry (live-writable): lowfs_mode, lowfs_pup_diam, lowfs_refl, tput.
+ *   - Analytic Lyot stop geometry & backend: lyot_outer, lyot_obs, lyot_nspider, lyot_spid_w,
+ *     lyot_spid_deg, backend.
+ */
 static char     param_in_beam[FUNCTION_PARAMETER_STRMAXLEN]    = "csim_beam0";
 static char     param_out_beam[FUNCTION_PARAMETER_STRMAXLEN]   = "csim_beam_coro";
 static char     param_out_lowfs[FUNCTION_PARAMETER_STRMAXLEN]  = "";
@@ -51,6 +88,15 @@ static int32_t  param_lyot_nspider                             = 4;
 static float    param_lyot_spid_w                              = 0.02f;
 static float    param_lyot_spid_deg                            = 45.0f;
 static int32_t  param_backend                                  = 0;
+
+/**
+ * CACAOSIM_CORO_PARAMS() - X-macro parameter table for the `cacaosim.coro` FPS unit
+ * @X: Visitor macro `(key, ptr, type, req, flags, desc)` expanded by `MILK_PARAMS_DEFINE`.
+ *
+ * Defines all shared-memory stream bindings, optional 2D/3D pupil/FPM/Lyot `.fits` or SHM mask
+ * paths, compact Babinet MFT vs padded 2D FFT numerical settings, polychromatic bandpass channels,
+ * live-writable LOWFS pickoff / throughput controls, and analytic Lyot stop geometry.
+ */
 
 #define CACAOSIM_CORO_PARAMS(X)                                                         \
     X(".in_beam", param_in_beam, FPTYPE_STREAMNAME, 1,                                  \
@@ -126,6 +172,19 @@ static int32_t  param_backend                                  = 0;
 
 MILK_PARAMS_DEFINE(cacaosim_coro, CACAOSIM_CORO_PARAMS);
 
+/**
+ * coro_free_masks() - Release all six temporary custom mask cubes in `cacaosim_coro_masks_t`
+ * @m: Mask container whose owned `.fits` / SHM staging arrays should be freed (non-NULL).
+ *
+ * Role:
+ *   Cold-path cleanup helper invoked immediately after `cacaosim_coro_init_masks()` (or on mask
+ *   load failure) to release raw mask buffers once complex propagator tables are built.
+ *
+ * Rationale:
+ *   `cacaosim_coro_init_masks()` bakes custom masks into `pup_mask_cplx`, `fpm_delta_cplx`,
+ *   `fft_mask_cplx`, and `lyot_cplx`, so retaining the raw float32 cubes during the real-time loop
+ *   would waste host RAM unnecessarily.
+ */
 static void coro_free_masks(cacaosim_coro_masks_t *m)
 {
     cacaosim_mask_free(&m->pup_amp);
@@ -136,6 +195,20 @@ static void coro_free_masks(cacaosim_coro_masks_t *m)
     cacaosim_mask_free(&m->lyot_pha);
 }
 
+/**
+ * coro_load_opt_mask() - Load an optional 2D or 3D optical mask from `.fits` or MILK SHM
+ * @spec: Optional file path or SHM stream name (NULL or empty string `""` is a valid no-op).
+ * @out:  Destination mask cube descriptor populated on success (non-NULL).
+ *
+ * Role:
+ *   Cold-path wrapper around `cacaosim_mask_load()` with diagnostic stderr logging.
+ *
+ * Rationale:
+ *   Allows any subset of the six pupil/focal/Lyot amplitude and phase inputs to be left blank in
+ *   FPS configurations while failing fast with a clear human-readable message on broken paths.
+ *
+ * Return: 0 when `@spec` is empty or loaded successfully, -1 on load error.
+ */
 static int coro_load_opt_mask(const char *spec, cacaosim_mask_cube_t *out)
 {
     if (spec == NULL || spec[0] == '\0')
@@ -151,6 +224,19 @@ static int coro_load_opt_mask(const char *spec, cacaosim_mask_cube_t *out)
     return 0;
 }
 
+/**
+ * coro_confcheck() - FPS configuration check callback enforcing live-tunable `FPFLAG_WRITERUN` bits
+ *
+ * Role:
+ *   Cold-path `confcheck` hook invoked by the `milk` FPS supervisor when parameters are updated.
+ *
+ * Rationale:
+ *   Explicitly re-asserts `FPFLAG_WRITERUN` on `.lowfs_mode`, `.lowfs_refl`, and `.tput` in
+ *   existing persisted FPS shared-memory tables created by older sessions so live runtime tuning
+ *   remains unlocked without requiring `fpsinit` table recreation.
+ *
+ * Return: `RETURN_SUCCESS`.
+ */
 static MILK_COLD errno_t coro_confcheck(void)
 {
     if (dcfpsptr != NULL)
@@ -168,8 +254,27 @@ static MILK_COLD errno_t coro_confcheck(void)
     return RETURN_SUCCESS;
 }
 
+/**
+ * coro_compute() - Real-time FPS compute loop for `cacaosim.coro`
+ * @self: Pointer to `runnable_cacaosim_coro` descriptor supplying `milk` processinfo bindings.
+ *
+ * Role:
+ *   Connects to (or creates fallback) `in_beam`, loads optional custom 2D/3D masks, initializes
+ *   the CPU/CUDA coronagraph context, creates `out_beam` (`[nwf x nwf x 2*eff_nlam]`) and optional
+ *   `out_lowfs` (`[nwf x nwf x 2]`) SHM streams, and runs the stream-triggered diffraction loop.
+ *
+ * Rationale:
+ *   - Interleaved SHM Striding: `ImageStreamIO` beam cubes store channel `c` as `[OPD_c, Amp_c]`
+ *     at slice indices `2*c` and `2*c + 1` (stride `2 * npix`), which `cacaosim_coro_step_poly()`
+ *     reads and writes directly without temporary repacking buffers.
+ *   - Fallback Photometry: Synthesizes a solar-type `V = 8` 8.2 m reference spectrum when upstream
+ *     `in_beam` lacks `CSIM_BM` keywords so downstream sensors still receive valid photon fluxes.
+ *
+ * Return: `RETURN_SUCCESS` on clean loop exit, `RETURN_FAILURE` on SHM or mask setup error.
+ */
 static MILK_HOT errno_t coro_compute(const MILK_RUNNABLE *self)
 {
+    /* Connect to upstream 3D beam stream or create a fallback [nwf x nwf x 2] stream */
     IMGID img_in = stream_connect(param_in_beam);
     if (img_in.ID == -1)
     {
@@ -235,6 +340,7 @@ static MILK_HOT errno_t coro_compute(const MILK_RUNNABLE *self)
         return RETURN_FAILURE;
     }
 
+    /* Publish 2 * eff_nlam slices: [OPD_0, Amp_0, OPD_1, Amp_1, ...] */
     uint32_t out_nz  = (uint32_t) (2 * coro_ctx.eff_nlam);
     IMGID    img_out = stream_connect_create_3Df32(param_out_beam, nwf, nwf, out_nz);
     if (img_out.ID == -1)
@@ -283,6 +389,7 @@ static MILK_HOT errno_t coro_compute(const MILK_RUNNABLE *self)
         cacaosim_spec_scale(&in_spec, param_tput, &out_spec);
         cacaosim_spec_scale(&in_spec, param_tput, &lo_spec);
 
+        /* Refresh live-tunable LOWFS pickoff parameters prior to propagation */
         coro_ctx.cfg.lowfs_mode = param_lowfs_mode;
         coro_ctx.cfg.lowfs_refl = param_lowfs_refl;
 
@@ -323,6 +430,12 @@ static MILK_HOT errno_t coro_compute(const MILK_RUNNABLE *self)
     return RETURN_SUCCESS;
 }
 
+/**
+ * runnable_cacaosim_coro - Public `MILK_RUNNABLE` record for `cacaosim.coro`
+ *
+ * Role: Registers `coro` (`csim_coro` default FPS name) inside `libmilkcacaosim.so` and exports
+ * the standalone `milk-fpsexec-cacaosim-coro` executable via `EXPORT_FPSEXEC`.
+ */
 const MILK_RUNNABLE runnable_cacaosim_coro = {
     .kind = MILK_RUNNABLE_FPS,
     .app  = { .fps_name    = "csim_coro",

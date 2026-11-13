@@ -4,7 +4,53 @@
 
 /**
  * @file    cacaosim_fpcam_engine.c
- * @brief   CPU (OpenBLAS MFT + FFTW3f) and host orchestration for focal plane PSF/camera simulator
+ * @brief   CPU (OpenBLAS MFT + FFTW3f) and host orchestration for focal-plane PSF camera
+ *
+ * Architectural Role in `cacaosim`:
+ *   Implements the CPU Fraunhofer diffraction backend and unified host/GPU lifecycle and
+ *   stepping entry points for the polychromatic focal-plane science camera (`cacaosim.fpcam`).
+ *   Supports cold precomputation (`cacaosim_fpcam_init`), teardown (`cacaosim_fpcam_free`),
+ *   multi-subframe polychromatic optical intensity integration (`cacaosim_fpcam_accum_subframe`,
+ *   `cacaosim_fpcam_accum_beam_poly`, `cacaosim_fpcam_accum_beam`), detector readout with
+ *   instantaneous and long-exposure Strehl telemetry (`cacaosim_fpcam_readout`), and single-call
+ *   stepping (`cacaosim_fpcam_step`). Dispatches transparently to `cacaosim_fpcam_cuda.cu` when
+ *   CUDA acceleration is active (`ctx->use_cuda == 1`).
+ *
+ * Design Rationale & Optical Physics Motivation:
+ *   1. Separable Soummer Matrix-DFT (`PROP_MFT`) vs Zero-Padded 2D FFT (`PROP_FFT`):
+ *      - High-contrast PSF and dark-hole imaging typically require a fine, non-integer detector
+ *        plate scale (`pixscale_ld`, e.g., `2.5..5.0` pixels per `lambda0 / D`) over a moderate
+ *        field (`ncam = 64..256`). Soummer et al. (2007) express the 2D Fraunhofer integral as a
+ *        separable complex matrix product `Efoc = U_c * Epup * V_c`, evaluated via two level-3
+ *        BLAS `cblas_cgemm` calls per spectral slice (`O(ncam * nwf^2 + ncam^2 * nwf)`) with zero
+ *        FFT padding overhead or interpolation ringing.
+ *      - Wide-field halo cameras (`ncam >= 512`) instead select `PROP_FFT`, embedding `Epup` in a
+ *        `nfft = nwf * pad_factor` grid (`FFTW3f` 2D C2C forward DFT) for `O(N^2 log N)` scaling.
+ *   2. Chromatic Fixed-Detector Plate Scale (`PROP_MFT`) vs Fixed-Grid FFT (`PROP_FFT`):
+ *      - On a physical detector with fixed pixel pitch `p_det`, diffraction units expand linearly
+ *        with wavelength, giving `sc = pixscale_ld * (lam_c / lam0)` pixels per `lambda_c / D`.
+ *        Precomputing `U_c` and `V_c` with `sc` per channel reproduces exact radial chromatic
+ *        speckle elongation across broad science filters without image-plane warping.
+ *      - In `PROP_FFT`, `nfft / dpix` pixels per `lambda_c / D` is constant across channels; DC
+ *        at `(0, 0)` is wrapped modularly onto `(ncam / 2, ncam / 2)` without a pupil phase ramp
+ *        because only phase-invariant intensity `|Efoc|^2` is accumulated.
+ *   3. Dynamic Per-Frame Pupil Amplitude & OPD:
+ *      - Downstream of `cacaosim.coro`, post-Lyot pupil amplitude and phase evolve every AO step
+ *        and vary chromatically across `[0 .. beam_nlam - 1]`. Rebuilding `Epup_c` from dynamic
+ *        `[OPD_um, Amplitude]` slices on every subframe faithfully propagates residual stellar
+ *        leakage, Lyot diffraction, and speckle pinning.
+ *   4. Dual Clear-Pupil Strehl + Infinite-Plane Parseval Photometric Calibration:
+ *      - Normalizing `U_c` and `V_c` each by `1 / sqrt(pup_sum_amp)` (and FFT intensities by
+ *        `1 / pup_sum_amp^2`) places accumulated optical images directly in **Strehl ratio units**
+ *        (`[0..1]`, where `1.0` equals the unaberrated clear-pupil on-axis peak).
+ *      - Precomputing `inf_flux_norm` via discrete Parseval's theorem maps `flux_ph` (total
+ *        clear-pupil incident photons) to photoelectrons per unit Strehl without summing the
+ *        cropped `ncam x ncam` window, preserving absolute stellar/coronagraphic throughput even
+ *        when outer Airy rings fall outside the sensor or a coronagraph blocks `99.99%` of light.
+ *   5. OpenBLAS vs OpenMP Thread Coordination:
+ *      - Weak-symbol `openblas_set_num_threads(1)` keeps OpenBLAS single-threaded so its internal
+ *        pthread pool never contends with OpenMP (`fpcam_build_epup_cpu` enables OpenMP only when
+ *        `npix_wf >= 16384`, i.e., `nwf >= 128`) or sibling real-time `cacao` control threads.
  */
 
 #define _GNU_SOURCE
@@ -20,25 +66,53 @@
 #include "common/cacaosim_cuda.h"
 #include "fpcam/cacaosim_fpcam.h"
 
+/*
+ * Optional weak symbol resolved at link/load time when linked against OpenBLAS; NULL when linked
+ * against reference Netlib CBLAS, Intel MKL, or Apple Accelerate.
+ */
 extern void openblas_set_num_threads(int num_threads) __attribute__((weak));
 
+/**
+ * fpcam_precompute_mft() - Precompute polychromatic 1D Soummer Matrix-DFT basis matrices U and V
+ * @ctx: Focal-plane camera context with `cfg`, `eff_nlam`, `lam_um`, `pup_sum_amp`, and allocated
+ *       `mft_U_cplx` / `mft_V_cplx` buffers
+ *
+ * Role: Cold initialization helper invoked once by `cacaosim_fpcam_init()` when `prop_mode` is
+ * `CACAOSIM_FPCAM_PROP_MFT` to populate all `[eff_nlam]` spectral slices of `mft_U_cplx`
+ * (`[ncam x nwf]` row/Y transform) and `mft_V_cplx` (`[nwf x ncam]` column/X transform).
+ *
+ * Rationale: Factoring the 2D Fraunhofer integral over normalized pupil coordinates
+ * `(xt, yt) in [-D/2, +D/2]` (in telescope diameters `dpix = pup_diam * nwf`) and focal
+ * coordinates `(xi, eta)` (in `lambda_c / D` units centered on camera pixel `f0 = ncam / 2`)
+ * yields two small 1D Fourier kernels per channel. Scaling the angular sampling per channel as
+ * `sc = ps0 * (lam_um[c] / lam0)` pixels per `lambda_c / D` models a physical fixed-pitch
+ * detector array where longer wavelengths produce proportionally wider diffraction rings and
+ * radially elongated speckles. Multiplying both `U` and `V` by `nrm = 1 / sqrt(pup_sum_amp)`
+ * divides the 2D product `Efoc = U * Epup * V` by `pup_sum_amp`, guaranteeing that an unaberrated
+ * clear pupil (`Epup = pup_amp`) produces an on-axis intensity peak `|Efoc(f0, f0)|^2 == 1.0`
+ * directly in Strehl ratio units.
+ */
 static void fpcam_precompute_mft(cacaosim_fpcam_ctx_t *ctx)
 {
     const uint32_t nwf  = ctx->cfg.nwf;
     const uint32_t ncam = ctx->cfg.ncam;
     const float    lam0 = (ctx->cfg.lambda_um > 0.05f) ? ctx->cfg.lambda_um : 1.65f;
     const float    dpix = ctx->cfg.pup_diam * (float) nwf;
+    /* Symmetric pixel-centered pupil origin `(nwf - 1)/2`; integer camera DC pixel `ncam / 2` */
     const float    p0   = 0.5f * (float) (nwf - 1u);
     const float    f0   = (float) (ncam / 2u);
+    /* Split `1 / pup_sum_amp` equally across U and V so `|U * pup_amp * V|^2` peaks at 1.0 */
     const float    nrm  = 1.0f / sqrtf(ctx->pup_sum_amp);
     const float    ps0  = (ctx->cfg.pixscale_ld > 0.05f) ? ctx->cfg.pixscale_ld : 2.5f;
 
     for (int32_t c = 0; c < ctx->eff_nlam; c++)
     {
+        /* Fixed physical pixel pitch -> `sc` pixels per (lambda_c / D) grows linearly with lam_c */
         const float sc = ps0 * (ctx->lam_um[c] / lam0);
         float      *U  = &ctx->mft_U_cplx[(size_t) c * ncam * nwf * 2u];
         float      *V  = &ctx->mft_V_cplx[(size_t) c * nwf * ncam * 2u];
 
+        /* Row-transform U_c[yf, yp] = nrm * exp(-i * 2*pi * yt * eta) */
         for (uint32_t yf = 0; yf < ncam; yf++)
         {
             const float eta = ((float) yf - f0) / sc;
@@ -55,6 +129,7 @@ static void fpcam_precompute_mft(cacaosim_fpcam_ctx_t *ctx)
             }
         }
 
+        /* Column-transform V_c[xp, xf] = nrm * exp(-i * 2*pi * xt * xi) */
         for (uint32_t xp = 0; xp < nwf; xp++)
         {
             const float xt = ((float) xp - p0) / dpix;
@@ -73,6 +148,26 @@ static void fpcam_precompute_mft(cacaosim_fpcam_ctx_t *ctx)
     }
 }
 
+/**
+ * fpcam_build_epup_cpu() - Synthesize 2D complex pupil phasor field for a single spectral slice
+ * @pup_amp:    Pupil or dynamic beam amplitude `[npix_wf]`, or NULL for unit amplitude (`1.0`)
+ * @atm_amp:    Optional atmospheric scintillation amplitude multiplier `[npix_wf]`, or NULL
+ * @wf_in:      Optional input wavefront error or beam OPD `[npix_wf]`, or NULL
+ * @dm_opd:     Optional deformable-mirror OPD correction `[npix_wf]` [um] (subtracted), or NULL
+ * @ncpa_opd:   Optional static science-arm NCPA OPD `[npix_wf]` [um] (added), or NULL
+ * @wf_to_opd:  Conversion scale factor mapping `wf_in` units to OPD [um]
+ * @opd_to_rad: Monochromatic wavenumber `2 * pi / lam_um[c]` [rad/um]
+ * @npix_wf:    Total number of pupil grid pixels (`nwf * nwf`)
+ * @epup_cplx:  Output interleaved `[Re, Im]` complex pupil field `[2 * npix_wf]`
+ *
+ * Role: Hot-loop CPU helper called once per spectral channel per subframe to assemble
+ * `Epup(p) = amp(p) * exp(i * (2*pi / lam_c) * (wf_to_opd * wf_in - dm_opd + ncpa_opd))`.
+ *
+ * Rationale: Combining static/dynamic pupil amplitude, scintillation, atmospheric turbulence,
+ * DM correction, and science-arm NCPA in a single streaming pass maximizes L1/L2 cache reuse and
+ * skips `sincosf` outside the illuminated pupil (`amp <= 0`). OpenMP threading is gated on
+ * `npix_wf >= 16384` (`nwf >= 128`) so small grids avoid fork/join barrier overhead.
+ */
 static void MILK_HOT fpcam_build_epup_cpu(
     const float *__restrict pup_amp,
     const float *__restrict atm_amp,
@@ -94,6 +189,7 @@ static void MILK_HOT fpcam_build_epup_cpu(
         {
             amp *= atm_amp[p];
         }
+        /* Short-circuit masked pixels outside pupil/Lyot support to skip transcendental math */
         if (amp <= 0.0f)
         {
             epup_cplx[2u * p]      = 0.0f;
@@ -122,6 +218,30 @@ static void MILK_HOT fpcam_build_epup_cpu(
     }
 }
 
+/**
+ * fpcam_accum_poly_cpu() - Propagate and incoherently sum polychromatic PSF channels on CPU
+ * @ctx:         Initialized focal-plane camera context
+ * @pup_amp:     Host pupil/beam amplitude slices (`[beam_nlam]` at `chan_stride`), or NULL
+ * @atm_amp:     Optional achromatic atmospheric amplitude `[npix_wf]`, or NULL
+ * @wf_in:       Optional wavefront/beam OPD slices (`[beam_nlam]` at `chan_stride`), or NULL
+ * @beam_nlam:   Number of spectral slices in `pup_amp` / `wf_in` (`1` = achromatic)
+ * @chan_stride: Float element stride between adjacent input spectral slices
+ * @dm_opd:      Optional DM OPD `[npix_wf]` [um], or NULL
+ * @ncpa_opd:    Optional static NCPA OPD `[npix_wf]` [um], or NULL
+ * @wf_to_opd:   Scale factor mapping `wf_in` units to OPD [um]
+ *
+ * Role: Core hot-path CPU propagator that evaluates Fraunhofer diffraction across all `eff_nlam`
+ * spectral channels for one optical subframe and accumulates `(1 / eff_nlam) * |Efoc_c|^2` into
+ * `ctx->cpu_accum_int` in Strehl-normalized units.
+ *
+ * Rationale: Supports both monochrome/achromatic wavefront inputs (`beam_nlam == 1`) and
+ * multi-wavelength post-coronagraphic `[OPD, Amp]` cubes (`beam_nlam >= 1`) via proportional
+ * slice mapping `bc = (c * beam_nlam) / eff_nlam`. In `PROP_MFT` mode, two `cblas_cgemm` calls
+ * compute `Efoc = U_c * Epup * V_c` directly onto the `[ncam x ncam]` grid. In `PROP_FFT` mode,
+ * `Epup` is zero-padded into `[nfft x nfft]`, transformed via `fftwf_execute`, and cropped
+ * modularly around index `(0, 0) -> (ncam / 2, ncam / 2)` without needing an `fftshift` phase
+ * ramp because `|F(kx, ky)|^2` is invariant to pupil origin translation.
+ */
 static void MILK_HOT fpcam_accum_poly_cpu(
     cacaosim_fpcam_ctx_t *ctx,
     const float          *pup_amp,
@@ -146,6 +266,7 @@ static void MILK_HOT fpcam_accum_poly_cpu(
 
         for (int32_t c = 0; c < ctx->eff_nlam; c++)
         {
+            /* Map camera channel `c` onto closest upstream beam channel `bc` */
             uint32_t bc = (beam_nlam <= 1u)
                               ? 0u
                               : ((beam_nlam == (uint32_t) ctx->eff_nlam)
@@ -171,6 +292,7 @@ static void MILK_HOT fpcam_accum_poly_cpu(
                         (int) nwf, c_one, ctx->cpu_mft_tmp_cplx, (int) nwf, Vc, (int) ncam,
                         c_zero, ctx->cpu_efoc_cplx, (int) ncam);
 
+            /* Incoherent broadband sum; Uc and Vc already carry `1 / sqrt(pup_sum_amp)` */
             const float *__restrict ef = MILK_ASSUME_ALIGNED(ctx->cpu_efoc_cplx);
 #pragma omp simd
             for (uint64_t i = 0; i < npix_cam; i++)
@@ -183,7 +305,10 @@ static void MILK_HOT fpcam_accum_poly_cpu(
     }
     else
     {
-        /* Zero-padded 2D FFT crop centered on DC at (ncam/2, ncam/2) */
+        /*
+         * Zero-padded 2D FFT crop centered on DC at `(ncam/2, ncam/2)`. Unnormalized DFT peak for
+         * an unaberrated clear pupil equals `pup_sum_amp`, so `inv_s2` normalizes to Strehl [0..1].
+         */
         const uint32_t nfft   = ctx->nfft;
         const float    inv_s2 = inv_nlam / (ctx->pup_sum_amp * ctx->pup_sum_amp);
         const int32_t  half_c = (int32_t) (ncam / 2u);
@@ -202,6 +327,7 @@ static void MILK_HOT fpcam_accum_poly_cpu(
             fpcam_build_epup_cpu(pup_c, atm_amp, wf_c, dm_opd, ncpa_opd, wf_to_opd, opd_to_rad,
                                  ctx->npix_wf, ctx->cpu_epup_cplx);
 
+            /* Embed [nwf x nwf] pupil in top-left corner; intensity |DFT|^2 is shift-invariant */
             __builtin_memset(ctx->cpu_fft_in_cplx, 0, ctx->npix_fft * 2u * sizeof(float));
             for (uint32_t yp = 0; yp < nwf; yp++)
             {
@@ -212,6 +338,7 @@ static void MILK_HOT fpcam_accum_poly_cpu(
 
             fftwf_execute((fftwf_plan) ctx->fftw_plan_fwd);
 
+            /* Modularly wrap signed offsets (dx, dy) around DFT DC bin (0, 0) onto camera center */
             const float *__restrict fo = ctx->cpu_fft_out_cplx;
             for (uint32_t yf = 0; yf < ncam; yf++)
             {
@@ -232,6 +359,22 @@ static void MILK_HOT fpcam_accum_poly_cpu(
     }
 }
 
+/**
+ * fpcam_accum_cpu() - Convenience wrapper for single-slice achromatic CPU PSF accumulation
+ * @ctx:       Initialized focal-plane camera context
+ * @pup_amp:   Pupil amplitude `[npix_wf]`, or NULL
+ * @atm_amp:   Optional atmospheric amplitude `[npix_wf]`, or NULL
+ * @wf_in:     Optional wavefront map `[npix_wf]`, or NULL
+ * @dm_opd:    Optional DM OPD `[npix_wf]` [um], or NULL
+ * @ncpa_opd:  Optional static NCPA OPD `[npix_wf]` [um], or NULL
+ * @wf_to_opd: Scale factor mapping `wf_in` units to OPD [um]
+ *
+ * Role: Forwards classical single-plane `(pup_amp, atm_amp, wf_in, dm_opd)` inputs to
+ * `fpcam_accum_poly_cpu()` with `beam_nlam = 1`.
+ *
+ * Rationale: Keeps a single unified diffraction code path for both classical AO wavefront streams
+ * and polychromatic `[OPD, Amp]` optical beam cubes.
+ */
 static void MILK_HOT fpcam_accum_cpu(
     cacaosim_fpcam_ctx_t *ctx,
     const float          *pup_amp,
@@ -245,6 +388,30 @@ static void MILK_HOT fpcam_accum_cpu(
                          wf_to_opd);
 }
 
+/**
+ * cacaosim_fpcam_init() - Precompute MFT/FFTW plans, Parseval norm, and optional CUDA context
+ * @ctx:        Caller-allocated focal-plane camera context to initialize
+ * @cfg:        Immutable geometric, spectral, propagation, and baseline detector configuration
+ * @pup_amp:    Static clear reference pupil amplitude `[nwf * nwf]` (required, non-NULL)
+ * @ncpa_opd:   Optional static science-arm NCPA OPD `[nwf * nwf]` [um], or NULL
+ * @ext_stream: Optional borrowed `cudaStream_t` (`void *`) for fused pipelines, or NULL
+ *
+ * Role: Cold setup routine invoked once prior to real-time execution. Computes clear-pupil
+ * amplitude integrals (`pup_sum_amp`, `pup_sum_amp2`), resolves the polychromatic wavelength grid,
+ * derives the infinite-plane Parseval photometric norm (`inf_flux_norm`), allocates 64-byte
+ * aligned CPU buffers and PRNG pools, precomputes `mft_U_cplx`/`mft_V_cplx` or the `fftwf` 2D
+ * forward plan, and initializes the CUDA backend when requested and available.
+ *
+ * Rationale: Isolating all heap allocations, trigonometric MFT basis construction, FFTW planning,
+ * and `cudaMalloc` calls into `cacaosim_fpcam_init()` guarantees deterministic zero-allocation
+ * real-time subframes. Computing `pup_sum_amp` and `inf_flux_norm = mean_c((dpix * sc)^2 * sum_a2
+ * / sum_a^2)` from the clear entrance pupil `pup_amp` anchors both Strehl ratios (`1.0` = clear
+ * diffraction peak) and photon calibration (`flux_ph` = total incident clear-pupil photons) to a
+ * physical, field-of-view-independent reference even when `in_beam` is attenuated by an upstream
+ * coronagraph or cropped by a small `ncam` detector window.
+ *
+ * Return: `0` on success, `-1` on invalid geometry/empty pupil or resource allocation failure.
+ */
 int MILK_COLD cacaosim_fpcam_init(
     cacaosim_fpcam_ctx_t       *ctx,
     const cacaosim_fpcam_cfg_t *cfg,
@@ -265,6 +432,7 @@ int MILK_COLD cacaosim_fpcam_init(
     ctx->npix_fft = (uint64_t) ctx->nfft * ctx->nfft;
     ctx->npix_cam = (uint64_t) cfg->ncam * cfg->ncam;
 
+    /* Clear-pupil L1 (`sum_a` -> Strehl peak) and L2 (`sum_a2` -> Parseval total energy) norms */
     double sum_a  = 0.0;
     double sum_a2 = 0.0;
     for (uint64_t p = 0; p < ctx->npix_wf; p++)
@@ -280,6 +448,7 @@ int MILK_COLD cacaosim_fpcam_init(
     ctx->pup_sum_amp  = (float) sum_a;
     ctx->pup_sum_amp2 = (float) sum_a2;
 
+    /* Resolve spectral channel centers from explicit upstream array or uniform top-hat bandpass */
     float   lam0 = (cfg->lambda_um > 0.05f) ? cfg->lambda_um : 1.65f;
     float   bw   = (cfg->bw_frac > 0.0f) ? cfg->bw_frac : 0.0f;
     int32_t nlam = cfg->nlambda;
@@ -324,7 +493,11 @@ int MILK_COLD cacaosim_fpcam_init(
         ctx->eff_pixscale_ld = (float) ctx->nfft / dpix;
     }
 
-    /* Infinite-plane Parseval energy so flux_ph equals total clear-pupil incident photons */
+    /*
+     * Infinite-plane Parseval energy so `flux_ph` equals total clear-pupil incident photons:
+     * Over a full Nyquist period `n_per_axis = dpix * sc`, an unnormalized DFT of `pup_amp` has
+     * total squared modulus `n_per_axis^2 * sum_a2`; dividing by `sum_a^2` converts to Strehl.
+     */
     double inf_acc = 0.0;
     for (int32_t c = 0; c < nlam; c++)
     {
@@ -405,6 +578,16 @@ int MILK_COLD cacaosim_fpcam_init(
     return 0;
 }
 
+/**
+ * cacaosim_fpcam_free() - Release all CPU, FFTW, PRNG, and CUDA resources owned by @ctx
+ * @ctx: Focal-plane camera context to tear down (safe on NULL or partially initialized @ctx)
+ *
+ * Role: Cold teardown counterpart to `cacaosim_fpcam_init()` that destroys GPU handles, FFTW3f
+ * plans, detector PRNG state, and aligned host buffers before zeroing `@ctx`.
+ *
+ * Rationale: Safe to call from partial-init error paths inside `cacaosim_fpcam_init()` as well as
+ * normal FPS loop shutdown without risking double-frees or leaked device allocations.
+ */
 void MILK_COLD cacaosim_fpcam_free(cacaosim_fpcam_ctx_t *ctx)
 {
     if (ctx == NULL)
@@ -434,6 +617,17 @@ void MILK_COLD cacaosim_fpcam_free(cacaosim_fpcam_ctx_t *ctx)
     __builtin_memset(ctx, 0, sizeof(*ctx));
 }
 
+/**
+ * cacaosim_fpcam_reset_long() - Clear cumulative long-exposure PSF buffer and Strehl counter
+ * @ctx: Focal-plane camera context (safe on NULL)
+ *
+ * Role: Resets `cpu_long_int`, `long_cnt`, and `long_strehl_peak` to zero without disturbing any
+ * in-progress short-exposure `subframe_cnt` integration or GPU plans.
+ *
+ * Rationale: Allows operators and automated AO/coronagraphic calibration scripts to restart
+ * long-exposure science PSF and Strehl integration cleanly the instant an AO loop closes or dark
+ * hole digging converges, via the live `.reset_long` FPS parameter.
+ */
 void cacaosim_fpcam_reset_long(cacaosim_fpcam_ctx_t *ctx)
 {
     if (ctx == NULL || ctx->cpu_long_int == NULL)
@@ -445,6 +639,26 @@ void cacaosim_fpcam_reset_long(cacaosim_fpcam_ctx_t *ctx)
     ctx->long_strehl_peak = 0.0f;
 }
 
+/**
+ * cacaosim_fpcam_accum_subframe() - Propagate and accumulate one classical-AO optical subframe
+ * @ctx:       Initialized focal-plane camera context
+ * @pup_amp:   Host static pupil amplitude `[nwf * nwf]` (used on CPU; GPU uses resident copy)
+ * @atm_amp:   Optional host atmospheric scintillation amplitude `[nwf * nwf]`, or NULL
+ * @wf_in:     Optional host atmospheric wavefront map `[nwf * nwf]`, or NULL
+ * @dm_opd:    Optional host DM OPD map `[nwf * nwf]` [um], or NULL
+ * @ncpa_opd:  Optional host static NCPA OPD `[nwf * nwf]` [um] (CPU path; GPU uses resident copy)
+ * @d_dm_opd:  Optional resident device DM OPD `[nwf * nwf]` [um] for zero-copy GPU benches, or NULL
+ * @turb_gain: Live atmospheric turbulence multiplier (`0.0` bypasses `wf_in`)
+ *
+ * Role: Hot-loop classical-AO accumulator invoked once per simulation tick when `cacaosim.fpcam`
+ * operates directly from `(pup_amp, atm_amp, wf_in, dm_opd)` streams rather than `in_beam`.
+ * Lazily zeroes the exposure accumulator on the first subframe (`subframe_cnt == 0`) and
+ * increments `subframe_cnt`.
+ *
+ * Rationale: Decoupling optical subframe diffraction (`accum_subframe`) from camera readout
+ * (`readout`) models realistic multi-frame science integrations (`navg > 1`) over rapidly evolving
+ * kHz turbulence and DM residuals while applying detector readout noise only once per exposure.
+ */
 void MILK_HOT cacaosim_fpcam_accum_subframe(
     cacaosim_fpcam_ctx_t *ctx,
     const float          *pup_amp,
@@ -479,6 +693,27 @@ void MILK_HOT cacaosim_fpcam_accum_subframe(
     ctx->subframe_cnt++;
 }
 
+/**
+ * cacaosim_fpcam_accum_beam_poly() - Accumulate one polychromatic dynamic `[OPD, Amp]` beam frame
+ * @ctx:         Initialized focal-plane camera context
+ * @beam_opd:    Host OPD slices `[beam_nlam]` [um] spaced by `chan_stride`, or NULL
+ * @beam_amp:    Host amplitude slices `[beam_nlam]` spaced by `chan_stride`, or NULL
+ * @beam_nlam:   Number of spectral channels in the input beam (`1` = collapsed, `>= 2` = poly)
+ * @chan_stride: Float stride between consecutive spectral slices (e.g., `2 * npix_wf` for SHM)
+ * @ncpa_opd:    Optional host static science-arm NCPA OPD `[nwf * nwf]` [um], or NULL
+ * @d_beam_opd:  Optional resident device OPD slices (`[beam_nlam]` at `chan_stride`), or NULL
+ * @d_beam_amp:  Optional resident device amplitude slices (`[beam_nlam]` at `chan_stride`), or NULL
+ *
+ * Role: Primary hot-loop entry point for post-coronagraphic and beam-relayed science imaging,
+ * propagating dynamic per-frame, per-wavelength `[OPD_um, Amplitude]` slices into the exposure
+ * accumulator (`cpu_accum_int` or GPU `d_accum_int`).
+ *
+ * Rationale: Downstream of `cacaosim.coro`, the post-Lyot electric field exhibits strong chromatic
+ * amplitude apodization, stellar diffraction rings, and phase jumps across focal mask transitions
+ * that change on every AO step. Accepting strided polychromatic `[OPD, Amp]` cubes directly from
+ * SHM (`chan_stride = 2 * npix_wf`) or fused GPU buffers (`chan_stride = npix_wf`) preserves exact
+ * broadband dark-hole contrast without extra buffer repacking.
+ */
 void MILK_HOT cacaosim_fpcam_accum_beam_poly(
     cacaosim_fpcam_ctx_t *ctx,
     const float          *beam_opd,
@@ -510,6 +745,22 @@ void MILK_HOT cacaosim_fpcam_accum_beam_poly(
     ctx->subframe_cnt++;
 }
 
+/**
+ * cacaosim_fpcam_accum_beam() - Accumulate one collapsed 2-slice `[OPD, Amp]` optical beam frame
+ * @ctx:        Initialized focal-plane camera context
+ * @beam_opd:   Host beam OPD plane `[nwf * nwf]` [um], or NULL
+ * @beam_amp:   Host beam amplitude plane `[nwf * nwf]`, or NULL
+ * @ncpa_opd:   Optional host static science-arm NCPA OPD `[nwf * nwf]` [um], or NULL
+ * @d_beam_opd: Optional resident device beam OPD `[nwf * nwf]` [um], or NULL
+ * @d_beam_amp: Optional resident device beam amplitude `[nwf * nwf]`, or NULL
+ *
+ * Role: Single-slice convenience wrapper around `cacaosim_fpcam_accum_beam_poly()` with
+ * `beam_nlam = 1` and `chan_stride = ctx->npix_wf`.
+ *
+ * Rationale: Simplifies callers that relay an achromatic 2-plane `[OPD_um, Amplitude]` beam (such
+ * as `cacaosim.mkbeam`, `cacaosim.beamsplit`, or `cacaosim.coro` with `poly_out = OFF`) while
+ * still propagating through all `ctx->eff_nlam` camera spectral channels if `bw_frac > 0`.
+ */
 void MILK_HOT cacaosim_fpcam_accum_beam(
     cacaosim_fpcam_ctx_t *ctx,
     const float          *beam_opd,
@@ -522,6 +773,25 @@ void MILK_HOT cacaosim_fpcam_accum_beam(
                                    d_beam_amp);
 }
 
+/**
+ * cacaosim_fpcam_readout() - Finalize exposure average, apply detector physics, and update Strehl
+ * @ctx:      Initialized focal-plane camera context (`subframe_cnt >= 1`; no-op if `0`)
+ * @det_live: Optional live detector override (flux, dark, RON, gain, shutter), or NULL for `cfg`
+ * @out_u16:  Destination `[ncam * ncam]` `uint16_t` ADU frame when `out_dtype == 0`, or NULL
+ * @out_f32:  Destination `[ncam * ncam]` `float` frame when `out_dtype != 0`, or NULL
+ * @out_long: Optional destination `[ncam * ncam]` `float` cumulative Strehl-normalized long PSF
+ *
+ * Role: Completes one science camera exposure after `navg` accumulated subframes: divides the
+ * summed optical intensity by `subframe_cnt`, applies Poisson photon noise, dark current, Gaussian
+ * readout noise, gain, bias, and ADU saturation via `inf_flux_norm`, updates cumulative
+ * long-exposure PSF `cpu_long_int` and Strehl metrics, and resets `subframe_cnt = 0`.
+ *
+ * Rationale: Keeping `cpu_exp_int` and `cpu_long_int` noise-free in optical Strehl units `[0..1]`
+ * (fetched back from GPU on CUDA readout) enables exact, unbiased telemetry (`last_strehl_axis`
+ * at bore-sight `(ncam/2, ncam/2)`, `last_strehl_peak` invariant to residual tip/tilt, and
+ * `long_strehl_peak`) even when the detector output is heavily photon-starved, saturated, or
+ * shuttered dark.
+ */
 void MILK_HOT cacaosim_fpcam_readout(
     cacaosim_fpcam_ctx_t     *ctx,
     const cacaosim_det_cfg_t *det_live,
@@ -558,7 +828,7 @@ void MILK_HOT cacaosim_fpcam_readout(
                                       out_f32);
     }
 
-    /* Update Strehl telemetry and cumulative long-exposure PSF */
+    /* Update Strehl telemetry and cumulative long-exposure PSF from noise-free optical `exp` */
     const float *__restrict exp      = MILK_ASSUME_ALIGNED(ctx->cpu_exp_int);
     float *__restrict       lbuf     = MILK_ASSUME_ALIGNED(ctx->cpu_long_int);
     ctx->long_cnt++;
@@ -591,6 +861,27 @@ void MILK_HOT cacaosim_fpcam_readout(
     ctx->subframe_cnt     = 0u;
 }
 
+/**
+ * cacaosim_fpcam_step() - Execute a single-subframe (`navg == 1`) classical-AO camera exposure
+ * @ctx:       Initialized focal-plane camera context
+ * @pup_amp:   Host static pupil amplitude `[nwf * nwf]`
+ * @atm_amp:   Optional host atmospheric amplitude `[nwf * nwf]`, or NULL
+ * @wf_in:     Optional host atmospheric wavefront `[nwf * nwf]`, or NULL
+ * @dm_opd:    Optional host DM OPD `[nwf * nwf]` [um], or NULL
+ * @ncpa_opd:  Optional host static science-arm NCPA OPD `[nwf * nwf]` [um], or NULL
+ * @d_dm_opd:  Optional resident device DM OPD `[nwf * nwf]` [um], or NULL
+ * @turb_gain: Live atmospheric turbulence multiplier
+ * @det_live:  Optional live detector override, or NULL
+ * @out_u16:   Destination `[ncam * ncam]` `uint16_t` frame when `out_dtype == 0`, or NULL
+ * @out_f32:   Destination `[ncam * ncam]` `float` frame when `out_dtype != 0`, or NULL
+ * @out_long:  Optional destination `[ncam * ncam]` `float` cumulative long-exposure PSF, or NULL
+ *
+ * Role: Convenience single-call wrapper combining `cacaosim_fpcam_accum_subframe()` followed
+ * immediately by `cacaosim_fpcam_readout()`.
+ *
+ * Rationale: Streamlines unit tests, throughput benchmarks (`cacaosim-benchmark`), and 1:1
+ * synchronous simulation loops that read out the camera on every simulation step.
+ */
 void MILK_HOT cacaosim_fpcam_step(
     cacaosim_fpcam_ctx_t     *ctx,
     const float              *pup_amp,

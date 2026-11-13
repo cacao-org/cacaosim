@@ -4,7 +4,43 @@
 
 /**
  * @file    cacaosim_view_main.c
- * @brief   Standalone CLI & interactive TUI visualizer/launcher for .bench AO configurations
+ * @brief   Standalone CLI (cacaosim-bench-view) for .bench schematic visualization, starter
+ *          template generation, live file/SHM watch, deployment, and cacaosim-CTRL TUI launch
+ *
+ * Architectural Role in cacaosim:
+ *   Implements the standalone cacaosim-bench-view executable (linked against libmilkcacaosim.so
+ *   without CLIcore dependencies). Acts as the primary user-facing terminal entry point for
+ *   inspecting, scaffolding, monitoring, and launching optical bench configurations across five
+ *   complementary modes:
+ *     1. One-Shot Stream Schematic (default): Resolves <config.bench> across the working directory,
+ *        CACAOSIM_SRC_DIR/examples, install-tree share/cacaosim/examples, MILK_ROOT, and
+ *        MILK_SHM_DIR, then calls cacaosim_bench_render_file() to print the schematic, 32-bin
+ *        spectra, and live SHM readiness badges directly into standard scrollback or pipes.
+ *     2. Starter Template Scaffolding (--init <file.bench>): Generates a commented two-stage
+ *        cascaded AO .bench configuration (8.2 m telescope -> woofer -> J-band PyWFS -> tweeter ->
+ *        visible PyWFS + H-band science camera) and renders it immediately if no other .bench path
+ *        was supplied.
+ *     3. Continuous File & SHM Monitoring (-w / --watch): Enters the terminal alternate screen
+ *        buffer without seizing raw keyboard input, polling nanosecond .bench file mtime and
+ *        MILK_SHM_DIR directory mtime every 150 ms to redraw live whenever the user saves edits
+ *        on disk or starts/stops SHM streams.
+ *     4. Pre-Validated Turnkey Deployment (-d / --deploy / --run): Validates .bench syntax and
+ *        multi-stage DAG photometry in-memory before invoking cacaosim-bench start (fused or
+ *        modular mode, optional --atmturb), then renders the live post-deployment schematic.
+ *     5. Interactive Builder & Live SHM TUI Handoff (-i / --interactive / -g / --gui): Delegates
+ *        to cacaosim_tui_run() (cacaosim-CTRL). When invoked with no .bench argument, passes NULL
+ *        so cacaosim-CTRL can synthesize a virtual cacaosim_bench_cfg_t from live MILK_SHM_DIR
+ *        streams/FPS entries or start from built-in hardware templates.
+ *
+ * Design Rationale & Motivation:
+ *   - Separating non-interactive stream rendering (default mode) from alternate-screen watch/TUI
+ *     modes ensures cacaosim-bench-view works cleanly inside automated scripts (cacaosim-bench
+ *     start/status), SSH commands, CI logs, and pagers (NO_COLOR, TERM=dumb, TIOCGWINSZ auto
+ *     width) while still offering a zero-configuration --watch companion for external text editors
+ *     ($VISUAL / $EDITOR) and direct -i escalation into the full cacaosim-CTRL GUI.
+ *   - Async-signal-safe terminal cleanup (handle_sig() using raw write(2) + tcsetattr(3)) ensures
+ *     SIGINT / SIGTERM never leaves the operator's terminal trapped on the alternate screen or
+ *     with cursor/echo disabled.
  */
 
 #include <errno.h>
@@ -26,13 +62,31 @@
 #include "bench/cacaosim_bench_view.h"
 #include "bench/cacaosim_tui.h"
 
+/** Saved original STDIN termios attributes restored upon exiting raw watch/TUI mode or signal. */
 static struct termios        g_orig_termios;
+
+/** Async-signal-safe flag: 1 while alternate screen (and optional raw termios) is active. */
 static volatile sig_atomic_t g_raw_active = 0;
+
+/** Async-signal-safe flag: set to 1 by SIGINT/SIGTERM handler to break out of the watch loop. */
 static volatile sig_atomic_t g_stop_req   = 0;
 
+/** DECSET 1049 (enter alternate screen buffer) + DECTCEM reset (hide text cursor). */
 static const char g_tui_enter_seq[] = "\033[?1049h\033[?25l";
+
+/** DECTCEM set (show cursor) + SGR 0 reset + DECRST 1049 (restore primary screen buffer). */
 static const char g_tui_exit_seq[]  = "\033[?25h\033[0m\033[?1049l";
 
+/**
+ * handle_sig() - Async-signal-safe SIGINT/SIGTERM handler restoring terminal state
+ * @sig: Delivered POSIX signal number (unused)
+ *
+ * Role: Flags clean termination of run_watch_or_tui() (@g_stop_req = 1) and immediately restores
+ * the primary screen buffer, cursor visibility, and original STDIN termios flags if active.
+ *
+ * Rationale: Uses only async-signal-safe POSIX primitives (write(2) and tcsetattr(3), avoiding
+ * stdio printf/fflush locks) so Ctrl-C or kill(1) during --watch never corrupts the calling shell.
+ */
 static void handle_sig(int sig)
 {
     (void) sig;
@@ -47,6 +101,19 @@ static void handle_sig(int sig)
     }
 }
 
+/**
+ * tui_enter() - Switch STDOUT to the alternate screen buffer and optionally put STDIN in raw mode
+ * @raw_keys: Non-zero to disable canonical line buffering, echo, XON/XOFF, and CR->NL translation
+ *            for single-keypress interactive dispatch; 0 in passive --watch mode so Ctrl-C still
+ *            generates kernel SIGINT normally
+ *
+ * Role: Enters flicker-free full-frame redraw mode prior to run_watch_or_tui() or re-enters it
+ * after returning from an external $VISUAL / $EDITOR subshell.
+ *
+ * Rationale: Guarding with @g_raw_active makes repeated calls idempotent, while keeping ISIG
+ * enabled (and skipping termios mutation entirely when @raw_keys == 0) lets passive --watch mode
+ * respond instantaneously to standard terminal signals.
+ */
 static void tui_enter(int raw_keys)
 {
     if (g_raw_active)
@@ -71,6 +138,16 @@ static void tui_enter(int raw_keys)
     g_raw_active = 1;
 }
 
+/**
+ * tui_exit() - Restore primary screen buffer, cursor visibility, and original STDIN termios state
+ * @raw_keys: Non-zero if STDIN termios was modified on entry and must be restored via TCSAFLUSH
+ *
+ * Role: Cleanly tears down alternate-screen state when exiting run_watch_or_tui() or suspending
+ * the overlay to launch an external text editor ($VISUAL / $EDITOR).
+ *
+ * Rationale: Emitting g_tui_exit_seq before restoring termios ensures the external editor or
+ * parent shell inherits a visible cursor, reset SGR colors, and an unpolluted scrollback buffer.
+ */
 static void tui_exit(int raw_keys)
 {
     if (!g_raw_active)
@@ -87,9 +164,11 @@ static void tui_exit(int raw_keys)
     g_raw_active = 0;
 }
 
+/** One-line CLI summary passed to milk_help_init() (-h1) and help banners. */
 static const char g_desc_short[] =
     "Graphical ANSI/UTF-8 optical bench (.bench) visualizer and launcher";
 
+/** Multi-line architectural summary passed to milk_help_init() (-h2). */
 static const char g_desc_long[] =
     "Parses a declarative cacaosim .bench file, validates the multi-stage optical DAG,\n"
     "propagates 32-bin (0.40..2.40 um) stellar photometry across all dichroic/coronagraph\n"
@@ -97,6 +176,20 @@ static const char g_desc_long[] =
     "preview, spectral sparklines, live MILK_SHM_DIR stream status, and interactive\n"
     "edit/deploy/stop TUI controls.";
 
+/**
+ * print_opt_line() - Format a single CLI option flag, optional metavariable, and description
+ * @c:    Non-zero to emit milk_help ANSI highlight macros (MH_OPT, MH_ARG), 0 for plain monochrome
+ * @opt:  Option flag synopsis (e.g. "-w, --watch" or "--theme")
+ * @arg:  Optional argument placeholder (e.g. "<name>" or NULL when flag takes no value)
+ * @desc: Concise human-readable description of the option's effect
+ *
+ * Role: Helper used by print_help_full() to align flag tables consistently across colored (-h)
+ * and monochrome (-hm / non-TTY) help outputs.
+ *
+ * Rationale: Options carrying argument metavariables wrap their description onto an indented
+ * continuation line so long "<fused|modular>" or "<file.bench>" placeholders never overflow 80-col
+ * terminals, whereas boolean flags stay compact on a single 22-column-aligned line.
+ */
 static void print_opt_line(int c, const char *opt, const char *arg, const char *desc)
 {
     if (c)
@@ -123,6 +216,18 @@ static void print_opt_line(int c, const char *opt, const char *arg, const char *
     }
 }
 
+/**
+ * print_help_full() - Render the complete categorized milk-styled CLI reference to stdout
+ * @prog:  Invoked program name (argv[0]) displayed in the banner and usage synopsis
+ * @color: Non-zero for ANSI-colored output (-h on TTY), 0 for monochrome (-hm or piped help)
+ *
+ * Role: Displays Usage, Workflow Modes, Display & Theme Options, Deploy Options, Help Options,
+ * and cross-references ("See Also") conforming to milk's CLI help standard.
+ *
+ * Rationale: Grouping flags by operator intent (Workflow vs Display vs Deploy) makes it obvious
+ * that cacaosim-bench-view supports one-shot rendering, --watch live reload, --init template
+ * creation, --deploy launch, and -i / --gui interactive TUI escalation from one unified tool.
+ */
 static void print_help_full(const char *prog, int color)
 {
     milk_help_banner(prog, g_desc_short, color);
@@ -193,6 +298,20 @@ static void print_help_full(const char *prog, int color)
     milk_help_see_also(see_also, 3, color);
 }
 
+/**
+ * get_exe_dir() - Resolve the directory containing the running cacaosim-bench-view binary
+ * @argv0:   Fallback program path from main()'s argv[0] (may be NULL)
+ * @out_dir: Destination buffer receiving NUL-terminated directory path (non-NULL)
+ * @cap:     Capacity of @out_dir in bytes
+ *
+ * Role: Locates the binary's build or install prefix so sibling scripts (cacaosim-bench) and
+ * bundled example benches (../share/cacaosim/examples, ../examples) can be discovered without
+ * requiring manual environment variable setup.
+ *
+ * Rationale: Resolves Linux /proc/self/exe first because PATH-dispatched invocations set argv[0]
+ * to a bare command name ("cacaosim-bench-view") whose dirname() would Collapse to ".", breaking
+ * relative asset lookup when run outside the build/install directory.
+ */
 static void get_exe_dir(const char *argv0, char *out_dir, size_t cap)
 {
     char link_buf[PATH_MAX];
@@ -209,6 +328,28 @@ static void get_exe_dir(const char *argv0, char *out_dir, size_t cap)
     snprintf(out_dir, cap, "%s", dirname(tmp));
 }
 
+/**
+ * resolve_bench_file() - Locate a .bench file across local, source, install, and SHM search roots
+ * @spec:    User-supplied file path or bare example filename (e.g. "two_stage_ao.bench")
+ * @exe_dir: Directory of the running executable from get_exe_dir() (non-NULL)
+ * @out:     Destination buffer receiving resolved readable path (or @spec fallback on miss)
+ * @cap:     Capacity of @out in bytes
+ *
+ * Role: Resolves shorthand .bench names across six ordered candidate locations:
+ *   1. Direct relative/absolute path @spec in the current working directory.
+ *   2. $CACAOSIM_SRC_DIR/examples/<spec> (developer source checkout).
+ *   3. <exe_dir>/../share/cacaosim/examples/<spec> (installed FHS prefix).
+ *   4. <exe_dir>/../examples/<spec> (uninstalled CMake _build/ directory).
+ *   5. $MILK_ROOT/share/cacaosim/examples/<spec> (active milk prefix).
+ *   6. $MILK_SHM_DIR/<spec> (runtime-generated .bench files stored alongside active SHM loops).
+ *
+ * Rationale: Letting operators type "cacaosim-bench-view two_stage_ao.bench" from any working
+ * directory eliminates tedious path lookups while still copying @spec verbatim into @out on miss
+ * so downstream cacaosim_bench_render_file() or cacaosim-CTRL can report the exact missing path or
+ * create a new file there.
+ *
+ * Return: 0 if an existing readable file was resolved into @out, -1 if @spec is empty or not found.
+ */
 static int resolve_bench_file(const char *spec, const char *exe_dir, char *out, size_t cap)
 {
     if (spec == NULL || spec[0] == '\0')
@@ -264,6 +405,22 @@ static int resolve_bench_file(const char *spec, const char *exe_dir, char *out, 
     return -1;
 }
 
+/**
+ * write_starter_template() - Write a self-documenting two-stage AO .bench template to @dest_path
+ * @dest_path: Target filesystem path to create (refuses to overwrite existing files; non-NULL)
+ *
+ * Role: Implements "--init <file.bench>", writing a complete, physically realistic cascaded
+ * two-stage AO configuration (8.2 m telescope, 2 kHz master clock, 12x12 woofer DM, J-band
+ * band-reflect dichroic + 1 kHz PyWFS, 24x24 tweeter DM, 1.0 um long-pass dichroic + 2 kHz visible
+ * PyWFS, and 100 Hz H-band focal-plane science camera).
+ *
+ * Rationale: Giving users a working multi-rate, multi-dichroic template with CACAO-compatible SHM
+ * stream names (dm01disp, aol1_wfsim, dm02disp, aol2_wfsim) is faster and less error-prone than
+ * writing section headers from scratch, while failing safely via access(dest_path, F_OK) prevents
+ * accidental clobbering of existing bench designs.
+ *
+ * Return: 0 on success, -1 if @dest_path already exists or cannot be opened for writing.
+ */
 static int write_starter_template(const char *dest_path)
 {
     if (access(dest_path, F_OK) == 0)
@@ -355,6 +512,22 @@ static int write_starter_template(const char *dest_path)
     return 0;
 }
 
+/**
+ * find_bench_script() - Locate the executable cacaosim-bench orchestration script
+ * @exe_dir: Directory containing the running binary (non-NULL)
+ * @out:     Destination buffer receiving resolved script path or PATH command name (non-NULL)
+ * @cap:     Capacity of @out in bytes
+ *
+ * Role: Finds the companion cacaosim-bench launcher across installed bin/, $CACAOSIM_SRC_DIR,
+ * uninstalled ../scripts/, or $PATH fallback so --deploy and interactive start/stop actions work
+ * identically in build trees and installed prefixes.
+ *
+ * Rationale: Checking sibling <exe_dir>/cacaosim-bench before falling back to $PATH guarantees
+ * that testing a local build invokes the matching local launcher rather than a stale system-wide
+ * installation.
+ *
+ * Return: Always 0 (@out is populated with either a verified executable path or "cacaosim-bench").
+ */
 static int find_bench_script(const char *exe_dir, char *out, size_t cap)
 {
     snprintf(out, cap, "%.1500s/cacaosim-bench", exe_dir);
@@ -380,6 +553,26 @@ static int find_bench_script(const char *exe_dir, char *out, size_t cap)
     return 0;
 }
 
+/**
+ * run_bench_action() - Invoke cacaosim-bench start or stop and capture a concise status summary
+ * @exe_dir:      Directory of the running executable used to locate cacaosim-bench (non-NULL)
+ * @subcmd:       Subcommand string ("start" or "stop")
+ * @bench_path:   Path to .bench configuration file (used when @subcmd != "stop")
+ * @mode:         Deployment engine mode ("fused" or "modular")
+ * @with_atmturb: Non-zero to append "--atmturb" so atmospheric turbulence starts alongside bench
+ * @seeing:       Seeing FWHM in arcseconds passed to "--seeing"
+ * @status_out:   Output buffer receiving single-line human-readable outcome message (non-NULL)
+ * @status_cap:   Capacity of @status_out in bytes
+ *
+ * Role: Executes process orchestration via cacaosim-bench (--no-view) over a pipe and distills
+ * its stdout/stderr stream into its final non-empty diagnostic line for UI/CLI display.
+ *
+ * Rationale: Passing "--no-view" prevents recursive invocation of cacaosim-bench-view by the
+ * shell script, while capturing stdout+stderr via popen() keeps subprocess chatter from corrupting
+ * the alternate screen buffer during interactive deployments.
+ *
+ * Return: 0 if cacaosim-bench exited with status 0, -1 on popen() failure or non-zero exit code.
+ */
 static int run_bench_action(
     const char *exe_dir,
     const char *subcmd,
@@ -413,6 +606,7 @@ static int run_bench_action(
         return -1;
     }
 
+    /* Drain subprocess output and retain the last non-blank status/error line */
     char last_line[256] = { 0 };
     char line[256];
     while (fgets(line, sizeof(line), pp) != NULL)
@@ -447,6 +641,17 @@ static int run_bench_action(
     return -1;
 }
 
+/**
+ * launch_editor() - Open @bench_path synchronously in the user's preferred terminal text editor
+ * @bench_path: Path to the .bench file to edit (non-NULL)
+ *
+ * Role: Spawns $VISUAL, $EDITOR, or POSIX fallback "vi" when the user presses 'e' inside
+ * run_watch_or_tui().
+ *
+ * Rationale: Respecting the standard Unix VISUAL -> EDITOR -> vi precedence lets operators edit
+ * raw INI/TOML comments and parameters in their own configured editor and immediately see the
+ * updated schematic upon quitting.
+ */
 static void launch_editor(const char *bench_path)
 {
     const char *ed = getenv("VISUAL");
@@ -464,6 +669,17 @@ static void launch_editor(const char *bench_path)
     (void) rc;
 }
 
+/**
+ * file_mtime_token() - Return a 64-bit nanosecond modification timestamp token for @path
+ * @path: Filesystem path to stat (non-NULL)
+ *
+ * Role: Detects on-disk saves of <config.bench> inside the 150 ms --watch polling loop.
+ *
+ * Rationale: Combining tv_sec * 1e9 + tv_nsec catches rapid sub-second saves from modern editors
+ * and automated formatters that coarse 1-second time_t comparisons would miss.
+ *
+ * Return: Monotonic-per-save nanosecond mtime token, or 0 if stat() fails.
+ */
 static uint64_t file_mtime_token(const char *path)
 {
     struct stat st;
@@ -474,6 +690,18 @@ static uint64_t file_mtime_token(const char *path)
     return ((uint64_t) st.st_mtim.tv_sec * 1000000000ULL) + (uint64_t) st.st_mtim.tv_nsec;
 }
 
+/**
+ * count_shm_files() - Return a lightweight change-detection stamp for MILK_SHM_DIR
+ *
+ * Role: Detects creation or removal of .im.shm files in MILK_SHM_DIR during --watch monitoring
+ * so LIVE / STANDBY stream badges update automatically when loops start or stop externally.
+ *
+ * Rationale: Stat'ing the MILK_SHM_DIR directory inode mtime (rather than readdir()-scanning
+ * hundreds of SHM entries every 150 ms) costs a single VFS lookup on tmpfs/devshm and changes
+ * whenever any .im.shm entry is linked or unlinked in that directory.
+ *
+ * Return: Non-negative directory modification stamp, or 0 if MILK_SHM_DIR does not exist.
+ */
 static int count_shm_files(void)
 {
     const char *sd = getenv("MILK_SHM_DIR");
@@ -487,6 +715,30 @@ static int count_shm_files(void)
     return (int) (st.st_mtim.tv_sec & 0x7FFFFFFF);
 }
 
+/**
+ * run_watch_or_tui() - Run continuous file/SHM watch mode or lightweight single-key TUI loop
+ * @bench_path:   Resolved filesystem path to the target .bench configuration file (non-NULL).
+ * @exe_dir:      Directory containing the running executable for locating cacaosim-bench.
+ * @opts:         In/out rendering options updated on theme/table toggles (non-NULL).
+ * @interactive:  0 for passive --watch polling mode; non-zero for raw-terminal hotkey mode.
+ * @with_atmturb: Initial state of the --atmturb turbulence generator flag (0 or 1).
+ * @seeing:       Atmospheric seeing FWHM at 500 nm [arcsec] forwarded to start actions.
+ *
+ * Role: Drives the alternate-screen event loop used by -w / --watch continuous monitoring mode
+ * (and serves as a self-contained single-key interactive loop if invoked with @interactive != 0).
+ * Every 150 ms it checks both the .bench file modification token (file_mtime_token()) and the
+ * MILK_SHM_DIR directory modification stamp (count_shm_files()), re-rendering the schematic only
+ * when an edit, SHM stream creation/removal, or user hotkey requests a redraw.
+ *
+ * Rationale: When tuning optical bench parameters in an external editor (vim, VS Code, emacs) in
+ * one terminal pane while running simulations in another, operators want an auto-updating side
+ * pane that instantly validates edits and reflects live SHM stream state without stealing focus or
+ * polluting scrollback. Combining O(1) stat() change tokens with a 150 ms poll/nanosleep cadence
+ * keeps idle CPU usage near zero while delivering sub-200 ms visual feedback on file save or
+ * bench start/stop events. Suppressing opts->show_footer avoids redundant CLI hint lines beneath
+ * the live status bar, and pre-validating the .bench file before invoking cacaosim-bench start
+ * prevents tearing down a working simulation due to a transient syntax error.
+ */
 static void run_watch_or_tui(
     const char           *bench_path,
     const char           *exe_dir,
@@ -495,12 +747,14 @@ static void run_watch_or_tui(
     int                   with_atmturb,
     float                 seeing)
 {
+    /* Install async-signal-safe SIGINT/SIGTERM handler so tui_exit() always runs cleanly */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_sig;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
+    /* Replace the static CLI footer with the live watch/hotkey status line */
     opts->show_footer = 0;
     if (opts->color_level < 0 && isatty(STDOUT_FILENO))
     {
@@ -522,6 +776,7 @@ static void run_watch_or_tui(
 
     while (!g_stop_req)
     {
+        /* Poll O(1) stat() tokens on both the .bench file and MILK_SHM_DIR */
         uint64_t mt        = file_mtime_token(bench_path);
         int      shm_stamp = count_shm_files();
         if (mt != last_mtime || shm_stamp != last_shm_stamp)
@@ -544,6 +799,7 @@ static void run_watch_or_tui(
 
         if (need_redraw)
         {
+            /* Home cursor and clear alternate screen before emitting fresh schematic frame */
             fputs("\033[H\033[2J", stdout);
             cacaosim_bench_render_file(bench_path, opts, stdout);
 
@@ -579,6 +835,7 @@ static void run_watch_or_tui(
             need_redraw = 0;
         }
 
+        /* Wait up to 150 ms for keystrokes (or sleep 150 ms in passive --watch mode) */
         struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN, .revents = 0 };
         int           pr  = poll(&pfd, interactive ? 1 : 0, 150);
         if (pr <= 0 && !interactive)
@@ -592,13 +849,14 @@ static void run_watch_or_tui(
             unsigned char ch = 0;
             if (read(STDIN_FILENO, &ch, 1) == 1)
             {
+                /* 'q', 'Q', or Ctrl-C (ETX = 3) exits cleanly */
                 if (ch == 'q' || ch == 'Q' || ch == 3)
                 {
                     break;
                 }
                 if (ch == 27)
                 {
-                    /* Drain any escape sequence bytes; bare ESC quits */
+                    /* Drain any multi-byte CSI escape sequence; bare ESC quits */
                     unsigned char seq[4];
                     if (read(STDIN_FILENO, seq, sizeof(seq)) <= 0)
                     {
@@ -633,6 +891,7 @@ static void run_watch_or_tui(
                 }
                 else if (ch == 'e' || ch == 'E')
                 {
+                    /* Temporarily restore cooked TTY so $EDITOR owns the terminal cleanly */
                     tui_exit(1);
                     launch_editor(bench_path);
                     tui_enter(1);
@@ -643,6 +902,7 @@ static void run_watch_or_tui(
                 }
                 else if (ch == 'f' || ch == 'F' || ch == 'm' || ch == 'M')
                 {
+                    /* Validate syntax & optical graph before invoking cacaosim-bench start */
                     const char          *dmode = (ch == 'm' || ch == 'M') ? "modular" : "fused";
                     cacaosim_bench_cfg_t tcfg;
                     cacaosim_bench_ctx_t tctx;
@@ -663,6 +923,7 @@ static void run_watch_or_tui(
                         fflush(stdout);
                         run_bench_action(exe_dir, "start", bench_path, dmode, with_atmturb, seeing,
                                          status_msg, sizeof(status_msg));
+                        /* Brief settle window so newly spawned SHM streams appear LIVE on redraw */
                         struct timespec ts = { .tv_sec = 0, .tv_nsec = 150000000L };
                         nanosleep(&ts, NULL);
                     }
@@ -683,8 +944,38 @@ static void run_watch_or_tui(
     tui_exit(interactive);
 }
 
+/**
+ * main() - CLI entry point for the cacaosim-bench-view optical bench schematic visualizer
+ * @argc: Command-line argument count.
+ * @argv: Command-line argument vector.
+ *
+ * Role: Initializes UTF-8 locale handling and standard milk CLI help hooks (-h1, -h2, -h, --help,
+ * --help-mono), parses rendering and workflow flags, optionally writes a starter .bench template
+ * (--init), resolves preset shorthand names via resolve_bench_file(), and dispatches to one of
+ * four execution paths:
+ *   1. Full-screen interactive configurator (-i / --interactive / -g / --gui) via
+ *      cacaosim_tui_run(), supporting live MILK_SHM_DIR auto-discovery when no .bench argument is
+ *      supplied.
+ *   2. Continuous file & SHM watch loop (-w / --watch) via run_watch_or_tui().
+ *   3. Pre-validated simulation launch (-d / --deploy / --run) followed by a 150 ms SHM settle
+ *      pause and a live-annotated schematic snapshot.
+ *   4. Default one-shot stream-oriented schematic rendering to stdout via
+ *      cacaosim_bench_render_file().
+ *
+ * Rationale: Consolidating quick scrollback inspection, starter template scaffolding, continuous
+ * watch reloads, one-command deploy-and-verify, and seamless escalation into cacaosim-CTRL behind
+ * a single fast startup binary gives AO engineers a frictionless workflow across interactive
+ * workstations, remote SSH sessions, cacaosim-bench shell wrappers, and automated CI logs. Calling
+ * setlocale(LC_CTYPE, "") upfront ensures standard C/POSIX character-classification routines align
+ * with the terminal's UTF-8 environment, while milk_help_init() guarantees uniform flag discovery
+ * across the entire milk ecosystem.
+ *
+ * Return: 0 on successful help display, render, watch session, TUI exit, or deployment; 1 on
+ * invalid CLI flags, missing target file, parse/topology validation failure, or deploy error.
+ */
 int main(int argc, char **argv)
 {
+    /* Enable environment UTF-8 locale and handle standard milk help queries (-h1/-h2/-h) */
     setlocale(LC_CTYPE, "");
     int hact = milk_help_init(argc, argv, g_desc_short, g_desc_long);
     if (hact == MH_ACTION_H1 || hact == MH_ACTION_H2)
@@ -709,6 +1000,7 @@ int main(int argc, char **argv)
     int         with_atmturb = 0;
     float       seeing       = 0.7f;
 
+    /* Parse CLI options; first non-option positional token is treated as the .bench target */
     for (int i = 1; i < argc; i++)
     {
         const char *a = argv[i];
@@ -796,6 +1088,7 @@ int main(int argc, char **argv)
         }
     }
 
+    /* Write starter .bench file if requested, and immediately render/open it unless overridden */
     if (init_path != NULL)
     {
         if (write_starter_template(init_path) != 0)
@@ -813,6 +1106,7 @@ int main(int argc, char **argv)
     char resolved[PATH_MAX];
     get_exe_dir(argv[0], exe_dir, sizeof(exe_dir));
 
+    /* Hand off -i / --gui to cacaosim-CTRL; NULL bench_arg triggers live MILK_SHM_DIR discovery */
     if (inter_mode)
     {
         cacaosim_tui_opts_t topts;
@@ -832,6 +1126,7 @@ int main(int argc, char **argv)
         return cacaosim_tui_run(NULL, &topts);
     }
 
+    /* Non-interactive modes require a target .bench path or preset name */
     if (bench_arg == NULL)
     {
         print_help_full(argv[0], isatty(STDOUT_FILENO));
@@ -846,6 +1141,7 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    /* Pre-validate syntax & topology, deploy via cacaosim-bench start, wait 150 ms, then render */
     if (do_deploy)
     {
         cacaosim_bench_cfg_t cfg;
@@ -871,5 +1167,6 @@ int main(int argc, char **argv)
         return (rc == 0) ? 0 : 1;
     }
 
+    /* Default path: one-shot stream-oriented schematic render to stdout */
     return (cacaosim_bench_render_file(resolved, &opts, stdout) == 0) ? 0 : 1;
 }

@@ -4,7 +4,40 @@
 
 /**
  * @file    cacaosim_fpcam_cuda.cu
- * @brief   cuBLAS StridedBatched MFT + cuFFT focal plane camera GPU backend
+ * @brief   cuBLAS StridedBatched MFT + cuFFT 2D focal-plane camera GPU backend
+ *
+ * Architectural Role in `cacaosim`:
+ *   Implements the CUDA GPU compute backend for the polychromatic focal-plane science camera
+ *   (`cacaosim.fpcam`). Executes batched pupil complex phasor synthesis, Soummer Matrix-DFT
+ *   (`cublasCgemmStridedBatched`) or zero-padded 2D FFT (`cufftExecC2C`) Fraunhofer propagation,
+ *   multi-subframe incoherent broadband intensity integration, and GPU Philox-PRNG detector
+ *   readout (`cacaosim_cuda_detector_readout`). Supports both standalone SHM execution via
+ *   asynchronous H2D transfers and zero-copy fused GPU benches (`cacaosim.htsim`) via borrowed
+ *   `cudaStream_t` (`ext_stream`) and resident device `[OPD, Amp]` pointers.
+ *
+ * Design Rationale & GPU Numerical Strategy:
+ *   1. Zero-Transpose Row-Major MFT via Column-Major `cublasCgemmStridedBatched`:
+ *      - Host-precomputed MFT basis matrices `U_c [ncam x nwf]` and `V_c [nwf x ncam]` and pupil
+ *        fields `Epup_c [nwf x nwf]` are stored in C row-major memory layout, whereas cuBLAS
+ *        interprets pointers as Fortran column-major matrices.
+ *      - Using the exact transpose equivalence `(A * B)_row == (B^T * A^T)_col`, row-major
+ *        `T = U * Epup` maps directly to column-major `T^T [nwf x ncam] = Epup^T * U^T`, and
+ *        `Efoc = T * V` maps to `Efoc^T [ncam x ncam] = V^T * T^T` with `CUBLAS_OP_N` and zero
+ *        matrix transpose kernels.
+ *      - Batching all `eff_nlam` spectral channels into just two `cublasCgemmStridedBatched`
+ *        invocations saturates GPU streaming multiprocessors on compact `128 x 128` grids where
+ *        serial per-wavelength GEMM launches would be bottlenecked by host launch overhead.
+ *   2. Shift-Invariant Modular FFT Cropping (`PROP_FFT`):
+ *      - In wide-field `PROP_FFT` mode, `cacaosim_cuda_build_pupil_padded()` places `Epup` in the
+ *        upper-left `[nwf x nwf]` quadrant of `[nfft x nfft]`, and `k_fpcam_accum_fft_crop` wraps
+ *        signed camera coordinates `(dx, dy)` modularly around DFT DC bin `(0, 0)` onto camera
+ *        center `(ncam / 2, ncam / 2)`. Because `|F(kx, ky)|^2` is invariant to spatial shifts of
+ *        the pupil origin, no pre- or post-FFT checkerboard phase modulation is needed.
+ *   3. Strided Polychromatic DMA Staging (`cudaMemcpy2DAsync`):
+ *      - Upstream polychromatic SHM beams pack `[OPD_0, Amp_0, OPD_1, Amp_1, ...]` with channel
+ *        stride `2 * npix_wf`. When `beam_nlam == eff_nlam`, `cudaMemcpy2DAsync` gathers all `OPD`
+ *        or `Amp` slices into contiguous `[nlam x npix_wf]` device memory in a single PCIe DMA
+ *        command rather than issuing `nlam` separate `cudaMemcpyAsync` calls.
  */
 
 #ifdef HAVE_CUDA
@@ -19,6 +52,35 @@
 #include "common/cacaosim_cuda.h"
 #include "fpcam/cacaosim_fpcam.h"
 
+/**
+ * struct fpcam_cuda_priv_t - Opaque resident GPU state owned by `cacaosim_fpcam_ctx_t::cuda_priv`
+ * @stream:       Active CUDA execution stream (owned non-blocking stream or borrowed `ext_stream`)
+ * @owns_stream:  Non-zero when `@stream` was created internally and must be destroyed on teardown
+ * @cublas:       cuBLAS handle bound to `@stream` for `PROP_MFT` batched complex GEMMs
+ * @fft_fwd:      2D `[nfft x nfft]` `CUFFT_C2C` plan bound to `@stream` for `PROP_FFT` mode
+ * @has_fft:      Non-zero when `@fft_fwd` holds a valid cuFFT plan requiring `cufftDestroy()`
+ * @d_pup_amp:    Resident clear reference pupil amplitude `[npix_wf]`
+ * @d_dyn_pup:    Staging buffer `[eff_nlam * npix_wf]` for dynamic host beam amplitudes
+ * @d_ncpa_opd:   Optional resident static science-arm NCPA OPD `[npix_wf]` [um], or NULL
+ * @d_atm_amp:    Staging buffer `[npix_wf]` for host atmospheric scintillation amplitude
+ * @d_wf_in:      Staging buffer `[eff_nlam * npix_wf]` for host wavefront or beam OPD slices
+ * @d_dm_opd:     Staging buffer `[npix_wf]` for host DM OPD [um]
+ * @d_lam_um:     Resident spectral channel wavelengths `[eff_nlam]` [um]
+ * @d_mft_U:      Resident row-major 1D MFT Y-basis `[eff_nlam * ncam * nwf]` (`cuComplex`)
+ * @d_mft_V:      Resident row-major 1D MFT X-basis `[eff_nlam * nwf * ncam]` (`cuComplex`)
+ * @d_epup_batch: Batched complex pupil fields `[eff_nlam * npix_wf]` for `PROP_MFT`
+ * @d_mft_tmp:    Batched intermediate `U * Epup` workspace `[eff_nlam * ncam * nwf]`
+ * @d_efoc_batch: Batched complex focal fields `[eff_nlam * npix_cam]` output by `T * V`
+ * @d_fft_in:     Zero-padded `[nfft * nfft]` complex input workspace for `PROP_FFT`
+ * @d_fft_out:    Transformed `[nfft * nfft]` complex output workspace for `PROP_FFT`
+ * @d_accum_int:  Running multi-subframe Strehl-normalized optical intensity sum `[npix_cam]`
+ * @d_exp_int:    Subframe-averaged noise-free exposure PSF `[npix_cam]` in Strehl units `[0..1]`
+ * @d_out_u16:    Device `uint16_t` ADU readout buffer `[npix_cam]` when `out_dtype == 0`
+ * @d_out_f32:    Device `float` readout buffer `[npix_cam]` when `out_dtype != 0`
+ *
+ * Pre-allocated once during `cacaosim_fpcam_cuda_init()` so hot per-subframe accumulation and
+ * camera readout perform zero `cudaMalloc()` or plan creation calls.
+ */
 typedef struct
 {
     cudaStream_t   stream;
@@ -50,6 +112,29 @@ typedef struct
     float         *d_out_f32;
 } fpcam_cuda_priv_t;
 
+/**
+ * k_fpcam_build_epup_batch() - Synthesize `[nlam x npix_wf]` complex pupil phasors across channels
+ * @pup_amp:     Device pupil/beam amplitude (`[beam_nlam]` at `chan_stride`), or NULL for `1.0f`
+ * @atm_amp:     Optional achromatic atmospheric amplitude `[npix_wf]`, or NULL
+ * @wf_in:       Optional wavefront/beam OPD (`[beam_nlam]` at `chan_stride`), or NULL
+ * @beam_nlam:   Number of spectral slices in `pup_amp` and `wf_in` (`1` = achromatic)
+ * @chan_stride: Float element stride between consecutive input spectral slices
+ * @dm_opd:      Optional DM OPD `[npix_wf]` [um] (subtracted), or NULL
+ * @ncpa_opd:    Optional static science-arm NCPA OPD `[npix_wf]` [um] (added), or NULL
+ * @lam_um:      Device spectral channel wavelengths `[nlam]` [um]
+ * @wf_to_opd:   Conversion factor mapping `wf_in` units to OPD [um]
+ * @npix_wf:     Pupil pixel count (`nwf * nwf`)
+ * @nlam:        Number of active camera spectral channels (`eff_nlam`)
+ * @epup_batch:  Output contiguous complex pupil batch `[nlam * npix_wf]`
+ *
+ * Role: 2D-grid GPU kernel (`blockIdx.x` = pixel block, `blockIdx.y` = wavelength channel `c`)
+ * launched once per subframe in `PROP_MFT` mode to populate all `nlam` complex pupil slices prior
+ * to `cublasCgemmStridedBatched`.
+ *
+ * Rationale: Fusing all `nlam` spectral channels into a single 2D launch eliminates per-channel
+ * kernel launch latency, reuses shared L2 cache lines for achromatic maps (`atm_amp`, `dm_opd`,
+ * `ncpa_opd`), and uses hardware SFU `__sincosf()` while early-exiting masked (`amp <= 0`) pixels.
+ */
 __global__ static void k_fpcam_build_epup_batch(
     const float *__restrict__ pup_amp,
     const float *__restrict__ atm_amp,
@@ -71,6 +156,7 @@ __global__ static void k_fpcam_build_epup_batch(
         return;
     }
 
+    /* Map camera wavelength slice `c` onto corresponding upstream beam slice `bc` */
     uint32_t bc = (beam_nlam <= 1u)
                       ? 0u
                       : ((beam_nlam == (uint32_t) nlam)
@@ -111,6 +197,20 @@ __global__ static void k_fpcam_build_epup_batch(
     epup_batch[out_idx] = make_cuComplex(amp * co, amp * s);
 }
 
+/**
+ * k_fpcam_accum_mft_batch() - Reduce polychromatic MFT focal amplitudes into broadband intensity
+ * @efoc_batch: Batched complex focal fields `[nlam * npix_cam]` from `cublasCgemmStridedBatched`
+ * @npix_cam:   Detector pixel count (`ncam * ncam`)
+ * @nlam:       Number of spectral slices in `@efoc_batch`
+ * @inv_nlam:   Reciprocal channel count `1.0f / nlam`
+ * @accum_int:  In/out running Strehl-normalized subframe intensity accumulator `[npix_cam]`
+ *
+ * Role: Post-MFT reduction kernel that sums `|Efoc_c(idx)|^2` incoherently across `[0 .. nlam - 1]`
+ * and accumulates `inv_nlam * sum` into `accum_int[idx]`.
+ *
+ * Rationale: Assigning one thread per focal pixel `idx` avoids atomic contention across spectral
+ * channels and performs only a single read-modify-write to `accum_int[idx]` per subframe.
+ */
 __global__ static void k_fpcam_accum_mft_batch(
     const cuComplex *__restrict__ efoc_batch,
     uint64_t                      npix_cam,
@@ -132,6 +232,22 @@ __global__ static void k_fpcam_accum_mft_batch(
     accum_int[idx] += inv_nlam * sum;
 }
 
+/**
+ * k_fpcam_accum_fft_crop() - Modularly center, crop, and accumulate 2D FFT focal intensity
+ * @fft_out:   Unshifted `[nfft x nfft]` complex output from `cufftExecC2C`
+ * @nfft:      Zero-padded 2D FFT dimension (`nwf * pad_factor`)
+ * @ncam:      Science camera grid dimension
+ * @scale_i:   Strehl + spectral weight `1.0f / (nlam * pup_sum_amp^2)`
+ * @accum_int: In/out running Strehl-normalized subframe intensity accumulator `[ncam * ncam]`
+ *
+ * Role: 2D focal-plane kernel launched per channel in `PROP_FFT` mode to map unshifted cuFFT bins
+ * `(kx, ky)` around DC `(0, 0)` onto camera center `(ncam / 2, ncam / 2)` and accumulate scaled
+ * squared modulus `scale_i * |fft_out(kx, ky)|^2`.
+ *
+ * Rationale: Modular index wrapping `((d % nfft) + nfft) % nfft` combines `fftshift`, central ROI
+ * cropping (or periodic wrapping if `ncam > nfft`), modulus-squared evaluation, and Strehl
+ * normalization into one memory-coalesced pass over `[ncam x ncam]`.
+ */
 __global__ static void k_fpcam_accum_fft_crop(
     const cufftComplex *__restrict__ fft_out,
     uint32_t                         nfft,
@@ -154,6 +270,20 @@ __global__ static void k_fpcam_accum_fft_crop(
     accum_int[(uint64_t) yf * ncam + xf] += scale_i * (z.x * z.x + z.y * z.y);
 }
 
+/**
+ * k_fpcam_scale_exposure() - Normalize multi-subframe intensity sum by `1 / subframe_cnt`
+ * @accum_int: Summed optical intensity `[npix]` over `subframe_cnt` subframes
+ * @exp_int:   Output mean exposure optical intensity `[npix]` in Strehl units `[0..1]`
+ * @npix:      Total camera pixels (`ncam * ncam`)
+ * @inv_sub:   Reciprocal subframe count `1.0f / subframe_cnt`
+ *
+ * Role: Divides `accum_int` by `subframe_cnt` into `exp_int` immediately before GPU detector
+ * readout and host Strehl telemetry copyback.
+ *
+ * Rationale: Writing to a separate `exp_int` buffer preserves the exact noise-free Strehl-scaled
+ * exposure PSF for asynchronous D2H copyback while `cacaosim_cuda_detector_readout()` consumes
+ * `exp_int` concurrently on device.
+ */
 __global__ static void k_fpcam_scale_exposure(
     const float *__restrict__ accum_int,
     float *__restrict__       exp_int,
@@ -167,6 +297,23 @@ __global__ static void k_fpcam_scale_exposure(
     }
 }
 
+/**
+ * cacaosim_fpcam_cuda_init() - Allocate device buffers, upload MFT/pupil data, and bind cuBLAS/FFT
+ * @ctx:        Host-initialized focal-plane camera context
+ * @pup_amp:    Host clear reference pupil amplitude `[npix_wf]`
+ * @ncpa_opd:   Optional host static science-arm NCPA OPD `[npix_wf]` [um], or NULL
+ * @ext_stream: Optional borrowed `cudaStream_t` (`void *`) for fused benches, or NULL
+ *
+ * Role: Cold GPU setup routine called from `cacaosim_fpcam_init()` to provision `fpcam_cuda_priv_t`
+ * device memory, upload `pup_amp`, `lam_um`, `ncpa_opd`, and MFT basis matrices (`d_mft_U`,
+ * `d_mft_V`) or create the 2D `CUFFT_C2C` plan, and synchronize `@stream` before returning.
+ *
+ * Rationale: Uploading static clear-pupil, wavelength, NCPA, and MFT basis arrays once at init
+ * leaves only dynamic per-subframe wavefront/beam planes on the H2D path (or zero H2D bytes when
+ * running on resident GPU pointers inside `cacaosim.htsim`).
+ *
+ * Return: `0` on success, `-1` on any CUDA/cuBLAS/cuFFT allocation or plan failure (auto-cleaned).
+ */
 extern "C" int cacaosim_fpcam_cuda_init(
     cacaosim_fpcam_ctx_t *ctx,
     const float          *pup_amp,
@@ -283,6 +430,16 @@ extern "C" int cacaosim_fpcam_cuda_init(
     return 0;
 }
 
+/**
+ * cacaosim_fpcam_cuda_free() - Destroy cuBLAS/cuFFT handles, device buffers, and owned CUDA stream
+ * @ctx: Focal-plane camera context owning `cuda_priv` (safe on NULL or partially allocated state)
+ *
+ * Role: Cold GPU teardown helper invoked by `cacaosim_fpcam_free()` and partial-init rollback
+ * paths inside `cacaosim_fpcam_cuda_init()`.
+ *
+ * Rationale: `cudaFree(NULL)` is a well-defined no-op in the CUDA Runtime API, while `owns_stream`
+ * ensures borrowed external streams (`cacaosim.htsim`) are never prematurely destroyed.
+ */
 extern "C" void cacaosim_fpcam_cuda_free(cacaosim_fpcam_ctx_t *ctx)
 {
     if (ctx == NULL || ctx->cuda_priv == NULL)
@@ -325,12 +482,40 @@ extern "C" void cacaosim_fpcam_cuda_free(cacaosim_fpcam_ctx_t *ctx)
     ctx->use_cuda  = 0;
 }
 
+/**
+ * cacaosim_fpcam_cuda_reset_accum() - Asynchronously zero device subframe intensity accumulator
+ * @ctx: Initialized focal-plane camera context with active `cuda_priv`
+ *
+ * Role: Enqueues `cudaMemsetAsync` on `p->stream` at the start of a new camera integration
+ * (`subframe_cnt == 0`) to clear `d_accum_int`.
+ *
+ * Rationale: Stream-ordered `cudaMemsetAsync` avoids host-device synchronization stalls between
+ * exposures while guaranteeing subsequent `+=` kernel accumulations start cleanly from zero.
+ */
 extern "C" void cacaosim_fpcam_cuda_reset_accum(cacaosim_fpcam_ctx_t *ctx)
 {
     fpcam_cuda_priv_t *p = (fpcam_cuda_priv_t *) ctx->cuda_priv;
     cudaMemsetAsync(p->d_accum_int, 0, ctx->npix_cam * sizeof(float), p->stream);
 }
 
+/**
+ * fpcam_cuda_run_prop() - Enqueue GPU polychromatic Fraunhofer diffraction and intensity sum
+ * @ctx:        Initialized focal-plane camera context
+ * @d_pup:      Device pupil or dynamic beam amplitude (`[dev_nlam]` at `dev_stride`), or NULL
+ * @d_amp:      Optional device atmospheric amplitude `[npix_wf]`, or NULL
+ * @d_wf:       Optional device wavefront or beam OPD (`[dev_nlam]` at `dev_stride`), or NULL
+ * @dev_nlam:   Number of spectral slices present in `d_pup` and `d_wf` (`1` = achromatic)
+ * @dev_stride: Float element stride between consecutive device spectral slices
+ * @d_dm:       Optional device DM OPD `[npix_wf]` [um], or NULL
+ * @wf_to_opd:  Scale factor mapping `d_wf` units to OPD [um]
+ *
+ * Role: Shared device-pointer propagation core invoked by both `cacaosim_fpcam_cuda_accum()` and
+ * `cacaosim_fpcam_cuda_accum_poly()` once inputs are resident in GPU memory.
+ *
+ * Rationale: Centralizing MFT vs FFT dispatch over device pointers lets standalone host-staged
+ * SHM loops and zero-copy fused `cacaosim.htsim` pipelines execute the exact same sequence of
+ * CUDA kernels and cuBLAS/cuFFT operations without code duplication.
+ */
 static void fpcam_cuda_run_prop(
     cacaosim_fpcam_ctx_t *ctx,
     const float          *d_pup,
@@ -362,13 +547,19 @@ static void fpcam_cuda_run_prop(
         long long int   stride_uv = (long long int) ncam * nwf;
         long long int   stride_ef = (long long int) npix_cam;
 
-        /* Row-major T[ncam x nwf] = U * Epup -> col-major T^T = Epup^T * U^T */
+        /*
+         * Row-major T[ncam x nwf] = U[ncam x nwf] * Epup[nwf x nwf] is identical in memory to
+         * column-major T^T[nwf x ncam] = Epup^T[nwf x nwf] * U^T[nwf x ncam] (lda=nwf, ldb=nwf).
+         */
         cublasCgemmStridedBatched(p->cublas, CUBLAS_OP_N, CUBLAS_OP_N, (int) nwf, (int) ncam,
                                   (int) nwf, &one, p->d_epup_batch, (int) nwf, stride_ep,
                                   p->d_mft_U, (int) nwf, stride_uv, &zero, p->d_mft_tmp, (int) nwf,
                                   stride_uv, nlam);
 
-        /* Row-major Efoc[ncam x ncam] = T * V -> col-major Efoc^T = V^T * T^T */
+        /*
+         * Row-major Efoc[ncam x ncam] = T[ncam x nwf] * V[nwf x ncam] is identical in memory to
+         * column-major Efoc^T[ncam x ncam] = V^T[ncam x nwf] * T^T[nwf x ncam] (lda=ncam, ldb=nwf).
+         */
         cublasCgemmStridedBatched(p->cublas, CUBLAS_OP_N, CUBLAS_OP_N, (int) ncam, (int) ncam,
                                   (int) nwf, &one, p->d_mft_V, (int) ncam, stride_uv, p->d_mft_tmp,
                                   (int) nwf, stride_uv, &zero, p->d_efoc_batch, (int) ncam,
@@ -380,6 +571,7 @@ static void fpcam_cuda_run_prop(
     }
     else
     {
+        /* Normalize unnormalized 2D cuFFT peak (`pup_sum_amp`) into Strehl units `[0..1]` */
         const float scale_i = 1.0f / ((float) nlam * ctx->pup_sum_amp * ctx->pup_sum_amp);
         dim3        b2d(16, 16);
         dim3        g2d((ncam + 15u) / 16u, (ncam + 15u) / 16u);
@@ -404,6 +596,25 @@ static void fpcam_cuda_run_prop(
     }
 }
 
+/**
+ * cacaosim_fpcam_cuda_accum() - Stage optional host/device AO planes and accumulate one subframe
+ * @ctx:           Initialized focal-plane camera context
+ * @dyn_pup_amp:   Optional host dynamic pupil amplitude `[npix_wf]`, or NULL for resident pupil
+ * @atm_amp:       Optional host atmospheric scintillation amplitude `[npix_wf]`, or NULL
+ * @wf_in:         Optional host wavefront map `[npix_wf]`, or NULL
+ * @dm_opd:        Optional host DM OPD `[npix_wf]` [um], or NULL
+ * @d_pup_amp_ext: Optional resident device pupil amplitude `[npix_wf]`, or NULL
+ * @d_wf_opd_ext:  Optional resident device wavefront/OPD `[npix_wf]`, or NULL
+ * @d_dm_opd_ext:  Optional resident device DM OPD `[npix_wf]` [um], or NULL
+ * @wf_to_opd:     Scale factor mapping `wf_in` / `d_wf_opd_ext` units to OPD [um]
+ *
+ * Role: GPU accumulation entry point for classical achromatic AO wavefronts, prioritizing external
+ * resident device pointers (`d_*_ext`) when non-NULL and falling back to asynchronous H2D staging
+ * (`cudaMemcpyAsync`) for host SHM pointers.
+ *
+ * Rationale: Allows hybrid benches (e.g., host SHM turbulence combined with GPU-resident DM OPD)
+ * to copy only host-sourced arrays across PCIe while leaving resident device arrays untouched.
+ */
 extern "C" void cacaosim_fpcam_cuda_accum(
     cacaosim_fpcam_ctx_t *ctx,
     const float          *dyn_pup_amp,
@@ -464,6 +675,26 @@ extern "C" void cacaosim_fpcam_cuda_accum(
     fpcam_cuda_run_prop(ctx, d_pup, d_amp, d_wf, 1u, npix_wf, d_dm, wf_to_opd);
 }
 
+/**
+ * cacaosim_fpcam_cuda_accum_poly() - Stage or consume polychromatic `[OPD, Amp]` beam on GPU
+ * @ctx:         Initialized focal-plane camera context
+ * @beam_opd:    Host OPD slices `[beam_nlam]` [um] at `chan_stride`, or NULL
+ * @beam_amp:    Host amplitude slices `[beam_nlam]` at `chan_stride`, or NULL
+ * @beam_nlam:   Number of spectral channels in the input beam (`1` = collapsed, `>= 2` = poly)
+ * @chan_stride: Float element stride between consecutive input spectral slices
+ * @d_beam_opd:  Optional resident device OPD slices (`[beam_nlam]` at `chan_stride`), or NULL
+ * @d_beam_amp:  Optional resident device amplitude slices (`[beam_nlam]` at `chan_stride`), or NULL
+ *
+ * Role: GPU entry point for dynamic `[OPD_um, Amplitude]` optical beams (e.g., post-coronagraphic
+ * `out_beam` cubes from `cacaosim.coro`). Bypasses all H2D copies when `d_beam_opd` or
+ * `d_beam_amp` is provided, or packs strided host SHM slices into contiguous `d_dyn_pup` /
+ * `d_wf_in` device buffers before calling `fpcam_cuda_run_prop()`.
+ *
+ * Rationale: Selects the fastest DMA transfer topology for every host layout: single-block
+ * `cudaMemcpyAsync` when contiguous (`beam_nlam == 1` or `chan_stride == npix_wf`), pitched 2D
+ * `cudaMemcpy2DAsync` when interleaved SHM `[OPD_c, Amp_c]` matches `nlam` (`chan_stride = 2 *
+ * npix_wf`), and nearest-slice gather copies when upstream `beam_nlam` differs from `nlam`.
+ */
 extern "C" void cacaosim_fpcam_cuda_accum_poly(
     cacaosim_fpcam_ctx_t *ctx,
     const float          *beam_opd,
@@ -478,6 +709,7 @@ extern "C" void cacaosim_fpcam_cuda_accum_poly(
     const size_t       wf_bytes = (size_t) npix_wf * sizeof(float);
     const int32_t      nlam     = ctx->eff_nlam;
 
+    /* Fast zero-copy path for fused GPU benches (`cacaosim.htsim`) */
     if (d_beam_opd != NULL || d_beam_amp != NULL)
     {
         const float *d_pup = (d_beam_amp != NULL) ? d_beam_amp : p->d_pup_amp;
@@ -503,6 +735,7 @@ extern "C" void cacaosim_fpcam_cuda_accum_poly(
         }
         else if (beam_nlam == (uint32_t) nlam)
         {
+            /* Gather strided SHM amplitude slices `[0 .. nlam-1]` in a single 2D DMA transaction */
             cudaMemcpy2DAsync(p->d_dyn_pup, wf_bytes, beam_amp,
                               (size_t) chan_stride * sizeof(float), wf_bytes, (size_t) nlam,
                               cudaMemcpyHostToDevice, p->stream);
@@ -533,6 +766,7 @@ extern "C" void cacaosim_fpcam_cuda_accum_poly(
         }
         else if (beam_nlam == (uint32_t) nlam)
         {
+            /* Gather strided SHM OPD slices `[0 .. nlam-1]` in a single 2D DMA transaction */
             cudaMemcpy2DAsync(p->d_wf_in, wf_bytes, beam_opd,
                               (size_t) chan_stride * sizeof(float), wf_bytes, (size_t) nlam,
                               cudaMemcpyHostToDevice, p->stream);
@@ -553,6 +787,24 @@ extern "C" void cacaosim_fpcam_cuda_accum_poly(
     fpcam_cuda_run_prop(ctx, d_pup, NULL, d_wf, dev_nlam, npix_wf, NULL, 1.0f);
 }
 
+/**
+ * cacaosim_fpcam_cuda_readout() - Average subframes, synthesize GPU detector noise, and copy D2H
+ * @ctx:          Initialized focal-plane camera context (`subframe_cnt >= 1`)
+ * @det_live:     Active detector readout configuration (flux, dark, RON, gain, bias, saturation)
+ * @host_exp_int: Optional host destination `[npix_cam]` for noise-free Strehl-scaled exposure PSF
+ * @out_u16:      Optional host destination `[npix_cam]` `uint16_t` frame when `out_dtype == 0`
+ * @out_f32:      Optional host destination `[npix_cam]` `float` frame when `out_dtype != 0`
+ *
+ * Role: Completes a GPU science camera exposure by scaling `d_accum_int` by `1 / subframe_cnt`
+ * into `d_exp_int`, executing Philox-PRNG Poisson + Gaussian detector readout on GPU via
+ * `cacaosim_cuda_detector_readout()`, queueing D2H copies for both `host_exp_int` and the active
+ * ADU buffer, and synchronizing `p->stream`.
+ *
+ * Rationale: Queueing both `d_exp_int -> host_exp_int` and `d_out_* -> out_*` before a single
+ * `cudaStreamSynchronize()` overlaps D2H DMA and delivers both the noisy science image for SHM
+ * consumers and the exact noise-free Strehl PSF for host `out_long` / `.strehl_*` telemetry in one
+ * stream barrier.
+ */
 extern "C" void cacaosim_fpcam_cuda_readout(
     cacaosim_fpcam_ctx_t     *ctx,
     const cacaosim_det_cfg_t *det_live,

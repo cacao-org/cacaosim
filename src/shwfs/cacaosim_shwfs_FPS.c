@@ -5,6 +5,26 @@
 /**
  * @file    cacaosim_shwfs_FPS.c
  * @brief   MILK_RUNNABLE compute unit for Diffractive Shack-Hartmann WFS and detector readout
+ *
+ * Architectural Role in cacaosim:
+ *   Implements the standalone MILK Function Parameter Structure (FPS) process (`csim_shwfs` /
+ *   `milk-fpsexec-cacaosim-shwfs`) wrapping `cacaosim_shwfs_ctx_t`. Binds upstream shared-memory
+ *   optical inputs (unified 3D `[OPD_um, Amplitude]` `.in_beam` or split `.in_wf` + `.in_dm` +
+ *   `.in_pup` streams), applies optional 2D pupil affine registration and spectral bandpass flux
+ *   integration, accumulates `.navg` subframes, and publishes stitched `[n_sub*pix_per_sub]^2`
+ *   detector frames to `.out_cam`.
+ *
+ * Design Rationale & Physics / Algorithmic Motivation:
+ *   1. Physical Diffractive Subaperture Spots in CACAO Loops:
+ *      Provides CACAO wavefront control pipelines with realistic lenslet focal-plane images
+ *      exhibiting diffraction-limited spot widths, high-WFE speckle breakup, spot elongation, and
+ *      edge/obscuration/spider vignetting via L1-cached OpenMP FFTW3f or GPU batched
+ *      `cufftPlanMany` propagation.
+ *   2. Seamless Modular Bench & Calibration Support:
+ *      Reads upstream 32-bin stellar photon spectra (`CSIM_BM` / `S00..S31`) when `.in_beam` and
+ *      `.use_beam_flux` are active, while exposing live `FPFLAG_WRITERUN` controls on `.turb_gain`,
+ *      `.flux_ph`, `.ron_e`, `.gain_eadu`, `.shutter`, and `.navg` so reference slopes, darks, and
+ *      interaction matrices can be acquired without restarting the WFS process.
  */
 
 #include <stdint.h>
@@ -18,6 +38,10 @@
 #include "shwfs/cacaosim_shwfs.h"
 #include "shwfs/cacaosim_shwfs_FPS.h"
 
+/*
+ * File-scope FPS parameter backing variables bound by `CACAOSIM_SHWFS_PARAMS(X)`.
+ * Parameters carrying `FPFLAG_WRITERUN` are sampled dynamically inside the real-time loop.
+ */
 static char     param_out_cam[FUNCTION_PARAMETER_STRMAXLEN] = "csim_shwfs";
 static char     param_in_beam[FUNCTION_PARAMETER_STRMAXLEN] = "";
 static char     param_in_wf[FUNCTION_PARAMETER_STRMAXLEN]   = "outarraypha";
@@ -56,6 +80,14 @@ static float    param_frame_rate                            = 0.0f;
 static uint64_t param_rng_seed                              = 23456;
 static int32_t  param_backend                               = 0;
 
+/**
+ * @brief X-macro FPS parameter table for `cacaosim.shwfs` (`csim_shwfs`).
+ *
+ * Defines SHM stream endpoints, lenslet array geometry (`.nwf`, `.n_sub`, `.pix_per_sub`,
+ * `.pad_factor`), spectral filter photometry, `.navg` multi-subframe integration, 2D pupil
+ * registration (`.shift_x`, `.shift_y`, `.rot_deg`, `.mag_scale`), detector noise/ADU settings,
+ * monotonic frame pacing, and CPU/CUDA backend selection.
+ */
 #define CACAOSIM_SHWFS_PARAMS(X)                                                        \
     X(".out_cam", param_out_cam, FPTYPE_STREAMNAME, 1, FPFLAG_DEFAULT_INPUT,            \
       "Output 2D Shack-Hartmann WFS camera stream [n_sub*pix_per_sub]")                 \
@@ -148,6 +180,18 @@ static int32_t  param_backend                               = 0;
 
 MILK_PARAMS_DEFINE(cacaosim_shwfs, CACAOSIM_SHWFS_PARAMS);
 
+/**
+ * shwfs_confcheck() - Validate FPS configuration and enforce `FPFLAG_WRITERUN` on live parameters
+ *
+ * Role:
+ *   Cold-path FPS `confcheck` hook invoked during configuration updates.
+ *
+ * Rationale:
+ *   Guarantees runtime mutability on turbulence gain, photometry, shutter, detector noise, pacing,
+ *   and `navg` parameters even when reattaching to an existing persisted FPS SHM table.
+ *
+ * Return: `RETURN_SUCCESS`.
+ */
 static MILK_COLD errno_t shwfs_confcheck(void)
 {
     if (dcfpsptr != NULL)
@@ -169,6 +213,25 @@ static MILK_COLD errno_t shwfs_confcheck(void)
     return RETURN_SUCCESS;
 }
 
+/**
+ * shwfs_compute() - Main MILK `processinfo` real-time Shack-Hartmann WFS simulation loop
+ * @self: Pointer to `runnable_cacaosim_shwfs` descriptor (non-NULL)
+ *
+ * Role:
+ *   Binds/creates SHM streams, initializes `cacaosim_shwfs_ctx_t`, runs stream-triggered or
+ *   `TIMER_ABSTIME`-paced diffractive subaperture integrations and camera readouts, and frees all
+ *   resources cleanly on termination.
+ *
+ * Rationale:
+ *   - Synthesizes a fallback 4-spider obstructed pupil when `.in_pup` is absent so standalone
+ *     launches work out of the box.
+ *   - Supports lazy reconnection to `.in_dm`, `.in_wf`, and `.in_amp` inside the hot loop and
+ *     optional 2D pupil affine registration (`cacaosim_beam_relay_cpu`) on `.in_beam`.
+ *   - Publishes `.out_cam` atomically (`md->write = 1` -> `processinfo_update_output_stream`) once
+ *     every `navg` optical subframes.
+ *
+ * Return: `RETURN_SUCCESS` on clean stop, `RETURN_FAILURE` on invalid geometry or init failure.
+ */
 static MILK_HOT errno_t shwfs_compute(const MILK_RUNNABLE *self)
 {
     if (param_out_cam[0] == '\0' || param_nwf < 8 || param_n_sub < 1 || param_pix_per_sub < 2)
@@ -189,6 +252,7 @@ static MILK_HOT errno_t shwfs_compute(const MILK_RUNNABLE *self)
     float       *fallback_pup = NULL;
     const float *pup_ptr      = NULL;
 
+    /* Use upstream SHM pupil amplitude if present, else synthesize default obstructed 4-spider */
     if (img_pup.ID != -1 && img_pup.md->datatype == _DATATYPE_FLOAT)
     {
         pup_ptr = img_pup.im->array.F;
@@ -223,6 +287,7 @@ static MILK_HOT errno_t shwfs_compute(const MILK_RUNNABLE *self)
     img_amp.ID     = -1;
     img_ncpa.ID    = -1;
 
+    /* Connect or pre-create 3D [OPD_um, Amp] input beam stream with CSIM_BM spectral keywords */
     if (param_in_beam[0] != '\0')
     {
         img_beam = stream_connect(param_in_beam);
@@ -299,6 +364,7 @@ static MILK_HOT errno_t shwfs_compute(const MILK_RUNNABLE *self)
         return RETURN_FAILURE;
     }
 
+    /* Allocate 2D pupil affine registration workspace only when non-identity transform is set */
     cacaosim_reg_t reg = {
         .shift_x = param_shift_x,
         .shift_y = param_shift_y,
@@ -317,6 +383,7 @@ static MILK_HOT errno_t shwfs_compute(const MILK_RUNNABLE *self)
     MILK_PROCINFO_INIT(self)
     MILK_PROCINFO_LOOPSTART(self)
     {
+        /* Optional absolute-deadline monotonic pacing when running internally clocked */
         if (param_frame_rate > 0.1f)
         {
             uint64_t period_ns = (uint64_t) (1.0e9f / param_frame_rate);
@@ -351,6 +418,7 @@ static MILK_HOT errno_t shwfs_compute(const MILK_RUNNABLE *self)
             }
             cacaosim_shwfs_accum_beam(&wfs_ctx, b_opd, b_amp, ncpa_ptr, NULL, NULL);
 
+            /* Derive per-exposure photon count from upstream 32-bin beam spectrum when enabled */
             cacaosim_spec_t b_spec;
             if (param_use_beam_flux && param_flux_ph >= 0.0f &&
                 cacaosim_beam_shm_read_spec(img_beam.im, &b_spec))
@@ -382,6 +450,7 @@ static MILK_HOT errno_t shwfs_compute(const MILK_RUNNABLE *self)
                                           NULL, param_turb_gain);
         }
 
+        /* Complete WFS camera exposure once `navg` subframes have been integrated */
         uint32_t target_navg = (param_navg >= 1u) ? param_navg : 1u;
         if (wfs_ctx.subframe_cnt >= target_navg)
         {
@@ -443,6 +512,9 @@ static MILK_HOT errno_t shwfs_compute(const MILK_RUNNABLE *self)
     return RETURN_SUCCESS;
 }
 
+/**
+ * @brief Registered MILK FPS runnable definition and standalone CLI export for `cacaosim.shwfs`.
+ */
 const MILK_RUNNABLE runnable_cacaosim_shwfs = {
     .kind = MILK_RUNNABLE_FPS,
     .app  = { .fps_name    = "csim_shwfs",

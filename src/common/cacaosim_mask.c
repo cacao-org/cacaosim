@@ -4,7 +4,31 @@
 
 /**
  * @file    cacaosim_mask.c
- * @brief   Self-contained 2D/3D FITS primary-HDU reader/writer and MILK SHM mask cube loader
+ * @brief   Self-contained 2D/3D FITS primary-HDU reader/writer and MILK SHM mask cube importer
+ *
+ * Architectural Role:
+ *   Implements all mask management and I/O routines declared in `cacaosim_mask.h`:
+ *     - Direct RFC 4047 FITS primary-HDU header card parsing, big-endian numeric conversion,
+ *       `BSCALE`/`BZERO` calibration, and 3rd-axis WCS decoding (`cacaosim_mask_load_fits()`)
+ *     - Standard big-endian `BITPIX = -32` 2D/3D FITS serialization (`cacaosim_mask_save_fits()`)
+ *     - Dual-path `ImageStreamIO` + `stream_connect()` SHM cube snapshot (`cacaosim_mask_load()`)
+ *
+ * Design Rationale & Motivation:
+ *   1. Zero dependency on `CLIcore` or stateful `cfitsio` globals: Standalone `milk-fpsexec-*`
+ *      processes intentionally omit `CLIcore`, and multi-instance `.bench` initialization benefits
+ *      from a re-entrant, thread-safe reader that decodes all five standard numeric FITS `BITPIX`
+ *      formats (`-32`, `-64`, `32`, `16`, `8`) directly into 64-byte aligned `float32` memory.
+ *   2. Broad compatibility with third-party optical design FITS cubes: Coronagraph masks exported
+ *      from Python (`POPPY`, `HCIPy`, `PROPER`, `astropy`), MATLAB, or `milk` specify 3rd-axis
+ *      wavelengths using varying conventions (`LAM0`/`LAM1`, `CSIM_WL0`/`CSIM_WL1`, `LAM0`+`DLAM`,
+ *      or standard FITS WCS `CRVAL3`/`CDELT3`/`CRPIX3`/`CUNIT3` in `um`, `m`, `nm`, or `Angstrom`).
+ *      Supporting all of them—including unitless order-of-magnitude inference (`< 1e-4 -> m`,
+ *      `> 100 -> nm`) guarded by a `[0.05, 50.0] um` plausibility window—eliminates manual header
+ *      patching by users.
+ *   3. Two-tier SHM attachment: Querying `ImageStreamIO_read_sharedmem_image_toIMAGE()` first
+ *      succeeds in lightweight standalone `fpsexec` daemons (`dcimg == NULL`), while falling back
+ *      to `stream_connect()` when hosted inside an interactive `milk` session (`dcimg != NULL`)
+ *      seamlessy resolves in-process image table entries.
  */
 
 #include <ctype.h>
@@ -26,6 +50,19 @@
 static void mask_err(char *buf, size_t cap, const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));
 
+/**
+ * mask_err() - Safely format a printf-style diagnostic string into an optional caller buffer
+ * @buf: Destination character buffer (safe no-op when `NULL`)
+ * @cap: Buffer capacity in bytes including terminating NUL (safe no-op when `0`)
+ * @fmt: `printf`-compatible format string checked at compile time via `__attribute__((format))`
+ *
+ * Role:
+ *   Internal error-reporting helper shared by FITS and SHM mask loaders so callers (FPS logs, TUI
+ *   status bars, or unit tests) receive actionable failure context without `stderr` spam.
+ *
+ * Rationale:
+ *   Centralizes `NULL`/`0` capacity guards around `vsnprintf()` to keep error paths concise.
+ */
 static void mask_err(char *buf, size_t cap, const char *fmt, ...)
 {
     if (buf == NULL || cap == 0u)
@@ -38,6 +75,18 @@ static void mask_err(char *buf, size_t cap, const char *fmt, ...)
     va_end(ap);
 }
 
+/**
+ * cacaosim_mask_free() - Free owned mask pixel data and zero-initialize the descriptor
+ * @mask: Target mask cube descriptor (`NULL` is safely ignored)
+ *
+ * Role:
+ *   Deallocates heap memory allocated by `cacaosim_mask_load*()` while leaving borrowed memory
+ *   from `cacaosim_mask_view_2d()` / `3d()` (`owns_data == 0`) intact.
+ *
+ * Rationale:
+ *   Zeroing the entire struct via `memset` resets `data = NULL`, `nx = ny = nz = 0`, and
+ *   `owns_data = 0`, preventing double-free bugs if called both at end-of-init and teardown.
+ */
 void cacaosim_mask_free(cacaosim_mask_cube_t *mask)
 {
     if (mask == NULL)
@@ -51,6 +100,20 @@ void cacaosim_mask_free(cacaosim_mask_cube_t *mask)
     memset(mask, 0, sizeof(*mask));
 }
 
+/**
+ * strip_bang() - Trim leading whitespace and an optional CFITSIO-style `'!'` prefix from a string
+ * @s: Input path or specifier string (`NULL` returns `""`)
+ *
+ * Role:
+ *   Normalizes user FITS paths such as `" !/tmp/lyot.fits"` into `"/tmp/lyot.fits"` before passing
+ *   them to POSIX `fopen()` or `access()`.
+ *
+ * Rationale:
+ *   `milk` and `cacao` scripts routinely prefix FITS filenames with `'!'` (the CFITSIO clobber
+ *   convention); stripping it transparently prevents `"No such file"` errors on standard `fopen`.
+ *
+ * Return: Pointer into `@s` (or static `""`) past leading whitespace and at most one `'!'`.
+ */
 static const char *strip_bang(const char *s)
 {
     if (s == NULL)
@@ -68,6 +131,19 @@ static const char *strip_bang(const char *s)
     return s;
 }
 
+/**
+ * has_fits_suffix_or_slash() - Check for directory separator `'/'` or FITS filename extension
+ * @s: Trimmed specifier string (non-NULL)
+ *
+ * Role:
+ *   Syntactic helper distinguishing filesystem paths from flat `ImageStreamIO` SHM stream names.
+ *
+ * Rationale:
+ *   Matches case-insensitive `.fits`, `.fit`, and `.fts` extensions (`n > ext_len` ensures at
+ *   least a 1-character stem) as well as any relative/absolute directory slash `'/'`.
+ *
+ * Return: `1` if `@s` contains `'/'` or ends with a standard FITS suffix, `0` otherwise.
+ */
 static int has_fits_suffix_or_slash(const char *s)
 {
     if (strchr(s, '/') != NULL)
@@ -84,6 +160,19 @@ static int has_fits_suffix_or_slash(const char *s)
     return 0;
 }
 
+/**
+ * cacaosim_mask_is_fits_path() - Classify whether `@spec` syntactically denotes a FITS file path
+ * @spec: Candidate mask specifier string (`NULL` or empty returns `0`)
+ *
+ * Role:
+ *   Public predicate used by `.bench` inspection tools and `cacaosim_mask_load()`.
+ *
+ * Rationale:
+ *   Recognizes an explicit `'!'` prefix, any `'/'` directory component, or `.fits`/`.fit`/`.fts`
+ *   suffixes without touching the filesystem, so non-existent output paths still classify cleanly.
+ *
+ * Return: `1` if `@spec` looks like a FITS path, `0` if empty or a bare SHM stream name.
+ */
 int cacaosim_mask_is_fits_path(const char *spec)
 {
     const char *s = strip_bang(spec);
@@ -98,9 +187,27 @@ int cacaosim_mask_is_fits_path(const char *spec)
     return has_fits_suffix_or_slash(s);
 }
 
+/**
+ * parse_fits_card_val() - Extract unquoted, trimmed value token from an 80-byte FITS header card
+ * @card:    80-character raw FITS header record (not NUL-terminated)
+ * @val_out: Destination NUL-terminated value string buffer (empty if card has no `'= '` value)
+ * @cap:     Byte capacity of `@val_out`
+ *
+ * Role:
+ *   Parses numeric and string FITS keyword values (`BITPIX`, `NAXIS*`, `BSCALE`, `CRVAL3`,
+ *   `CUNIT3`, etc.) inside `cacaosim_mask_load_fits()`.
+ *
+ * Rationale:
+ *   Per RFC 4047, value-bearing FITS cards carry `'= '` in bytes `8..9` and value + optional `'/'`
+ *   comment in bytes `10..79`. Tracking single-quote state (`in_sq`) prevents stripping `'/'`
+ *   characters that appear inside string literals (e.g., units or paths), and trimming both outer
+ *   and inner FITS fixed-width string padding (`'um      '` -> `"um"`) simplifies downstream unit
+ *   matching.
+ */
 static void parse_fits_card_val(const char card[80], char *val_out, size_t cap)
 {
     val_out[0] = '\0';
+    /* Non-value cards (COMMENT, HISTORY, blank, END) lack '= ' in columns 9-10 */
     if (card[8] != '=' || card[9] != ' ')
     {
         return;
@@ -124,6 +231,7 @@ static void parse_fits_card_val(const char card[80], char *val_out, size_t cap)
         }
     }
 
+    /* Trim surrounding whitespace, then unquote and trim FITS fixed-width character strings */
     char *p = tmp;
     while (*p != '\0' && isspace((unsigned char) *p))
     {
@@ -151,6 +259,19 @@ static void parse_fits_card_val(const char card[80], char *val_out, size_t cap)
     snprintf(val_out, cap, "%s", p);
 }
 
+/**
+ * bswap_f32() - Convert a big-endian IEEE-754 32-bit word from FITS into native host `float`
+ * @be_u32: Raw big-endian 32-bit bit pattern read from FITS payload
+ *
+ * Role:
+ *   Decodes `BITPIX = -32` FITS pixels on little-endian x86-64 / ARM64 hosts.
+ *
+ * Rationale:
+ *   Uses `__builtin_bswap32` + `memcpy` type-punning to strictly obey C11 strict-aliasing rules
+ *   while compiling down to a single `bswap` + register move instruction.
+ *
+ * Return: Host-endian single-precision `float`.
+ */
 static float bswap_f32(uint32_t be_u32)
 {
     uint32_t host = __builtin_bswap32(be_u32);
@@ -159,6 +280,20 @@ static float bswap_f32(uint32_t be_u32)
     return f;
 }
 
+/**
+ * bswap_f64() - Convert a big-endian IEEE-754 64-bit word from FITS into native host `double`
+ * @be_u64: Raw big-endian 64-bit bit pattern read from FITS payload
+ *
+ * Role:
+ *   Decodes `BITPIX = -64` double-precision FITS optical masks prior to `BSCALE`/`BZERO` scaling
+ *   and narrowing to `float32`.
+ *
+ * Rationale:
+ *   Strict-aliasing-safe `memcpy` + `__builtin_bswap64` preserves full 53-bit mantissa precision
+ *   through the `bzero + bscale * val` linear transform before rounding once to `float`.
+ *
+ * Return: Host-endian double-precision `double`.
+ */
 static double bswap_f64(uint64_t be_u64)
 {
     uint64_t host = __builtin_bswap64(be_u64);
@@ -167,6 +302,20 @@ static double bswap_f64(uint64_t be_u64)
     return d;
 }
 
+/**
+ * to_be_f32() - Convert a native host `float` into a big-endian IEEE-754 32-bit FITS word
+ * @f: Host single-precision `float` pixel value
+ *
+ * Role:
+ *   Encodes outgoing `float32` mask pixels into standard FITS network/big-endian byte order inside
+ *   `cacaosim_mask_save_fits()`.
+ *
+ * Rationale:
+ *   Type-puns via `memcpy` and swaps bytes with `__builtin_bswap32` without violating C strict
+ *   aliasing.
+ *
+ * Return: Big-endian 32-bit unsigned integer ready for `fwrite()`.
+ */
 static uint32_t to_be_f32(float f)
 {
     uint32_t u = 0u;
@@ -174,6 +323,30 @@ static uint32_t to_be_f32(float f)
     return __builtin_bswap32(u);
 }
 
+/**
+ * cacaosim_mask_load_fits() - Read a 2D or 3D primary-HDU FITS mask into aligned `float32` memory
+ * @path:    Filesystem path to FITS file (leading `'!'` stripped if present)
+ * @out:     Output mask cube descriptor populated on success (`owns_data = 1`)
+ * @err_buf: Optional error message buffer
+ * @err_cap: Capacity of `@err_buf` in bytes
+ *
+ * Role:
+ *   Cold-path (`MILK_COLD`) FITS mask decoder supporting 2D (`NAXIS = 2`) and 3D (`NAXIS = 3`)
+ *   floating-point (`BITPIX = -32, -64`) and integer (`BITPIX = 8, 16, 32` with `BSCALE`/`BZERO`,
+ *   including unsigned `BITPIX = 16` with `BZERO = 32768`) primary arrays.
+ *
+ * Rationale:
+ *   Scans up to 64 FITS 2880-byte header blocks (`2304` cards) until `END`, reads the contiguous
+ *   big-endian binary payload in a single `fread()`, converts to calibrated `float32` inside a
+ *   64-byte aligned buffer, and resolves optional 3rd-axis spectral metadata via a three-tier
+ *   priority order:
+ *     1. Explicit endpoint keywords `LAM0`/`LAM1` (or `CSIM_WL0`/`CSIM_WL1`) `[um]`
+ *     2. Start + step keywords `LAM0` + `DLAM` `[um]`
+ *     3. Standard FITS WCS `CRVAL3` + `(z + 1 - CRPIX3) * CDELT3` scaled by `CUNIT3` (`um`, `m`,
+ *        `nm`, `Angstrom`, or magnitude heuristic when `CUNIT3` is omitted).
+ *
+ * Return: `0` on success, `-1` on failure (with `@err_buf` populated).
+ */
 int MILK_COLD cacaosim_mask_load_fits(
     const char           *path,
     cacaosim_mask_cube_t *out,
@@ -215,6 +388,7 @@ int MILK_COLD cacaosim_mask_load_fits(
     double dlam       = 0.0;
     int    found_end  = 0;
 
+    /* Read 2880-byte FITS header blocks (36 x 80-byte cards each) until the END card */
     char block[2880];
     for (int blk = 0; blk < 64 && !found_end; blk++)
     {
@@ -232,6 +406,7 @@ int MILK_COLD cacaosim_mask_load_fits(
                 found_end = 1;
                 break;
             }
+            /* Extract 8-character keyword name and strip trailing space padding */
             char kw[9];
             memcpy(kw, card, 8u);
             kw[8] = '\0';
@@ -355,6 +530,7 @@ int MILK_COLD cacaosim_mask_load_fits(
         return -1;
     }
 
+    /* Payload begins at the first 2880-byte boundary immediately following the END block */
     size_t nr = fread(raw, elem_bytes, nele, fp);
     fclose(fp);
     if (nr != nele)
@@ -365,6 +541,7 @@ int MILK_COLD cacaosim_mask_load_fits(
         return -1;
     }
 
+    /* Byte-swap big-endian FITS data and apply physical = BZERO + BSCALE * raw_value */
     if (bitpix == -32)
     {
         const uint32_t *src = (const uint32_t *) raw;
@@ -401,6 +578,7 @@ int MILK_COLD cacaosim_mask_load_fits(
     }
     else
     {
+        /* FITS BITPIX = 8 is unsigned uint8_t by standard (unlike signed BITPIX 16/32) */
         const uint8_t *src = (const uint8_t *) raw;
         for (size_t i = 0; i < nele; i++)
         {
@@ -415,6 +593,7 @@ int MILK_COLD cacaosim_mask_load_fits(
     out->nz        = nz;
     out->owns_data = 1;
 
+    /* Decode optional 3rd-axis wavelength coordinates into microns [um] */
     uint32_t n_store = (nz <= CACAOSIM_MASK_MAX_LAMBDA) ? nz : CACAOSIM_MASK_MAX_LAMBDA;
     if (nz > 1u && lam0 > 0.0 && lam1 > 0.0)
     {
@@ -435,6 +614,7 @@ int MILK_COLD cacaosim_mask_load_fits(
     }
     else if (has_crval3 && (nz == 1u || (has_cdelt3 && fabs(cdelt3) > 0.0)))
     {
+        /* Normalize standard FITS WCS CUNIT3 ('m', 'nm', 'Angstrom', or implicit) to microns */
         double unit_scale = 1.0;
         if (strcasecmp(cunit3, "m") == 0 || strcasecmp(cunit3, "meter") == 0)
         {
@@ -450,6 +630,7 @@ int MILK_COLD cacaosim_mask_load_fits(
         }
         else if (cunit3[0] == '\0')
         {
+            /* Unitless heuristic: < 100 nm in meters -> SI [m]; > 100 -> [nm] */
             if (crval3 > 0.0 && crval3 < 1.0e-4)
             {
                 unit_scale = 1.0e6;
@@ -459,12 +640,14 @@ int MILK_COLD cacaosim_mask_load_fits(
                 unit_scale = 1.0e-3;
             }
         }
+        /* Sanity-gate converted slice-1 wavelength to optical/IR domain (0.05..50 um) */
         double l_test = (crval3 + (1.0 - crpix3) * cdelt3) * unit_scale;
         if (l_test > 0.05 && l_test < 50.0)
         {
             out->has_wcs_lam = 1;
             for (uint32_t z = 0; z < n_store; z++)
             {
+                /* FITS pixel coordinates (CRPIX3) are 1-indexed: slice z corresponds to z + 1 */
                 double w       = (crval3 + ((double) (z + 1u) - crpix3) * cdelt3) * unit_scale;
                 out->lam_um[z] = (float) w;
             }
@@ -477,6 +660,20 @@ int MILK_COLD cacaosim_mask_load_fits(
 static void put_fits_card(char *hdr, int *idx, const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));
 
+/**
+ * put_fits_card() - Format and append one space-padded 80-byte FITS header card into a block
+ * @hdr: 2880-byte FITS header block buffer (pre-filled with ASCII `' '`)
+ * @idx: In/out card index (`0 .. 35`), incremented by 1 after writing
+ * @fmt: `printf`-style card format string
+ *
+ * Role:
+ *   Internal FITS header builder used by `cacaosim_mask_save_fits()`.
+ *
+ * Rationale:
+ *   FITS headers forbid NUL bytes (`'\0'`) and require exact 80-byte space-padded ASCII records;
+ *   formatting into a temporary buffer and `memcpy`-ing without the trailing NUL guarantees strict
+ *   RFC 4047 compliance.
+ */
 static void put_fits_card(char *hdr, int *idx, const char *fmt, ...)
 {
     char line[96];
@@ -494,6 +691,27 @@ static void put_fits_card(char *hdr, int *idx, const char *fmt, ...)
     (*idx)++;
 }
 
+/**
+ * cacaosim_mask_save_fits() - Write a 2D or 3D `float32` mask cube to a standard FITS file
+ * @path:   Destination FITS path (leading `'!'` stripped if present)
+ * @data:   Source `[nx * ny * nz]` float32 buffer (non-NULL)
+ * @nx:     Spatial width `[pixels]` (`> 0`)
+ * @ny:     Spatial height `[pixels]` (`> 0`)
+ * @nz:     Spectral slice count (`1` writes 2D `NAXIS = 2`; `> 1` writes 3D `NAXIS = 3`)
+ * @lam_um: Optional wavelength array `[nz]` in `[um]` written as WCS + `LAM0`/`LAM1` when `nz > 1`
+ *
+ * Role:
+ *   Cold-path (`MILK_COLD`) FITS writer persisting generated pupils, apodizers, FPMs, and test
+ *   cubes to disk.
+ *
+ * Rationale:
+ *   Produces a single 2880-byte ASCII header block, byte-swaps all floats to IEEE-754 big-endian
+ *   `BITPIX = -32`, and zero-pads the binary payload up to an exact 2880-byte FITS record multiple
+ *   as mandated by the FITS standard (whereas header blocks are space-padded, binary data blocks
+ *   must be NUL-padded).
+ *
+ * Return: `0` on success, `-1` on invalid arguments, allocation failure, or I/O error.
+ */
 int MILK_COLD cacaosim_mask_save_fits(
     const char  *path,
     const float *data,
@@ -559,6 +777,7 @@ int MILK_COLD cacaosim_mask_save_fits(
         ok = 0;
     }
 
+    /* Pad binary data payload with NUL bytes to complete the final 2880-byte FITS record */
     size_t pay_bytes = nele * sizeof(uint32_t);
     size_t rem       = pay_bytes % 2880u;
     if (ok && rem != 0u)
@@ -580,6 +799,26 @@ int MILK_COLD cacaosim_mask_save_fits(
     return ok ? 0 : -1;
 }
 
+/**
+ * load_from_image() - Snapshot a 2D or 3D `FLOAT`/`DOUBLE` MILK `IMAGE` into an owned mask cube
+ * @im:      Source mapped `ImageStreamIO` `IMAGE`
+ * @name:    Stream identifier for diagnostic error messages
+ * @out:     Output mask cube descriptor (`owns_data = 1` on success)
+ * @err_buf: Optional error message buffer
+ * @err_cap: Capacity of `@err_buf` in bytes
+ *
+ * Role:
+ *   Internal helper shared by both direct `ImageStreamIO` and `stream_connect()` SHM lookup paths
+ *   in `cacaosim_mask_load()`.
+ *
+ * Rationale:
+ *   Copies SHM pixels (converting `_DATATYPE_DOUBLE` to `float` if needed) into a private 64-byte
+ *   aligned heap buffer so the caller can immediately unmap/close the SHM handle without holding
+ *   shared-memory file descriptors open or risking mid-propagation races, and extracts optional
+ *   `LAM0`/`LAM1` or `CSIM_WL0`/`CSIM_WL1` keywords when `nz > 1`.
+ *
+ * Return: `0` on success, `-1` on invalid axis/datatype or allocation failure.
+ */
 static int load_from_image(
     const IMAGE          *im,
     const char           *name,
@@ -631,6 +870,7 @@ static int load_from_image(
     out->nz        = nz;
     out->owns_data = 1;
 
+    /* Inspect SHM keyword table for explicit wavelength endpoints on 3D polychromatic masks */
     if (nz > 1u && im->kw != NULL && im->md->NBkw > 0)
     {
         double l0 = 0.0;
@@ -665,6 +905,30 @@ static int load_from_image(
     return 0;
 }
 
+/**
+ * cacaosim_mask_load() - Resolve and load a 2D/3D optical mask from FITS path or MILK SHM stream
+ * @spec:      FITS filename/path or `ImageStreamIO` shared-memory stream name
+ * @allow_shm: Non-zero to permit SHM lookup when `@spec` is not a FITS path or existing file
+ * @out:       Output mask cube descriptor (`owns_data = 1` on success)
+ * @err_buf:   Optional diagnostic message buffer
+ * @err_cap:   Capacity of `@err_buf` in bytes
+ *
+ * Role:
+ *   Cold-path (`MILK_COLD`) unified mask loader invoked across `cacaosim` optical modules.
+ *
+ * Rationale:
+ *   Follows a deterministic four-stage resolution cascade:
+ *     1. If `@spec` carries `'!'`, `'/'`, a `.fits`/`.fit`/`.fts` suffix, or exists as a readable
+ *        file in the working directory (`access(s, R_OK) == 0`), load directly as FITS.
+ *     2. If `@allow_shm == 0`, still attempt `cacaosim_mask_load_fits()` to surface an OS `errno`
+ *        file error.
+ *     3. Map directly from `MILK_SHM_DIR` via `ImageStreamIO_read_sharedmem_image_toIMAGE()` (works
+ *        in standalone `milk-fpsexec-*` processes where `dcimg == NULL`) and close immediately.
+ *     4. If hosted inside a `milk` CLI session (`dcimg != NULL`), fall back to `stream_connect()`
+ *        to resolve process-local images before reporting failure.
+ *
+ * Return: `0` on success, `-1` on failure.
+ */
 int MILK_COLD cacaosim_mask_load(
     const char           *spec,
     int                   allow_shm,
@@ -696,6 +960,7 @@ int MILK_COLD cacaosim_mask_load(
         return cacaosim_mask_load_fits(s, out, err_buf, err_cap);
     }
 
+    /* Standalone-safe SHM attachment directly via ImageStreamIO without CLIcore globals */
     IMAGE im;
     memset(&im, 0, sizeof(im));
     if (ImageStreamIO_read_sharedmem_image_toIMAGE(s, &im) == IMAGESTREAMIO_SUCCESS)
@@ -705,6 +970,7 @@ int MILK_COLD cacaosim_mask_load(
         return rc;
     }
 
+    /* Hosted `milk` session fallback when global image table `dcimg` is active */
     if (dcimg != NULL)
     {
         IMGID img = stream_connect(s);
