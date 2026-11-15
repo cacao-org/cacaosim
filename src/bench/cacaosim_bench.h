@@ -1171,6 +1171,81 @@ const uint16_t *cacaosim_bench_sensor_u16(
     const cacaosim_bench_ctx_t *ctx,
     int                         sensor_slot);
 
+/**
+ * struct cacaosim_plan_opts_t - Deployment-plan compiler options for `fpspipe` orchestration
+ * @modular_mode:     `0` for fused zero-hop `cacaosim.htsim`, `1` for modular multi-process FPS.
+ * @flat_mode:        `1` for zero-config single-stage flat mode, `0` for declarative `.bench` DAG.
+ * @with_atmturb:     Non-zero to include `csim_atmturb` (`atmturb-mkwfs`) when available in `PATH`.
+ * @seeing_arcsec:    Zenith seeing FWHM `[arcsec]` at `ref_lambda` when `@with_atmturb != 0`.
+ * @atm_master_size:  Master turbulence screen size `[pixels]` (`0` queries `ATMTURB_MASTER_SIZE`).
+ * @rate_override:    Master hardware clock override `[Hz]` when `> 0.1f`, else `[bench]` rate.
+ * @backend:          Backend override (`-1` inherits `[bench]` backend, `0..2` overrides).
+ * @flat_nwf:         Flat-mode pupil grid size `[pixels]` (default: `128`).
+ * @flat_nact:        Flat-mode linear DM actuator count (default: `20`).
+ * @flat_wfs_ncam:    Flat-mode WFS camera dimension `[pixels]` (default: `64`).
+ * @flat_fp_ncam:     Flat-mode science camera dimension `[pixels]` (default: `128`).
+ * @flat_mod_rad:     Flat-mode Pyramid modulation radius `[lambda/D]` (default: `3.0`).
+ * @staged_bench:     Optional output path for the SHM-rewritten `.bench` snapshot.
+ * @active_bench_arg: Value assigned to `csim_htsim.bench_file` in fused `.bench` mode.
+ *
+ * Role:
+ *   Parameterizes `cacaosim_bench_emit_plan()` so both `.bench` multi-stage DAGs and zero-config
+ *   flat single-stage benches compile through a single validated C implementation.
+ */
+typedef struct
+{
+    int32_t  modular_mode;
+    int32_t  flat_mode;
+    int32_t  with_atmturb;
+    float    seeing_arcsec;
+    uint32_t atm_master_size;
+    float    rate_override;
+    int32_t  backend;
+    uint32_t flat_nwf;
+    uint32_t flat_nact;
+    uint32_t flat_wfs_ncam;
+    uint32_t flat_fp_ncam;
+    float    flat_mod_rad;
+    char     staged_bench[1024];
+    char     active_bench_arg[CACAOSIM_BENCH_NAME_LEN];
+} cacaosim_plan_opts_t;
+
+/**
+ * cacaosim_plan_opts_defaults() - Initialize `cacaosim_plan_opts_t` with standard CLI defaults
+ * @opts: Caller-owned plan options struct (safe no-op if `NULL`).
+ *
+ * Role:
+ *   Sets fused `.bench` mode (`modular_mode = 0`, `flat_mode = 0`), `backend = -1` (inherit),
+ *   `seeing_arcsec = 0.7f`, `atm_master_size = 0` (env/1024), standard flat single-stage sizes,
+ *   and `active_bench_arg = "csim_active.bench"`.
+ */
+void cacaosim_plan_opts_defaults(cacaosim_plan_opts_t *opts);
+
+/**
+ * cacaosim_bench_emit_plan() - Validate a bench and emit declarative `fpspipe` deployment files
+ * @bench_file: Path to input `.bench` file (ignored when `opts->flat_mode != 0`).
+ * @plan_dir:   Destination directory created/populated with `meta.tsv`, `loadfits.tsv`,
+ *              `units.manifest`, `params.batch`, `waves.tsv`, `units.list`, and `streams.list`.
+ * @opts:       Optional plan compiler options (`NULL` uses `cacaosim_plan_opts_defaults()`).
+ * @err_buf:    Optional caller-owned diagnostic buffer populated on failure.
+ * @err_cap:    Capacity of `@err_buf` in bytes.
+ *
+ * Role:
+ *   Compiles a `.bench` DAG (via `cacaosim_bench_load_file()` + `cacaosim_bench_analyze()`) or
+ *   flat single-stage setup into batched `milk-fps-init`, `milk-fps-set -b`, topological-wave
+ *   `milk-fps-runstart`, and `milk-stream-wait` specifications consumed by `cacaosim.bash`.
+ *   Resolves any FITS / `.fits.gz` / `.fits.fz` mask paths into `loadfits.tsv` and rewrites
+ *   long filesystem paths into compact SHM stream stems inside `opts->staged_bench`.
+ *
+ * Return: `0` on success, `-1` on syntax, DAG topology, missing mask file, or I/O error.
+ */
+int cacaosim_bench_emit_plan(
+    const char                 *bench_file,
+    const char                 *plan_dir,
+    const cacaosim_plan_opts_t *opts,
+    char                       *err_buf,
+    size_t                      err_cap);
+
 #ifdef __cplusplus
 }
 #endif

@@ -336,28 +336,25 @@ fi
 echo "  [PASS] Modular optical beam + 3D custom coronagraph masks + WFS + FPcam verified"
 
 # -------------------------------------------------------------------------------------------------
-# Stage [4/7]: Flat Fused `htsim`, Live `milkatmturb` Stream & Default `cacaosim-bench` Lifecycle
+# Stage [4/9]: Flat Fused `htsim`, Live `milkatmturb` Stream & Default `cacaosim-bench` Lifecycle
 # -------------------------------------------------------------------------------------------------
 # Role:
 #   Streams dynamic 0.6"-seeing phase screens (`outarraypha`) from `milk-fpsexec-atmturb-mkwfs`
 #   (if installed) into `cacaosim.htsim` at 2 kHz (`fp_navg = 5`), then tests default single-stage
-#   daemonized `cacaosim-bench start / status / stop` orchestration.
-#
-# Rationale:
-#   Confirms zero-copy fused single-stage compatibility with live external `milk` turbulence
-#   streams and validates background FPS daemon start/stop PID and unit tracking.
-echo "=== [4/7] Testing fused htsim + milkatmturb live stream + default cacaosim-bench ==="
+#   fpspipe-driven `cacaosim-bench start / status / teardown` orchestration with zero sleeps.
+echo "=== [4/9] Testing fused htsim + milkatmturb live stream + default cacaosim-bench ==="
+rm -f "${TEST_SHM}"/*.im.shm "${TEST_SHM}"/*.fps.shm
 if command -v milk-fpsexec-atmturb-mkwfs >/dev/null 2>&1; then
     milk-fpsexec-atmturb-mkwfs --no-procinfo exec \
         .wfsize=128 \
         .master_size=256 \
         .seeing=0.6 \
         .time_step=0.0005 \
-        .time_span=0.02 \
+        .time_span=0.05 \
         .stream_mode=2 \
         .save_fits=0 >/dev/null 2>&1 &
     ATM_PID=$!
-    sleep 0.2
+    milk-stream-wait -t 10 outarraypha:128x128+1
 fi
 
 milk-fpsexec-cacaosim-htsim fpsinit \
@@ -374,72 +371,76 @@ if [[ -n "${ATM_PID:-}" ]]; then
     wait "${ATM_PID}" 2>/dev/null || true
 fi
 
-cacaosim-bench start --mode fused --rate 1000
-sleep 0.25
-cacaosim-bench status >/dev/null
-cacaosim-bench stop
-echo "  [PASS] Flat fused htsim + milkatmturb + cacaosim-bench start/status/stop verified"
+rm -f "${TEST_SHM}"/*.im.shm "${TEST_SHM}"/*.fps.shm
+cacaosim-bench start --mode fused --rate 1000 --no-view
+for s in csim_pup aol0_dmC aol0_wfsim csim_fpcam csim_fplong; do
+    test -f "${TEST_SHM}/${s}.im.shm"
+done
+cacaosim-bench status --no-view >/dev/null
+cacaosim-bench teardown
+shopt -s nullglob
+REM_SHM=("${TEST_SHM}"/*.im.shm "${TEST_SHM}"/*.fps.shm)
+shopt -u nullglob
+test "${#REM_SHM[@]}" -eq 0
+echo "  [PASS] Flat fused htsim + milkatmturb + zero-sleep start/status/teardown verified"
 
 # -------------------------------------------------------------------------------------------------
-# Stage [5/7]: Declarative 2-Stage `.bench` DAG in Fused Zero-Hop Mode (`two_stage_ao.bench`)
+# Stage [5/9]: Declarative 2-Stage `.bench` DAG in Fused Mode + Warm Deploy vs `--restart`
 # -------------------------------------------------------------------------------------------------
 # Role:
-#   Clears `TEST_SHM`, deploys `examples/two_stage_ao.bench` inside a single `cacaosim.htsim`
-#   process (`--mode fused`), and asserts creation of all hardware boundary SHM streams (`dm01disp`,
-#   `dm02disp`, `aol1_wfsim`, `aol2_wfsim`, `csim_fpcam`, `csim_fplong`).
-#
-# Rationale:
-#   Verifies that fused `.bench` execution exposes the exact DM command and WFS/science camera SHM
-#   interfaces expected by `cacao` loops `aol1` and `aol2` without creating intermediate beam IPC.
-echo "=== [5/7] Testing 2-stage .bench DAG in FUSED mode (two_stage_ao.bench) ==="
-rm -f "${TEST_SHM}"/*.im.shm "${TEST_SHM}"/*.fps.shm
-cacaosim-bench start --config "${SCRIPT_ROOT}/examples/two_stage_ao.bench" --mode fused --rate 600
-sleep 0.35
+#   Deploys `examples/two_stage_ao.bench` in `--mode fused`, asserts immediate stream readiness
+#   without `sleep`, verifies that a warm `cacaosim-bench deploy` preserves live `FPFLAG_WRITERUN`
+#   edits (`csim_htsim.turb_gain = 0.42`) while `--restart` resets back to `.bench` defaults, and
+#   verifies clean `teardown`.
+echo "=== [5/9] Testing 2-stage .bench DAG in FUSED mode + warm deploy / --restart ==="
+cacaosim-bench deploy --config "${SCRIPT_ROOT}/examples/two_stage_ao.bench" \
+    --mode fused --rate 600 --no-view
 for s in dm01disp dm02disp aol1_wfsim aol2_wfsim csim_fpcam csim_fplong; do
     test -f "${TEST_SHM}/${s}.im.shm"
 done
-cacaosim-bench stop
-echo "  [PASS] Fused two_stage_ao.bench streams (dm01disp, dm02disp, aol1/2_wfsim, fpcam) OK"
+
+ORIG_TG="$(milk-script -e <<< '@get v="f.csim_htsim.turb_gain"; printf "%s\n" "${v}"')"
+milk-fps-set -q csim_htsim.turb_gain=0.42
+cacaosim-bench deploy --config "${SCRIPT_ROOT}/examples/two_stage_ao.bench" \
+    --mode fused --rate 600 --no-view
+WARM_TG="$(milk-script -e <<< '@get v="f.csim_htsim.turb_gain"; printf "%s\n" "${v}"')"
+python3 -c "import sys; sys.exit(0 if abs(float('${WARM_TG}') - 0.42) < 1e-4 else 1)"
+
+cacaosim-bench deploy --config "${SCRIPT_ROOT}/examples/two_stage_ao.bench" \
+    --mode fused --rate 600 --restart --no-view
+RST_TG="$(milk-script -e <<< '@get v="f.csim_htsim.turb_gain"; printf "%s\n" "${v}"')"
+python3 -c "import sys; sys.exit(0 if abs(float('${RST_TG}') - float('${ORIG_TG}')) < 1e-4 else 1)"
+
+cacaosim-bench teardown
+shopt -s nullglob
+REM_SHM=("${TEST_SHM}"/*.im.shm "${TEST_SHM}"/*.fps.shm)
+shopt -u nullglob
+test "${#REM_SHM[@]}" -eq 0
+echo "  [PASS] Fused two_stage_ao.bench + warm WRITERUN preservation + --restart + teardown OK"
 
 # -------------------------------------------------------------------------------------------------
-# Stage [6/7]: Declarative 2-Stage `.bench` DAG in Modular Multi-Process FPS Mode
+# Stage [6/9]: Declarative 2-Stage `.bench` DAG in Modular Multi-Process FPS Mode
 # -------------------------------------------------------------------------------------------------
 # Role:
-#   Clears `TEST_SHM`, deploys the same `examples/two_stage_ao.bench` file via `--mode modular`,
-#   and asserts creation of both intermediate optical beam SHM streams (`b_pup`, `b_post_dm1`,
-#   `b_nir_wfs`, `b_stg2_in`, `b_post_dm2`) and endpoint DM/WFS streams.
-#
-# Rationale:
-#   Validates the `awk`-synthesized multi-process launcher in `cacaosim-bench`, confirming that
-#   semaphore-triggered (`triggermode = 3`) downstream FPS daemons wake up and propagate frames
-#   driven by root `csim_mkbeam` (`triggermode = 0`).
-echo "=== [6/7] Testing 2-stage .bench DAG in MODULAR FPS mode (two_stage_ao.bench) ==="
-rm -f "${TEST_SHM}"/*.im.shm "${TEST_SHM}"/*.fps.shm
-cacaosim-bench start --config "${SCRIPT_ROOT}/examples/two_stage_ao.bench" --mode modular --rate 300
-sleep 0.5
+#   Deploys `examples/two_stage_ao.bench` via `--mode modular`, verifying wave-ordered `fpspipe`
+#   startup and immediate semaphore-chained beam & sensor readiness with zero `sleep`.
+echo "=== [6/9] Testing 2-stage .bench DAG in MODULAR FPS mode (two_stage_ao.bench) ==="
+cacaosim-bench start --config "${SCRIPT_ROOT}/examples/two_stage_ao.bench" \
+    --mode modular --rate 300 --no-view
 for s in b_pup b_post_dm1 b_nir_wfs b_stg2_in b_post_dm2 dm01disp dm02disp aol1_wfsim aol2_wfsim; do
     test -f "${TEST_SHM}/${s}.im.shm"
 done
-cacaosim-bench stop
-echo "  [PASS] Modular two_stage_ao.bench multi-process beam & sensor streams OK"
+cacaosim-bench teardown
+shopt -s nullglob
+REM_SHM=("${TEST_SHM}"/*.im.shm "${TEST_SHM}"/*.fps.shm)
+shopt -u nullglob
+test "${#REM_SHM[@]}" -eq 0
+echo "  [PASS] Modular two_stage_ao.bench wave-ordered multi-process beam & sensor streams OK"
 
 # -------------------------------------------------------------------------------------------------
-# Stage [7/8]: Edit -> Visualize -> Deploy Workflow & Interactive PTY `cacaosim-CTRL` Verification
+# Stage [7/9]: Edit -> Visualize -> Deploy Workflow & Interactive PTY `cacaosim-CTRL` Verification
 # -------------------------------------------------------------------------------------------------
-# Role:
-#   1. Generates a starter `.bench` template (`--init`), customizes actuator count, checks offline
-#      `STANDBY` rendering and `--theme night` palette, deploys live via `--deploy --mode fused`,
-#      and verifies transition to `SHM LIVE` telemetry badges.
-#   2. Spawns `cacaosim-CTRL` attached to a real `128x40` pseudo-terminal (`pty.openpty()`), injects
-#      interactive keystrokes (ExAO preset -> add DM -> add WFE -> cycle F2..F6 tabs -> save ->
-#      quit), and checks synchronized-output CSI sequences plus valid saved `.bench` output.
-#
-# Rationale:
-#   Exercises real TTY `TIOCSWINSZ` window sizing, raw-mode escape-sequence parsing, DEC Mode 2026
-#   flicker-free synchronized frame commits (`\x1b[?2026h`), and alternate-screen restoration
-#   (`\x1b[?1049l`) that headless string rendering alone cannot test.
-echo "=== [7/8] Testing edit -> visualize -> deploy & run workflow (cacaosim-bench-view) ==="
-rm -f "${TEST_SHM}"/*.im.shm "${TEST_SHM}"/*.fps.shm
+echo "=== [7/9] Testing edit -> visualize -> deploy & run workflow (cacaosim-bench-view) ==="
 CUSTOM_BENCH="${TEST_WORK}/custom_edit_test.bench"
 cacaosim-bench-view --init "${CUSTOM_BENCH}" >/dev/null
 sed -i 's/name       = "custom_two_stage_ao"/name       = "tweaked_2stg_bench"/' "${CUSTOM_BENCH}"
@@ -457,11 +458,10 @@ grep -q "coro_h" <<<"${VIEW_NIGHT}"
 EDITOR=true cacaosim-bench edit "${CUSTOM_BENCH}" >/dev/null
 
 cacaosim-bench-view --deploy --mode fused "${CUSTOM_BENCH}" >/dev/null
-sleep 0.25
 VIEW_LIVE="$(cacaosim-bench view "${CUSTOM_BENCH}" -t)"
 grep -q "SHM LIVE" <<<"${VIEW_LIVE}"
-cacaosim-bench stop
-echo "  [PASS] Edit .bench -> visualize -> deploy & run -> SHM LIVE indicator verified"
+cacaosim-bench teardown
+echo "  [PASS] Edit .bench -> visualize -> zero-sleep deploy -> SHM LIVE indicator verified"
 
 # Drive `cacaosim-CTRL` interactively inside a `128x40` pseudo-terminal (`pty.openpty()`) to test
 # preset selection, node addition, F-key view switching, `.bench` file saving, and clean TTY exit.
@@ -517,17 +517,99 @@ PYEOF
 fi
 
 # -------------------------------------------------------------------------------------------------
-# Stage [8/8]: Dynamic `milk-cli` Shared-Library Plugin Loading (`libmilkcacaosim.so`)
+# Stage [8/9]: `milk-script` `cacaosim.*` Commands + Long-Path Compressed `.fits.gz` 3D WCS Mask
 # -------------------------------------------------------------------------------------------------
 # Role:
-#   When `milk-cli` and `libmilkcacaosim.so` are installed under `INSTALL_DIR`, verifies that the
-#   `milk` command-line interpreter lazy-loads `cacaosim.*` commands (`pyrwfs`, `shwfs`, `coro`,
-#   `wfe`, `mkpupil`) via `MILK_MODULE_RUNNABLES` and creates a 64x64 pupil SHM stream.
-#
-# Rationale:
-#   Ensures binary ABI and runnable-registration compatibility with interactive `milk` / `cacao`
-#   CLI scripts in addition to standalone `milk-fpsexec-cacaosim-*` executables.
-echo "=== [8/8] Testing milk-cli dynamic module load (cacaosim) ==="
+#   Synthesizes a 4-slice (`1.50..1.80 um`, `CRVAL3`/`CDELT3`/`CUNIT3`) gzip-compressed `.fits.gz`
+#   coronagraphic focal phase mask inside a >80-character nested directory, deploys a modular
+#   `.bench` directly through `milk-script -e`, asserts that `b_coro_gz`
+#   promoted to `zsize == 8` (`2 * 4` spectral planes via SHM WCS keywords), and tears down cleanly.
+echo "=== [8/9] Testing milk-script cacaosim.* + >80-char .fits.gz 3D WCS coronagraph mask ==="
+if command -v python3 >/dev/null 2>&1; then
+    DEEP_DIR="${TEST_WORK}/deep_optical_mask_repository_exceeding_fps_64char_limit_xyz_0123456789"
+    mkdir -p "${DEEP_DIR}"
+    GZ_FITS="${DEEP_DIR}/fpm_3d_wcs_mask.fits.gz"
+    GZ_BENCH="${TEST_WORK}/coro_gz_test.bench"
+
+    python3 - "${GZ_FITS}" <<'PYEOF'
+import gzip, math, struct, sys
+
+nx, ny, nz = 32, 32, 4
+cards = [
+    "SIMPLE  =                    T",
+    "BITPIX  =                  -32",
+    "NAXIS   =                    3",
+    f"NAXIS1  = {nx:20d}",
+    f"NAXIS2  = {ny:20d}",
+    f"NAXIS3  = {nz:20d}",
+    "CRPIX3  =                  1.0",
+    f"CRVAL3  = {1.50:20.8f}",
+    f"CDELT3  = {0.10:20.8f}",
+    "CUNIT3  = 'um      '",
+    "END",
+]
+hdr = b"".join(c.ljust(80).encode("ascii") for c in cards)
+hdr += b" " * ((2880 - len(hdr) % 2880) % 2880)
+vals = [
+    math.pi if (x - 15.5) ** 2 + (y - 15.5) ** 2 < 25.0 else 0.0
+    for z in range(nz) for y in range(ny) for x in range(nx)
+]
+raw = struct.pack(f">{len(vals)}f", *vals)
+raw += b"\x00" * ((2880 - len(raw) % 2880) % 2880)
+with gzip.open(sys.argv[1], "wb") as gf:
+    gf.write(hdr + raw)
+PYEOF
+
+    cat <<EOF > "${GZ_BENCH}"
+[bench]
+name      = "coro_gz_3d"
+nwf       = 64
+master_hz = 400.0
+in_pup    = "csim_pup"
+out_beam  = "b_in_gz"
+
+[coro.cgz]
+in           = "b_in_gz"
+out          = "b_coro_gz"
+mode         = "custom_mft"
+fpm_pixscale = 6.0
+lambda_um    = 1.65
+bw_frac      = 0.20
+in_fpm_pha   = "${GZ_FITS}"
+
+[fpcam.scigz]
+in        = "b_coro_gz"
+out_cam   = "csim_cam_gz"
+ncam      = 32
+lambda_um = 1.65
+bw_frac   = 0.20
+navg      = 1
+EOF
+
+    CSIM_BASH="${SCRIPT_ROOT}/scripts/commands.d/cacaosim.bash"
+    export _TEST_CSIM_BASH="${CSIM_BASH}"
+    export _TEST_GZ_BENCH="${GZ_BENCH}"
+    ZSIZE="$(milk-script -e <<'MSEOF'
+source "${_TEST_CSIM_BASH}"
+cacaosim.deploy "${_TEST_GZ_BENCH}" modular 0 0.7 0 1 1 >/dev/null
+cacaosim.status "" 0 >/dev/null
+@get z="s.b_coro_gz.zsize"
+printf "%s\n" "${z}"
+cacaosim.teardown "" 1 >/dev/null
+MSEOF
+)"
+    test "${ZSIZE}" = "8"
+    shopt -s nullglob
+    REM_SHM=("${TEST_SHM}"/*.im.shm "${TEST_SHM}"/*.fps.shm)
+    shopt -u nullglob
+    test "${#REM_SHM[@]}" -eq 0
+    echo "  [PASS] milk-script cacaosim.* + >80-char .fits.gz 3D WCS coro (zsize=8) + teardown OK"
+fi
+
+# -------------------------------------------------------------------------------------------------
+# Stage [9/9]: Dynamic `milk-cli` Shared-Library Plugin Loading (`libmilkcacaosim.so`)
+# -------------------------------------------------------------------------------------------------
+echo "=== [9/9] Testing milk-cli dynamic module load (cacaosim) ==="
 if [[ -x "${INSTALL_DIR}/bin/milk-cli" && -f "${INSTALL_DIR}/lib/libmilkcacaosim.so" ]]; then
     CLI_OUT="$("${INSTALL_DIR}/bin/milk-cli" -q -c \
         "cacaosim.pyrwfs -h; cacaosim.shwfs -h; cacaosim.coro -h; cacaosim.wfe -h" 2>&1)"

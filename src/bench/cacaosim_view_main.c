@@ -594,7 +594,7 @@ static int run_bench_action(
     else
     {
         snprintf(cmd, sizeof(cmd),
-                 "\"%.1800s\" start --config \"%.1800s\" --mode %.32s %s --seeing %.2f"
+                 "\"%.1800s\" start --restart --config \"%.1800s\" --mode %.32s %s --seeing %.2f"
                  " --no-view 2>&1",
                  script, bench_path, mode, with_atmturb ? "--atmturb" : "", seeing);
     }
@@ -923,9 +923,6 @@ static void run_watch_or_tui(
                         fflush(stdout);
                         run_bench_action(exe_dir, "start", bench_path, dmode, with_atmturb, seeing,
                                          status_msg, sizeof(status_msg));
-                        /* Brief settle window so newly spawned SHM streams appear LIVE on redraw */
-                        struct timespec ts = { .tv_sec = 0, .tv_nsec = 150000000L };
-                        nanosleep(&ts, NULL);
                     }
                     last_shm_stamp = count_shm_files();
                     need_redraw    = 1;
@@ -990,15 +987,18 @@ int main(int argc, char **argv)
 
     cacaosim_view_opts_t opts;
     cacaosim_view_opts_defaults(&opts);
+    cacaosim_plan_opts_t popts;
+    cacaosim_plan_opts_defaults(&popts);
 
-    const char *bench_arg    = NULL;
-    const char *init_path    = NULL;
-    const char *deploy_mode  = "fused";
-    int         watch_mode   = 0;
-    int         inter_mode   = 0;
-    int         do_deploy    = 0;
-    int         with_atmturb = 0;
-    float       seeing       = 0.7f;
+    const char *bench_arg     = NULL;
+    const char *init_path     = NULL;
+    const char *emit_plan_dir = NULL;
+    const char *deploy_mode   = "fused";
+    int         watch_mode    = 0;
+    int         inter_mode    = 0;
+    int         do_deploy     = 0;
+    int         with_atmturb  = 0;
+    float       seeing        = 0.7f;
 
     /* Parse CLI options; first non-option positional token is treated as the .bench target */
     for (int i = 1; i < argc; i++)
@@ -1045,6 +1045,10 @@ int main(int argc, char **argv)
         {
             with_atmturb = 1;
         }
+        else if (strcmp(a, "--flat") == 0)
+        {
+            popts.flat_mode = 1;
+        }
         else if ((strcmp(a, "--theme") == 0) && i + 1 < argc)
         {
             int th = cacaosim_view_theme_from_name(argv[++i]);
@@ -1069,6 +1073,18 @@ int main(int argc, char **argv)
         {
             init_path = argv[++i];
         }
+        else if (strcmp(a, "--emit-plan") == 0 && i + 1 < argc)
+        {
+            emit_plan_dir = argv[++i];
+        }
+        else if (strcmp(a, "--staged-bench") == 0 && i + 1 < argc)
+        {
+            snprintf(popts.staged_bench, sizeof(popts.staged_bench), "%s", argv[++i]);
+        }
+        else if (strcmp(a, "--active-bench-arg") == 0 && i + 1 < argc)
+        {
+            snprintf(popts.active_bench_arg, sizeof(popts.active_bench_arg), "%s", argv[++i]);
+        }
         else if (strcmp(a, "--mode") == 0 && i + 1 < argc)
         {
             deploy_mode = argv[++i];
@@ -1076,6 +1092,34 @@ int main(int argc, char **argv)
         else if (strcmp(a, "--seeing") == 0 && i + 1 < argc)
         {
             seeing = strtof(argv[++i], NULL);
+        }
+        else if (strcmp(a, "--rate") == 0 && i + 1 < argc)
+        {
+            popts.rate_override = strtof(argv[++i], NULL);
+        }
+        else if (strcmp(a, "--backend") == 0 && i + 1 < argc)
+        {
+            popts.backend = atoi(argv[++i]);
+        }
+        else if (strcmp(a, "--nwf") == 0 && i + 1 < argc)
+        {
+            popts.flat_nwf = (uint32_t) strtoul(argv[++i], NULL, 10);
+        }
+        else if (strcmp(a, "--nact") == 0 && i + 1 < argc)
+        {
+            popts.flat_nact = (uint32_t) strtoul(argv[++i], NULL, 10);
+        }
+        else if (strcmp(a, "--wfs-ncam") == 0 && i + 1 < argc)
+        {
+            popts.flat_wfs_ncam = (uint32_t) strtoul(argv[++i], NULL, 10);
+        }
+        else if (strcmp(a, "--fp-ncam") == 0 && i + 1 < argc)
+        {
+            popts.flat_fp_ncam = (uint32_t) strtoul(argv[++i], NULL, 10);
+        }
+        else if (strcmp(a, "--mod-rad") == 0 && i + 1 < argc)
+        {
+            popts.flat_mod_rad = strtof(argv[++i], NULL);
         }
         else if (a[0] == '-')
         {
@@ -1105,6 +1149,48 @@ int main(int argc, char **argv)
     char exe_dir[PATH_MAX];
     char resolved[PATH_MAX];
     get_exe_dir(argv[0], exe_dir, sizeof(exe_dir));
+
+    /* Emit declarative fpspipe deployment plan files and exit when --emit-plan is requested */
+    if (emit_plan_dir != NULL)
+    {
+        if (strcmp(deploy_mode, "modular") == 0)
+        {
+            popts.modular_mode = 1;
+        }
+        else if (strcmp(deploy_mode, "fused") == 0)
+        {
+            popts.modular_mode = 0;
+        }
+        else
+        {
+            fprintf(stderr, "[cacaosim] Invalid --mode '%s' (expected fused or modular)\n",
+                    deploy_mode);
+            return 1;
+        }
+        popts.with_atmturb  = with_atmturb;
+        popts.seeing_arcsec = seeing;
+
+        const char *plan_bench = NULL;
+        if (!popts.flat_mode)
+        {
+            if (bench_arg == NULL)
+            {
+                fprintf(stderr, "[cacaosim] --emit-plan requires <config.bench> or --flat\n");
+                return 1;
+            }
+            resolve_bench_file(bench_arg, exe_dir, resolved, sizeof(resolved));
+            plan_bench = resolved;
+        }
+
+        char err_buf[512] = { 0 };
+        if (cacaosim_bench_emit_plan(plan_bench, emit_plan_dir, &popts, err_buf,
+                                     sizeof(err_buf)) != 0)
+        {
+            fprintf(stderr, "[cacaosim] ERROR: %s\n", err_buf);
+            return 1;
+        }
+        return 0;
+    }
 
     /* Hand off -i / --gui to cacaosim-CTRL; NULL bench_arg triggers live MILK_SHM_DIR discovery */
     if (inter_mode)
@@ -1141,7 +1227,7 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    /* Pre-validate syntax & topology, deploy via cacaosim-bench start, wait 150 ms, then render */
+    /* Pre-validate syntax & topology, deploy via cacaosim-bench start, then render live view */
     if (do_deploy)
     {
         cacaosim_bench_cfg_t cfg;
@@ -1160,8 +1246,6 @@ int main(int argc, char **argv)
         char status_msg[320] = { 0 };
         int  rc = run_bench_action(exe_dir, "start", resolved, deploy_mode, with_atmturb, seeing,
                                    status_msg, sizeof(status_msg));
-        struct timespec ts = { .tv_sec = 0, .tv_nsec = 150000000L };
-        nanosleep(&ts, NULL);
         cacaosim_bench_render_file(resolved, &opts, stdout);
         printf("  %s\n", status_msg);
         return (rc == 0) ? 0 : 1;

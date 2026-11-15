@@ -316,13 +316,11 @@ static void resolve_bench_path(const char *spec, char *out, size_t cap)
     if (spec[0] != '/')
     {
         const char *shm_dir = getenv("MILK_SHM_DIR");
-        if (shm_dir != NULL && shm_dir[0] != '\0')
+        const char *sdir    = (shm_dir != NULL && shm_dir[0] != '\0') ? shm_dir : "/milk/shm";
+        snprintf(out, cap, "%s/%s", sdir, spec);
+        if (access(out, R_OK) == 0)
         {
-            snprintf(out, cap, "%s/%s", shm_dir, spec);
-            if (access(out, R_OK) == 0)
-            {
-                return;
-            }
+            return;
         }
         const char *milk_root = getenv("MILK_ROOT");
         if (milk_root != NULL && milk_root[0] != '\0')

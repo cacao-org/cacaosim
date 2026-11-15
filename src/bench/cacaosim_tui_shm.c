@@ -750,8 +750,8 @@ int cs_tui_exec_deploy(cs_tui_app_t *app, const char *mode)
 
     char cmd[2048];
     snprintf(cmd, sizeof(cmd),
-             "\"%.480s\" start --config \"%.480s\" --mode %.16s --backend %d %s --seeing %.2f"
-             " --no-view 2>&1",
+             "\"%.480s\" start --restart --config \"%.480s\" --mode %.16s --backend %d %s"
+             " --seeing %.2f --no-view 2>&1",
              bench_bin, stage_path, mode, app->cfg.backend,
              app->opts.with_atmturb ? "--atmturb" : "", app->opts.seeing_arcsec);
 

@@ -62,6 +62,7 @@ set(SOURCEFILES
     src/bench/cacaosim_bench_cfg.c
     src/bench/cacaosim_bench_edit.c
     src/bench/cacaosim_bench_dag.c
+    src/bench/cacaosim_bench_plan.c
     src/bench/cacaosim_bench_view.c
     src/bench/cacaosim_tui_ansi.c
     src/bench/cacaosim_tui_shm.c
@@ -199,6 +200,7 @@ if(COMMAND milk_add_runnable_module)
         FILES_MATCHING PATTERN "*.bench"
     )
     install(PROGRAMS ${SCRIPTS} DESTINATION bin)
+    install(FILES scripts/commands.d/cacaosim.bash DESTINATION share/milk/commands.d)
 else()
     # ── Out-of-tree standalone build against milk (feat/bash-engine) ─────────
     set(MILK_SOURCE_CANDIDATES
@@ -347,6 +349,7 @@ else()
         FILES_MATCHING PATTERN "*.bench"
     )
     install(PROGRAMS ${SCRIPTS} DESTINATION bin)
+    install(FILES scripts/commands.d/cacaosim.bash DESTINATION share/milk/commands.d)
 
     # ── Generate standalone milk-fpsexec-cacaosim-* executables (no CLIcore) ─
     set(_FPSEXEC_STUB_TPL [=[

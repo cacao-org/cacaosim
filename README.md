@@ -14,10 +14,12 @@ interoperable layers:
 2. **Stream-Composable `MILK_RUNNABLE` FPS Processes**: Standalone `milk-fpsexec-cacaosim-*` daemons
    and `milk` CLI commands connected by `[nwf, nwf, 2]` `FLOAT32` optical beam streams
    (`[OPD_um, Amplitude]` + 32-bin photon spectrum keywords).
-3. **Declarative `.bench` DAG Engine & Interactive TUI**: INI/TOML-style `.bench` topology files
-   inspected/edited in `cacaosim-CTRL` or `cacaosim-bench-view`, and executed either **fused inside
-   a single zero-hop GPU/CPU process** (`cacaosim.htsim .bench_file=...`) or **modularly across
-   separate semaphore-chained FPS processes** (`cacaosim-bench start --config ... --mode modular`).
+3. **Declarative `.bench` DAG Engine, `fpspipe` Orchestration & Interactive TUI**: INI/TOML-style
+   `.bench` topology files inspected/edited in `cacaosim-CTRL` or `cacaosim-bench-view`, compiled by
+   `cacaosim_bench_plan.c` (`--emit-plan`), and deployed via `share/milk/commands.d/cacaosim.bash`
+   (`cacaosim.deploy` / `fpspipe.*` + event-driven `milk-stream-wait`) either **fused inside a
+   single zero-hop GPU/CPU process** (`cacaosim.htsim`) or **modularly across wave-ordered
+   semaphore-chained FPS processes** (`cacaosim-bench deploy --config ... --mode modular`).
 
 ---
 
@@ -219,16 +221,21 @@ cacaosim-bench-view my_ao.bench
 # 2. (Optional) Edit topology, splice coronagraphs/DMs, or inspect scales interactively:
 cacaosim-CTRL my_ao.bench
 
-# 3. Start the simulator in zero-hop fused GPU/CPU mode (add --atmturb for live turbulence,
-#    or use --mode modular to spawn one standalone milk-fpsexec-* daemon per optical element):
-cacaosim-bench start --config my_ao.bench --mode fused
+# 3. Deploy the simulator via fpspipe in zero-hop fused GPU/CPU mode (add --atmturb for live
+#    turbulence, --mode modular for wave-ordered multi-process FPS daemons, or --restart to reset
+#    live FPFLAG_WRITERUN edits; 2D/3D .fits/.fits.gz/.fits.fz masks auto-stage into SHM):
+cacaosim-bench deploy --config my_ao.bench --mode fused
 
 # 4. Check live SHM streams (dm00disp, aol0_wfsim, csim_fpcam) and FPS status:
 cacaosim-bench status
 cacaosim-CTRL --status my_ao.bench   # interactive F5:STATUS live SHM & Strehl monitor
 
-# 5. Stop all running cacaosim units cleanly:
+# 5. Stop running loops (preserving SHM) or tear down all tracked FPS & SHM artifacts:
 cacaosim-bench stop
+cacaosim-bench teardown
+
+# 6. Or orchestrate directly from milk-script via share/milk/commands.d/cacaosim.bash:
+milk-script -e <<< 'cacaosim.deploy "my_ao.bench" fused; cacaosim.status "" 0; cacaosim.teardown'
 ```
 
 ---
@@ -340,8 +347,10 @@ mask suppression, dual-mode LOWFS (`fpm_refl` + `lowfs_pup_diam` & `lyot_refl`),
 synthesis, topological hardware splicing, `cacaosim-CTRL` headless TUI snapshots, and multi-stage
 closed-loop AO tests (`H-band Strehl: open=0.153 -> Stage-1=0.815 -> 2-Stage=0.998`).
 `tests/test_closed_loop.sh` verifies zero `libCLIcore` linkage across all 11 `fpsexec` binaries,
-`cacaosim-CTRL`, and `cacaosim-bench-view`, modular 3D beam SHM pipelines, fused/modular `.bench`
-runs, interactive `cacaosim-CTRL` PTY workflows, and `milk-cli` loading.
+`cacaosim-CTRL`, and `cacaosim-bench-view`, modular 3D beam SHM pipelines, zero-sleep `fpspipe`
+`fused`/`modular` `.bench` deployment (including warm `FPFLAG_WRITERUN` preservation, `--restart`,
+`>80`-char `.fits.gz` 3D WCS masks, and `teardown`), interactive `cacaosim-CTRL` PTY workflows, and
+`milk-cli` / `milk-script` integration.
 
 Measured with `cacaosim-benchmark` on Intel Core i9-12950HX + NVIDIA RTX A5500 Laptop GPU:
 

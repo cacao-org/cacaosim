@@ -11,7 +11,7 @@ hardware and optical simulation plugin for the `milk` framework (`feat/bash-engi
 - **`src/common/`**: Aligned memory, monotonic `TIMER_ABSTIME` pacing, thread-local `xoshiro128++`
   CPU PRNG, Philox-style CUDA PRNG, 32-bin (`0.40..2.40 um`) spectral photometry & dichroic
   beamsplitters, 2D affine pupil registration, SHM beam keyword serialization, 2D/3D polychromatic
-  FITS/SHM mask cube I/O (`cacaosim_mask`), and detector readout.
+  `.fits`/`.fits.gz`/`.fits.fz`/SHM WCS mask cube I/O (`cacaosim_mask`), and detector readout.
 - **`src/pupil/`**: Anti-aliased telescope pupil and static NCPA generator (`cacaosim.mkpupil`,
   `milk-fpsexec-cacaosim-mkpupil`).
 - **`src/beam/`**: Optical beam `[OPD_um, Amplitude]` source (`cacaosim.mkbeam`,
@@ -37,11 +37,15 @@ hardware and optical simulation plugin for the `milk` framework (`feat/bash-engi
 - **`src/fpcam/`**: Focal-plane science camera (`cacaosim.fpcam`, `milk-fpsexec-cacaosim-fpcam`)
   supporting Soummer Matrix-DFT and padded FFT across polychromatic channels, dynamic `in_beam`
   amplitude/OPD, subframe integration, and Strehl telemetry.
-- **`src/bench/` & `src/fused/`**: Declarative `.bench` INI/TOML parser/serializer, presets &
-  topological optical-splicing editor, zero-FFT spectral analyzer, `milk-CTRL`-style flicker-free
-  hardware configurator & live SHM status GUI (`cacaosim-CTRL`, `cacaosim-bench gui`), one-shot CLI
-  schematic visualizer (`cacaosim-bench-view`), and multi-rate optical bench engine
-  (`cacaosim.htsim`, `milk-fpsexec-cacaosim-htsim`, `scripts/cacaosim-bench`).
+- **`src/bench/`, `src/fused/` & `scripts/commands.d/cacaosim.bash`**: Declarative `.bench`
+  INI/TOML parser/serializer, presets & topological optical-splicing editor, zero-FFT spectral
+  analyzer, C `fpspipe` deployment-plan compiler (`cacaosim_bench_plan.c`, `cacaosim-bench-view
+  --emit-plan`), `milk-CTRL`-style flicker-free hardware configurator & live SHM status GUI
+  (`cacaosim-CTRL`, `cacaosim-bench gui`), one-shot CLI schematic visualizer
+  (`cacaosim-bench-view`), multi-rate optical bench engine (`cacaosim.htsim`,
+  `milk-fpsexec-cacaosim-htsim`), and `milk-script` / `fpspipe` lifecycle orchestration
+  (`cacaosim.deploy`, `cacaosim.stop`, `cacaosim.status`, `cacaosim.teardown`,
+  `scripts/cacaosim-bench`).
 
 ---
 

@@ -139,10 +139,11 @@ static const char *strip_bang(const char *s)
  *   Syntactic helper distinguishing filesystem paths from flat `ImageStreamIO` SHM stream names.
  *
  * Rationale:
- *   Matches case-insensitive `.fits`, `.fit`, and `.fts` extensions (`n > ext_len` ensures at
- *   least a 1-character stem) as well as any relative/absolute directory slash `'/'`.
+ *   Matches case-insensitive `.fits`, `.fit`, `.fts`, and compressed `.fits.gz`, `.fits.fz`,
+ *   `.fit.gz`, `.fit.fz`, `.fts.gz`, `.fts.fz` extensions (`n > ext_len` ensures at least a
+ *   1-character stem) as well as any relative/absolute directory slash `'/'`.
  *
- * Return: `1` if `@s` contains `'/'` or ends with a standard FITS suffix, `0` otherwise.
+ * Return: `1` if `@s` contains `'/'` or ends with a standard/compressed FITS suffix, `0` else.
  */
 static int has_fits_suffix_or_slash(const char *s)
 {
@@ -153,7 +154,13 @@ static int has_fits_suffix_or_slash(const char *s)
     size_t n = strlen(s);
     if ((n > 5u && strcasecmp(s + n - 5u, ".fits") == 0) ||
         (n > 4u && strcasecmp(s + n - 4u, ".fit") == 0) ||
-        (n > 4u && strcasecmp(s + n - 4u, ".fts") == 0))
+        (n > 4u && strcasecmp(s + n - 4u, ".fts") == 0) ||
+        (n > 8u && strcasecmp(s + n - 8u, ".fits.gz") == 0) ||
+        (n > 8u && strcasecmp(s + n - 8u, ".fits.fz") == 0) ||
+        (n > 7u && strcasecmp(s + n - 7u, ".fit.gz") == 0) ||
+        (n > 7u && strcasecmp(s + n - 7u, ".fit.fz") == 0) ||
+        (n > 7u && strcasecmp(s + n - 7u, ".fts.gz") == 0) ||
+        (n > 7u && strcasecmp(s + n - 7u, ".fts.fz") == 0))
     {
         return 1;
     }
@@ -321,6 +328,127 @@ static uint32_t to_be_f32(float f)
     uint32_t u = 0u;
     memcpy(&u, &f, sizeof(uint32_t));
     return __builtin_bswap32(u);
+}
+
+/**
+ * decode_wcs_lambda() - Populate `out->lam_um[]` from FITS/SHM 3rd-axis wavelength metadata
+ * @out:        Destination mask cube descriptor (`has_wcs_lam` and `lam_um` updated on match)
+ * @nz:         Spectral slice count (`>= 1`)
+ * @lam0:       Optional explicit first-slice wavelength `[um]` (`LAM0` or `CSIM_WL0`)
+ * @lam1:       Optional explicit last-slice wavelength `[um]` (`LAM1` or `CSIM_WL1`)
+ * @dlam:       Optional wavelength step `[um]` (`DLAM`)
+ * @has_crval3: Non-zero if `CRVAL3` was present
+ * @crval3:     WCS reference coordinate value (`CRVAL3`)
+ * @has_cdelt3: Non-zero if `CDELT3` was present
+ * @cdelt3:     WCS coordinate increment per channel (`CDELT3`)
+ * @crpix3:     1-based WCS reference pixel (`CRPIX3`, default `1.0`)
+ * @cunit3_raw: Optional WCS unit string (`CUNIT3`, may carry FITS fixed-width padding/quotes)
+ *
+ * Role:
+ *   Unified 3rd-axis spectral coordinate resolver shared by `cacaosim_mask_load_fits()` and
+ *   `load_from_image()` (for masks staged into `ImageStreamIO` SHM via `fpspipe.loadfits`).
+ *
+ * Rationale:
+ *   Applies the same three-tier priority (`LAM0`/`LAM1` -> `LAM0`+`DLAM` -> `CRVAL3`/`CDELT3`/
+ *   `CRPIX3`/`CUNIT3` with `[0.05, 50.0] um` sanity gating) across both direct FITS files and
+ *   SHM keyword tables so `.fits.gz` / `.fits.fz` cubes decompressed into SHM preserve exact
+ *   per-slice wavelengths.
+ */
+static void decode_wcs_lambda(
+    cacaosim_mask_cube_t *out,
+    uint32_t              nz,
+    double                lam0,
+    double                lam1,
+    double                dlam,
+    int                   has_crval3,
+    double                crval3,
+    int                   has_cdelt3,
+    double                cdelt3,
+    double                crpix3,
+    const char           *cunit3_raw)
+{
+    uint32_t n_store = (nz <= CACAOSIM_MASK_MAX_LAMBDA) ? nz : CACAOSIM_MASK_MAX_LAMBDA;
+    if (nz > 1u && lam0 > 0.0 && lam1 > 0.0)
+    {
+        out->has_wcs_lam = 1;
+        for (uint32_t z = 0; z < n_store; z++)
+        {
+            double u       = (double) z / (double) (nz - 1u);
+            out->lam_um[z] = (float) (lam0 + (lam1 - lam0) * u);
+        }
+        return;
+    }
+    if (nz >= 1u && lam0 > 0.0 && (nz == 1u || fabs(dlam) > 0.0))
+    {
+        out->has_wcs_lam = 1;
+        for (uint32_t z = 0; z < n_store; z++)
+        {
+            out->lam_um[z] = (float) (lam0 + dlam * (double) z);
+        }
+        return;
+    }
+    if (!has_crval3 || !(nz == 1u || (has_cdelt3 && fabs(cdelt3) > 0.0)))
+    {
+        return;
+    }
+
+    char cunit3[32] = "";
+    if (cunit3_raw != NULL)
+    {
+        const char *p = cunit3_raw;
+        while (*p != '\0' && (isspace((unsigned char) *p) || *p == '\'' || *p == '"'))
+        {
+            p++;
+        }
+        snprintf(cunit3, sizeof(cunit3), "%s", p);
+        size_t clen = strlen(cunit3);
+        while (clen > 0u &&
+               (isspace((unsigned char) cunit3[clen - 1u]) || cunit3[clen - 1u] == '\'' ||
+                cunit3[clen - 1u] == '"'))
+        {
+            cunit3[--clen] = '\0';
+        }
+    }
+
+    /* Normalize standard FITS WCS CUNIT3 ('um', 'm', 'nm', 'Angstrom', or implicit) to microns */
+    double unit_scale = 1.0;
+    if (strcasecmp(cunit3, "m") == 0 || strcasecmp(cunit3, "meter") == 0)
+    {
+        unit_scale = 1.0e6;
+    }
+    else if (strcasecmp(cunit3, "nm") == 0)
+    {
+        unit_scale = 1.0e-3;
+    }
+    else if (strcasecmp(cunit3, "a") == 0 || strcasecmp(cunit3, "angstrom") == 0)
+    {
+        unit_scale = 1.0e-4;
+    }
+    else if (cunit3[0] == '\0')
+    {
+        /* Unitless heuristic: < 100 nm in meters -> SI [m]; > 100 -> [nm] */
+        if (crval3 > 0.0 && crval3 < 1.0e-4)
+        {
+            unit_scale = 1.0e6;
+        }
+        else if (crval3 > 100.0)
+        {
+            unit_scale = 1.0e-3;
+        }
+    }
+
+    /* Sanity-gate converted slice-1 wavelength to optical/IR domain (0.05..50 um) */
+    double l_test = (crval3 + (1.0 - crpix3) * cdelt3) * unit_scale;
+    if (l_test > 0.05 && l_test < 50.0)
+    {
+        out->has_wcs_lam = 1;
+        for (uint32_t z = 0; z < n_store; z++)
+        {
+            /* FITS pixel coordinates (CRPIX3) are 1-indexed: slice z corresponds to z + 1 */
+            double w       = (crval3 + ((double) (z + 1u) - crpix3) * cdelt3) * unit_scale;
+            out->lam_um[z] = (float) w;
+        }
+    }
 }
 
 /**
@@ -594,65 +722,8 @@ int MILK_COLD cacaosim_mask_load_fits(
     out->owns_data = 1;
 
     /* Decode optional 3rd-axis wavelength coordinates into microns [um] */
-    uint32_t n_store = (nz <= CACAOSIM_MASK_MAX_LAMBDA) ? nz : CACAOSIM_MASK_MAX_LAMBDA;
-    if (nz > 1u && lam0 > 0.0 && lam1 > 0.0)
-    {
-        out->has_wcs_lam = 1;
-        for (uint32_t z = 0; z < n_store; z++)
-        {
-            double u      = (double) z / (double) (nz - 1u);
-            out->lam_um[z] = (float) (lam0 + (lam1 - lam0) * u);
-        }
-    }
-    else if (nz >= 1u && lam0 > 0.0 && (nz == 1u || fabs(dlam) > 0.0))
-    {
-        out->has_wcs_lam = 1;
-        for (uint32_t z = 0; z < n_store; z++)
-        {
-            out->lam_um[z] = (float) (lam0 + dlam * (double) z);
-        }
-    }
-    else if (has_crval3 && (nz == 1u || (has_cdelt3 && fabs(cdelt3) > 0.0)))
-    {
-        /* Normalize standard FITS WCS CUNIT3 ('m', 'nm', 'Angstrom', or implicit) to microns */
-        double unit_scale = 1.0;
-        if (strcasecmp(cunit3, "m") == 0 || strcasecmp(cunit3, "meter") == 0)
-        {
-            unit_scale = 1.0e6;
-        }
-        else if (strcasecmp(cunit3, "nm") == 0)
-        {
-            unit_scale = 1.0e-3;
-        }
-        else if (strcasecmp(cunit3, "a") == 0 || strcasecmp(cunit3, "angstrom") == 0)
-        {
-            unit_scale = 1.0e-4;
-        }
-        else if (cunit3[0] == '\0')
-        {
-            /* Unitless heuristic: < 100 nm in meters -> SI [m]; > 100 -> [nm] */
-            if (crval3 > 0.0 && crval3 < 1.0e-4)
-            {
-                unit_scale = 1.0e6;
-            }
-            else if (crval3 > 100.0)
-            {
-                unit_scale = 1.0e-3;
-            }
-        }
-        /* Sanity-gate converted slice-1 wavelength to optical/IR domain (0.05..50 um) */
-        double l_test = (crval3 + (1.0 - crpix3) * cdelt3) * unit_scale;
-        if (l_test > 0.05 && l_test < 50.0)
-        {
-            out->has_wcs_lam = 1;
-            for (uint32_t z = 0; z < n_store; z++)
-            {
-                /* FITS pixel coordinates (CRPIX3) are 1-indexed: slice z corresponds to z + 1 */
-                double w       = (crval3 + ((double) (z + 1u) - crpix3) * cdelt3) * unit_scale;
-                out->lam_um[z] = (float) w;
-            }
-        }
-    }
+    decode_wcs_lambda(out, nz, lam0, lam1, dlam, has_crval3, crval3, has_cdelt3, cdelt3, crpix3,
+                      cunit3);
 
     return 0;
 }
@@ -870,36 +941,73 @@ static int load_from_image(
     out->nz        = nz;
     out->owns_data = 1;
 
-    /* Inspect SHM keyword table for explicit wavelength endpoints on 3D polychromatic masks */
-    if (nz > 1u && im->kw != NULL && im->md->NBkw > 0)
+    /* Inspect SHM keyword table for WCS and endpoint wavelengths (including loadfits cubes) */
+    if (im->kw != NULL && im->md->NBkw > 0)
     {
-        double l0 = 0.0;
-        double l1 = 0.0;
+        double lam0       = 0.0;
+        double lam1       = 0.0;
+        double dlam       = 0.0;
+        int    has_crval3 = 0;
+        int    has_cdelt3 = 0;
+        double crval3     = 0.0;
+        double cdelt3     = 0.0;
+        double crpix3     = 1.0;
+        char   cunit3[32] = "";
+
         for (uint16_t k = 0; k < im->md->NBkw; k++)
         {
-            if (im->kw[k].type == 'D')
+            const char *kn      = im->kw[k].name;
+            char        kt      = im->kw[k].type;
+            int         has_num = 0;
+            double      numv    = 0.0;
+
+            if (kt == 'D')
             {
-                if (strcmp(im->kw[k].name, "LAM0") == 0 || strcmp(im->kw[k].name, "CSIM_WL0") == 0)
+                numv    = im->kw[k].value.numf;
+                has_num = 1;
+            }
+            else if (kt == 'L')
+            {
+                numv    = (double) im->kw[k].value.numl;
+                has_num = 1;
+            }
+
+            if (has_num)
+            {
+                if (strcmp(kn, "LAM0") == 0 || strcmp(kn, "CSIM_WL0") == 0)
                 {
-                    l0 = im->kw[k].value.numf;
+                    lam0 = numv;
                 }
-                else if (strcmp(im->kw[k].name, "LAM1") == 0 ||
-                         strcmp(im->kw[k].name, "CSIM_WL1") == 0)
+                else if (strcmp(kn, "LAM1") == 0 || strcmp(kn, "CSIM_WL1") == 0)
                 {
-                    l1 = im->kw[k].value.numf;
+                    lam1 = numv;
+                }
+                else if (strcmp(kn, "DLAM") == 0)
+                {
+                    dlam = numv;
+                }
+                else if (strcmp(kn, "CRVAL3") == 0)
+                {
+                    crval3     = numv;
+                    has_crval3 = 1;
+                }
+                else if (strcmp(kn, "CDELT3") == 0)
+                {
+                    cdelt3     = numv;
+                    has_cdelt3 = 1;
+                }
+                else if (strcmp(kn, "CRPIX3") == 0)
+                {
+                    crpix3 = numv;
                 }
             }
-        }
-        if (l0 > 0.0 && l1 > 0.0)
-        {
-            uint32_t n_store = (nz <= CACAOSIM_MASK_MAX_LAMBDA) ? nz : CACAOSIM_MASK_MAX_LAMBDA;
-            out->has_wcs_lam = 1;
-            for (uint32_t z = 0; z < n_store; z++)
+            else if (kt == 'S' && strcmp(kn, "CUNIT3") == 0)
             {
-                double u       = (double) z / (double) (nz - 1u);
-                out->lam_um[z] = (float) (l0 + (l1 - l0) * u);
+                snprintf(cunit3, sizeof(cunit3), "%s", im->kw[k].value.valstr);
             }
         }
+        decode_wcs_lambda(out, nz, lam0, lam1, dlam, has_crval3, crval3, has_cdelt3, cdelt3,
+                          crpix3, cunit3);
     }
 
     return 0;
