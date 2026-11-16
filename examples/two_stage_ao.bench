@@ -47,8 +47,8 @@
 #     delivering realistic moderate-flux photon shot noise across Visible, J, and H bands.
 #   - master_hz = 3000.0: Matches the fastest sensor rate (Stage-2 Visible PyWFS at 3 kHz) so all
 #     slower sensors (1 kHz Stage-1 WFS, 100 Hz H-band camera) decimate cleanly via integer navg.
-#   - wf_unit = 1, ref_lambda = 0.50: Interprets incoming outarraypha turbulence screens in OPD
-#     [um] (or 0.50 um reference scaling) when synthesizing root optical beam b_pup.
+#   - wf_unit = 1, ref_lambda = 0.50: Interprets incoming outarraypha turbulence screens in phase
+#     [rad] at ref_lambda = 0.50 um (use wf_unit = 0 for OPD [um]) when synthesizing root beam b_pup.
 [bench]
 name       = "two_stage_cascaded_ao"
 nwf        = 128
