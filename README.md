@@ -21,6 +21,12 @@ interoperable layers:
    single zero-hop GPU/CPU process** (`cacaosim.htsim`) or **modularly across wave-ordered
    semaphore-chained FPS processes** (`cacaosim-bench deploy --config ... --mode modular`).
 
+![cacaosim-CTRL F2:BUILDER 3-pane workspace](docs/assets/cacaosim-ctrl-builder.png)
+
+*`cacaosim-CTRL` (`F2:BUILDER`) inspecting `examples/exao_coro_lowfs.bench`: Elements & Arranger
+with live SHM dots, `16x16` entrance pupil & focal-scale dock, interactive 2D schematic, and
+parameter inspector.*
+
 ---
 
 ## Compute Units & Source Architecture
@@ -107,6 +113,16 @@ mouse + draggable splitters + hover tooltips, 5 `milk` themes, and `--ascii` 7-b
 - **`F3:SCHEMATIC` / `F4:TABLES` / `F5:STATUS` / `F6:SOURCE`**: Full-screen optical diagram &
   32-bin (`0.40..2.40 um`) spectral deck, hardware summary tables, live `.im.shm` / `.fps.shm`
   rates + Strehl + one-key `fused`/`modular` deployment, and `.bench` INI/TOML preview.
+
+![cacaosim-CTRL F3:SCHEMATIC 2D diagram and spectra](docs/assets/cacaosim-ctrl-schematic.png)
+
+*`F3:SCHEMATIC`: Full-screen 2D optical topology with per-sensor photon budgets and 32-bin
+(`0.40..2.40 um`) polychromatic spectral deck.*
+
+![cacaosim-CTRL F5:STATUS live SHM and FPS telemetry](docs/assets/cacaosim-ctrl-status.png)
+
+*`F5:STATUS`: Live `MILK_SHM_DIR` shared-memory stream rates, active `milk` FPS units with Strehl
+telemetry, deployment controls, and activity log.*
 
 ---
 
