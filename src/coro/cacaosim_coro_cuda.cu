@@ -214,8 +214,8 @@ __global__ static void k_coro_apply_lyot_batch(
     int32_t                       lo_lyot,
     uint64_t                      npix_wf,
     int32_t                       eff_nlam,
-    int32_t                       c_mid,
     uint64_t                      out_stride,
+    uint64_t                      lo_stride,
     float *__restrict__           out_opd,
     float *__restrict__           out_amp,
     float *__restrict__           lowfs_opd,
@@ -240,20 +240,21 @@ __global__ static void k_coro_apply_lyot_batch(
     out_amp[oidx] = amp;
     out_opd[oidx] = (amp > 1e-12f) ? (atan2f(li, lr) * rad_to_opd) : 0.0f;
 
-    if (c == c_mid && lowfs_opd != NULL && lowfs_amp != NULL)
+    if (lowfs_opd != NULL && lowfs_amp != NULL)
     {
+        uint64_t loidx = (uint64_t) c * lo_stride + p;
         if (lo_lyot)
         {
-            float lya2   = ly.x * ly.x + ly.y * ly.y;
-            float r_ly   = refl * ((lya2 < 1.0f) ? sqrtf(1.0f - lya2) : 0.0f);
-            float la     = r_ly * hypotf(u.x, u.y);
-            lowfs_amp[p] = la;
-            lowfs_opd[p] = (la > 1e-12f) ? (atan2f(u.y, u.x) * rad_to_opd) : 0.0f;
+            float lya2       = ly.x * ly.x + ly.y * ly.y;
+            float r_ly       = refl * ((lya2 < 1.0f) ? sqrtf(1.0f - lya2) : 0.0f);
+            float la         = r_ly * hypotf(u.x, u.y);
+            lowfs_amp[loidx] = la;
+            lowfs_opd[loidx] = (la > 1e-12f) ? (atan2f(u.y, u.x) * rad_to_opd) : 0.0f;
         }
         else
         {
-            lowfs_amp[p] = 0.0f;
-            lowfs_opd[p] = 0.0f;
+            lowfs_amp[loidx] = 0.0f;
+            lowfs_opd[loidx] = 0.0f;
         }
     }
 }
@@ -304,23 +305,29 @@ __global__ static void k_coro_scale_real_copy(
  *   Applies both scalar mirror reflectivity `@refl` and the relay pupil stop `@lowfs_pup_mask`
  *   before converting complex phasors into `[OPD_um, Amplitude]`.
  */
-__global__ static void k_coro_write_lowfs(
+__global__ static void k_coro_write_lowfs_batch(
     const cuComplex *__restrict__ ecore,
     const float *__restrict__     lowfs_pup_mask,
+    const float *__restrict__     lam_um,
     float                         refl,
-    float                         rad_to_opd,
-    uint64_t                      npix,
+    uint64_t                      npix_wf,
+    int32_t                       eff_nlam,
+    uint64_t                      lo_stride,
     float *__restrict__           lowfs_opd,
     float *__restrict__           lowfs_amp)
 {
     uint64_t p = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (p < npix)
+    int32_t  c = (int32_t) blockIdx.y;
+    if (p < npix_wf && c < eff_nlam)
     {
-        cuComplex ec = ecore[p];
-        float     pm = (lowfs_pup_mask != NULL) ? lowfs_pup_mask[p] : 1.0f;
-        float     la = refl * pm * hypotf(ec.x, ec.y);
-        lowfs_amp[p] = la;
-        lowfs_opd[p] = (la > 1e-12f) ? (atan2f(ec.y, ec.x) * rad_to_opd) : 0.0f;
+        uint64_t  cidx       = (uint64_t) c * npix_wf + p;
+        uint64_t  loidx      = (uint64_t) c * lo_stride + p;
+        cuComplex ec         = ecore[cidx];
+        float     pm         = (lowfs_pup_mask != NULL) ? lowfs_pup_mask[p] : 1.0f;
+        float     la         = refl * pm * hypotf(ec.x, ec.y);
+        float     rad_to_opd = lam_um[c] / CACAOSIM_TWO_PI_F;
+        lowfs_amp[loidx]     = la;
+        lowfs_opd[loidx]     = (la > 1e-12f) ? (atan2f(ec.y, ec.x) * rad_to_opd) : 0.0f;
     }
 }
 
@@ -383,8 +390,8 @@ __global__ static void k_coro_babinet_finalize_batch(
     float                         refl,
     uint64_t                      npix_wf,
     int32_t                       eff_nlam,
-    int32_t                       c_mid,
     uint64_t                      out_stride,
+    uint64_t                      lo_stride,
     float *__restrict__           out_opd,
     float *__restrict__           out_amp,
     float *__restrict__           lowfs_opd,
@@ -412,13 +419,14 @@ __global__ static void k_coro_babinet_finalize_batch(
     out_amp[oidx] = amp;
     out_opd[oidx] = (amp > 1e-12f) ? (atan2f(li, lr) * rad_to_opd) : 0.0f;
 
-    if (c == c_mid && lowfs_opd != NULL && lowfs_amp != NULL)
+    if (lowfs_opd != NULL && lowfs_amp != NULL)
     {
-        float lya2   = ly.x * ly.x + ly.y * ly.y;
-        float r_ly   = refl * ((lya2 < 1.0f) ? sqrtf(1.0f - lya2) : 0.0f);
-        float la     = r_ly * hypotf(ur, ui);
-        lowfs_amp[p] = la;
-        lowfs_opd[p] = (la > 1e-12f) ? (atan2f(ui, ur) * rad_to_opd) : 0.0f;
+        uint64_t loidx   = (uint64_t) c * lo_stride + p;
+        float    lya2    = ly.x * ly.x + ly.y * ly.y;
+        float    r_ly    = refl * ((lya2 < 1.0f) ? sqrtf(1.0f - lya2) : 0.0f);
+        float    la      = r_ly * hypotf(ur, ui);
+        lowfs_amp[loidx] = la;
+        lowfs_opd[loidx] = (la > 1e-12f) ? (atan2f(ui, ur) * rad_to_opd) : 0.0f;
     }
 }
 
@@ -689,8 +697,8 @@ extern "C" int cacaosim_coro_cuda_init(cacaosim_coro_ctx_t *ctx, void *ext_strea
         cudaMalloc((void **) &cs->d_in_amp, poly_f) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_out_opd, poly_f) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_out_amp, poly_f) != cudaSuccess ||
-        cudaMalloc((void **) &cs->d_lowfs_opd, wf_bytes) != cudaSuccess ||
-        cudaMalloc((void **) &cs->d_lowfs_amp, wf_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_lowfs_opd, poly_f) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_lowfs_amp, poly_f) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_epup, poly_c) != cudaSuccess)
     {
         cacaosim_coro_cuda_free(ctx);
@@ -729,7 +737,6 @@ extern "C" int cacaosim_coro_cuda_init(cacaosim_coro_ctx_t *ctx, void *ext_strea
         size_t   t_bytes = nlam * (size_t) max_m * ctx->cfg.nwf * sizeof(cuComplex);
         size_t   mft_c   = nlam * (size_t) ctx->npix_mft * sizeof(cuComplex);
         size_t   mft_f   = nlam * (size_t) ctx->npix_mft * sizeof(float);
-        size_t   mft_1c  = (size_t) ctx->npix_mft * sizeof(cuComplex);
 
         if (cudaMalloc((void **) &cs->d_fwd_U, u_bytes) != cudaSuccess ||
             cudaMalloc((void **) &cs->d_inv_U, u_bytes) != cudaSuccess ||
@@ -740,7 +747,7 @@ extern "C" int cacaosim_coro_cuda_init(cacaosim_coro_ctx_t *ctx, void *ext_strea
             cudaMalloc((void **) &cs->d_ecore, poly_c) != cudaSuccess ||
             cudaMalloc((void **) &cs->d_tmp, t_bytes) != cudaSuccess ||
             cudaMalloc((void **) &cs->d_efoc, mft_c) != cudaSuccess ||
-            cudaMalloc((void **) &cs->d_efoc_r, mft_1c) != cudaSuccess)
+            cudaMalloc((void **) &cs->d_efoc_r, mft_c) != cudaSuccess)
         {
             cacaosim_coro_cuda_free(ctx);
             return -1;
@@ -759,7 +766,7 @@ extern "C" int cacaosim_coro_cuda_init(cacaosim_coro_ctx_t *ctx, void *ext_strea
     {
         size_t sh_bytes  = (size_t) ctx->nfft * 2u * sizeof(cuComplex);
         size_t msk_bytes = nlam * (size_t) ctx->npix_fft * sizeof(cuComplex);
-        size_t rw_bytes  = (size_t) ctx->npix_fft * sizeof(float);
+        size_t rw_bytes  = nlam * (size_t) ctx->npix_fft * sizeof(float);
         size_t fft_bytes = (size_t) ctx->npix_fft * sizeof(cuComplex);
         if (cudaMalloc((void **) &cs->d_shift_1d, sh_bytes) != cudaSuccess ||
             cudaMalloc((void **) &cs->d_fft_mask, msk_bytes) != cudaSuccess ||
@@ -901,7 +908,6 @@ extern "C" void cacaosim_coro_cuda_step_poly(
     coro_cuda_state_t *cs       = (coro_cuda_state_t *) ctx->cuda_priv;
     const uint64_t     npix_wf  = ctx->npix_wf;
     const int32_t      eff_nlam = ctx->eff_nlam;
-    const int32_t      c_mid    = eff_nlam / 2;
     const size_t       wf_bytes = (size_t) npix_wf * sizeof(float);
     const int          dev_mode = (d_in_opd != NULL && d_out_opd != NULL) ? 1 : 0;
 
@@ -918,6 +924,7 @@ extern "C" void cacaosim_coro_cuda_step_poly(
     int          want_lo       = (d_lowfs_opd != NULL || h_lowfs_opd != NULL) ? 1 : 0;
     float       *dlo_o = want_lo ? ((d_lowfs_opd != NULL) ? d_lowfs_opd : cs->d_lowfs_opd) : NULL;
     float       *dlo_a = want_lo ? ((d_lowfs_amp != NULL) ? d_lowfs_amp : cs->d_lowfs_amp) : NULL;
+    uint64_t     dev_lo_str    = (d_lowfs_opd != NULL) ? out_stride : npix_wf;
 
     /* Stage host SHM slices to contiguous GPU buffers when not running purely device-resident */
     if (!dev_mode)
@@ -967,22 +974,24 @@ extern "C" void cacaosim_coro_cuda_step_poly(
     if (ctx->skip_fpm)
     {
         k_coro_apply_lyot_batch<<<grd_wf, 256, 0, cs->stream>>>(
-            cs->d_epup, cs->d_lyot_cplx, cs->d_lam_um, refl, lo_lyot, npix_wf, eff_nlam, c_mid,
-            dev_out_str, dout_o, dout_a, dlo_o, dlo_a);
+            cs->d_epup, cs->d_lyot_cplx, cs->d_lam_um, refl, lo_lyot, npix_wf, eff_nlam,
+            dev_out_str, dev_lo_str, dout_o, dout_a, dlo_o, dlo_a);
     }
     else if (ctx->is_babinet)
     {
-        const int           nwf   = (int) ctx->cfg.nwf;
-        const int           mx    = (int) ctx->nx_mft;
-        const int           my    = (int) ctx->ny_mft;
-        const int           max_m = (mx > my) ? mx : my;
-        const cuComplex     one   = make_cuComplex(1.0f, 0.0f);
-        const cuComplex     zero  = make_cuComplex(0.0f, 0.0f);
-        const long long int str_ep = (long long int) npix_wf;
-        const long long int str_u  = (long long int) my * nwf;
-        const long long int str_v  = (long long int) mx * nwf;
-        const long long int str_t  = (long long int) max_m * nwf;
-        const long long int str_ef = (long long int) ctx->npix_mft;
+        const int           nwf       = (int) ctx->cfg.nwf;
+        const int           mx        = (int) ctx->nx_mft;
+        const int           my        = (int) ctx->ny_mft;
+        const int           max_m     = (mx > my) ? mx : my;
+        const cuComplex     one       = make_cuComplex(1.0f, 0.0f);
+        const cuComplex     zero      = make_cuComplex(0.0f, 0.0f);
+        const long long int str_ep    = (long long int) npix_wf;
+        const long long int str_u     = (long long int) my * nwf;
+        const long long int str_v     = (long long int) mx * nwf;
+        const long long int str_t     = (long long int) max_m * nwf;
+        const long long int str_ef    = (long long int) ctx->npix_mft;
+        const uint64_t      total_mft = (uint64_t) eff_nlam * ctx->npix_mft;
+        const uint32_t      bl_mft    = (uint32_t) ((total_mft + 255ULL) / 256ULL);
 
         /*
          * Batched forward 2D MFT via column-major transpose identity (A*B)^T = B^T * A^T:
@@ -996,26 +1005,23 @@ extern "C" void cacaosim_coro_cuda_step_poly(
                                   cs->d_fwd_V, mx, str_v, cs->d_tmp, nwf, str_t, &zero, cs->d_efoc,
                                   mx, str_ef, eff_nlam);
 
-        /* Central-channel fpm_refl LOWFS inverse MFT: ecore = inv_U * (w * efoc) * inv_V */
+        /* Batched fpm_refl LOWFS inverse MFT: ecore = inv_U * (w * efoc) * inv_V */
         if (want_lo && !lo_lyot && dlo_o != NULL && dlo_a != NULL)
         {
-            uint32_t bl_m1 = (uint32_t) ((ctx->npix_mft + 255ULL) / 256ULL);
-            k_coro_scale_real_copy<<<bl_m1, 256, 0, cs->stream>>>(
-                cs->d_efoc + (size_t) c_mid * ctx->npix_mft,
-                cs->d_fpm_refl_w + (size_t) c_mid * ctx->npix_mft, cs->d_efoc_r, ctx->npix_mft);
-            cublasCgemm(cs->cublas, CUBLAS_OP_N, CUBLAS_OP_N, mx, nwf, my, &one, cs->d_efoc_r, mx,
-                        cs->d_inv_U + (size_t) c_mid * str_u, my, &zero, cs->d_tmp, mx);
-            cublasCgemm(cs->cublas, CUBLAS_OP_N, CUBLAS_OP_N, nwf, nwf, mx, &one,
-                        cs->d_inv_V + (size_t) c_mid * str_v, nwf, cs->d_tmp, mx, &zero,
-                        cs->d_ecore, nwf);
-            float rad_to_opd_mid = ctx->lam_um[c_mid] / CACAOSIM_TWO_PI_F;
-            k_coro_write_lowfs<<<bl_wf, 256, 0, cs->stream>>>(
-                cs->d_ecore, cs->d_lowfs_pup_mask, refl, rad_to_opd_mid, npix_wf, dlo_o, dlo_a);
+            k_coro_scale_real_copy<<<bl_mft, 256, 0, cs->stream>>>(
+                cs->d_efoc, cs->d_fpm_refl_w, cs->d_efoc_r, total_mft);
+            cublasCgemmStridedBatched(cs->cublas, CUBLAS_OP_N, CUBLAS_OP_N, mx, nwf, my, &one,
+                                      cs->d_efoc_r, mx, str_ef, cs->d_inv_U, my, str_u, &zero,
+                                      cs->d_tmp, mx, str_t, eff_nlam);
+            cublasCgemmStridedBatched(cs->cublas, CUBLAS_OP_N, CUBLAS_OP_N, nwf, nwf, mx, &one,
+                                      cs->d_inv_V, nwf, str_v, cs->d_tmp, mx, str_t, &zero,
+                                      cs->d_ecore, nwf, str_ep, eff_nlam);
+            k_coro_write_lowfs_batch<<<grd_wf, 256, 0, cs->stream>>>(
+                cs->d_ecore, cs->d_lowfs_pup_mask, cs->d_lam_um, refl, npix_wf, eff_nlam,
+                dev_lo_str, dlo_o, dlo_a);
         }
 
         /* Apply Babinet focal perturbation (T - 1) and batched inverse 2D MFT back to pupil */
-        uint64_t total_mft = (uint64_t) eff_nlam * ctx->npix_mft;
-        uint32_t bl_mft    = (uint32_t) ((total_mft + 255ULL) / 256ULL);
         k_coro_mul_cplx<<<bl_mft, 256, 0, cs->stream>>>(cs->d_efoc, cs->d_fpm_delta, total_mft);
 
         cublasCgemmStridedBatched(cs->cublas, CUBLAS_OP_N, CUBLAS_OP_N, mx, nwf, my, &one,
@@ -1026,8 +1032,8 @@ extern "C" void cacaosim_coro_cuda_step_poly(
                                   cs->d_ecore, nwf, str_ep, eff_nlam);
 
         k_coro_babinet_finalize_batch<<<grd_wf, 256, 0, cs->stream>>>(
-            cs->d_epup, cs->d_ecore, cs->d_lyot_cplx, cs->d_lam_um, refl, npix_wf, eff_nlam, c_mid,
-            dev_out_str, dout_o, dout_a, (want_lo && lo_lyot) ? dlo_o : NULL,
+            cs->d_epup, cs->d_ecore, cs->d_lyot_cplx, cs->d_lam_um, refl, npix_wf, eff_nlam,
+            dev_out_str, dev_lo_str, dout_o, dout_a, (want_lo && lo_lyot) ? dlo_o : NULL,
             (want_lo && lo_lyot) ? dlo_a : NULL);
     }
     else
@@ -1039,9 +1045,9 @@ extern "C" void cacaosim_coro_cuda_step_poly(
 
         for (int32_t c = 0; c < eff_nlam; c++)
         {
-            int    is_mid = (c == c_mid && want_lo && dlo_o != NULL && dlo_a != NULL) ? 1 : 0;
-            float *lo_o_c = (is_mid && lo_lyot) ? dlo_o : NULL;
-            float *lo_a_c = (is_mid && lo_lyot) ? dlo_a : NULL;
+            int    do_lo  = (want_lo && dlo_o != NULL && dlo_a != NULL) ? 1 : 0;
+            float *lo_o_c = (do_lo && lo_lyot) ? (dlo_o + (size_t) c * dev_lo_str) : NULL;
+            float *lo_a_c = (do_lo && lo_lyot) ? (dlo_a + (size_t) c * dev_lo_str) : NULL;
             float  r2o_c  = ctx->lam_um[c] / CACAOSIM_TWO_PI_F;
 
             k_coro_fft_embed_epup<<<bl_fft, 256, 0, cs->stream>>>(
@@ -1049,14 +1055,15 @@ extern "C" void cacaosim_coro_cuda_step_poly(
                 cs->d_fft_buf);
             cufftExecC2C(cs->fft_plan, cs->d_fft_buf, cs->d_fft_buf, CUFFT_FORWARD);
 
-            if (is_mid && !lo_lyot)
+            if (do_lo && !lo_lyot)
             {
                 k_coro_scale_real_copy<<<bl_fft, 256, 0, cs->stream>>>(
-                    cs->d_fft_buf, cs->d_fft_refl_w, cs->d_fft_lo_buf, ctx->npix_fft);
+                    cs->d_fft_buf, cs->d_fft_refl_w + (size_t) c * ctx->npix_fft, cs->d_fft_lo_buf,
+                    ctx->npix_fft);
                 cufftExecC2C(cs->fft_plan, cs->d_fft_lo_buf, cs->d_fft_lo_buf, CUFFT_INVERSE);
                 k_coro_fft_extract_lowfs_fpm<<<bl_wf, 256, 0, cs->stream>>>(
                     cs->d_fft_lo_buf, sh_x, sh_y, cs->d_lowfs_pup_mask, refl, r2o_c, ctx->cfg.nwf,
-                    ctx->nfft, dlo_o, dlo_a);
+                    ctx->nfft, dlo_o + (size_t) c * dev_lo_str, dlo_a + (size_t) c * dev_lo_str);
             }
 
             k_coro_fft_mul_mask<<<bl_fft, 256, 0, cs->stream>>>(
@@ -1100,11 +1107,31 @@ extern "C" void cacaosim_coro_cuda_step_poly(
         }
         if (h_lowfs_opd != NULL && dlo_o != NULL)
         {
-            cudaMemcpyAsync(h_lowfs_opd, dlo_o, wf_bytes, cudaMemcpyDeviceToHost, cs->stream);
+            if (eff_nlam == 1 || out_stride == npix_wf)
+            {
+                cudaMemcpyAsync(h_lowfs_opd, dlo_o, (size_t) eff_nlam * wf_bytes,
+                                cudaMemcpyDeviceToHost, cs->stream);
+            }
+            else
+            {
+                cudaMemcpy2DAsync(h_lowfs_opd, (size_t) out_stride * sizeof(float), dlo_o,
+                                  wf_bytes, wf_bytes, (size_t) eff_nlam, cudaMemcpyDeviceToHost,
+                                  cs->stream);
+            }
         }
         if (h_lowfs_amp != NULL && dlo_a != NULL)
         {
-            cudaMemcpyAsync(h_lowfs_amp, dlo_a, wf_bytes, cudaMemcpyDeviceToHost, cs->stream);
+            if (eff_nlam == 1 || out_stride == npix_wf)
+            {
+                cudaMemcpyAsync(h_lowfs_amp, dlo_a, (size_t) eff_nlam * wf_bytes,
+                                cudaMemcpyDeviceToHost, cs->stream);
+            }
+            else
+            {
+                cudaMemcpy2DAsync(h_lowfs_amp, (size_t) out_stride * sizeof(float), dlo_a,
+                                  wf_bytes, wf_bytes, (size_t) eff_nlam, cudaMemcpyDeviceToHost,
+                                  cs->stream);
+            }
         }
         cudaStreamSynchronize(cs->stream);
     }

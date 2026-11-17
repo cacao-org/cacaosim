@@ -215,10 +215,14 @@ typedef struct
     char                 pup_refl[CACAOSIM_BENCH_NAME_LEN];
     char                 pup_trans[CACAOSIM_BENCH_NAME_LEN];
 
-    /* Throughput, cadence, photometry, static WFE synthesis, and 2D registration */
+    /* Throughput, cadence, clock skew, photometry, static WFE synthesis, and 2D registration */
     float                tput;
     uint32_t             navg;
     float                rate_hz;
+    float                clock_offset_us;
+    float                clock_drift_ppm;
+    uint32_t             subframe_stride;
+    float                sim_hz;
     float                bw_frac;
     float                qe;
     int32_t              use_beam_flux;
@@ -285,6 +289,9 @@ typedef struct
     float               star_teff;
     float               tput_tel;
     float               master_hz;
+    uint32_t            oversample;
+    int32_t             atm_interp;
+    uint32_t            telemetry_stride;
     char                in_wf[CACAOSIM_BENCH_NAME_LEN];
     char                in_amp[CACAOSIM_BENCH_NAME_LEN];
     char                in_pup[CACAOSIM_BENCH_NAME_LEN];
@@ -332,6 +339,7 @@ typedef struct
     float          *d_amp;
     IMGID           img_shm;
     int32_t         export_shm;
+    int32_t         owns_buf;
 } cacaosim_beam_slot_t;
 
 /**
@@ -347,6 +355,9 @@ typedef struct
  * @eff_navg:        Quantized master-clock ticks integrated per camera readout (>= 1).
  * @eff_flux_ph:     Effective incident/detected photons per camera exposure [photons/readout].
  * @eff_lambda_um:   Flux-weighted effective central wavelength [um] across the sensor passband.
+ * @eff_nlam:        Resolved number of polychromatic optical slices integrated per subframe.
+ * @chan_lam_um:     Flux-weighted sub-band centroid wavelengths [um] for slices [0..eff_nlam-1].
+ * @chan_weight:     Normalized sub-band photoevent weights summing to 1.0 across [0..eff_nlam-1].
  * @ncam:            Square output detector dimension [pixels] (n_sub * pix_per_sub for SHWFS).
  * @out_dtype:       Detector pixel datatype (CACAOSIM_DTYPE_U16 or CACAOSIM_DTYPE_F32).
  * @ready_this_tick: 1 on master ticks when this sensor completes an eff_navg readout, else 0.
@@ -408,10 +419,21 @@ typedef struct
     int32_t             dm_slot;
     int32_t             sensor_slot;
 
-    /* Effective cadence and integrated photon flux per readout */
+    /* Effective cadence, DM delay, subframe stride, clock phase, and photon flux per readout */
     uint32_t            eff_navg;
+    float               eff_delay_ticks;
+    uint32_t            eff_stride;
+    uint32_t            stagger_tick;
+    double              clock_phase;
+    double              clock_phase_init;
+    uint32_t            prev_subframe_cnt;
+    int32_t             alias_refl;
+    int32_t             alias_trans;
     float               eff_flux_ph;
     float               eff_lambda_um;
+    int32_t             eff_nlam;
+    float               chan_lam_um[CACAOSIM_MAX_LAMBDA];
+    float               chan_weight[CACAOSIM_MAX_LAMBDA];
     uint32_t            ncam;
     int32_t             out_dtype;
     int32_t             ready_this_tick;
@@ -511,18 +533,27 @@ typedef struct
     int32_t               use_cuda;
     uint32_t              nwf;
     uint64_t              npix_wf;
+    uint32_t              eff_oversample;
+    float                 eff_master_hz;
     float                 dt_master_s;
     uint64_t              tick_cnt;
     void                 *cuda_stream;
 
-    /* Entrance pupil, static NCPA, and atmosphere buffers */
+    /* Entrance pupil, static NCPA, and dual-screen atmosphere interpolation buffers */
     float                *fallback_pup;
     const float          *pup_ptr;
     const float          *ncpa_ptr;
+    float                *h_wf_prev;
+    float                *h_wf_curr;
     float                *d_pup_amp;
     float                *d_ncpa_opd;
     float                *d_wf_in;
+    float                *d_wf_prev;
+    float                *d_wf_curr;
     float                *d_atm_amp;
+    uint64_t              wf_prev_cnt0;
+    uint32_t              wf_substep;
+    int32_t               wf_interp_primed;
 
     /* Entrance SHM streams (when connect_shm == 1) */
     IMGID                 img_pup;
@@ -547,6 +578,15 @@ typedef struct
     float                 last_strehl_inst;
     float                 last_strehl_ave;
     int32_t               export_beams_active;
+
+    /* Lockstep step-and-shoot / temporal calibration & in-DAG wfstat liveness controls */
+    int32_t               calib_fast;
+    int32_t               calib_temporal;
+    int32_t               calib_dm_node;
+    const float          *calib_cmd_override;
+    char                  calib_wfs_out[CACAOSIM_BENCH_NAME_LEN];
+    int32_t               wfstat_step_active;
+    int32_t               wfstat_beam_idx[3];
 } cacaosim_bench_ctx_t;
 
 /**
@@ -1206,6 +1246,7 @@ typedef struct
     float    seeing_arcsec;
     uint32_t atm_master_size;
     float    rate_override;
+    uint32_t oversample_override;
     int32_t  backend;
     uint32_t flat_nwf;
     uint32_t flat_nact;
@@ -1275,6 +1316,21 @@ int cacaosim_bench_bind_export_beams(
  * Return: Beam slot index in `[0, ctx->n_beams - 1]`, or `-1` if not found / NULL args.
  */
 int cacaosim_bench_find_beam(const cacaosim_bench_ctx_t *ctx, const char *name);
+
+/**
+ * cacaosim_bench_find_dm_stream() - Resolve a DM stream name or node id to its bound SHM IMAGE
+ * @ctx:  Initialized bench context with `connect_shm == 1` (may be NULL).
+ * @spec: DM node id or `in_cmd` stream name (e.g. `"dm01disp"`; `"none"` / empty returns NULL).
+ *
+ * Return: Pointer to the bound `IMAGE` handle, or `NULL` if unavailable / not found.
+ */
+IMAGE *cacaosim_bench_find_dm_stream(const cacaosim_bench_ctx_t *ctx, const char *spec);
+
+/**
+ * cacaosim_bench_reset_wfs_accum() - Reset subframe accumulators across all sensor nodes
+ * @ctx: Initialized bench context (no-op if NULL).
+ */
+void cacaosim_bench_reset_wfs_accum(cacaosim_bench_ctx_t *ctx);
 
 #ifdef __cplusplus
 }

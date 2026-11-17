@@ -28,12 +28,15 @@ typedef struct
     double      *sum[WFG_MAX_LOC];
     double      *sum2[WFG_MAX_LOC];
     float       *tmp[WFG_MAX_LOC];
+    float       *ts[WFG_MAX_LOC];
 } wfg_ptrs_t;
 
 typedef struct
 {
     uint64_t     npix;
     uint32_t     nloc;
+    uint64_t     ts_cap;
+    uint64_t     ts_len;
     cudaStream_t stream;
     double      *d_w;
     double      *d_frame; /* [nloc * 4]: pist, svar, min, max of the latest frame */
@@ -100,7 +103,7 @@ __global__ void k_wfg_pix(const double *w, wfg_ptrs_t P, uint64_t npix, const do
 }
 
 __global__ void k_wfg_stat(const double *w, wfg_ptrs_t P, uint64_t npix, double *frame,
-                           double *acc)
+                           double *acc, uint64_t ts_slot, uint64_t ts_cap)
 {
     __shared__ double sh[WFG_RED_THREADS];
     uint32_t          k    = blockIdx.x;
@@ -147,11 +150,16 @@ __global__ void k_wfg_stat(const double *w, wfg_ptrs_t P, uint64_t npix, double 
 
     if (threadIdx.x == 0)
     {
+        double srms      = sqrt(svar > 0.0 ? svar : 0.0);
         frame[4 * k + 1] = svar;
         frame[4 * k + 2] = vmin;
         frame[4 * k + 3] = vmax;
-        acc[2 * k + 0] += sqrt(svar > 0.0 ? svar : 0.0);
+        acc[2 * k + 0] += srms;
         acc[2 * k + 1] += svar;
+        if (ts_slot < ts_cap && P.ts[k] != NULL)
+        {
+            P.ts[k][ts_slot] = (float) srms;
+        }
     }
 }
 
@@ -165,6 +173,7 @@ static void wfg_release(wfg_ctx_t *g)
         cudaFree(g->p.sum[k]);
         cudaFree(g->p.sum2[k]);
         cudaFree(g->p.tmp[k]);
+        cudaFree(g->p.ts[k]);
     }
     free(g);
 }
@@ -173,6 +182,7 @@ extern "C" void *cacaosim_wfstat_gpu_create(
     const double *h_weights,
     uint64_t      npix,
     uint32_t      nloc,
+    uint64_t      ts_cap,
     void         *cuda_stream)
 {
     if (h_weights == NULL || npix == 0 || nloc == 0 || nloc > WFG_MAX_LOC)
@@ -186,6 +196,8 @@ extern "C" void *cacaosim_wfstat_gpu_create(
     }
     g->npix   = npix;
     g->nloc   = nloc;
+    g->ts_cap = ts_cap;
+    g->ts_len = 0;
     g->stream = (cudaStream_t) cuda_stream;
 
     int ok = (cudaMalloc((void **) &g->d_w, npix * sizeof(double)) == cudaSuccess &&
@@ -196,6 +208,10 @@ extern "C" void *cacaosim_wfstat_gpu_create(
         ok = (cudaMalloc((void **) &g->p.sum[k], npix * sizeof(double)) == cudaSuccess &&
               cudaMalloc((void **) &g->p.sum2[k], npix * sizeof(double)) == cudaSuccess &&
               cudaMalloc((void **) &g->p.tmp[k], npix * sizeof(float)) == cudaSuccess);
+        if (ok && ts_cap > 0)
+        {
+            ok = (cudaMalloc((void **) &g->p.ts[k], ts_cap * sizeof(float)) == cudaSuccess);
+        }
         if (ok)
         {
             ok = (cudaMemsetAsync(g->p.sum[k], 0, npix * sizeof(double), g->stream) ==
@@ -243,8 +259,12 @@ extern "C" void cacaosim_wfstat_gpu_accum(void *gpu, const float *const d_opd[])
     dim3 grid_pix((unsigned) ((g->npix + 255) / 256), g->nloc);
     k_wfg_pist<<<g->nloc, WFG_RED_THREADS, 0, g->stream>>>(g->d_w, g->p, g->npix, g->d_frame);
     k_wfg_pix<<<grid_pix, 256, 0, g->stream>>>(g->d_w, g->p, g->npix, g->d_frame);
-    k_wfg_stat<<<g->nloc, WFG_RED_THREADS, 0, g->stream>>>(g->d_w, g->p, g->npix, g->d_frame,
-                                                           g->d_acc);
+    k_wfg_stat<<<g->nloc, WFG_RED_THREADS, 0, g->stream>>>(
+        g->d_w, g->p, g->npix, g->d_frame, g->d_acc, g->ts_len, g->ts_cap);
+    if (g->ts_len < g->ts_cap)
+    {
+        g->ts_len++;
+    }
 }
 
 extern "C" int cacaosim_wfstat_gpu_fetch_sample(void *gpu, float *const h_maps[],
@@ -269,7 +289,9 @@ extern "C" int cacaosim_wfstat_gpu_fetch_sums(
     void         *gpu,
     double *const h_sum[],
     double *const h_sum2[],
-    double       *h_acc)
+    double       *h_acc,
+    float *const  h_ts_rms[],
+    uint64_t     *out_ts_len)
 {
     if (gpu == NULL)
     {
@@ -282,8 +304,17 @@ extern "C" int cacaosim_wfstat_gpu_fetch_sums(
                         g->stream);
         cudaMemcpyAsync(h_sum2[k], g->p.sum2[k], g->npix * sizeof(double),
                         cudaMemcpyDeviceToHost, g->stream);
+        if (h_ts_rms != NULL && h_ts_rms[k] != NULL && g->p.ts[k] != NULL && g->ts_len > 0)
+        {
+            cudaMemcpyAsync(h_ts_rms[k], g->p.ts[k], g->ts_len * sizeof(float),
+                            cudaMemcpyDeviceToHost, g->stream);
+        }
     }
     cudaMemcpyAsync(h_acc, g->d_acc, 2 * g->nloc * sizeof(double), cudaMemcpyDeviceToHost,
                     g->stream);
+    if (out_ts_len != NULL)
+    {
+        *out_ts_len = g->ts_len;
+    }
     return (cudaStreamSynchronize(g->stream) == cudaSuccess) ? 0 : -1;
 }

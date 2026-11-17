@@ -64,6 +64,7 @@ static float    param_dimple_ld                             = 1.06f;
 static float    param_dimple_rad                            = 1.57079633f;
 static float    param_dimple_amp                            = 1.0f;
 static float    param_bw_frac                               = 0.20f;
+static int32_t  param_nlambda                               = 0;
 static float    param_qe                                    = 0.80f;
 static float    param_dt_exp                                = 0.001f;
 static int64_t  param_use_beam_flux                         = 1;
@@ -134,7 +135,9 @@ static int32_t  param_backend                               = 0;
     X(".dimple_amp", &param_dimple_amp, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,        \
       "Dimple amplitude transmission [0..1] (default: 1.0)")                            \
     X(".bw_frac", &param_bw_frac, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,              \
-      "Filter fractional bandwidth dlambda/lambda0 for beam flux (default: 0.20)")      \
+      "Filter fractional bandwidth dlambda/lambda0 (default: 0.20)")                    \
+    X(".nlambda", &param_nlambda, FPTYPE_INT32, 0, FPFLAG_DEFAULT_INPUT,                \
+      "Polychromatic spectral slices (0 = auto -> 2, 1..32, default: 0)")               \
     X(".qe", &param_qe, FPTYPE_FLOAT32, 0,                                              \
       FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
       "Detector quantum efficiency [0..1] for beam photometry (default: 0.80)")         \
@@ -361,6 +364,8 @@ static MILK_HOT errno_t zwfs_compute(const MILK_RUNNABLE *self)
         .n_mft      = param_n_mft,
         .pup_diam   = param_pup_diam,
         .lambda_um  = param_lambda_um,
+        .bw_frac    = param_bw_frac,
+        .nlambda    = param_nlambda,
         .dimple_ld  = param_dimple_ld,
         .dimple_rad = param_dimple_rad,
         .dimple_amp = param_dimple_amp,
@@ -381,6 +386,41 @@ static MILK_HOT errno_t zwfs_compute(const MILK_RUNNABLE *self)
         },
     };
 
+    float    beam_lam[CACAOSIM_MAX_LAMBDA] = { 0.0f };
+    uint32_t init_b_nwl                    = 1u;
+    if (img_beam.ID != -1)
+    {
+        float b_wl0 = 0.0f;
+        float b_wl1 = 0.0f;
+        if (cacaosim_beam_shm_read_poly_kw(img_beam.im, &init_b_nwl, &b_wl0, &b_wl1) &&
+            init_b_nwl > 1u)
+        {
+            if (init_b_nwl > CACAOSIM_MAX_LAMBDA)
+            {
+                init_b_nwl = CACAOSIM_MAX_LAMBDA;
+            }
+            for (uint32_t c = 0; c < init_b_nwl; c++)
+            {
+                float t     = (float) c / (float) (init_b_nwl - 1u);
+                beam_lam[c] = (b_wl0 > 0.05f && b_wl1 > 0.05f) ? (b_wl0 + (b_wl1 - b_wl0) * t)
+                                                               : param_lambda_um;
+            }
+            if (cfg.nlambda <= 0)
+            {
+                cfg.nlambda = (int32_t) init_b_nwl;
+            }
+        }
+        cacaosim_spec_t init_spec;
+        if (param_use_beam_flux && cacaosim_beam_shm_read_spec(img_beam.im, &init_spec))
+        {
+            int32_t nl       = cacaosim_resolve_nlambda(cfg.nlambda, init_b_nwl, cfg.bw_frac);
+            cfg.nlambda      = nl;
+            cfg.has_ext_chan = 1;
+            cacaosim_spec_sample_band(&init_spec, cfg.lambda_um, cfg.bw_frac, nl, 0.001f, param_qe,
+                                      cfg.ext_lam_um, cfg.ext_weight, NULL);
+        }
+    }
+
     cacaosim_zwfs_ctx_t wfs_ctx;
     if (cacaosim_zwfs_init(&wfs_ctx, &cfg, pup_ptr, ncpa_ptr, NULL) != 0)
     {
@@ -399,7 +439,8 @@ static MILK_HOT errno_t zwfs_compute(const MILK_RUNNABLE *self)
     float *reg_buf = NULL;
     if (!cacaosim_reg_is_identity(&reg))
     {
-        reg_buf = (float *) cacaosim_aligned_calloc(npix * 2u, sizeof(float));
+        reg_buf = (float *) cacaosim_aligned_calloc(
+            (size_t) CACAOSIM_MAX_LAMBDA * npix * 2u, sizeof(float));
     }
 
     struct timespec deadline;
@@ -433,19 +474,6 @@ static MILK_HOT errno_t zwfs_compute(const MILK_RUNNABLE *self)
         float eff_flux = param_flux_ph;
         if (img_beam.ID != -1 && cacaosim_beam_shm_is_valid(img_beam.im, nwf))
         {
-            /* Unified 3D beam mode: slice 0 = OPD [um], slice 1 = pupil amplitude */
-            const float *b_opd = img_beam.im->array.F;
-            const float *b_amp = img_beam.im->array.F + npix;
-            if (reg_buf != NULL)
-            {
-                cacaosim_beam_relay_cpu(b_opd, b_amp, NULL, NULL, &reg, nwf, reg_buf,
-                                        reg_buf + npix);
-                b_opd = reg_buf;
-                b_amp = reg_buf + npix;
-            }
-            cacaosim_zwfs_accum_beam(&wfs_ctx, b_opd, b_amp, ncpa_ptr, NULL, NULL);
-
-            /* Integrate 32-bin beam photon spectrum across WFS passband and navg exposure window */
             cacaosim_spec_t b_spec;
             if (param_use_beam_flux && param_flux_ph >= 0.0f &&
                 cacaosim_beam_shm_read_spec(img_beam.im, &b_spec))
@@ -454,9 +482,36 @@ static MILK_HOT errno_t zwfs_compute(const MILK_RUNNABLE *self)
                 float    dts = (param_frame_rate > 0.1f)
                                    ? (1.0f / param_frame_rate)
                                    : ((param_dt_exp > 1e-7f) ? param_dt_exp : 0.001f);
-                eff_flux     = cacaosim_spec_band_flux(&b_spec, param_lambda_um, param_bw_frac,
-                                                       dts * (float) nav, param_qe, NULL);
+                float    dyn_w[CACAOSIM_MAX_LAMBDA];
+                eff_flux = cacaosim_spec_sample_band(&b_spec, param_lambda_um, param_bw_frac,
+                                                     wfs_ctx.eff_nlam, dts * (float) nav, param_qe,
+                                                     NULL, dyn_w, NULL);
+                cacaosim_zwfs_set_weights(&wfs_ctx, dyn_w);
             }
+
+            uint32_t b_nwl = (img_beam.md->size[2] >= 4u) ? (img_beam.md->size[2] / 2u) : 1u;
+            if (b_nwl > CACAOSIM_MAX_LAMBDA)
+            {
+                b_nwl = CACAOSIM_MAX_LAMBDA;
+            }
+            const float *b_opd    = img_beam.im->array.F;
+            const float *b_amp    = img_beam.im->array.F + npix;
+            uint64_t     b_stride = npix * 2u;
+            if (reg_buf != NULL)
+            {
+                for (uint32_t c = 0; c < b_nwl; c++)
+                {
+                    cacaosim_beam_relay_cpu(b_opd + (uint64_t) c * b_stride,
+                                            b_amp + (uint64_t) c * b_stride, NULL, NULL, &reg, nwf,
+                                            reg_buf + (uint64_t) c * b_stride,
+                                            reg_buf + (uint64_t) c * b_stride + npix);
+                }
+                b_opd = reg_buf;
+                b_amp = reg_buf + npix;
+            }
+            cacaosim_zwfs_accum_beam_poly(&wfs_ctx, b_opd, b_amp,
+                                          (init_b_nwl == b_nwl && b_nwl > 1u) ? beam_lam : NULL,
+                                          b_nwl, b_stride, ncpa_ptr, NULL, NULL);
         }
         else
         {

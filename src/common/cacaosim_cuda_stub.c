@@ -313,6 +313,46 @@ void cacaosim_cuda_beam_init(
 }
 
 /**
+ * cacaosim_cuda_beam_init_lerp() - No-op GPU linear-lerp beam synthesis stub for CPU-only builds
+ * @d_pup_amp:   Unused device pupil amplitude pointer
+ * @d_atm_amp:   Unused device scintillation amplitude pointer
+ * @d_wf_prev:   Unused device previous wavefront pointer
+ * @d_wf_curr:   Unused device current wavefront pointer
+ * @wf_alpha:    Unused blend weight
+ * @d_ncpa_opd:  Unused device NCPA OPD pointer
+ * @wf_to_opd:   Unused wavefront-to-OPD scale
+ * @nwf:         Unused pupil grid width
+ * @d_out_opd:   Unused device output OPD pointer
+ * @d_out_amp:   Unused device output amplitude pointer
+ * @cuda_stream: Unused CUDA stream handle
+ */
+void cacaosim_cuda_beam_init_lerp(
+    const float *d_pup_amp,
+    const float *d_atm_amp,
+    const float *d_wf_prev,
+    const float *d_wf_curr,
+    float        wf_alpha,
+    const float *d_ncpa_opd,
+    float        wf_to_opd,
+    uint32_t     nwf,
+    float       *d_out_opd,
+    float       *d_out_amp,
+    void        *cuda_stream)
+{
+    (void) d_pup_amp;
+    (void) d_atm_amp;
+    (void) d_wf_prev;
+    (void) d_wf_curr;
+    (void) wf_alpha;
+    (void) d_ncpa_opd;
+    (void) wf_to_opd;
+    (void) nwf;
+    (void) d_out_opd;
+    (void) d_out_amp;
+    (void) cuda_stream;
+}
+
+/**
  * cacaosim_cuda_beam_apply_dm() - No-op GPU DM subtraction stub for CPU-only builds
  * @d_in_opd:    Unused device input OPD pointer
  * @d_in_amp:    Unused device input amplitude pointer
@@ -482,6 +522,31 @@ void cacaosim_pyrwfs_cuda_upload_masks(cacaosim_pyrwfs_ctx_t *ctx)
     (void) ctx;
 }
 
+void cacaosim_pyrwfs_cuda_upload_weights(cacaosim_pyrwfs_ctx_t *ctx)
+{
+    (void) ctx;
+}
+
+void cacaosim_pyrwfs_cuda_accum_poly(
+    cacaosim_pyrwfs_ctx_t *ctx,
+    const float           *beam_opd,
+    const float           *beam_amp,
+    const float           *beam_lam_um,
+    uint32_t               beam_nlam,
+    uint64_t               chan_stride,
+    const float           *d_beam_opd,
+    const float           *d_beam_amp)
+{
+    (void) ctx;
+    (void) beam_opd;
+    (void) beam_amp;
+    (void) beam_lam_um;
+    (void) beam_nlam;
+    (void) chan_stride;
+    (void) d_beam_opd;
+    (void) d_beam_amp;
+}
+
 /**
  * cacaosim_pyrwfs_cuda_free() - No-op Pyramid WFS CUDA destructor stub for CPU-only builds
  * @ctx: Unused Pyramid WFS context
@@ -601,6 +666,11 @@ int cacaosim_fpcam_cuda_init(
  *   Resolves GPU teardown symbols without `#ifdef HAVE_CUDA` in `cacaosim_fpcam.c`.
  */
 void cacaosim_fpcam_cuda_free(cacaosim_fpcam_ctx_t *ctx)
+{
+    (void) ctx;
+}
+
+void cacaosim_fpcam_cuda_upload_weights(cacaosim_fpcam_ctx_t *ctx)
 {
     (void) ctx;
 }
@@ -765,6 +835,31 @@ void cacaosim_shwfs_cuda_free(cacaosim_shwfs_ctx_t *ctx)
     (void) ctx;
 }
 
+void cacaosim_shwfs_cuda_upload_weights(cacaosim_shwfs_ctx_t *ctx)
+{
+    (void) ctx;
+}
+
+void cacaosim_shwfs_cuda_accum_poly(
+    cacaosim_shwfs_ctx_t *ctx,
+    const float          *beam_opd,
+    const float          *beam_amp,
+    const float          *beam_lam_um,
+    uint32_t              beam_nlam,
+    uint64_t              chan_stride,
+    const float          *d_beam_opd,
+    const float          *d_beam_amp)
+{
+    (void) ctx;
+    (void) beam_opd;
+    (void) beam_amp;
+    (void) beam_lam_um;
+    (void) beam_nlam;
+    (void) chan_stride;
+    (void) d_beam_opd;
+    (void) d_beam_amp;
+}
+
 /**
  * cacaosim_shwfs_cuda_accum() - No-op Shack-Hartmann WFS CUDA subframe accumulator stub
  * @ctx:           Unused Shack-Hartmann WFS context
@@ -871,6 +966,31 @@ int cacaosim_zwfs_cuda_init(
 void cacaosim_zwfs_cuda_free(cacaosim_zwfs_ctx_t *ctx)
 {
     (void) ctx;
+}
+
+void cacaosim_zwfs_cuda_upload_weights(cacaosim_zwfs_ctx_t *ctx)
+{
+    (void) ctx;
+}
+
+void cacaosim_zwfs_cuda_accum_poly(
+    cacaosim_zwfs_ctx_t *ctx,
+    const float         *beam_opd,
+    const float         *beam_amp,
+    const float         *beam_lam_um,
+    uint32_t             beam_nlam,
+    uint64_t             chan_stride,
+    const float         *d_beam_opd,
+    const float         *d_beam_amp)
+{
+    (void) ctx;
+    (void) beam_opd;
+    (void) beam_amp;
+    (void) beam_lam_um;
+    (void) beam_nlam;
+    (void) chan_stride;
+    (void) d_beam_opd;
+    (void) d_beam_amp;
 }
 
 /**
@@ -1082,11 +1202,13 @@ void *cacaosim_wfstat_gpu_create(
     const double *h_weights,
     uint64_t      npix,
     uint32_t      nloc,
+    uint64_t      ts_cap,
     void         *cuda_stream)
 {
     (void) h_weights;
     (void) npix;
     (void) nloc;
+    (void) ts_cap;
     (void) cuda_stream;
     return NULL;
 }
@@ -1114,12 +1236,16 @@ int cacaosim_wfstat_gpu_fetch_sums(
     void         *gpu,
     double *const h_sum[],
     double *const h_sum2[],
-    double       *h_acc)
+    double       *h_acc,
+    float *const  h_ts_rms[],
+    uint64_t     *out_ts_len)
 {
     (void) gpu;
     (void) h_sum;
     (void) h_sum2;
     (void) h_acc;
+    (void) h_ts_rms;
+    (void) out_ts_len;
     return -1;
 }
 

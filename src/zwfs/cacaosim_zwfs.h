@@ -55,28 +55,34 @@ extern "C" {
  */
 typedef struct
 {
-    uint32_t           nwf;        /**< Input square pupil grid dimension [pixels] (>= 8) */
-    uint32_t           ncam;       /**< Output square WFS camera dimension [pixels] (>= 4) */
-    uint32_t           n_mft;      /**< Focal-core MFT grid size across dimple (>= 16, def: 32) */
-    float              pup_diam;   /**< Clear pupil diameter fraction of nwf (default: 0.9375) */
-    float              lambda_um;  /**< Monochromatic sensing wavelength [um] (default: 0.75) */
-    float              dimple_ld;  /**< Phase dimple diameter [lambda/D] (default: 1.06) */
-    float              dimple_rad; /**< Phase shift inside dimple [radians] (default: pi/2) */
-    float              dimple_amp; /**< Amplitude transmission inside dimple [0..1] (def: 1.0) */
-    int32_t            wf_unit;    /**< Input WF unit: 0 = OPD [um], 1 = phase [rad] */
-    float              ref_lambda; /**< Reference wavelength [um] when wf_unit == 1 */
-    uint64_t           rng_seed;   /**< Base 64-bit PRNG seed for photon/readout noise */
-    int32_t            backend;    /**< cacaosim_backend_t: 0 = auto, 1 = CPU, 2 = CUDA */
-    cacaosim_det_cfg_t det;        /**< Integrated WFS camera readout electronics parameters */
+    uint32_t           nwf;           /**< Input square pupil grid dimension [pixels] (>= 8) */
+    uint32_t           ncam;          /**< Output square WFS camera dimension [pixels] (>= 4) */
+    uint32_t           n_mft;         /**< Focal-core MFT grid size across dimple (>= 16, def:32) */
+    float              pup_diam;      /**< Clear pupil diameter fraction of nwf (default: 0.9375) */
+    float              lambda_um;     /**< Central sensing wavelength [um] (default: 0.75) */
+    float              bw_frac;       /**< Fractional bandpass dlambda/lambda0 (0 = mono) */
+    int32_t            nlambda;       /**< Spectral slices (0 = auto -> 2 if bw_frac > 0) */
+    int32_t            achrom_dimple; /**< 1 = achromatic phase shift, 0 = physical step */
+    int32_t            has_ext_chan;  /**< 1 to use ext_lam_um / ext_weight channel tables */
+    float              ext_lam_um[CACAOSIM_MAX_LAMBDA]; /**< Optional channel wavelengths [um] */
+    float              ext_weight[CACAOSIM_MAX_LAMBDA]; /**< Optional channel photon weights */
+    float              dimple_ld;     /**< Phase dimple diameter [lambda0/D] (default: 1.06) */
+    float              dimple_rad;    /**< Phase shift inside dimple at lambda0 [rad] (def: pi/2) */
+    float              dimple_amp;    /**< Amplitude transmission inside dimple [0..1] (def: 1.0) */
+    int32_t            wf_unit;       /**< Input WF unit: 0 = OPD [um], 1 = phase [rad] */
+    float              ref_lambda;    /**< Reference wavelength [um] when wf_unit == 1 */
+    uint64_t           rng_seed;      /**< Base 64-bit PRNG seed for photon/readout noise */
+    int32_t            backend;       /**< cacaosim_backend_t: 0 = auto, 1 = CPU, 2 = CUDA */
+    cacaosim_det_cfg_t det;           /**< Integrated WFS camera readout electronics parameters */
 } cacaosim_zwfs_cfg_t;
 
 /**
  * @brief Persistent CPU (OpenBLAS) and CUDA (cuBLAS) Zernike WFS state.
  *
- * Stores precomputed separable forward/inverse Matrix-DFT bases (`fwd_U/V`, `inv_U/V`), the
- * subpixel-integrated complex Babinet dimple mask `(t_d * exp(i*theta) - 1) * D(u, v)`, open-pupil
- * Parseval flux normalization, aligned CPU GEMM workspaces, detector PRNG pool, and an opaque
- * pointer to the GPU cuBLAS backend (`zwfs_cuda_state_t`).
+ * Stores precomputed per-channel separable forward/inverse Matrix-DFT bases (`fwd_U/V`, `inv_U/V`),
+ * subpixel-integrated complex Babinet dimple masks `(t_d * exp(i*theta_c) - 1) * D(u, v)`,
+ * open-pupil Parseval flux normalization, aligned CPU GEMM workspaces, detector PRNG pool, and an
+ * opaque pointer to the GPU cuBLAS backend (`zwfs_cuda_state_t`).
  */
 typedef struct
 {
@@ -85,17 +91,21 @@ typedef struct
     uint64_t            npix_wf;        /**< Total input pupil pixels (`nwf * nwf`) */
     uint64_t            npix_mft;       /**< Total focal-core MFT samples (`n_mft * n_mft`) */
     uint64_t            npix_cam;       /**< Total output WFS camera pixels (`ncam * ncam`) */
+    int32_t             eff_nlam;       /**< Active spectral slices [1..CACAOSIM_MAX_LAMBDA] */
+    float               lam_um[CACAOSIM_MAX_LAMBDA]; /**< Channel wavelengths [um] */
+    float               chan_w[CACAOSIM_MAX_LAMBDA]; /**< Normalized channel photon weights */
+    float               k_rad[CACAOSIM_MAX_LAMBDA];  /**< 2*pi / lam_um[c] [rad/um] */
     float               flat_flux_norm; /**< Open-pupil Parseval intensity `sum(|pup_amp|^2)` */
     int32_t             use_cuda;       /**< 1 when cuBLAS GPU backend is active, 0 for CPU BLAS */
     uint32_t            subframe_cnt;   /**< Optical subframes accumulated in current exposure */
     uint64_t            frame_seq;      /**< Monotonic camera readout counter for PRNG seeding */
 
-    /* Precomputed MFT matrices & complex Babinet focal mask (t_d*exp(i*theta) - 1)*M(u,v) */
-    float              *fwd_U_cplx;     /**< Left forward MFT matrix `[n_mft * nwf * 2]` */
-    float              *fwd_V_cplx;     /**< Right forward MFT matrix `[nwf * n_mft * 2]` */
-    float              *inv_U_cplx;     /**< Left inverse MFT matrix `[nwf * n_mft * 2]` */
-    float              *inv_V_cplx;     /**< Right inverse MFT matrix `[n_mft * nwf * 2]` */
-    float              *mask_bab_cplx;  /**< Anti-aliased Babinet dimple `[n_mft * n_mft * 2]` */
+    /* Precomputed per-channel MFT matrices [eff_nlam * n_mft * nwf * 2] & Babinet masks */
+    float              *fwd_U_cplx;     /**< Left forward MFT matrices `[nlam * n_mft * nwf * 2]` */
+    float              *fwd_V_cplx;     /**< Right forward MFT matrices `[nlam * nwf * n_mft * 2]`*/
+    float              *inv_U_cplx;     /**< Left inverse MFT matrices `[nlam * nwf * n_mft * 2]` */
+    float              *inv_V_cplx;     /**< Right inverse MFT matrices `[nlam * n_mft * nwf * 2]`*/
+    float              *mask_bab_cplx;  /**< Anti-aliased Babinet dimple `[nlam * npix_mft * 2]` */
 
     /* CPU work buffers */
     float              *cpu_epup_cplx;  /**< Complex pupil/output field `[nwf * nwf * 2]` */
@@ -208,6 +218,27 @@ void cacaosim_zwfs_accum_beam(
     const float         *d_beam_amp);
 
 /**
+ * cacaosim_zwfs_accum_beam_poly() - Propagate 1 or M polychromatic beam channels into ZWFS
+ */
+void cacaosim_zwfs_accum_beam_poly(
+    cacaosim_zwfs_ctx_t *ctx,
+    const float         *beam_opd,
+    const float         *beam_amp,
+    const float         *beam_lam_um,
+    uint32_t             beam_nlam,
+    uint64_t             chan_stride,
+    const float         *ncpa_opd,
+    const float         *d_beam_opd,
+    const float         *d_beam_amp);
+
+/**
+ * cacaosim_zwfs_set_weights() - Update incoherent channel weights from live beam spectrum
+ */
+void cacaosim_zwfs_set_weights(
+    cacaosim_zwfs_ctx_t *ctx,
+    const float         *weights);
+
+/**
  * cacaosim_zwfs_readout() - Finalize accumulated ZWFS exposure and run detector readout
  * @ctx:      Initialized Zernike WFS context with `subframe_cnt >= 1` (no-op if 0)
  * @det_live: Optional live detector configuration override (NULL uses `ctx->cfg.det`)
@@ -302,6 +333,15 @@ int  cacaosim_zwfs_cuda_init(cacaosim_zwfs_ctx_t *ctx,
  *   Releases all cuBLAS and device memory cleanly while preserving shared external streams.
  */
 void cacaosim_zwfs_cuda_free(cacaosim_zwfs_ctx_t *ctx);
+void cacaosim_zwfs_cuda_upload_weights(cacaosim_zwfs_ctx_t *ctx);
+void cacaosim_zwfs_cuda_accum_poly(cacaosim_zwfs_ctx_t *ctx,
+                                   const float         *beam_opd,
+                                   const float         *beam_amp,
+                                   const float         *beam_lam_um,
+                                   uint32_t             beam_nlam,
+                                   uint64_t             chan_stride,
+                                   const float         *d_beam_opd,
+                                   const float         *d_beam_amp);
 
 /**
  * cacaosim_zwfs_cuda_accum() - Execute GPU cuBLAS Babinet MFT propagation and camera binning

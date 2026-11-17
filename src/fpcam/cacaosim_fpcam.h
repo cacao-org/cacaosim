@@ -97,22 +97,26 @@ typedef enum
  */
 typedef struct
 {
-    uint32_t           nwf;         /**< Input pupil grid dimension [pixels] */
-    uint32_t           ncam;        /**< Output square camera dimension [pixels] */
-    int32_t            prop_mode;   /**< 0 = MFT (arbitrary pixscale_ld), 1 = padded FFT */
-    uint32_t           pad_factor;  /**< FFT zero-padding factor when prop_mode == 1 (>= 2) */
-    float              pup_diam;    /**< Clear pupil diameter fraction of nwf (default: 0.9375) */
-    float              lambda_um;   /**< Central science wavelength [microns] (default: 1.65) */
-    float              bw_frac;     /**< Fractional bandpass dlambda / lambda0 [0..0.5] */
-    int32_t            nlambda;     /**< Polychromatic spectral channels (1..32, default: 1) */
-    int32_t            has_ext_lam; /**< 1 to use explicit ext_lam_um[0..nlambda-1] */
+    uint32_t           nwf;            /**< Input pupil grid dimension [pixels] */
+    uint32_t           ncam;           /**< Output square camera dimension [pixels] */
+    int32_t            prop_mode;      /**< 0 = MFT (arbitrary pixscale_ld), 1 = padded FFT */
+    uint32_t           pad_factor;     /**< FFT zero-padding factor when prop_mode == 1 (>= 2) */
+    float              pup_diam;       /**< Clear pupil diameter fraction of nwf (def: 0.9375) */
+    float              lambda_um;      /**< Central science wavelength [microns] (default: 1.65) */
+    float              bw_frac;        /**< Fractional bandpass dlambda / lambda0 [0..0.5] */
+    int32_t            nlambda;        /**< Spectral slices (0 = auto -> 2 if bw>0, 1..32) */
+    int32_t            has_ext_lam;    /**< 1 to use explicit ext_lam_um[0..nlambda-1] */
     float              ext_lam_um[CACAOSIM_FPCAM_MAX_LAMBDA]; /**< Explicit channel wavelengths */
-    float              pixscale_ld; /**< Focal sampling [pixels per lambda0/D] (MFT mode) */
-    int32_t            wf_unit;     /**< Input WF unit: 0 = OPD [um], 1 = phase [rad] */
-    float              ref_lambda;  /**< Reference wavelength [um] when wf_unit == 1 */
-    uint64_t           rng_seed;    /**< Base PRNG seed for photon/readout noise */
-    int32_t            backend;     /**< cacaosim_backend_t: 0 = auto, 1 = CPU, 2 = CUDA */
-    cacaosim_det_cfg_t det;         /**< Integrated science detector readout parameters */
+    int32_t            has_ext_weight; /**< 1 to use explicit ext_weight[0..nlambda-1] */
+    float              ext_weight[CACAOSIM_FPCAM_MAX_LAMBDA]; /**< Optional channel photon wts */
+    int32_t            has_in_lam;     /**< 1 when upstream beam wavelengths in_lam_um are set */
+    float              in_lam_um[CACAOSIM_FPCAM_MAX_LAMBDA];  /**< Upstream beam channel [um] */
+    float              pixscale_ld;    /**< Focal sampling [pixels per lambda0/D] (MFT mode) */
+    int32_t            wf_unit;        /**< Input WF unit: 0 = OPD [um], 1 = phase [rad] */
+    float              ref_lambda;     /**< Reference wavelength [um] when wf_unit == 1 */
+    uint64_t           rng_seed;       /**< Base PRNG seed for photon/readout noise */
+    int32_t            backend;        /**< cacaosim_backend_t: 0 = auto, 1 = CPU, 2 = CUDA */
+    cacaosim_det_cfg_t det;            /**< Integrated science detector readout parameters */
 } cacaosim_fpcam_cfg_t;
 
 /**
@@ -164,12 +168,17 @@ typedef struct
     float                eff_pixscale_ld;
     float                pup_sum_amp;
     float                pup_sum_amp2;
+    float                base_inf_norm;
     float                inf_flux_norm;
     int32_t              use_cuda;
     uint64_t             frame_seq;
 
-    /* Spectral channel wavelengths [eff_nlam] */
+    /* Spectral channel wavelengths [eff_nlam], weights, scales, and wavenumbers */
     float                lam_um[CACAOSIM_FPCAM_MAX_LAMBDA];
+    float                chan_w[CACAOSIM_FPCAM_MAX_LAMBDA];
+    float                strehl_w[CACAOSIM_FPCAM_MAX_LAMBDA];
+    float                scale_c[CACAOSIM_FPCAM_MAX_LAMBDA];
+    float                k_rad[CACAOSIM_FPCAM_MAX_LAMBDA];
 
     /* Precomputed MFT basis matrices: U [eff_nlam * ncam * nwf], V [eff_nlam * nwf * ncam] */
     float               *mft_U_cplx;
@@ -248,6 +257,13 @@ void cacaosim_fpcam_free(cacaosim_fpcam_ctx_t *ctx);
  *   after closing the AO loop without tearing down FFT/cuBLAS plans or SHM streams.
  */
 void cacaosim_fpcam_reset_long(cacaosim_fpcam_ctx_t *ctx);
+
+/**
+ * cacaosim_fpcam_set_weights() - Update incoherent channel photon weights and Parseval flux norm
+ */
+void cacaosim_fpcam_set_weights(
+    cacaosim_fpcam_ctx_t *ctx,
+    const float          *weights);
 
 /**
  * cacaosim_fpcam_accum_subframe() - Propagate one optical subframe into exposure accumulator
@@ -425,6 +441,7 @@ int  cacaosim_fpcam_cuda_init(cacaosim_fpcam_ctx_t *ctx,
  *   Preserves externally borrowed CUDA streams (`owns_stream == 0`) while freeing all owned VRAM.
  */
 void cacaosim_fpcam_cuda_free(cacaosim_fpcam_ctx_t *ctx);
+void cacaosim_fpcam_cuda_upload_weights(cacaosim_fpcam_ctx_t *ctx);
 
 /**
  * cacaosim_fpcam_cuda_reset_accum() - Zero the GPU focal-plane subframe intensity accumulator

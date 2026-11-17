@@ -40,33 +40,17 @@
 #include <math.h>
 #include <stdlib.h>
 
+#include "common/cacaosim_beam.h"
 #include "common/cacaosim_cuda.h"
 #include "zwfs/cacaosim_zwfs.h"
 
-/**
- * struct zwfs_cuda_state_t - Private GPU state and pre-allocated VRAM buffers for ZWFS propagation
- * @stream:      Active CUDA execution stream (owned internally or borrowed from `cacaosim.htsim`)
- * @owns_stream: `1` if `stream` was created by `cacaosim_zwfs_cuda_init()` and must be destroyed
- * @cublas:      `cuBLAS` handle bound to `@stream` for separable Matrix-DFT `cublasCgemm` calls
- * @d_pup_amp:   Static entrance pupil amplitude `[nwf x nwf]` uploaded at initialization
- * @d_dyn_pup:   Staging buffer `[nwf x nwf]` for dynamic host `in_beam` pupil amplitude slices
- * @d_ncpa_opd:  Optional static WFS-path NCPA OPD `[nwf x nwf]` [um] on device, or NULL
- * @d_atm_amp:   Staging buffer `[nwf x nwf]` for host atmospheric scintillation maps
- * @d_wf_in:     Staging buffer `[nwf x nwf]` for host incident wavefront phase/OPD maps
- * @d_dm_opd:    Staging buffer `[nwf x nwf]` for host DM correction OPD maps [um]
- * @d_fwd_U:     Row-major forward vertical MFT matrix `[n_mft x nwf]` (`cuComplex`)
- * @d_fwd_V:     Row-major forward horizontal MFT matrix `[nwf x n_mft]` (`cuComplex`)
- * @d_inv_U:     Row-major inverse vertical MFT matrix `[nwf x n_mft]` (`cuComplex`)
- * @d_inv_V:     Row-major inverse horizontal MFT matrix `[n_mft x nwf]` (`cuComplex`)
- * @d_mask_bab:  Pre-baked Babinet dimple mask `[n_mft x n_mft]` (`(t_d * exp(i*theta) - 1) * D`)
- * @d_epup:      Complex pupil field `[nwf x nwf]` (entrance `Psi_pup` -> interfered `Psi_out`)
- * @d_tmp:       Intermediate separable MFT workspace `[n_mft x nwf]` / `[nwf x n_mft]`
- * @d_efoc:      Fine-sampled complex focal-plane dimple field `[n_mft x n_mft]`
- * @d_cam_int:   Single-subframe binned noiseless detector intensity `[ncam x ncam]`
- * @d_accum_int: Multi-subframe (`navg > 1`) exposure intensity accumulator `[ncam x ncam]`
- * @d_out_u16:   Device quantized `uint16_t` detector readout frame `[ncam x ncam]`
- * @d_out_f32:   Device `float` detector readout frame `[ncam x ncam]`
- */
+typedef struct
+{
+    uint32_t m0[CACAOSIM_MAX_LAMBDA];
+    uint32_t m1[CACAOSIM_MAX_LAMBDA];
+    float    alpha[CACAOSIM_MAX_LAMBDA];
+} zwfs_poly_map_t;
+
 typedef struct
 {
     cudaStream_t   stream;
@@ -79,6 +63,10 @@ typedef struct
     float         *d_atm_amp;
     float         *d_wf_in;
     float         *d_dm_opd;
+    float         *d_k_rad;
+    float         *d_chan_w;
+    float         *d_poly_opd;
+    float         *d_poly_amp;
 
     cuComplex     *d_fwd_U;
     cuComplex     *d_fwd_V;
@@ -95,36 +83,16 @@ typedef struct
     float         *d_out_f32;
 } zwfs_cuda_state_t;
 
-/**
- * k_zwfs_build_epup() - Synthesize the complex entrance pupil field `Psi_pup(x, y)` on GPU
- * @pup_amp:    2D pupil amplitude `[npix_wf]`, or NULL for uniform unit transmission
- * @atm_amp:    Optional multiplicative atmospheric scintillation amplitude `[npix_wf]`, or NULL
- * @wf_in:      Optional incident wavefront map `[npix_wf]`, or NULL
- * @dm_opd:     Optional subtracted DM surface OPD `[npix_wf]` [um], or NULL
- * @ncpa_opd:   Optional additive static WFS-path NCPA OPD `[npix_wf]` [um], or NULL
- * @wf_to_opd:  Scale factor converting `@wf_in` into microns of OPD
- * @opd_to_rad: Wavenumber `2 * pi / lambda_um` [rad/um]
- * @npix_wf:    Total pupil grid pixel count (`nwf * nwf`)
- * @epup:       Output complex pupil field `[npix_wf]`
- *
- * Role:
- *   Fused 1D elementwise CUDA kernel that combines amplitude apodization, turbulence/beam OPD, DM
- *   correction, and static NCPA into `A(x, y) * exp(i * 2*pi/lambda * OPD)` in a single pass.
- *
- * Rationale:
- *   Fusing all optional optical terms into one memory-bandwidth-bound kernel avoids intermediate
- *   VRAM reads/writes, while early-exiting on masked pixels (`amp <= 0`) skips SFU `__sincosf()`
- *   instructions outside the clear telescope aperture.
- */
 __global__ static void k_zwfs_build_epup(
     const float *__restrict__ pup_amp,
     const float *__restrict__ atm_amp,
     const float *__restrict__ wf_in,
     const float *__restrict__ dm_opd,
     const float *__restrict__ ncpa_opd,
+    const float *__restrict__ k_rad,
     float                     wf_to_opd,
-    float                     opd_to_rad,
     uint64_t                  npix_wf,
+    int32_t                   nlam,
     cuComplex *__restrict__   epup)
 {
     uint64_t p = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -140,7 +108,10 @@ __global__ static void k_zwfs_build_epup(
     }
     if (amp <= 0.0f)
     {
-        epup[p] = make_cuComplex(0.0f, 0.0f);
+        for (int32_t c = 0; c < nlam; c++)
+        {
+            epup[(uint64_t) c * npix_wf + p] = make_cuComplex(0.0f, 0.0f);
+        }
         return;
     }
 
@@ -158,28 +129,69 @@ __global__ static void k_zwfs_build_epup(
         opd += ncpa_opd[p];
     }
 
-    float phi = opd * opd_to_rad;
-    float s   = 0.0f;
-    float co  = 1.0f;
-    __sincosf(phi, &s, &co);
-    epup[p] = make_cuComplex(amp * co, amp * s);
+    for (int32_t c = 0; c < nlam; c++)
+    {
+        float phi = opd * k_rad[c];
+        float s   = 0.0f;
+        float co  = 1.0f;
+        __sincosf(phi, &s, &co);
+        epup[(uint64_t) c * npix_wf + p] = make_cuComplex(amp * co, amp * s);
+    }
 }
 
-/**
- * k_zwfs_mul_mask() - Multiply focal-plane dimple patch field in-place by Babinet complex mask
- * @efoc:     In/out complex focal-plane field `[npix_mft]` over the fine-sampled dimple window
- * @mask_bab: Precomputed complex Babinet mask `(t_d * exp(i * dimple_rad) - 1) * D(u, v)`
- * @npix_mft: Total focal MFT sample count (`n_mft * n_mft`, typically `1024`)
- *
- * Role:
- *   Applies the subpixel-anti-aliased Zernike phase-contrast dimple transfer function between the
- *   forward and inverse `cublasCgemm` Matrix-DFT stages.
- *
- * Rationale:
- *   Because `(t_d * exp(i * dimple_rad) - 1)` is pre-multiplied into `@mask_bab` during cold init,
- *   this single `n_mft^2` complex multiply prepares the exact Babinet perturbation wave for direct
- *   `beta = +1` accumulation onto `d_epup`.
- */
+__global__ static void k_zwfs_build_epup_poly(
+    const float *__restrict__ beam_opd,
+    const float *__restrict__ beam_amp,
+    const float *__restrict__ ncpa_opd,
+    const float *__restrict__ k_rad,
+    zwfs_poly_map_t           map,
+    uint64_t                  chan_stride,
+    uint64_t                  npix_wf,
+    int32_t                   nlam,
+    cuComplex *__restrict__   epup)
+{
+    uint64_t p = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= npix_wf)
+    {
+        return;
+    }
+
+    float nc = (ncpa_opd != NULL) ? ncpa_opd[p] : 0.0f;
+    for (int32_t c = 0; c < nlam; c++)
+    {
+        uint32_t m0   = map.m0[c];
+        uint32_t m1   = map.m1[c];
+        float    w1   = map.alpha[c];
+        float    w0   = 1.0f - w1;
+        float    kc   = k_rad[c];
+        uint64_t off0 = (uint64_t) m0 * chan_stride + p;
+        uint64_t off1 = (uint64_t) m1 * chan_stride + p;
+        float    amp0 = (beam_amp != NULL) ? beam_amp[off0] : 1.0f;
+        float    amp1 = (beam_amp != NULL) ? beam_amp[off1] : 1.0f;
+        if (amp0 <= 0.0f && amp1 <= 0.0f)
+        {
+            epup[(uint64_t) c * npix_wf + p] = make_cuComplex(0.0f, 0.0f);
+            continue;
+        }
+        float p0  = (((beam_opd != NULL) ? beam_opd[off0] : 0.0f) + nc) * kc;
+        float s0  = 0.0f;
+        float co0 = 1.0f;
+        __sincosf(p0, &s0, &co0);
+        float re = w0 * amp0 * co0;
+        float im = w0 * amp0 * s0;
+        if (m1 != m0 && w1 > 0.0f)
+        {
+            float p1  = (((beam_opd != NULL) ? beam_opd[off1] : 0.0f) + nc) * kc;
+            float s1  = 0.0f;
+            float co1 = 1.0f;
+            __sincosf(p1, &s1, &co1);
+            re += w1 * amp1 * co1;
+            im += w1 * amp1 * s1;
+        }
+        epup[(uint64_t) c * npix_wf + p] = make_cuComplex(re, im);
+    }
+}
+
 __global__ static void k_zwfs_mul_mask(
     cuComplex *__restrict__       efoc,
     const cuComplex *__restrict__ mask_bab,
@@ -194,28 +206,12 @@ __global__ static void k_zwfs_mul_mask(
     }
 }
 
-/**
- * k_zwfs_bin_cam() - Compute output pupil intensity `|Psi_out|^2` and bin onto detector pixels
- * @epup:    Interfered output pupil complex field `[nwf x nwf]`
- * @nwf:     Source pupil grid linear size [pixels]
- * @ncam:    Destination WFS camera grid linear size [pixels]
- * @cam_int: Output flux-conserving 2D detector intensity `[ncam x ncam]`
- *
- * Role:
- *   Converts the Babinet-interfered pupil complex amplitude `@epup` into optical intensity and
- *   resamples it from `nwf x nwf` onto the `ncam x ncam` camera pixel array.
- *
- * Rationale:
- *   Fusing modulus-squared evaluation (`z.x^2 + z.y^2`) directly into gather-based detector
- *   binning (1 thread per output camera pixel) eliminates an intermediate `nwf x nwf` float buffer
- *   and avoids GPU atomic contention. Provides specialized fast paths for `nwf == ncam` (1:1) and
- *   integer superpixel factors (`nwf % ncam == 0`), plus exact 2D fractional overlap integration
- *   for arbitrary non-integer pupil-to-detector pitch ratios.
- */
 __global__ static void k_zwfs_bin_cam(
     const cuComplex *__restrict__ epup,
+    const float *__restrict__     chan_w,
     uint32_t                      nwf,
     uint32_t                      ncam,
+    int32_t                       nlam,
     float *__restrict__           cam_int)
 {
     uint32_t cid   = blockIdx.x * blockDim.x + threadIdx.x;
@@ -225,18 +221,22 @@ __global__ static void k_zwfs_bin_cam(
         return;
     }
 
-    uint32_t cx = cid % ncam;
-    uint32_t cy = cid / ncam;
+    uint32_t cx      = cid % ncam;
+    uint32_t cy      = cid / ncam;
+    uint64_t npix_wf = (uint64_t) nwf * nwf;
 
-    /* Fast path 1: 1:1 pupil-to-camera sampling */
     if (nwf == ncam)
     {
-        cuComplex z  = epup[cid];
-        cam_int[cid] = z.x * z.x + z.y * z.y;
+        float sum = 0.0f;
+        for (int32_t c = 0; c < nlam; c++)
+        {
+            cuComplex z = epup[(uint64_t) c * npix_wf + cid];
+            sum += chan_w[c] * (z.x * z.x + z.y * z.y);
+        }
+        cam_int[cid] = sum;
         return;
     }
 
-    /* Fast path 2: exact integer bin x bin superpixel summation */
     if (nwf > ncam && (nwf % ncam) == 0u)
     {
         uint32_t bin = nwf / ncam;
@@ -248,15 +248,20 @@ __global__ static void k_zwfs_bin_cam(
             uint64_t roff = (uint64_t) (y0 + by) * nwf + x0;
             for (uint32_t bx = 0; bx < bin; bx++)
             {
-                cuComplex z = epup[roff + bx];
-                acc += z.x * z.x + z.y * z.y;
+                uint64_t p     = roff + bx;
+                float    p_int = 0.0f;
+                for (int32_t c = 0; c < nlam; c++)
+                {
+                    cuComplex z = epup[(uint64_t) c * npix_wf + p];
+                    p_int += chan_w[c] * (z.x * z.x + z.y * z.y);
+                }
+                acc += p_int;
             }
         }
         cam_int[cid] = acc;
         return;
     }
 
-    /* General path: exact 2D geometric pixel-overlap area weighting */
     float scale = (float) nwf / (float) ncam;
     float fx0   = (float) cx * scale;
     float fx1   = (float) (cx + 1u) * scale;
@@ -292,8 +297,14 @@ __global__ static void k_zwfs_bin_cam(
             float wx  = wx1 - wx0;
             if (wx > 0.0f)
             {
-                cuComplex z = epup[(uint64_t) iy * nwf + (uint32_t) ix];
-                acc += wx * wy * (z.x * z.x + z.y * z.y);
+                uint64_t p     = (uint64_t) iy * nwf + (uint32_t) ix;
+                float    p_int = 0.0f;
+                for (int32_t c = 0; c < nlam; c++)
+                {
+                    cuComplex z = epup[(uint64_t) c * npix_wf + p];
+                    p_int += chan_w[c] * (z.x * z.x + z.y * z.y);
+                }
+                acc += wx * wy * p_int;
             }
         }
     }
@@ -371,6 +382,48 @@ __global__ static void k_zwfs_scale_accum(
  *
  * Return: `0` on success, or `-1` on CUDA stream, `cuBLAS`, or VRAM allocation failure.
  */
+static void zwfs_cuda_run_babinet_batched(
+    cacaosim_zwfs_ctx_t *ctx,
+    zwfs_cuda_state_t   *cs,
+    int32_t              nlam)
+{
+    int             nwf      = (int) ctx->cfg.nwf;
+    int             m        = (int) ctx->n_mft;
+    long long       uv_cplx  = (long long) ctx->n_mft * ctx->cfg.nwf;
+    long long       wf_cplx  = (long long) ctx->npix_wf;
+    long long       mft_cplx = (long long) ctx->npix_mft;
+    const cuComplex one      = make_cuComplex(1.0f, 0.0f);
+    const cuComplex zero     = make_cuComplex(0.0f, 0.0f);
+
+    cublasCgemmStridedBatched(cs->cublas, CUBLAS_OP_N, CUBLAS_OP_N, nwf, m, nwf, &one, cs->d_epup,
+                              nwf, wf_cplx, cs->d_fwd_U, nwf, uv_cplx, &zero, cs->d_tmp, nwf,
+                              uv_cplx, nlam);
+    cublasCgemmStridedBatched(cs->cublas, CUBLAS_OP_N, CUBLAS_OP_N, m, m, nwf, &one, cs->d_fwd_V, m,
+                              uv_cplx, cs->d_tmp, nwf, uv_cplx, &zero, cs->d_efoc, m, mft_cplx,
+                              nlam);
+
+    uint64_t total_mft = (uint64_t) nlam * ctx->npix_mft;
+    uint32_t bl_mft    = (uint32_t) ((total_mft + 255ULL) / 256ULL);
+    k_zwfs_mul_mask<<<bl_mft, 256, 0, cs->stream>>>(cs->d_efoc, cs->d_mask_bab, total_mft);
+
+    cublasCgemmStridedBatched(cs->cublas, CUBLAS_OP_N, CUBLAS_OP_N, m, nwf, m, &one, cs->d_efoc, m,
+                              mft_cplx, cs->d_inv_U, m, uv_cplx, &zero, cs->d_tmp, m, uv_cplx,
+                              nlam);
+    cublasCgemmStridedBatched(cs->cublas, CUBLAS_OP_N, CUBLAS_OP_N, nwf, nwf, m, &one, cs->d_inv_V,
+                              nwf, uv_cplx, cs->d_tmp, m, uv_cplx, &one, cs->d_epup, nwf, wf_cplx,
+                              nlam);
+
+    uint32_t bl_cam = (uint32_t) ((ctx->npix_cam + 255ULL) / 256ULL);
+    k_zwfs_bin_cam<<<bl_cam, 256, 0, cs->stream>>>(cs->d_epup, cs->d_chan_w, ctx->cfg.nwf,
+                                                   ctx->cfg.ncam, nlam, cs->d_cam_int);
+
+    if (ctx->subframe_cnt >= 1u)
+    {
+        k_zwfs_add_accum<<<bl_cam, 256, 0, cs->stream>>>(
+            cs->d_cam_int, ctx->npix_cam, cs->d_accum_int);
+    }
+}
+
 extern "C" int cacaosim_zwfs_cuda_init(
     cacaosim_zwfs_ctx_t *ctx,
     const float         *pup_amp,
@@ -406,18 +459,26 @@ extern "C" int cacaosim_zwfs_cuda_init(
         return -1;
     }
 
-    size_t wf_bytes  = (size_t) ctx->npix_wf * sizeof(float);
-    size_t uv_bytes  = (size_t) ctx->n_mft * ctx->cfg.nwf * sizeof(cuComplex);
-    size_t mft_bytes = (size_t) ctx->npix_mft * sizeof(cuComplex);
-    size_t ep_bytes  = (size_t) ctx->npix_wf * sizeof(cuComplex);
-    size_t cam_f     = (size_t) ctx->npix_cam * sizeof(float);
-    size_t cam_u     = (size_t) ctx->npix_cam * sizeof(uint16_t);
+    int32_t nlam       = (ctx->eff_nlam >= 1) ? ctx->eff_nlam : 1;
+    size_t  nlam_sz    = (size_t) nlam;
+    size_t  wf_bytes   = (size_t) ctx->npix_wf * sizeof(float);
+    size_t  lam_bytes  = nlam_sz * sizeof(float);
+    size_t  poly_bytes = (size_t) (2 * nlam) * wf_bytes;
+    size_t  uv_bytes   = nlam_sz * ctx->n_mft * ctx->cfg.nwf * sizeof(cuComplex);
+    size_t  mft_bytes  = nlam_sz * ctx->npix_mft * sizeof(cuComplex);
+    size_t  ep_bytes   = nlam_sz * ctx->npix_wf * sizeof(cuComplex);
+    size_t  cam_f      = (size_t) ctx->npix_cam * sizeof(float);
+    size_t  cam_u      = (size_t) ctx->npix_cam * sizeof(uint16_t);
 
     if (cudaMalloc((void **) &cs->d_pup_amp, wf_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_dyn_pup, wf_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_atm_amp, wf_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_wf_in, wf_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_dm_opd, wf_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_k_rad, lam_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_chan_w, lam_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_poly_opd, poly_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_poly_amp, poly_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_fwd_U, uv_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_fwd_V, uv_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_inv_U, uv_bytes) != cudaSuccess ||
@@ -446,6 +507,8 @@ extern "C" int cacaosim_zwfs_cuda_init(
     }
 
     cudaMemcpyAsync(cs->d_pup_amp, pup_amp, wf_bytes, cudaMemcpyHostToDevice, cs->stream);
+    cudaMemcpyAsync(cs->d_k_rad, ctx->k_rad, lam_bytes, cudaMemcpyHostToDevice, cs->stream);
+    cudaMemcpyAsync(cs->d_chan_w, ctx->chan_w, lam_bytes, cudaMemcpyHostToDevice, cs->stream);
     cudaMemcpyAsync(cs->d_fwd_U, ctx->fwd_U_cplx, uv_bytes, cudaMemcpyHostToDevice, cs->stream);
     cudaMemcpyAsync(cs->d_fwd_V, ctx->fwd_V_cplx, uv_bytes, cudaMemcpyHostToDevice, cs->stream);
     cudaMemcpyAsync(cs->d_inv_U, ctx->inv_U_cplx, uv_bytes, cudaMemcpyHostToDevice, cs->stream);
@@ -457,17 +520,6 @@ extern "C" int cacaosim_zwfs_cuda_init(
     return 0;
 }
 
-/**
- * cacaosim_zwfs_cuda_free() - Destroy cuBLAS handle, owned stream, and all ZWFS device buffers
- * @ctx: ZWFS context owning `cuda_priv` (safe when `cuda_priv == NULL` or partially allocated)
- *
- * Role:
- *   Cold-path GPU teardown routine invoked by `cacaosim_zwfs_free()` or on init rollback.
- *
- * Rationale:
- *   Releases owned CUDA streams while leaving externally borrowed streams (`owns_stream == 0`)
- *   intact for the parent `cacaosim.htsim` orchestrator.
- */
 extern "C" void cacaosim_zwfs_cuda_free(cacaosim_zwfs_ctx_t *ctx)
 {
     zwfs_cuda_state_t *cs = (zwfs_cuda_state_t *) ctx->cuda_priv;
@@ -485,6 +537,10 @@ extern "C" void cacaosim_zwfs_cuda_free(cacaosim_zwfs_ctx_t *ctx)
     cudaFree(cs->d_atm_amp);
     cudaFree(cs->d_wf_in);
     cudaFree(cs->d_dm_opd);
+    cudaFree(cs->d_k_rad);
+    cudaFree(cs->d_chan_w);
+    cudaFree(cs->d_poly_opd);
+    cudaFree(cs->d_poly_amp);
     cudaFree(cs->d_fwd_U);
     cudaFree(cs->d_fwd_V);
     cudaFree(cs->d_inv_U);
@@ -505,29 +561,17 @@ extern "C" void cacaosim_zwfs_cuda_free(cacaosim_zwfs_ctx_t *ctx)
     ctx->cuda_priv = NULL;
 }
 
-/**
- * cacaosim_zwfs_cuda_accum() - Enqueue one asynchronous GPU Babinet MFT ZWFS subframe propagation
- * @ctx:           Initialized ZWFS context with active CUDA backend
- * @dyn_pup_amp:   Optional dynamic host pupil amplitude `[nwf x nwf]` (`in_beam`), or NULL
- * @atm_amp:       Optional host atmospheric scintillation amplitude `[nwf x nwf]`, or NULL
- * @wf_in:         Optional host incident wavefront `[nwf x nwf]`, or NULL
- * @dm_opd:        Optional host DM correction OPD `[nwf x nwf]` [um], or NULL
- * @d_pup_amp_ext: Optional zero-copy device dynamic pupil amplitude `[nwf x nwf]`, or NULL
- * @d_wf_opd_ext:  Optional zero-copy device beam/wavefront OPD `[nwf x nwf]` [um], or NULL
- * @d_dm_opd_ext:  Optional zero-copy device DM correction OPD `[nwf x nwf]` [um], or NULL
- * @wf_to_opd:     Scale factor converting `@wf_in` / `@d_wf_opd_ext` into microns of OPD
- *
- * Role:
- *   Hot-loop asynchronous GPU subframe propagator that stages any host inputs, synthesizes the
- *   complex pupil field, runs the 4-GEMM `cuBLAS` Babinet Matrix-DFT, bins intensity onto
- *   `d_cam_int`, and lazily accumulates into `d_accum_int` when `navg > 1`.
- *
- * Rationale:
- *   - Prioritizes zero-copy device pointers (`*_ext`) over host H2D copies so fused GPU benches
- *     incur zero PCIe traffic between upstream optical elements and the ZWFS.
- *   - Enqueues all transfers, `cublasCgemm` calls, and kernels asynchronously onto `cs->stream`
- *     without host blocking; synchronization occurs once per camera frame at readout.
- */
+extern "C" void cacaosim_zwfs_cuda_upload_weights(cacaosim_zwfs_ctx_t *ctx)
+{
+    zwfs_cuda_state_t *cs = (zwfs_cuda_state_t *) ctx->cuda_priv;
+    if (cs == NULL || ctx->eff_nlam < 1)
+    {
+        return;
+    }
+    cudaMemcpyAsync(cs->d_chan_w, ctx->chan_w, (size_t) ctx->eff_nlam * sizeof(float),
+                    cudaMemcpyHostToDevice, cs->stream);
+}
+
 extern "C" void cacaosim_zwfs_cuda_accum(
     cacaosim_zwfs_ctx_t *ctx,
     const float         *dyn_pup_amp,
@@ -541,10 +585,8 @@ extern "C" void cacaosim_zwfs_cuda_accum(
 {
     zwfs_cuda_state_t *cs       = (zwfs_cuda_state_t *) ctx->cuda_priv;
     size_t             wf_bytes = (size_t) ctx->npix_wf * sizeof(float);
-    int                nwf      = (int) ctx->cfg.nwf;
-    int                m        = (int) ctx->n_mft;
+    int32_t            nlam     = (ctx->eff_nlam >= 1) ? ctx->eff_nlam : 1;
 
-    /* Select zero-copy device pupil, dynamic host beam amplitude, or static cached pupil */
     const float *d_pup = cs->d_pup_amp;
     if (d_pup_amp_ext != NULL)
     {
@@ -585,49 +627,103 @@ extern "C" void cacaosim_zwfs_cuda_accum(
         d_dm = cs->d_dm_opd;
     }
 
-    /* Lazily seed multi-subframe accumulator from subframe 0 only when subframe 1 arrives */
     if (ctx->subframe_cnt == 1u)
     {
         cudaMemcpyAsync(cs->d_accum_int, cs->d_cam_int, (size_t) ctx->npix_cam * sizeof(float),
                         cudaMemcpyDeviceToDevice, cs->stream);
     }
 
-    float    lam        = (ctx->cfg.lambda_um > 0.1f) ? ctx->cfg.lambda_um : 0.75f;
-    float    opd_to_rad = CACAOSIM_TWO_PI_F / lam;
-    uint32_t bl_wf      = (uint32_t) ((ctx->npix_wf + 255ULL) / 256ULL);
+    uint32_t bl_wf = (uint32_t) ((ctx->npix_wf + 255ULL) / 256ULL);
     k_zwfs_build_epup<<<bl_wf, 256, 0, cs->stream>>>(
-        d_pup, d_amp, d_wf, d_dm, cs->d_ncpa_opd, wf_to_opd, opd_to_rad, ctx->npix_wf,
+        d_pup, d_amp, d_wf, d_dm, cs->d_ncpa_opd, cs->d_k_rad, wf_to_opd, ctx->npix_wf, nlam,
         cs->d_epup);
 
-    const cuComplex one  = make_cuComplex(1.0f, 0.0f);
-    const cuComplex zero = make_cuComplex(0.0f, 0.0f);
+    zwfs_cuda_run_babinet_batched(ctx, cs, nlam);
+}
 
-    /* Row-major tmp[m x nwf] = fwd_U[m x nwf] * epup[nwf x nwf] => col-major tmp^T = epup^T*U^T */
-    cublasCgemm(cs->cublas, CUBLAS_OP_N, CUBLAS_OP_N, nwf, m, nwf, &one, cs->d_epup, nwf,
-                cs->d_fwd_U, nwf, &zero, cs->d_tmp, nwf);
-    /* Row-major efoc[m x m] = tmp[m x nwf] * fwd_V[nwf x m] => col-major efoc^T = V^T * tmp^T */
-    cublasCgemm(cs->cublas, CUBLAS_OP_N, CUBLAS_OP_N, m, m, nwf, &one, cs->d_fwd_V, m, cs->d_tmp,
-                nwf, &zero, cs->d_efoc, m);
+extern "C" void cacaosim_zwfs_cuda_accum_poly(
+    cacaosim_zwfs_ctx_t *ctx,
+    const float         *beam_opd,
+    const float         *beam_amp,
+    const float         *beam_lam_um,
+    uint32_t             beam_nlam,
+    uint64_t             chan_stride,
+    const float         *d_beam_opd,
+    const float         *d_beam_amp)
+{
+    zwfs_cuda_state_t *cs       = (zwfs_cuda_state_t *) ctx->cuda_priv;
+    size_t             wf_bytes = (size_t) ctx->npix_wf * sizeof(float);
+    int32_t            nlam     = (ctx->eff_nlam >= 1) ? ctx->eff_nlam : 1;
 
-    uint32_t bl_mft = (uint32_t) ((ctx->npix_mft + 255ULL) / 256ULL);
-    k_zwfs_mul_mask<<<bl_mft, 256, 0, cs->stream>>>(cs->d_efoc, cs->d_mask_bab, ctx->npix_mft);
+    float lam0   = (ctx->cfg.lambda_um > 0.05f) ? ctx->cfg.lambda_um : 0.75f;
+    float bw     = (ctx->cfg.bw_frac > 0.0f) ? ctx->cfg.bw_frac : 0.20f;
+    float def_l0 = lam0 * (1.0f - 0.5f * bw);
+    float def_l1 = lam0 * (1.0f + 0.5f * bw);
 
-    /* Row-major tmp[nwf x m] = inv_U * efoc => col-major tmp^T = efoc^T * inv_U^T */
-    cublasCgemm(cs->cublas, CUBLAS_OP_N, CUBLAS_OP_N, m, nwf, m, &one, cs->d_efoc, m, cs->d_inv_U,
-                m, &zero, cs->d_tmp, m);
-    /* Row-major epup += tmp[nwf x m] * inv_V[m x nwf] => col-major epup^T += inv_V^T * tmp^T */
-    cublasCgemm(cs->cublas, CUBLAS_OP_N, CUBLAS_OP_N, nwf, nwf, m, &one, cs->d_inv_V, nwf,
-                cs->d_tmp, m, &one, cs->d_epup, nwf);
+    zwfs_poly_map_t map        = { { 0 }, { 0 }, { 0.0f } };
+    const float    *d_opd_use  = d_beam_opd;
+    const float    *d_amp_use  = d_beam_amp;
+    uint64_t        stride_use = chan_stride;
 
-    uint32_t bl_cam = (uint32_t) ((ctx->npix_cam + 255ULL) / 256ULL);
-    k_zwfs_bin_cam<<<bl_cam, 256, 0, cs->stream>>>(cs->d_epup, ctx->cfg.nwf, ctx->cfg.ncam,
-                                                   cs->d_cam_int);
-
-    if (ctx->subframe_cnt >= 1u)
+    for (int32_t c = 0; c < nlam; c++)
     {
-        k_zwfs_add_accum<<<bl_cam, 256, 0, cs->stream>>>(
-            cs->d_cam_int, ctx->npix_cam, cs->d_accum_int);
+        uint32_t m0 = 0u;
+        uint32_t m1 = 0u;
+        float    al = 0.0f;
+        cacaosim_poly_interp_bracket(ctx->lam_um[c], beam_lam_um, beam_nlam, def_l0, def_l1, &m0,
+                                     &m1, &al);
+        if (d_beam_opd == NULL && beam_opd != NULL)
+        {
+            uint32_t s0 = (uint32_t) (2 * c);
+            uint32_t s1 = (m1 == m0) ? s0 : (s0 + 1u);
+            cudaMemcpyAsync(cs->d_poly_opd + (uint64_t) s0 * ctx->npix_wf,
+                            beam_opd + (uint64_t) m0 * chan_stride, wf_bytes,
+                            cudaMemcpyHostToDevice, cs->stream);
+            if (s1 != s0)
+            {
+                cudaMemcpyAsync(cs->d_poly_opd + (uint64_t) s1 * ctx->npix_wf,
+                                beam_opd + (uint64_t) m1 * chan_stride, wf_bytes,
+                                cudaMemcpyHostToDevice, cs->stream);
+            }
+            if (beam_amp != NULL)
+            {
+                cudaMemcpyAsync(cs->d_poly_amp + (uint64_t) s0 * ctx->npix_wf,
+                                beam_amp + (uint64_t) m0 * chan_stride, wf_bytes,
+                                cudaMemcpyHostToDevice, cs->stream);
+                if (s1 != s0)
+                {
+                    cudaMemcpyAsync(cs->d_poly_amp + (uint64_t) s1 * ctx->npix_wf,
+                                    beam_amp + (uint64_t) m1 * chan_stride, wf_bytes,
+                                    cudaMemcpyHostToDevice, cs->stream);
+                }
+            }
+            map.m0[c]    = s0;
+            map.m1[c]    = s1;
+            map.alpha[c] = al;
+            d_opd_use    = cs->d_poly_opd;
+            d_amp_use    = (beam_amp != NULL) ? cs->d_poly_amp : NULL;
+            stride_use   = ctx->npix_wf;
+        }
+        else
+        {
+            map.m0[c]    = m0;
+            map.m1[c]    = m1;
+            map.alpha[c] = al;
+        }
     }
+
+    if (ctx->subframe_cnt == 1u)
+    {
+        cudaMemcpyAsync(cs->d_accum_int, cs->d_cam_int, (size_t) ctx->npix_cam * sizeof(float),
+                        cudaMemcpyDeviceToDevice, cs->stream);
+    }
+
+    uint32_t bl_wf = (uint32_t) ((ctx->npix_wf + 255ULL) / 256ULL);
+    k_zwfs_build_epup_poly<<<bl_wf, 256, 0, cs->stream>>>(
+        d_opd_use, d_amp_use, cs->d_ncpa_opd, cs->d_k_rad, map, stride_use, ctx->npix_wf, nlam,
+        cs->d_epup);
+
+    zwfs_cuda_run_babinet_batched(ctx, cs, nlam);
 }
 
 /**

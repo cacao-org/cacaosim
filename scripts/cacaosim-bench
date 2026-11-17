@@ -42,6 +42,7 @@ WFS_NCAM=64
 FP_NCAM=128
 RATE_HZ=2000
 RATE_SET=0
+OVERSAMPLE=0
 MOD_RAD=3.0
 BACKEND=0
 BACKEND_SET=0
@@ -75,6 +76,7 @@ Options:
   --wfs-ncam <int>           WFS camera size [pixels] (default: ${WFS_NCAM})
   --fp-ncam <int>            Focal plane camera size [pixels] (default: ${FP_NCAM})
   --rate <float>             Hardware master frame rate [Hz] (default: ${RATE_HZ})
+  --oversample <int>         Temporal oversampling factor K (0 = bench default)
   --mod-rad <float>          Pyramid modulation radius [lambda/D] (default: ${MOD_RAD})
   --backend <0|1|2>          0=auto (default), 1=CPU, 2=CUDA
   --atmturb                  Also launch milk-fpsexec-atmturb-mkwfs phase stream
@@ -134,6 +136,7 @@ while [[ $# -gt 0 ]]; do
         --wfs-ncam)  WFS_NCAM="$2"; shift 2 ;;
         --fp-ncam)   FP_NCAM="$2"; shift 2 ;;
         --rate)      RATE_HZ="$2"; RATE_SET=1; shift 2 ;;
+        --oversample) OVERSAMPLE="$2"; shift 2 ;;
         --mod-rad)   MOD_RAD="$2"; shift 2 ;;
         --backend)   BACKEND="$2"; BACKEND_SET=1; shift 2 ;;
         --atmturb)   WITH_ATMTURB=1; shift ;;
@@ -203,6 +206,7 @@ export _CSIM_NACT="${NACT}"
 export _CSIM_WFS_NCAM="${WFS_NCAM}"
 export _CSIM_FP_NCAM="${FP_NCAM}"
 export _CSIM_MOD_RAD="${MOD_RAD}"
+export _CSIM_OVERSAMPLE="${OVERSAMPLE}"
 export _CSIM_SHOW_VIEW="${SHOW_VIEW}"
 
 case "${CMD}" in
@@ -222,7 +226,8 @@ cacaosim.deploy \
     "${_CSIM_NACT}" \
     "${_CSIM_WFS_NCAM}" \
     "${_CSIM_FP_NCAM}" \
-    "${_CSIM_MOD_RAD}"
+    "${_CSIM_MOD_RAD}" \
+    "${_CSIM_OVERSAMPLE}"
 EOF
         if (( SHOW_VIEW )) && command -v cacaosim-bench-view >/dev/null 2>&1; then
             if [[ -f "${SHM_DIR}/csim_active.bench" ]]; then

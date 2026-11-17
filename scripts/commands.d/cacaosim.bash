@@ -64,7 +64,8 @@ cacaosim.deploy() {
           'nact:int=20:flat-mode DM actuators across pupil' \
           'wfs_ncam:int=64:flat-mode PyWFS camera size [pixels]' \
           'fp_ncam:int=128:flat-mode science camera size [pixels]' \
-          'mod_rad:float=3.0:flat-mode PyWFS modulation radius [lambda/D]' -- "$@"
+          'mod_rad:float=3.0:flat-mode PyWFS modulation radius [lambda/D]' \
+          'oversample:int=0:temporal oversampling override (0 = bench default)' -- "$@"
 
     if [[ "${mode}" != "fused" && "${mode}" != "modular" ]]; then
         echo "cacaosim.deploy: invalid mode '${mode}' (expected 'fused' or 'modular')" >&2
@@ -111,6 +112,9 @@ cacaosim.deploy() {
     fi
     if (( backend >= 0 )); then
         plan_cmd+=(--backend "${backend}")
+    fi
+    if (( oversample >= 1 )); then
+        plan_cmd+=(--oversample "${oversample}")
     fi
 
     if [[ -z "${bench_file}" ]]; then
@@ -304,6 +308,7 @@ cacaosim.deploy() {
     done
     cp -f "${plan_dir}/units.list" "${FPSPIPE_RUNDIR}/cacaosim.units"
     cp -f "${plan_dir}/streams.list" "${FPSPIPE_RUNDIR}/cacaosim.streams"
+    cp -f "${plan_dir}/meta.tsv" "${FPSPIPE_RUNDIR}/cacaosim.meta"
     printf '%s\n' "${meta_SIGNATURE}" > "${FPSPIPE_RUNDIR}/cacaosim.signature"
 
     rm -rf "${plan_dir}"
@@ -425,6 +430,7 @@ cacaosim.teardown() {
     local shm_dir="${MILK_SHM_DIR:-/milk/shm}"
     rm -f "${FPSPIPE_RUNDIR}/cacaosim.units" \
           "${FPSPIPE_RUNDIR}/cacaosim.streams" \
+          "${FPSPIPE_RUNDIR}/cacaosim.meta" \
           "${FPSPIPE_RUNDIR}/cacaosim.signature" \
           "${shm_dir}/csim_active.bench"
     return 0

@@ -190,8 +190,20 @@ static int view_btn(
 void cs_render_view_schematic(cs_tui_app_t *app, int x, int y, int w, int h)
 {
     const cs_tui_pal_t *pal     = cs_tui_get_palette(app->opts.theme);
-    /* Reserve 11 bottom rows for the pupil/scale/spectrum deck only when terminal height permits */
-    int                 deck_h  = (h >= 24) ? 11 : 0;
+    /* Reserve bottom rows for the pupil/scale/spectrum deck when terminal height permits */
+    int                 deck_h  = 0;
+    if (h >= 24)
+    {
+        deck_h = 11;
+        if (h >= 44 && app->dag_valid && (int) app->ctx.n_beams + 3 > deck_h)
+        {
+            deck_h = (int) app->ctx.n_beams + 3;
+            if (deck_h > 16)
+            {
+                deck_h = 16;
+            }
+        }
+    }
     int                 schem_h = h - deck_h;
 
     cs_draw_box(&app->scr, x, y, w, schem_h, 1, "FULL-SCREEN 2D OPTICAL BENCH SCHEMATIC",
@@ -229,7 +241,7 @@ void cs_render_view_schematic(cs_tui_app_t *app, int x, int y, int w, int h)
     cs_printf_at(&app->scr, x + 20, dy + 7, 33, pal->fg_accent, pal->bg_panel, 0u, 1,
                  "Star : mV=%.1f  %.0fK  %.0fHz", app->cfg.star_mag, app->cfg.star_teff,
                  app->cfg.master_hz);
-    cs_printf_at(&app->scr, x + 20, dy + 8, 33, pal->fg_dim, pal->bg_panel, 0u, 1,
+    cs_printf_at(&app->scr, x + 20, dy + 8, 34, pal->fg_dim, pal->bg_panel, 0u, 1,
                  "SHM  : wf=%s pup=%s", app->cfg.in_wf, app->cfg.in_pup);
 
     /* Right deck columns: per-beam 32-bin wavelength-colored spectrum bars & photon flux */
@@ -344,7 +356,14 @@ void cs_render_view_tables(cs_tui_app_t *app, int x, int y, int w, int h)
         {
             snprintf(dyn, sizeof(dyn), "rc %.0fus", nd->dm.tau_sec * 1.0e6f);
         }
-        snprintf(dly, sizeof(dly), "%.2ffr", nd->dm.delay_frames);
+        if (nd->dm.delay_sec > 0.0f)
+        {
+            snprintf(dly, sizeof(dly), "%.0fus", nd->dm.delay_sec * 1.0e6f);
+        }
+        else
+        {
+            snprintf(dly, sizeof(dly), "%.2ffr", nd->dm.delay_frames);
+        }
         snprintf(bms, sizeof(bms), "%s -> %s", nd->in_beam, nd->out_beam);
 
         cs_printf_at(&app->scr, x + 2, ry, w - 4, sel ? pal->fg_bright : pal->fg_text, bg,
@@ -406,15 +425,17 @@ void cs_render_view_tables(cs_tui_app_t *app, int x, int y, int w, int h)
         float mhz = (app->cfg.master_hz > 0.0f) ? app->cfg.master_hz : 2000.0f;
         float hz  = (nd->rate_hz > 0.0f) ? nd->rate_hz : (mhz / (float) (nd->navg ? nd->navg : 1u));
 
-        /* Look up precomputed per-frame photon flux from the zero-FFT spectral analyzer */
-        float flux = 0.0f;
+        /* Look up precomputed per-frame photon flux and eff_navg from spectral analyzer */
+        float    flux     = 0.0f;
+        uint32_t disp_nav = nd->navg ? nd->navg : 1u;
         if (app->dag_valid)
         {
             for (uint32_t si = 0; si < app->ctx.n_nodes; si++)
             {
                 if (strcmp(app->ctx.nodes[si].cfg.id, nd->id) == 0)
                 {
-                    flux = app->ctx.nodes[si].eff_flux_ph;
+                    flux     = app->ctx.nodes[si].eff_flux_ph;
+                    disp_nav = app->ctx.nodes[si].eff_navg;
                     break;
                 }
             }
@@ -423,7 +444,7 @@ void cs_render_view_tables(cs_tui_app_t *app, int x, int y, int w, int h)
         char dets[16], band[16], rstr[16], fstr[16], rons[12];
         snprintf(dets, sizeof(dets), "%ux%u", ncam, ncam);
         snprintf(band, sizeof(band), "%.2f (%.0f%%)", lam, nd->bw_frac * 100.0f);
-        snprintf(rstr, sizeof(rstr), "%.0f (/%u)", hz, nd->navg ? nd->navg : 1u);
+        snprintf(rstr, sizeof(rstr), "%.0f (/%u)", hz, disp_nav);
         fmt_flux_v(flux, fstr, sizeof(fstr));
         snprintf(rons, sizeof(rons), "%.1fe-", ron);
 

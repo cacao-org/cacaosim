@@ -357,10 +357,13 @@ static MILK_HOT errno_t coro_compute(const MILK_RUNNABLE *self)
     img_lowfs.ID    = -1;
     if (param_out_lowfs[0] != '\0')
     {
-        img_lowfs = stream_connect_create_3Df32(param_out_lowfs, nwf, nwf, 2);
+        img_lowfs = stream_connect_create_3Df32(param_out_lowfs, nwf, nwf, out_nz);
         if (img_lowfs.ID != -1)
         {
             cacaosim_beam_shm_init_kw(img_lowfs.im);
+            cacaosim_beam_shm_write_poly_kw(img_lowfs.im, (uint32_t) coro_ctx.eff_nlam,
+                                            coro_ctx.lam_um[0],
+                                            coro_ctx.lam_um[coro_ctx.eff_nlam - 1]);
         }
     }
 
@@ -415,6 +418,9 @@ static MILK_HOT errno_t coro_compute(const MILK_RUNNABLE *self)
         if (img_lowfs.ID != -1)
         {
             cacaosim_beam_shm_write_spec(img_lowfs.im, &lo_spec);
+            cacaosim_beam_shm_write_poly_kw(img_lowfs.im, (uint32_t) coro_ctx.eff_nlam,
+                                            coro_ctx.lam_um[0],
+                                            coro_ctx.lam_um[coro_ctx.eff_nlam - 1]);
             processinfo_update_output_stream(processinfo, img_lowfs.im, img_in.im);
         }
     }

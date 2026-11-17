@@ -39,6 +39,7 @@
 
 #include "milkDebugTools.h"
 #include "milk_compiler.h"
+#include "common/cacaosim_beam.h"
 #include "common/cacaosim_cuda.h"
 #include "zwfs/cacaosim_zwfs.h"
 
@@ -180,71 +181,86 @@ static void MILK_HOT zwfs_bin_image_cpu(
  */
 static void zwfs_precompute_babinet(cacaosim_zwfs_ctx_t *ctx)
 {
-    const uint32_t nwf   = ctx->cfg.nwf;
-    const uint32_t m     = ctx->n_mft;
-    const float    pdim  = (ctx->cfg.pup_diam > 0.05f) ? ctx->cfg.pup_diam : 0.9375f;
-    const float    dpix  = pdim * (float) nwf;
-    const float    p0    = 0.5f * (float) (nwf - 1u);
-    const float    d_ld  = (ctx->cfg.dimple_ld > 0.05f) ? ctx->cfg.dimple_ld : 1.06f;
-    const float    r_ld  = 0.5f * d_ld;
-    /* Margin around dimple diameter ensures clean support inside the MFT focal patch */
-    const float    fov   = (1.4f * d_ld > 2.0f) ? (1.4f * d_ld) : 2.0f;
-    const float    du    = fov / (float) m;
-    /* Unitary Soummer MFT normalization sqrt(du / D_pup) shared equally by fwd and inv matrices */
-    const float    nrm   = sqrtf(du / dpix);
+    const uint32_t nwf      = ctx->cfg.nwf;
+    const uint32_t m        = ctx->n_mft;
+    const int32_t  nlam     = (ctx->eff_nlam >= 1) ? ctx->eff_nlam : 1;
+    const size_t   uv_elems = (size_t) m * nwf * 2u;
+    const float    lam0     = (ctx->cfg.lambda_um > 0.05f) ? ctx->cfg.lambda_um : 0.75f;
+    const float    pdim     = (ctx->cfg.pup_diam > 0.05f) ? ctx->cfg.pup_diam : 0.9375f;
+    const float    dpix     = pdim * (float) nwf;
+    const float    p0       = 0.5f * (float) (nwf - 1u);
+    const float    d_ld     = (ctx->cfg.dimple_ld > 0.05f) ? ctx->cfg.dimple_ld : 1.06f;
+    const float    r_ld     = 0.5f * d_ld;
+    const float    fov0     = (1.4f * d_ld > 2.0f) ? (1.4f * d_ld) : 2.0f;
+    const float    du0      = fov0 / (float) m;
+    const float    t_amp    = (ctx->cfg.dimple_amp >= 0.0f && ctx->cfg.dimple_amp <= 1.0f)
+                                  ? ctx->cfg.dimple_amp
+                                  : 1.0f;
 
-    /* Separable 1D DFT kernels centered symmetrically on pixel midpoint p0 and focal origin */
-    for (uint32_t k = 0; k < m; k++)
+    float bab_re[CACAOSIM_MAX_LAMBDA];
+    float bab_im[CACAOSIM_MAX_LAMBDA];
+
+    for (int32_t c = 0; c < nlam; c++)
     {
-        const float u = (((float) k + 0.5f) / (float) m - 0.5f) * fov;
-        for (uint32_t p = 0; p < nwf; p++)
+        const float scale = lam0 / ctx->lam_um[c];
+        const float fov_c = fov0 * scale;
+        const float du_c  = fov_c / (float) m;
+        const float nrm_c = sqrtf(du_c / dpix);
+
+        float *fU = &ctx->fwd_U_cplx[(size_t) c * uv_elems];
+        float *fV = &ctx->fwd_V_cplx[(size_t) c * uv_elems];
+        float *iU = &ctx->inv_U_cplx[(size_t) c * uv_elems];
+        float *iV = &ctx->inv_V_cplx[(size_t) c * uv_elems];
+
+        for (uint32_t k = 0; k < m; k++)
         {
-            const float xt  = ((float) p - p0) / dpix;
-            const float ang = -CACAOSIM_TWO_PI_F * xt * u;
-            float       s   = 0.0f;
-            float       co  = 1.0f;
-            sincosf(ang, &s, &co);
+            const float u = (((float) k + 0.5f) / (float) m - 0.5f) * fov_c;
+            for (uint32_t p = 0; p < nwf; p++)
+            {
+                const float xt  = ((float) p - p0) / dpix;
+                const float ang = -CACAOSIM_TWO_PI_F * xt * u;
+                float       s   = 0.0f;
+                float       co  = 1.0f;
+                sincosf(ang, &s, &co);
 
-            size_t idx_kp             = ((size_t) k * nwf + p) * 2u;
-            size_t idx_pk             = ((size_t) p * m + k) * 2u;
-            ctx->fwd_U_cplx[idx_kp]   = nrm * co;
-            ctx->fwd_U_cplx[idx_kp + 1] = nrm * s;
-            ctx->fwd_V_cplx[idx_pk]   = nrm * co;
-            ctx->fwd_V_cplx[idx_pk + 1] = nrm * s;
+                size_t idx_kp  = ((size_t) k * nwf + p) * 2u;
+                size_t idx_pk  = ((size_t) p * m + k) * 2u;
+                fU[idx_kp]     = nrm_c * co;
+                fU[idx_kp + 1] = nrm_c * s;
+                fV[idx_pk]     = nrm_c * co;
+                fV[idx_pk + 1] = nrm_c * s;
 
-            /* Conjugate transpose kernels (+2*pi*xt*u) for inverse MFT back to pupil plane */
-            ctx->inv_U_cplx[idx_pk]   = nrm * co;
-            ctx->inv_U_cplx[idx_pk + 1] = -nrm * s;
-            ctx->inv_V_cplx[idx_kp]   = nrm * co;
-            ctx->inv_V_cplx[idx_kp + 1] = -nrm * s;
+                iU[idx_pk]     = nrm_c * co;
+                iU[idx_pk + 1] = -nrm_c * s;
+                iV[idx_kp]     = nrm_c * co;
+                iV[idx_kp + 1] = -nrm_c * s;
+            }
         }
+
+        float theta_c = ctx->cfg.achrom_dimple ? ctx->cfg.dimple_rad
+                                               : (ctx->cfg.dimple_rad * scale);
+        bab_re[c]     = t_amp * cosf(theta_c) - 1.0f;
+        bab_im[c]     = t_amp * sinf(theta_c);
     }
 
-    /* Complex Babinet contrast coefficient: c = t_d * exp(i * dimple_rad) - 1 */
-    float t_amp = (ctx->cfg.dimple_amp >= 0.0f && ctx->cfg.dimple_amp <= 1.0f)
-                      ? ctx->cfg.dimple_amp
-                      : 1.0f;
-    float c_re  = t_amp * cosf(ctx->cfg.dimple_rad) - 1.0f;
-    float c_im  = t_amp * sinf(ctx->cfg.dimple_rad);
-
-    /* 8x8 subpixel area integration of circular focal dimple */
+    /* 8x8 subpixel area integration of physical focal dimple (invariant in normalized MFT box) */
     const int   nsub = 8;
     const float invs = 1.0f / (float) (nsub * nsub);
     const float r2   = r_ld * r_ld;
 
     for (uint32_t ky = 0; ky < m; ky++)
     {
-        const float vc = (((float) ky + 0.5f) / (float) m - 0.5f) * fov;
+        const float vc = (((float) ky + 0.5f) / (float) m - 0.5f) * fov0;
         for (uint32_t kx = 0; kx < m; kx++)
         {
-            const float uc   = (((float) kx + 0.5f) / (float) m - 0.5f) * fov;
+            const float uc   = (((float) kx + 0.5f) / (float) m - 0.5f) * fov0;
             int         hits = 0;
             for (int sy = 0; sy < nsub; sy++)
             {
-                float vs = vc + (((float) sy + 0.5f) / (float) nsub - 0.5f) * du;
+                float vs = vc + (((float) sy + 0.5f) / (float) nsub - 0.5f) * du0;
                 for (int sx = 0; sx < nsub; sx++)
                 {
-                    float us = uc + (((float) sx + 0.5f) / (float) nsub - 0.5f) * du;
+                    float us = uc + (((float) sx + 0.5f) / (float) nsub - 0.5f) * du0;
                     if (us * us + vs * vs <= r2)
                     {
                         hits++;
@@ -252,104 +268,42 @@ static void zwfs_precompute_babinet(cacaosim_zwfs_ctx_t *ctx)
                 }
             }
             float  w   = (float) hits * invs;
-            size_t idx = ((size_t) ky * m + kx) * 2u;
-            ctx->mask_bab_cplx[idx]      = w * c_re;
-            ctx->mask_bab_cplx[idx + 1u] = w * c_im;
+            size_t pix = (size_t) ky * m + kx;
+            for (int32_t c = 0; c < nlam; c++)
+            {
+                size_t idx                   = ((size_t) c * ctx->npix_mft + pix) * 2u;
+                ctx->mask_bab_cplx[idx]      = w * bab_re[c];
+                ctx->mask_bab_cplx[idx + 1u] = w * bab_im[c];
+            }
         }
     }
 }
 
-/**
- * zwfs_propagate_cpu() - Propagate one optical subframe through the Babinet MFT Zernike WFS on CPU
- * @ctx:       Initialized ZWFS context
- * @pup_amp:   2D entrance pupil amplitude `[nwf x nwf]`, or NULL for uniform unit amplitude
- * @atm_amp:   Optional multiplicative scintillation amplitude `[nwf x nwf]`, or NULL
- * @wf_in:     Optional incident wavefront map `[nwf x nwf]`, or NULL
- * @dm_opd:    Optional subtracted DM correction OPD `[nwf x nwf]` [um], or NULL
- * @ncpa_opd:  Optional additive static WFS-path NCPA OPD `[nwf x nwf]` [um], or NULL
- * @wf_to_opd: Conversion factor mapping `wf_in` units into optical path difference [um]
- *
- * Role:
- *   Core hot-loop CPU diffractive propagator that builds the complex entrance pupil field,
- *   evaluates Zernike phase-contrast interference via four `cblas_cgemm` matrix multiplies,
- *   computes output pupil intensity `|Psi_out|^2`, and rebins onto `ctx->cpu_cam_int`.
- *
- * Rationale:
- *   Implements Babinet's exact identity
- *   `Psi_out = Psi_pup + inv_U * (mask_bab .* (fwd_U * Psi_pup * fwd_V)) * inv_V`:
- *   - Passing `beta = c_one` (`+1 + 0i`) to the final `cblas_cgemm` fuses the Babinet reference-
- *     wave addition with the inverse MFT matrix product directly onto `epup` in-place, saving an
- *     extra full-pupil buffer allocation and memory sweep.
- *   - OpenMP parallelization of pupil phasor `sincosf()` synthesis is gated on `npix_wf >= 16384`
- *     (`nwf >= 128`) so thread-fork overhead never penalizes compact LOWFS grids.
- */
-static void MILK_HOT zwfs_propagate_cpu(
-    cacaosim_zwfs_ctx_t    *ctx,
-    const float *__restrict pup_amp,
-    const float *__restrict atm_amp,
-    const float *__restrict wf_in,
-    const float *__restrict dm_opd,
-    const float *__restrict ncpa_opd,
-    float                   wf_to_opd)
+static void MILK_HOT zwfs_eval_babinet_chan_cpu(
+    cacaosim_zwfs_ctx_t *ctx,
+    int32_t              c)
 {
-    const uint32_t nwf        = ctx->cfg.nwf;
-    const uint32_t m          = ctx->n_mft;
-    const uint64_t npix_wf    = ctx->npix_wf;
-    const float    lam        = (ctx->cfg.lambda_um > 0.1f) ? ctx->cfg.lambda_um : 0.75f;
-    const float    opd_to_rad = CACAOSIM_TWO_PI_F / lam;
-    const int      nth        = (npix_wf >= 16384ULL) ? omp_get_max_threads() : 1;
+    const uint32_t nwf      = ctx->cfg.nwf;
+    const uint32_t m        = ctx->n_mft;
+    const uint64_t npix_wf  = ctx->npix_wf;
+    const size_t   uv_elems = (size_t) m * nwf * 2u;
+    const float    wc       = ctx->chan_w[c];
+    const float    c_one[2] = { 1.0f, 0.0f };
+    const float    c_zero[2] = { 0.0f, 0.0f };
 
-    float *__restrict epup = MILK_ASSUME_ALIGNED(ctx->cpu_epup_cplx);
+    float *__restrict       epup = MILK_ASSUME_ALIGNED(ctx->cpu_epup_cplx);
+    float *__restrict       ef   = MILK_ASSUME_ALIGNED(ctx->cpu_efoc_cplx);
+    const float *__restrict fU   = &ctx->fwd_U_cplx[(size_t) c * uv_elems];
+    const float *__restrict fV   = &ctx->fwd_V_cplx[(size_t) c * uv_elems];
+    const float *__restrict iU   = &ctx->inv_U_cplx[(size_t) c * uv_elems];
+    const float *__restrict iV   = &ctx->inv_V_cplx[(size_t) c * uv_elems];
+    const float *__restrict mb   = &ctx->mask_bab_cplx[(size_t) c * ctx->npix_mft * 2u];
 
-    /* Synthesize complex entrance pupil Psi_pup(x, y) = A(x, y) * exp(i * 2*pi/lambda * OPD) */
-#pragma omp parallel for num_threads(nth) if (nth > 1) schedule(static)
-    for (uint64_t p = 0; p < npix_wf; p++)
-    {
-        float amp = (pup_amp != NULL) ? pup_amp[p] : 1.0f;
-        if (atm_amp != NULL)
-        {
-            amp *= atm_amp[p];
-        }
-        if (amp <= 0.0f)
-        {
-            epup[2u * p]      = 0.0f;
-            epup[2u * p + 1u] = 0.0f;
-            continue;
-        }
-        float opd = 0.0f;
-        if (wf_in != NULL)
-        {
-            opd += wf_to_opd * wf_in[p];
-        }
-        if (dm_opd != NULL)
-        {
-            opd -= dm_opd[p];
-        }
-        if (ncpa_opd != NULL)
-        {
-            opd += ncpa_opd[p];
-        }
-        float phi = opd * opd_to_rad;
-        float s   = 0.0f;
-        float co  = 1.0f;
-        sincosf(phi, &s, &co);
-        epup[2u * p]      = amp * co;
-        epup[2u * p + 1u] = amp * s;
-    }
-
-    const float c_one[2]  = { 1.0f, 0.0f };
-    const float c_zero[2] = { 0.0f, 0.0f };
-
-    /* Forward MFT onto focal dimple patch: Efoc [m x m] = fwd_U * Epup * fwd_V */
     cblas_cgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, (int) m, (int) nwf, (int) nwf, c_one,
-                ctx->fwd_U_cplx, (int) nwf, epup, (int) nwf, c_zero, ctx->cpu_tmp_cplx, (int) nwf);
+                fU, (int) nwf, epup, (int) nwf, c_zero, ctx->cpu_tmp_cplx, (int) nwf);
     cblas_cgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, (int) m, (int) m, (int) nwf, c_one,
-                ctx->cpu_tmp_cplx, (int) nwf, ctx->fwd_V_cplx, (int) m, c_zero, ctx->cpu_efoc_cplx,
-                (int) m);
+                ctx->cpu_tmp_cplx, (int) nwf, fV, (int) m, c_zero, ef, (int) m);
 
-    /* Apply Babinet complex mask (t_d * exp(i*theta) - 1) * M(u, v) */
-    float *__restrict       ef = MILK_ASSUME_ALIGNED(ctx->cpu_efoc_cplx);
-    const float *__restrict mb = MILK_ASSUME_ALIGNED(ctx->mask_bab_cplx);
 #pragma omp simd
     for (uint64_t i = 0; i < ctx->npix_mft; i++)
     {
@@ -361,23 +315,165 @@ static void MILK_HOT zwfs_propagate_cpu(
         ef[2u * i + 1] = er * mi + ei * mr;
     }
 
-    /* Inverse MFT + Babinet superposition: Epup += inv_U * Efoc * inv_V (in-place via beta = +1) */
     cblas_cgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, (int) nwf, (int) m, (int) m, c_one,
-                ctx->inv_U_cplx, (int) m, ef, (int) m, c_zero, ctx->cpu_tmp_cplx, (int) m);
+                iU, (int) m, ef, (int) m, c_zero, ctx->cpu_tmp_cplx, (int) m);
     cblas_cgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, (int) nwf, (int) nwf, (int) m, c_one,
-                ctx->cpu_tmp_cplx, (int) m, ctx->inv_V_cplx, (int) nwf, c_one, epup, (int) nwf);
+                ctx->cpu_tmp_cplx, (int) m, iV, (int) nwf, c_one, epup, (int) nwf);
 
-    /* Convert interfered output pupil field into intensity |Psi_out|^2 and bin onto detector */
     float *__restrict pint = MILK_ASSUME_ALIGNED(ctx->cpu_pup_int);
-#pragma omp simd
-    for (uint64_t p = 0; p < npix_wf; p++)
+    if (c == 0)
     {
-        float re = epup[2u * p];
-        float im = epup[2u * p + 1u];
-        pint[p]  = re * re + im * im;
+#pragma omp simd
+        for (uint64_t p = 0; p < npix_wf; p++)
+        {
+            float re = epup[2u * p];
+            float im = epup[2u * p + 1u];
+            pint[p]  = wc * (re * re + im * im);
+        }
+    }
+    else
+    {
+#pragma omp simd
+        for (uint64_t p = 0; p < npix_wf; p++)
+        {
+            float re = epup[2u * p];
+            float im = epup[2u * p + 1u];
+            pint[p] += wc * (re * re + im * im);
+        }
+    }
+}
+
+static void MILK_HOT zwfs_propagate_cpu(
+    cacaosim_zwfs_ctx_t    *ctx,
+    const float *__restrict pup_amp,
+    const float *__restrict atm_amp,
+    const float *__restrict wf_in,
+    const float *__restrict dm_opd,
+    const float *__restrict ncpa_opd,
+    float                   wf_to_opd)
+{
+    const uint32_t nwf     = ctx->cfg.nwf;
+    const uint64_t npix_wf = ctx->npix_wf;
+    const int32_t  nlam    = (ctx->eff_nlam >= 1) ? ctx->eff_nlam : 1;
+    const int      nth     = (npix_wf >= 16384ULL) ? omp_get_max_threads() : 1;
+
+    float *__restrict epup = MILK_ASSUME_ALIGNED(ctx->cpu_epup_cplx);
+
+    for (int32_t c = 0; c < nlam; c++)
+    {
+        const float opd_to_rad = ctx->k_rad[c];
+
+#pragma omp parallel for num_threads(nth) if (nth > 1) schedule(static)
+        for (uint64_t p = 0; p < npix_wf; p++)
+        {
+            float amp = (pup_amp != NULL) ? pup_amp[p] : 1.0f;
+            if (atm_amp != NULL)
+            {
+                amp *= atm_amp[p];
+            }
+            if (amp <= 0.0f)
+            {
+                epup[2u * p]      = 0.0f;
+                epup[2u * p + 1u] = 0.0f;
+                continue;
+            }
+            float opd = 0.0f;
+            if (wf_in != NULL)
+            {
+                opd += wf_to_opd * wf_in[p];
+            }
+            if (dm_opd != NULL)
+            {
+                opd -= dm_opd[p];
+            }
+            if (ncpa_opd != NULL)
+            {
+                opd += ncpa_opd[p];
+            }
+            float phi = opd * opd_to_rad;
+            float s   = 0.0f;
+            float co  = 1.0f;
+            sincosf(phi, &s, &co);
+            epup[2u * p]      = amp * co;
+            epup[2u * p + 1u] = amp * s;
+        }
+
+        zwfs_eval_babinet_chan_cpu(ctx, c);
     }
 
-    zwfs_bin_image_cpu(pint, nwf, ctx->cfg.ncam, ctx->cpu_cam_int);
+    zwfs_bin_image_cpu(ctx->cpu_pup_int, nwf, ctx->cfg.ncam, ctx->cpu_cam_int);
+}
+
+static void MILK_HOT zwfs_propagate_poly_cpu(
+    cacaosim_zwfs_ctx_t *ctx,
+    const float         *beam_opd,
+    const float         *beam_amp,
+    const float         *beam_lam_um,
+    uint32_t             beam_nlam,
+    uint64_t             chan_stride,
+    const float         *ncpa_opd)
+{
+    const uint32_t nwf     = ctx->cfg.nwf;
+    const uint64_t npix_wf = ctx->npix_wf;
+    const int32_t  nlam    = (ctx->eff_nlam >= 1) ? ctx->eff_nlam : 1;
+    const int      nth     = (npix_wf >= 16384ULL) ? omp_get_max_threads() : 1;
+    const float    lam0    = (ctx->cfg.lambda_um > 0.05f) ? ctx->cfg.lambda_um : 0.75f;
+    const float    bw      = (ctx->cfg.bw_frac > 0.0f) ? ctx->cfg.bw_frac : 0.20f;
+    const float    def_l0  = lam0 * (1.0f - 0.5f * bw);
+    const float    def_l1  = lam0 * (1.0f + 0.5f * bw);
+
+    float *__restrict epup = MILK_ASSUME_ALIGNED(ctx->cpu_epup_cplx);
+
+    for (int32_t c = 0; c < nlam; c++)
+    {
+        uint32_t m0 = 0u;
+        uint32_t m1 = 0u;
+        float    w1 = 0.0f;
+        cacaosim_poly_interp_bracket(ctx->lam_um[c], beam_lam_um, beam_nlam, def_l0, def_l1, &m0,
+                                     &m1, &w1);
+        float        w0 = 1.0f - w1;
+        float        kc = ctx->k_rad[c];
+        const float *o0 = (beam_opd != NULL) ? (beam_opd + (uint64_t) m0 * chan_stride) : NULL;
+        const float *a0 = (beam_amp != NULL) ? (beam_amp + (uint64_t) m0 * chan_stride) : NULL;
+        const float *o1 = (beam_opd != NULL) ? (beam_opd + (uint64_t) m1 * chan_stride) : NULL;
+        const float *a1 = (beam_amp != NULL) ? (beam_amp + (uint64_t) m1 * chan_stride) : NULL;
+
+#pragma omp parallel for num_threads(nth) if (nth > 1) schedule(static)
+        for (uint64_t p = 0; p < npix_wf; p++)
+        {
+            float amp0 = (a0 != NULL) ? a0[p] : 1.0f;
+            float amp1 = (a1 != NULL) ? a1[p] : 1.0f;
+            if (amp0 <= 0.0f && amp1 <= 0.0f)
+            {
+                epup[2u * p]      = 0.0f;
+                epup[2u * p + 1u] = 0.0f;
+                continue;
+            }
+            float nc  = (ncpa_opd != NULL) ? ncpa_opd[p] : 0.0f;
+            float p0  = (((o0 != NULL) ? o0[p] : 0.0f) + nc) * kc;
+            float s0  = 0.0f;
+            float co0 = 1.0f;
+            sincosf(p0, &s0, &co0);
+            float re = w0 * amp0 * co0;
+            float im = w0 * amp0 * s0;
+
+            if (m1 != m0 && w1 > 0.0f)
+            {
+                float p1  = (((o1 != NULL) ? o1[p] : 0.0f) + nc) * kc;
+                float s1  = 0.0f;
+                float co1 = 1.0f;
+                sincosf(p1, &s1, &co1);
+                re += w1 * amp1 * co1;
+                im += w1 * amp1 * s1;
+            }
+            epup[2u * p]      = re;
+            epup[2u * p + 1u] = im;
+        }
+
+        zwfs_eval_babinet_chan_cpu(ctx, c);
+    }
+
+    zwfs_bin_image_cpu(ctx->cpu_pup_int, nwf, ctx->cfg.ncam, ctx->cpu_cam_int);
 }
 
 /**
@@ -482,12 +578,51 @@ int MILK_COLD cacaosim_zwfs_init(
         openblas_set_num_threads(1);
     }
 
+    float lam0    = (cfg->lambda_um > 0.05f) ? cfg->lambda_um : 0.75f;
+    ctx->eff_nlam = cacaosim_resolve_nlambda(cfg->nlambda, 1u, cfg->bw_frac);
+    if (cfg->has_ext_chan)
+    {
+        double wsum = 0.0;
+        for (int32_t c = 0; c < ctx->eff_nlam; c++)
+        {
+            ctx->lam_um[c] = (cfg->ext_lam_um[c] > 0.05f) ? cfg->ext_lam_um[c] : lam0;
+            ctx->chan_w[c] = (cfg->ext_weight[c] > 0.0f) ? cfg->ext_weight[c] : 0.0f;
+            wsum += (double) ctx->chan_w[c];
+        }
+        if (wsum > 1e-20)
+        {
+            for (int32_t c = 0; c < ctx->eff_nlam; c++)
+            {
+                ctx->chan_w[c] = (float) ((double) ctx->chan_w[c] / wsum);
+            }
+        }
+        else
+        {
+            float inv_n = 1.0f / (float) ctx->eff_nlam;
+            for (int32_t c = 0; c < ctx->eff_nlam; c++)
+            {
+                ctx->chan_w[c] = inv_n;
+            }
+        }
+    }
+    else
+    {
+        cacaosim_spec_sample_band(NULL, lam0, cfg->bw_frac, ctx->eff_nlam, 0.001f, 1.0f,
+                                  ctx->lam_um, ctx->chan_w, NULL);
+    }
+    for (int32_t c = 0; c < ctx->eff_nlam; c++)
+    {
+        ctx->k_rad[c] = CACAOSIM_TWO_PI_F / ctx->lam_um[c];
+    }
+
+    size_t nlam_sz     = (size_t) ctx->eff_nlam;
     size_t uv_elems    = (size_t) ctx->n_mft * cfg->nwf * 2u;
-    ctx->fwd_U_cplx    = (float *) cacaosim_aligned_calloc(uv_elems, sizeof(float));
-    ctx->fwd_V_cplx    = (float *) cacaosim_aligned_calloc(uv_elems, sizeof(float));
-    ctx->inv_U_cplx    = (float *) cacaosim_aligned_calloc(uv_elems, sizeof(float));
-    ctx->inv_V_cplx    = (float *) cacaosim_aligned_calloc(uv_elems, sizeof(float));
-    ctx->mask_bab_cplx = (float *) cacaosim_aligned_calloc(ctx->npix_mft * 2u, sizeof(float));
+    ctx->fwd_U_cplx    = (float *) cacaosim_aligned_calloc(nlam_sz * uv_elems, sizeof(float));
+    ctx->fwd_V_cplx    = (float *) cacaosim_aligned_calloc(nlam_sz * uv_elems, sizeof(float));
+    ctx->inv_U_cplx    = (float *) cacaosim_aligned_calloc(nlam_sz * uv_elems, sizeof(float));
+    ctx->inv_V_cplx    = (float *) cacaosim_aligned_calloc(nlam_sz * uv_elems, sizeof(float));
+    ctx->mask_bab_cplx =
+        (float *) cacaosim_aligned_calloc(nlam_sz * ctx->npix_mft * 2u, sizeof(float));
     ctx->cpu_epup_cplx = (float *) cacaosim_aligned_calloc(ctx->npix_wf * 2u, sizeof(float));
     ctx->cpu_tmp_cplx  = (float *) cacaosim_aligned_calloc(uv_elems, sizeof(float));
     ctx->cpu_efoc_cplx = (float *) cacaosim_aligned_calloc(ctx->npix_mft * 2u, sizeof(float));
@@ -650,6 +785,81 @@ void MILK_HOT cacaosim_zwfs_accum_beam(
     else
     {
         zwfs_accum_cpu_common(ctx, beam_amp, NULL, beam_opd, NULL, ncpa_opd, 1.0f);
+    }
+    ctx->subframe_cnt++;
+}
+
+void cacaosim_zwfs_set_weights(
+    cacaosim_zwfs_ctx_t *ctx,
+    const float         *weights)
+{
+    if (ctx == NULL || weights == NULL || ctx->eff_nlam < 1)
+    {
+        return;
+    }
+    double wsum = 0.0;
+    for (int32_t c = 0; c < ctx->eff_nlam; c++)
+    {
+        wsum += (weights[c] > 0.0f) ? (double) weights[c] : 0.0;
+    }
+    int changed = 0;
+    for (int32_t c = 0; c < ctx->eff_nlam; c++)
+    {
+        float nw = (wsum > 1e-20)
+                       ? (float) (((weights[c] > 0.0f) ? (double) weights[c] : 0.0) / wsum)
+                       : (1.0f / (float) ctx->eff_nlam);
+        if (fabsf(nw - ctx->chan_w[c]) > 1e-6f)
+        {
+            changed = 1;
+        }
+        ctx->chan_w[c] = nw;
+    }
+    if (changed && ctx->use_cuda)
+    {
+        cacaosim_zwfs_cuda_upload_weights(ctx);
+    }
+}
+
+void MILK_HOT cacaosim_zwfs_accum_beam_poly(
+    cacaosim_zwfs_ctx_t *ctx,
+    const float         *beam_opd,
+    const float         *beam_amp,
+    const float         *beam_lam_um,
+    uint32_t             beam_nlam,
+    uint64_t             chan_stride,
+    const float         *ncpa_opd,
+    const float         *d_beam_opd,
+    const float         *d_beam_amp)
+{
+    if (beam_nlam <= 1u)
+    {
+        cacaosim_zwfs_accum_beam(ctx, beam_opd, beam_amp, ncpa_opd, d_beam_opd, d_beam_amp);
+        return;
+    }
+
+    if (ctx->use_cuda)
+    {
+        cacaosim_zwfs_cuda_accum_poly(ctx, beam_opd, beam_amp, beam_lam_um, beam_nlam,
+                                      chan_stride, d_beam_opd, d_beam_amp);
+    }
+    else
+    {
+        if (ctx->subframe_cnt == 1u)
+        {
+            __builtin_memcpy(ctx->cpu_accum_int, ctx->cpu_cam_int, ctx->npix_cam * sizeof(float));
+        }
+        zwfs_propagate_poly_cpu(ctx, beam_opd, beam_amp, beam_lam_um, beam_nlam, chan_stride,
+                                ncpa_opd);
+        if (ctx->subframe_cnt >= 1u)
+        {
+            float *__restrict       acc = MILK_ASSUME_ALIGNED(ctx->cpu_accum_int);
+            const float *__restrict cam = MILK_ASSUME_ALIGNED(ctx->cpu_cam_int);
+#pragma omp simd
+            for (uint64_t i = 0; i < ctx->npix_cam; i++)
+            {
+                acc[i] += cam[i];
+            }
+        }
     }
     ctx->subframe_cnt++;
 }

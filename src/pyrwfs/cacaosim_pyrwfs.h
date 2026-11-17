@@ -52,6 +52,26 @@
 extern "C" {
 #endif
 
+/** Maximum subframe modulation arc/interleaved slices cached in CUDA Graph slots. */
+#define CACAOSIM_PYRWFS_MAX_SLICES 16
+
+/**
+ * enum cacaosim_pyrmod_mode_t - Subframe tip-tilt modulation partitioning across an exposure
+ * @CACAOSIM_PYRMOD_FULL:        Evaluate all `eff_npts` ring points on every subframe (models a
+ *                               simultaneous static ring diffuser or `navg == 1`).
+ * @CACAOSIM_PYRMOD_SYNC_ARC:    Sweep a contiguous `2*pi / n_slices` piezo arc per subframe over
+ *                               `mod_rev` revolutions per exposure (`K + N_mod` FFTs/exposure;
+ *                               models real synchronous kHz piezo tip-tilt modulators).
+ * @CACAOSIM_PYRMOD_INTERLEAVED: Evaluate a quadrature-strided subset `s + j * n_slices` per
+ *                               subframe (`K + N_mod` FFTs/exposure, isotropic per-subframe).
+ */
+typedef enum
+{
+    CACAOSIM_PYRMOD_FULL        = 0,
+    CACAOSIM_PYRMOD_SYNC_ARC    = 1,
+    CACAOSIM_PYRMOD_INTERLEAVED = 2
+} cacaosim_pyrmod_mode_t;
+
 /**
  * @brief Optical and detector configuration for the 4-sided Pyramid WFS engine.
  *
@@ -62,21 +82,31 @@ extern "C" {
  */
 typedef struct
 {
-    uint32_t           nwf;        /**< Input square pupil grid dimension [pixels] (>= 8) */
-    uint32_t           pad_factor; /**< Optical FFT oversampling factor (>= 2, default: 2) */
-    uint32_t           ncam;       /**< Output square WFS camera dimension [pixels] (>= 4) */
-    float              pup_diam;   /**< Clear pupil diameter fraction of nwf (default: 0.9375) */
-    float              lambda_um;  /**< Monochromatic sensing wavelength [um] (default: 0.75) */
-    float              mod_rad_ld; /**< Circular modulation radius [lambda/D] (0 = unmodulated) */
-    int32_t            mod_npts;   /**< Discrete modulation points around circle (>= 1) */
-    float              pup_sep;    /**< Sub-pupil center separation fraction of nfft (def: 0.5) */
-    float              roof_ld;    /**< Pyramid vertex roof rounding width [lambda/D] (0 = sharp) */
-    float              fstop_frac; /**< Focal field-stop half-width fraction of nfft (def: 0.45) */
-    int32_t            wf_unit;    /**< Input WF unit: 0 = OPD [um], 1 = phase [rad] */
-    float              ref_lambda; /**< Reference wavelength [um] when wf_unit == 1 */
-    uint64_t           rng_seed;   /**< Base 64-bit PRNG seed for photon/readout noise */
-    int32_t            backend;    /**< cacaosim_backend_t: 0 = auto, 1 = CPU, 2 = CUDA */
-    cacaosim_det_cfg_t det;        /**< Integrated WFS camera readout electronics parameters */
+    uint32_t           nwf;               /**< Input square pupil grid dimension [pixels] (>= 8) */
+    uint32_t           pad_factor;        /**< Optical FFT oversampling factor (>= 2, def: 2) */
+    uint32_t           ncam;              /**< Output square WFS camera dimension [pixels] (>= 4) */
+    float              pup_diam;          /**< Clear pupil diameter fraction of nwf (def: 0.9375) */
+    float              lambda_um;         /**< Central sensing wavelength [um] (def: 0.75) */
+    float              bw_frac;           /**< Fractional bandpass dlambda/lambda0 (0 = mono) */
+    int32_t            nlambda;           /**< Spectral slices (0 = auto -> 2 if bw_frac > 0) */
+    float              chrom_sep;         /**< Prism dispersion d(pup_sep)/d(lam/lam0) (def: 0) */
+    int32_t            has_ext_chan;      /**< 1 to use ext_lam_um / ext_weight channel tables */
+    float              ext_lam_um[CACAOSIM_MAX_LAMBDA]; /**< Optional channel wavelengths [um] */
+    float              ext_weight[CACAOSIM_MAX_LAMBDA]; /**< Optional channel photon weights */
+    float              mod_rad_ld;        /**< Circular modulation radius [lambda0/D] (0 = unmod) */
+    int32_t            mod_npts;          /**< Discrete modulation points around circle (>= 1) */
+    int32_t            mod_subframe_mode; /**< cacaosim_pyrmod_mode_t: 0=full, 1=sync_arc, 2=int */
+    int32_t            mod_rev;           /**< Modulator revolutions per WFS exposure (def: 1) */
+    float              mod_phase_deg;     /**< Initial modulator azimuth at t=0 of exposure [deg] */
+    uint32_t           mod_subframes;     /**< Subframes integrated per WFS exposure (0/1 = full) */
+    float              pup_sep;           /**< Sub-pupil center separation fraction of nfft */
+    float              roof_ld;           /**< Pyramid vertex roof rounding width [lambda/D] */
+    float              fstop_frac;        /**< Focal field-stop half-width fraction of nfft */
+    int32_t            wf_unit;           /**< Input WF unit: 0 = OPD [um], 1 = phase [rad] */
+    float              ref_lambda;        /**< Reference wavelength [um] when wf_unit == 1 */
+    uint64_t           rng_seed;          /**< Base 64-bit PRNG seed for photon/readout noise */
+    int32_t            backend;           /**< cacaosim_backend_t: 0 = auto, 1 = CPU, 2 = CUDA */
+    cacaosim_det_cfg_t det;               /**< Integrated WFS camera readout electronics params */
 } cacaosim_pyrwfs_cfg_t;
 
 /**
@@ -95,13 +125,22 @@ typedef struct
     uint64_t              npix_fft;       /**< Total optical FFT plane pixels (nfft * nfft) */
     uint64_t              npix_cam;       /**< Total output detector pixels (ncam * ncam) */
     int32_t               eff_npts;       /**< Allocated modulation point count (>= 1) */
+    int32_t               eff_nlam;       /**< Active spectral slices [1..CACAOSIM_MAX_LAMBDA] */
+    int32_t               n_slices;       /**< Modulation slices per revolution [1..MAX_SLICES] */
+    int32_t               pts_per_slice;  /**< Inverse FFT batch size per subframe slice */
+    int32_t               slice_cursor;   /**< Current modulation slice index [0..n_slices-1] */
+    int32_t               force_full_mod; /**< 1 to integrate all n_slices in 1 call (calib_fast) */
+    float                 lam_um[CACAOSIM_MAX_LAMBDA];         /**< Channel wavelengths [um] */
+    float                 chan_w[CACAOSIM_MAX_LAMBDA];         /**< Normalized channel weights */
+    float                 k_rad[CACAOSIM_MAX_LAMBDA];          /**< 2*pi / lam_um[c] [rad/um] */
+    float                 chan_flat_norm[CACAOSIM_MAX_LAMBDA]; /**< Per-channel flat intensity */
     float                 cached_mod_rad; /**< Modulation radius [lambda/D] baked into masks_cplx */
     float                 flat_flux_norm; /**< Unaberrated total camera intensity for photometry */
     int32_t               use_cuda;       /**< 1 when CUDA backend is active, 0 for CPU FFTW3f */
     uint32_t              subframe_cnt;   /**< Optical subframes accumulated in current exposure */
     uint64_t              frame_seq;      /**< Monotonic camera readout counter for PRNG seeding */
 
-    /* Precomputed shifted complex pyramid masks [eff_npts * npix_fft * 2] (interleaved re,im) */
+    /* Shifted complex pyramid masks [n_slices * eff_nlam * pts_per_slice * npix_fft * 2] */
     float                *masks_cplx;     /**< Host shifted complex focal pyramid mask stack */
 
     /* CPU FFTW3f state (1 forward buffer + per-thread L2-resident inverse buffers) */
@@ -250,6 +289,40 @@ void cacaosim_pyrwfs_accum_beam(
     float                  mod_rad);
 
 /**
+ * cacaosim_pyrwfs_accum_beam_poly() - Propagate 1 or M polychromatic beam channels into PyWFS
+ * @ctx:         Initialized Pyramid WFS context (non-NULL)
+ * @beam_opd:    Host beam OPD cube (`@beam_nlam` planes separated by `@chan_stride`)
+ * @beam_amp:    Host beam amplitude cube (`@beam_nlam` planes separated by `@chan_stride`)
+ * @beam_lam_um: Optional array `[beam_nlam]` of upstream channel wavelengths `[um]`
+ * @beam_nlam:   Number of coherent upstream channels (`1` delegates to `accum_beam`)
+ * @chan_stride: Float stride between consecutive input beam channels
+ * @ncpa_opd:    Optional host 2D static WFS-arm NCPA OPD `[nwf * nwf]` in `[um]`
+ * @d_beam_opd:  Optional device beam OPD cube (`@beam_nlam` planes at `@chan_stride`)
+ * @d_beam_amp:  Optional device beam amplitude cube
+ * @mod_rad:     Live circular modulation radius `[lambda0/D]`
+ */
+void cacaosim_pyrwfs_accum_beam_poly(
+    cacaosim_pyrwfs_ctx_t *ctx,
+    const float           *beam_opd,
+    const float           *beam_amp,
+    const float           *beam_lam_um,
+    uint32_t               beam_nlam,
+    uint64_t               chan_stride,
+    const float           *ncpa_opd,
+    const float           *d_beam_opd,
+    const float           *d_beam_amp,
+    float                  mod_rad);
+
+/**
+ * cacaosim_pyrwfs_set_weights() - Update incoherent channel weights from live beam spectrum
+ * @ctx:     Initialized Pyramid WFS context (non-NULL)
+ * @weights: Array `[ctx->eff_nlam]` of positive photon weights (renormalized internally)
+ */
+void cacaosim_pyrwfs_set_weights(
+    cacaosim_pyrwfs_ctx_t *ctx,
+    const float           *weights);
+
+/**
  * cacaosim_pyrwfs_readout() - Finalize accumulated WFS exposure and perform detector readout
  * @ctx:      Initialized Pyramid WFS context with `subframe_cnt >= 1` (no-op if 0)
  * @det_live: Optional live detector configuration override (NULL uses `ctx->cfg.det`)
@@ -350,6 +423,15 @@ int  cacaosim_pyrwfs_cuda_init(cacaosim_pyrwfs_ctx_t *ctx,
  *   keeping device mask contents coherent with host state.
  */
 void cacaosim_pyrwfs_cuda_upload_masks(cacaosim_pyrwfs_ctx_t *ctx);
+void cacaosim_pyrwfs_cuda_upload_weights(cacaosim_pyrwfs_ctx_t *ctx);
+void cacaosim_pyrwfs_cuda_accum_poly(cacaosim_pyrwfs_ctx_t *ctx,
+                                     const float           *beam_opd,
+                                     const float           *beam_amp,
+                                     const float           *beam_lam_um,
+                                     uint32_t               beam_nlam,
+                                     uint64_t               chan_stride,
+                                     const float           *d_beam_opd,
+                                     const float           *d_beam_amp);
 
 /**
  * cacaosim_pyrwfs_cuda_free() - Release all GPU plans, CUDA Graphs, device buffers, and streams

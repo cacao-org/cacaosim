@@ -781,6 +781,10 @@ int cacaosim_bench_emit_plan(
         {
             cfg.master_hz = opts.rate_override;
         }
+        if (opts.oversample_override >= 1u)
+        {
+            cfg.oversample = opts.oversample_override;
+        }
         if (opts.backend >= 0)
         {
             cfg.backend = opts.backend;
@@ -896,12 +900,14 @@ int cacaosim_bench_emit_plan(
             add_unique_item(streams, &n_streams, PLAN_MAX_STREAMS, cfg.in_pup);
         }
 
-        float eff_rate = (cfg.master_hz > 0.1f) ? cfg.master_hz : 2000.0f;
-        float dt_s     = 1.0f / eff_rate;
+        float base_rate = (cfg.master_hz > 0.1f) ? cfg.master_hz : 2000.0f;
+        float eff_rate  = (ctx.eff_master_hz > 0.1f) ? ctx.eff_master_hz : base_rate;
+        float dt_s      = 1.0f / eff_rate;
+        float atm_rate  = (!opts.modular_mode && cfg.atm_interp) ? base_rate : eff_rate;
 
         if (inc_atmturb)
         {
-            emit_atmturb_plan(f_man, f_bat, f_wav, cfg.nwf, eff_rate, cfg.pup_diam, cfg.tel_diam_m,
+            emit_atmturb_plan(f_man, f_bat, f_wav, cfg.nwf, atm_rate, cfg.pup_diam, cfg.tel_diam_m,
                               cfg.ref_lambda, opts.seeing_arcsec, atm_master, cfg.in_wf, units,
                               &n_units, streams, &n_streams);
         }
@@ -996,6 +1002,7 @@ int cacaosim_bench_emit_plan(
                 if (nd->cfg.kind == CACAOSIM_NODE_CORO)
                 {
                     int c_poly = in_p || (nd->cfg.coro.nlambda > 1) ||
+                                 (nd->cfg.coro.nlambda <= 0 && nd->cfg.coro.bw_frac > 1e-6f) ||
                                  (nd->cfg.in_pup_amp[0] != '\0') ||
                                  (nd->cfg.in_pup_pha[0] != '\0') ||
                                  (nd->cfg.in_fpm_amp[0] != '\0') ||
@@ -1010,7 +1017,7 @@ int cacaosim_bench_emit_plan(
                     if (nd->lowfs_idx >= 0)
                     {
                         beam_depth[nd->lowfs_idx] = d;
-                        beam_poly[nd->lowfs_idx]  = 0;
+                        beam_poly[nd->lowfs_idx]  = c_poly;
                     }
                 }
                 else
@@ -1120,7 +1127,7 @@ int cacaosim_bench_emit_plan(
                     fprintf(f_bat, "%s.tau_sec = %.7f\n", fps, nd->cfg.dm.tau_sec);
                     fprintf(f_bat, "%s.f0_hz = %.8g\n", fps, nd->cfg.dm.f0_hz);
                     fprintf(f_bat, "%s.zeta = %.8g\n", fps, nd->cfg.dm.zeta);
-                    fprintf(f_bat, "%s.delay_frames = %.8g\n", fps, nd->cfg.dm.delay_frames);
+                    fprintf(f_bat, "%s.delay_frames = %.8g\n", fps, nd->eff_delay_ticks);
                     emit_reg_params(f_bat, fps, &nd->cfg.reg);
                     fprintf(f_bat, "%s.backend = %d\n", fps, cfg.backend);
 
@@ -1255,6 +1262,7 @@ int cacaosim_bench_emit_plan(
                     fprintf(f_bat, "%s.pup_diam = %.8g\n", fps, cfg.pup_diam);
                     fprintf(f_bat, "%s.lambda_um = %.8g\n", fps, nd->cfg.pyrwfs.lambda_um);
                     fprintf(f_bat, "%s.bw_frac = %.8g\n", fps, nd->cfg.bw_frac);
+                    fprintf(f_bat, "%s.nlambda = %d\n", fps, nd->cfg.pyrwfs.nlambda);
                     fprintf(f_bat, "%s.qe = %.8g\n", fps, nd->cfg.qe);
                     fprintf(f_bat, "%s.dt_exp = %.7f\n", fps, dt_s);
                     fprintf(f_bat, "%s.use_beam_flux = %s\n", fps,
@@ -1262,6 +1270,10 @@ int cacaosim_bench_emit_plan(
                     fprintf(f_bat, "%s.navg = %u\n", fps, nd->eff_navg);
                     fprintf(f_bat, "%s.mod_rad = %.8g\n", fps, nd->cfg.pyrwfs.mod_rad_ld);
                     fprintf(f_bat, "%s.mod_npts = %d\n", fps, nd->cfg.pyrwfs.mod_npts);
+                    fprintf(f_bat, "%s.mod_mode = %d\n", fps, nd->cfg.pyrwfs.mod_subframe_mode);
+                    fprintf(f_bat, "%s.mod_rev = %d\n", fps, nd->cfg.pyrwfs.mod_rev);
+                    fprintf(f_bat, "%s.mod_phase_deg = %.8g\n", fps,
+                            nd->cfg.pyrwfs.mod_phase_deg);
                     fprintf(f_bat, "%s.pup_sep = %.8g\n", fps, nd->cfg.pyrwfs.pup_sep);
                     fprintf(f_bat, "%s.roof_ld = %.8g\n", fps, nd->cfg.pyrwfs.roof_ld);
                     emit_reg_params(f_bat, fps, &nd->cfg.reg);
@@ -1290,6 +1302,7 @@ int cacaosim_bench_emit_plan(
                     fprintf(f_bat, "%s.pup_diam = %.8g\n", fps, cfg.pup_diam);
                     fprintf(f_bat, "%s.lambda_um = %.8g\n", fps, nd->cfg.shwfs.lambda_um);
                     fprintf(f_bat, "%s.bw_frac = %.8g\n", fps, nd->cfg.bw_frac);
+                    fprintf(f_bat, "%s.nlambda = %d\n", fps, nd->cfg.shwfs.nlambda);
                     fprintf(f_bat, "%s.qe = %.8g\n", fps, nd->cfg.qe);
                     fprintf(f_bat, "%s.dt_exp = %.7f\n", fps, dt_s);
                     fprintf(f_bat, "%s.use_beam_flux = %s\n", fps,
@@ -1323,6 +1336,7 @@ int cacaosim_bench_emit_plan(
                     fprintf(f_bat, "%s.dimple_rad = %.8g\n", fps, nd->cfg.zwfs.dimple_rad);
                     fprintf(f_bat, "%s.dimple_amp = %.8g\n", fps, nd->cfg.zwfs.dimple_amp);
                     fprintf(f_bat, "%s.bw_frac = %.8g\n", fps, nd->cfg.bw_frac);
+                    fprintf(f_bat, "%s.nlambda = %d\n", fps, nd->cfg.zwfs.nlambda);
                     fprintf(f_bat, "%s.qe = %.8g\n", fps, nd->cfg.qe);
                     fprintf(f_bat, "%s.dt_exp = %.7f\n", fps, dt_s);
                     fprintf(f_bat, "%s.use_beam_flux = %s\n", fps,
@@ -1528,6 +1542,8 @@ int cacaosim_bench_emit_plan(
         fprintf(f_meta, "MODE\t%s\n", opts.modular_mode ? "modular" : "fused");
         fprintf(f_meta, "FLAT\t0\n");
         fprintf(f_meta, "NWF\t%u\n", cfg.nwf);
+        fprintf(f_meta, "BASE_RATE\t%.6g\n", base_rate);
+        fprintf(f_meta, "OVERSAMPLE\t%u\n", ctx.eff_oversample);
         fprintf(f_meta, "EFF_RATE\t%.6g\n", eff_rate);
         fprintf(f_meta, "PUP_DIAM\t%.8g\n", cfg.pup_diam);
         fprintf(f_meta, "COBS\t%.8g\n", cfg.cobs);

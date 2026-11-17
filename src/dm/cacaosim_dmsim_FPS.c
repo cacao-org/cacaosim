@@ -63,6 +63,7 @@ static float    param_tau_sec                                = 0.00015f;
 static float    param_f0_hz                                  = 3000.0f;
 static float    param_zeta                                   = 0.7f;
 static float    param_delay_fr                               = 0.0f;
+static float    param_delay_us                               = 0.0f;
 static float    param_shift_x                                = 0.0f;
 static float    param_shift_y                                = 0.0f;
 static float    param_rot_deg                                = 0.0f;
@@ -148,6 +149,9 @@ static int32_t  param_backend                                = 0;
     X(".delay_frames", &param_delay_fr, FPTYPE_FLOAT32, 0,                              \
       FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
       "Transport latency [frames, fractional supported]")                               \
+    X(".delay_us", &param_delay_us, FPTYPE_FLOAT32, 0,                                  \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Physical transport latency [us] (>0 overrides delay_frames via delay_us/dt)")    \
     X(".shift_x", &param_shift_x, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,              \
       "DM-to-pupil X shift [pixels] (default: 0)")                                      \
     X(".shift_y", &param_shift_y, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,              \
@@ -181,7 +185,9 @@ static MILK_COLD errno_t dmsim_confcheck(void)
 {
     if (dcfpsptr != NULL)
     {
-        const char *live_keys[] = { ".max_stroke", ".tau_sec", ".delay_frames", ".tput" };
+        const char *live_keys[] = {
+            ".max_stroke", ".tau_sec", ".delay_frames", ".delay_us", ".tput"
+        };
         for (size_t i = 0; i < sizeof(live_keys) / sizeof(live_keys[0]); i++)
         {
             long idx = functionparameter_GetParamIndex(dcfpsptr, live_keys[i]);
@@ -375,8 +381,11 @@ static MILK_HOT errno_t dmsim_compute(const MILK_RUNNABLE *self)
         }
 
         /* Mode A (always active): step DM hardware physics and publish 2D .out_opd [um] */
+        float eff_dly = (param_delay_us > 0.0f && dm_ctx.cfg.dt_sec > 1e-9f)
+                            ? ((param_delay_us * 1.0e-6f) / dm_ctx.cfg.dt_sec)
+                            : param_delay_fr;
         img_opd.md->write = 1;
-        cacaosim_dm_step(&dm_ctx, cmd_ptr, flat_ptr, param_delay_fr, param_tau_sec,
+        cacaosim_dm_step(&dm_ctx, cmd_ptr, flat_ptr, eff_dly, param_tau_sec,
                          param_max_stroke, img_opd.im->array.F);
         processinfo_update_output_stream(processinfo, img_opd.im, img_cmd.im);
 

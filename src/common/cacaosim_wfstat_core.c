@@ -19,6 +19,7 @@
 
 #include "milk_runnable.h"
 #include "COREMOD_memory/COREMOD_memory.h"
+#include "common/cacaosim_beam.h"
 #include "common/cacaosim_mask.h"
 #include "common/cacaosim_wfstat_core.h"
 
@@ -29,6 +30,12 @@ typedef struct
     int         kind; /* 0=dm_opd, 1=dm_cmd, 2=wfs_raw, 3=wfs_sig, 4=psf_inst */
 } wfstat_extra_def_t;
 
+typedef struct
+{
+    const char *key;
+    const char *stream_name;
+} wfstat_strehl_def_t;
+
 static const wfstat_extra_def_t s_extra_defs[CACAOSIM_WFSTAT_NB_EXTRA] = {
     { "wfs_raw_stg1", "csim_wfs_nir", 2 },        { "wfs_sig_stg1", "aol1_imWFS2", 3 },
     { "wfs_raw_stg2", "csim_wfs_vis", 2 },        { "wfs_sig_stg2", "aol2_imWFS2", 3 },
@@ -37,6 +44,13 @@ static const wfstat_extra_def_t s_extra_defs[CACAOSIM_WFSTAT_NB_EXTRA] = {
     { "psf_inst_vis_raw", "psf_vis_raw", 4 },     { "psf_inst_vis_stg1", "psf_vis_stg1", 4 },
     { "psf_inst_vis_final", "psf_vis_final", 4 }, { "psf_inst_nir_raw", "psf_nir_raw", 4 },
     { "psf_inst_nir_stg1", "psf_nir_stg1", 4 },   { "psf_inst_nir_final", "psf_nir_final", 4 },
+};
+
+static const wfstat_strehl_def_t s_strehl_defs[CACAOSIM_WFSTAT_NB_STREHL] = {
+    { "vis_raw", "psf_vis_raw_long" },     { "vis_stg1", "psf_vis_stg1_long" },
+    { "vis_final", "psf_vis_final_long" }, { "nir_raw", "psf_nir_raw_long" },
+    { "nir_stg1", "psf_nir_stg1_long" },   { "nir_final", "psf_nir_final_long" },
+    { "sci", "csim_fplong" },
 };
 
 static const char *s_loc_keys[CACAOSIM_WFSTAT_NB_LOC] = { "raw", "stg1", "final" };
@@ -83,9 +97,14 @@ int cacaosim_wfstat_init(
     {
         ws->extras[e].img.ID = -1;
     }
+    for (int c = 0; c < CACAOSIM_WFSTAT_NB_STREHL; c++)
+    {
+        ws->strehl[c].img.ID = -1;
+    }
     ws->nwf        = nwf;
     ws->npix       = (uint64_t) nwf * nwf;
     ws->snap_extra = snap_extra;
+    ws->ts_cap     = (target_ticks > 10) ? (target_ticks + 4096ULL) : 262144ULL;
     uint64_t npix  = ws->npix;
 
     ws->mask    = (uint8_t *) calloc(npix, sizeof(uint8_t));
@@ -103,7 +122,8 @@ int cacaosim_wfstat_init(
         ws->sum_wf[k]  = (double *) calloc(npix, sizeof(double));
         ws->sum2_wf[k] = (double *) calloc(npix, sizeof(double));
         ws->samp_wf[k] = (float *) calloc(CACAOSIM_WFSTAT_NB_SAMP * npix, sizeof(float));
-        if (!ws->sum_wf[k] || !ws->sum2_wf[k] || !ws->samp_wf[k])
+        ws->ts_rms[k]  = (float *) calloc(ws->ts_cap, sizeof(float));
+        if (!ws->sum_wf[k] || !ws->sum2_wf[k] || !ws->samp_wf[k] || !ws->ts_rms[k])
         {
             cacaosim_wfstat_free(ws);
             return -1;
@@ -164,12 +184,32 @@ int cacaosim_wfstat_init(
                 es->active = (es->cube != NULL);
             }
         }
+        for (int c = 0; c < CACAOSIM_WFSTAT_NB_STREHL; c++)
+        {
+            cacaosim_wfstat_strehl_t *st = &ws->strehl[c];
+            st->img                      = stream_connect(s_strehl_defs[c].stream_name);
+            if (st->img.ID != -1 && st->img.md != NULL)
+            {
+                st->cap     = ws->ts_cap;
+                st->frame   = (uint64_t *) calloc(st->cap, sizeof(uint64_t));
+                st->sr_inst = (float *) calloc(st->cap, sizeof(float));
+                st->sr_long = (float *) calloc(st->cap, sizeof(float));
+                st->sr_axis = (float *) calloc(st->cap, sizeof(float));
+                if (!st->frame || !st->sr_inst || !st->sr_long || !st->sr_axis)
+                {
+                    cacaosim_wfstat_free(ws);
+                    return -1;
+                }
+                st->last_cnt0 = st->img.md->cnt0;
+                st->active    = 1;
+            }
+        }
     }
 
     if (use_cuda)
     {
         ws->gpu = cacaosim_wfstat_gpu_create(ws->weights, npix, CACAOSIM_WFSTAT_NB_LOC,
-                                             cuda_stream);
+                                             ws->ts_cap, cuda_stream);
         if (ws->gpu == NULL)
         {
             cacaosim_wfstat_free(ws);
@@ -215,6 +255,11 @@ static void accum_host_plane(cacaosim_wfstat_t *ws, int k, const float *opd, int
     double srms = sqrt((svar > 0.0) ? svar : 0.0);
     ws->sum_svar[k] += svar;
     ws->sum_srms[k] += srms;
+    uint64_t slot = ws->n_frames - 1ULL;
+    if (slot < ws->ts_cap && ws->ts_rms[k] != NULL)
+    {
+        ws->ts_rms[k][slot] = (float) srms;
+    }
     if (is_samp)
     {
         memcpy(ws->samp_wf[k] + (uint64_t) ws->nsamp * npix, ws->wf_tmp, npix * sizeof(float));
@@ -350,12 +395,40 @@ void cacaosim_wfstat_frame(cacaosim_wfstat_t *ws, const float *const opd_um[])
         {
             accum_host_plane(ws, k, opd_um[k], is_samp);
         }
+        ws->ts_len = (ws->n_frames <= ws->ts_cap) ? ws->n_frames : ws->ts_cap;
     }
 
     if (is_samp)
     {
         snapshot_extras(ws);
         ws->nsamp++;
+    }
+
+    if (ws->snap_extra)
+    {
+        for (int c = 0; c < CACAOSIM_WFSTAT_NB_STREHL; c++)
+        {
+            cacaosim_wfstat_strehl_t *st = &ws->strehl[c];
+            if (!st->active || st->img.md == NULL)
+            {
+                continue;
+            }
+            uint64_t cnt0 = st->img.md->cnt0;
+            if (cnt0 != st->last_cnt0)
+            {
+                st->last_cnt0 = cnt0;
+                double srl = 0.0, sri = 0.0, sra = 0.0;
+                if (cacaosim_fpcam_shm_read_kw(st->img.im, &srl, &sri, &sra) &&
+                    st->len < st->cap)
+                {
+                    st->frame[st->len]   = ws->n_frames;
+                    st->sr_inst[st->len] = (float) sri;
+                    st->sr_long[st->len] = (float) srl;
+                    st->sr_axis[st->len] = (float) sra;
+                    st->len++;
+                }
+            }
+        }
     }
 }
 
@@ -434,19 +507,139 @@ static void write_samples_json(FILE *jfp, const cacaosim_wfstat_t *ws, double dt
     fprintf(jfp, "  ]\n");
 }
 
+static uint64_t write_wf_timeseries_csv(
+    const cacaosim_wfstat_t *ws,
+    const char              *out_dir,
+    double                   dt_phys)
+{
+    if (ws->ts_len == 0)
+    {
+        return 0;
+    }
+    char tmp[1280], dst[1280];
+    snprintf(tmp, sizeof(tmp), "%s/.wf_timeseries.csv.tmp", out_dir);
+    snprintf(dst, sizeof(dst), "%s/wf_timeseries.csv", out_dir);
+    FILE *fp = fopen(tmp, "w");
+    if (fp == NULL)
+    {
+        return 0;
+    }
+    fprintf(fp, "frame,t_phys_s,rms_raw_nm,rms_stg1_nm,rms_final_nm\n");
+    for (uint64_t i = 0; i < ws->ts_len; i++)
+    {
+        uint64_t fr = i + 1ULL;
+        fprintf(fp, "%" PRIu64 ",%.6f,%.4f,%.4f,%.4f\n", fr, (double) fr * dt_phys,
+                (double) ws->ts_rms[0][i], (double) ws->ts_rms[1][i],
+                (double) ws->ts_rms[2][i]);
+    }
+    fclose(fp);
+    return (rename(tmp, dst) == 0) ? ws->ts_len : 0;
+}
+
+static uint64_t write_strehl_timeseries_csv(
+    const cacaosim_wfstat_t *ws,
+    const char              *out_dir,
+    double                   dt_phys)
+{
+    uint64_t ao3k_max_len = 0;
+    for (int c = 0; c < 6; c++)
+    {
+        if (ws->strehl[c].active && ws->strehl[c].len > ao3k_max_len)
+        {
+            ao3k_max_len = ws->strehl[c].len;
+        }
+    }
+    if (ao3k_max_len > 0)
+    {
+        static const int pref[6] = { 2, 5, 1, 4, 0, 3 };
+        int              ref_c   = 0;
+        for (int p = 0; p < 6; p++)
+        {
+            int c = pref[p];
+            if (ws->strehl[c].active && ws->strehl[c].len == ao3k_max_len)
+            {
+                ref_c = c;
+                break;
+            }
+        }
+        char tmp[1280], dst[1280];
+        snprintf(tmp, sizeof(tmp), "%s/.strehl_timeseries.csv.tmp", out_dir);
+        snprintf(dst, sizeof(dst), "%s/strehl_timeseries.csv", out_dir);
+        FILE *fp = fopen(tmp, "w");
+        if (fp == NULL)
+        {
+            return 0;
+        }
+        fprintf(fp, "exposure,frame,t_phys_s");
+        for (int c = 0; c < 6; c++)
+        {
+            fprintf(fp, ",%s_inst,%s_long", s_strehl_defs[c].key, s_strehl_defs[c].key);
+        }
+        fprintf(fp, "\n");
+        for (uint64_t r = 0; r < ao3k_max_len; r++)
+        {
+            uint64_t exp_id = r + 1U;
+            uint64_t fr     = ws->strehl[ref_c].frame[r];
+            fprintf(fp, "%" PRIu64 ",%" PRIu64 ",%.6f", exp_id, fr, (double) fr * dt_phys);
+            for (int c = 0; c < 6; c++)
+            {
+                const cacaosim_wfstat_strehl_t *st = &ws->strehl[c];
+                if (st->active && r < st->len)
+                {
+                    fprintf(fp, ",%.6f,%.6f", (double) st->sr_inst[r], (double) st->sr_long[r]);
+                }
+                else
+                {
+                    fprintf(fp, ",nan,nan");
+                }
+            }
+            fprintf(fp, "\n");
+        }
+        fclose(fp);
+        return (rename(tmp, dst) == 0) ? ao3k_max_len : 0;
+    }
+
+    const cacaosim_wfstat_strehl_t *sci = &ws->strehl[6];
+    if (sci->active && sci->len > 0)
+    {
+        char tmp[1280], dst[1280];
+        snprintf(tmp, sizeof(tmp), "%s/.strehl_timeseries.csv.tmp", out_dir);
+        snprintf(dst, sizeof(dst), "%s/strehl_timeseries.csv", out_dir);
+        FILE *fp = fopen(tmp, "w");
+        if (fp == NULL)
+        {
+            return 0;
+        }
+        fprintf(fp, "exposure,frame,t_phys_s,sci_inst,sci_long\n");
+        for (uint64_t r = 0; r < sci->len; r++)
+        {
+            uint64_t exp_id = r + 1U;
+            uint64_t fr     = sci->frame[r];
+            fprintf(fp, "%" PRIu64 ",%" PRIu64 ",%.6f,%.6f,%.6f\n", exp_id, fr,
+                    (double) fr * dt_phys, (double) sci->sr_inst[r], (double) sci->sr_long[r]);
+        }
+        fclose(fp);
+        return (rename(tmp, dst) == 0) ? sci->len : 0;
+    }
+    return 0;
+}
+
 int cacaosim_wfstat_write(cacaosim_wfstat_t *ws, const char *out_dir, double dt_phys)
 {
     uint64_t npix = ws->npix;
     if (ws->use_cuda)
     {
-        double acc[2 * CACAOSIM_WFSTAT_NB_LOC];
-        if (cacaosim_wfstat_gpu_fetch_sums(ws->gpu, ws->sum_wf, ws->sum2_wf, acc) == 0)
+        double   acc[2 * CACAOSIM_WFSTAT_NB_LOC];
+        uint64_t gpu_ts_len = 0;
+        if (cacaosim_wfstat_gpu_fetch_sums(ws->gpu, ws->sum_wf, ws->sum2_wf, acc, ws->ts_rms,
+                                           &gpu_ts_len) == 0)
         {
             for (int k = 0; k < CACAOSIM_WFSTAT_NB_LOC; k++)
             {
                 ws->sum_srms[k] = acc[2 * k + 0];
                 ws->sum_svar[k] = acc[2 * k + 1];
             }
+            ws->ts_len = gpu_ts_len;
         }
     }
 
@@ -536,9 +729,21 @@ int cacaosim_wfstat_write(cacaosim_wfstat_t *ws, const char *out_dir, double dt_
         }
     }
 
+    /* Flush CSV time series before publishing wf_stats.json so pollers see complete artifacts */
+    uint64_t wf_rows = write_wf_timeseries_csv(ws, out_dir, dt_phys);
+    uint64_t sr_rows = write_strehl_timeseries_csv(ws, out_dir, dt_phys);
+
     int rc = -1;
     if (jfp)
     {
+        fprintf(jfp, "  },\n");
+        fprintf(jfp, "  \"timeseries_files\": {\n");
+        fprintf(jfp, "    \"wf_rms_csv\": %s,\n",
+                (wf_rows > 0) ? "\"wf_timeseries.csv\"" : "null");
+        fprintf(jfp, "    \"wf_rms_rows\": %" PRIu64 ",\n", wf_rows);
+        fprintf(jfp, "    \"strehl_csv\": %s,\n",
+                (sr_rows > 0) ? "\"strehl_timeseries.csv\"" : "null");
+        fprintf(jfp, "    \"strehl_rows\": %" PRIu64 "\n", sr_rows);
         fprintf(jfp, "  },\n");
         write_samples_json(jfp, ws, dt_phys);
         fprintf(jfp, "}\n");
@@ -571,11 +776,24 @@ void cacaosim_wfstat_free(cacaosim_wfstat_t *ws)
             ws->extras[e].img.ID = -1;
         }
     }
+    for (int c = 0; c < CACAOSIM_WFSTAT_NB_STREHL; c++)
+    {
+        free(ws->strehl[c].frame);
+        free(ws->strehl[c].sr_inst);
+        free(ws->strehl[c].sr_long);
+        free(ws->strehl[c].sr_axis);
+        if (ws->strehl[c].img.ID != -1)
+        {
+            imgid_free(&ws->strehl[c].img);
+            ws->strehl[c].img.ID = -1;
+        }
+    }
     for (int k = 0; k < CACAOSIM_WFSTAT_NB_LOC; k++)
     {
         free(ws->sum_wf[k]);
         free(ws->sum2_wf[k]);
         free(ws->samp_wf[k]);
+        free(ws->ts_rms[k]);
     }
     free(ws->mask);
     free(ws->weights);
@@ -586,5 +804,9 @@ void cacaosim_wfstat_free(cacaosim_wfstat_t *ws)
     for (int e = 0; e < CACAOSIM_WFSTAT_NB_EXTRA; e++)
     {
         ws->extras[e].img.ID = -1;
+    }
+    for (int c = 0; c < CACAOSIM_WFSTAT_NB_STREHL; c++)
+    {
+        ws->strehl[c].img.ID = -1;
     }
 }

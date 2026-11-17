@@ -63,6 +63,7 @@
 
 #include "milk_config.h"
 #include "milk_types.h"
+#include "common/cacaosim_beam.h"
 #include "common/cacaosim_cuda.h"
 #include "fpcam/cacaosim_fpcam.h"
 
@@ -242,6 +243,97 @@ static void MILK_HOT fpcam_build_epup_cpu(
  * modularly around index `(0, 0) -> (ncam / 2, ncam / 2)` without needing an `fftshift` phase
  * ramp because `|F(kx, ky)|^2` is invariant to pupil origin translation.
  */
+static void MILK_HOT fpcam_build_epup_poly_cpu(
+    const float *__restrict beam_amp,
+    const float *__restrict atm_amp,
+    const float *__restrict beam_opd,
+    uint32_t                m0,
+    uint32_t                m1,
+    float                   alpha,
+    uint64_t                chan_stride,
+    const float *__restrict dm_opd,
+    const float *__restrict ncpa_opd,
+    float                   wf_to_opd,
+    float                   opd_to_rad,
+    uint64_t                npix_wf,
+    float *__restrict       epup_cplx)
+{
+    if (m1 == m0 || alpha <= 0.0f)
+    {
+        const float *pa = (beam_amp != NULL) ? (beam_amp + (uint64_t) m0 * chan_stride) : NULL;
+        const float *po = (beam_opd != NULL) ? (beam_opd + (uint64_t) m0 * chan_stride) : NULL;
+        fpcam_build_epup_cpu(pa, atm_amp, po, dm_opd, ncpa_opd, wf_to_opd, opd_to_rad, npix_wf,
+                             epup_cplx);
+        return;
+    }
+
+    const int    nth = (npix_wf >= 16384ULL) ? omp_get_max_threads() : 1;
+    const float  w1  = alpha;
+    const float  w0  = 1.0f - w1;
+    const float *a0  = (beam_amp != NULL) ? (beam_amp + (uint64_t) m0 * chan_stride) : NULL;
+    const float *a1  = (beam_amp != NULL) ? (beam_amp + (uint64_t) m1 * chan_stride) : NULL;
+    const float *o0  = (beam_opd != NULL) ? (beam_opd + (uint64_t) m0 * chan_stride) : NULL;
+    const float *o1  = (beam_opd != NULL) ? (beam_opd + (uint64_t) m1 * chan_stride) : NULL;
+
+#pragma omp parallel for num_threads(nth) if (nth > 1) schedule(static)
+    for (uint64_t p = 0; p < npix_wf; p++)
+    {
+        float at   = (atm_amp != NULL) ? atm_amp[p] : 1.0f;
+        float amp0 = ((a0 != NULL) ? a0[p] : 1.0f) * at;
+        float amp1 = ((a1 != NULL) ? a1[p] : 1.0f) * at;
+        if (amp0 <= 0.0f && amp1 <= 0.0f)
+        {
+            epup_cplx[2u * p]      = 0.0f;
+            epup_cplx[2u * p + 1u] = 0.0f;
+            continue;
+        }
+        float common = ((ncpa_opd != NULL) ? ncpa_opd[p] : 0.0f) -
+                       ((dm_opd != NULL) ? dm_opd[p] : 0.0f);
+        float p0  = (((o0 != NULL) ? (wf_to_opd * o0[p]) : 0.0f) + common) * opd_to_rad;
+        float p1  = (((o1 != NULL) ? (wf_to_opd * o1[p]) : 0.0f) + common) * opd_to_rad;
+        float s0  = 0.0f;
+        float co0 = 1.0f;
+        float s1  = 0.0f;
+        float co1 = 1.0f;
+        sincosf(p0, &s0, &co0);
+        sincosf(p1, &s1, &co1);
+        epup_cplx[2u * p]      = w0 * amp0 * co0 + w1 * amp1 * co1;
+        epup_cplx[2u * p + 1u] = w0 * amp0 * s0 + w1 * amp1 * s1;
+    }
+}
+
+static void fpcam_resolve_poly_bracket(
+    const cacaosim_fpcam_ctx_t *ctx,
+    int32_t                     c,
+    uint32_t                    beam_nlam,
+    uint32_t                   *m0,
+    uint32_t                   *m1,
+    float                      *alpha)
+{
+    if (beam_nlam <= 1u)
+    {
+        *m0    = 0u;
+        *m1    = 0u;
+        *alpha = 0.0f;
+        return;
+    }
+    const float *in_lam = NULL;
+    if (ctx->cfg.has_in_lam)
+    {
+        in_lam = ctx->cfg.in_lam_um;
+    }
+    else if (ctx->cfg.has_ext_lam && beam_nlam == (uint32_t) ctx->eff_nlam)
+    {
+        in_lam = ctx->lam_um;
+    }
+    float lam0   = (ctx->cfg.lambda_um > 0.05f) ? ctx->cfg.lambda_um : 1.65f;
+    float bw     = (ctx->cfg.bw_frac > 0.0f) ? ctx->cfg.bw_frac : 0.20f;
+    float span   = 0.5f * bw * ((float) (beam_nlam - 1u) / (float) beam_nlam);
+    float def_l0 = lam0 * (1.0f - span);
+    float def_l1 = lam0 * (1.0f + span);
+    cacaosim_poly_interp_bracket(ctx->lam_um[c], in_lam, beam_nlam, def_l0, def_l1, m0, m1, alpha);
+}
+
 static void MILK_HOT fpcam_accum_poly_cpu(
     cacaosim_fpcam_ctx_t *ctx,
     const float          *pup_amp,
@@ -256,7 +348,6 @@ static void MILK_HOT fpcam_accum_poly_cpu(
     const uint32_t nwf      = ctx->cfg.nwf;
     const uint32_t ncam     = ctx->cfg.ncam;
     const uint64_t npix_cam = ctx->npix_cam;
-    const float    inv_nlam = 1.0f / (float) ctx->eff_nlam;
     float *__restrict acc   = MILK_ASSUME_ALIGNED(ctx->cpu_accum_int);
 
     if (ctx->cfg.prop_mode == CACAOSIM_FPCAM_PROP_MFT)
@@ -266,68 +357,60 @@ static void MILK_HOT fpcam_accum_poly_cpu(
 
         for (int32_t c = 0; c < ctx->eff_nlam; c++)
         {
-            /* Map camera channel `c` onto closest upstream beam channel `bc` */
-            uint32_t bc = (beam_nlam <= 1u)
-                              ? 0u
-                              : ((beam_nlam == (uint32_t) ctx->eff_nlam)
-                                     ? (uint32_t) c
-                                     : (((uint32_t) c * beam_nlam) / (uint32_t) ctx->eff_nlam));
-            const float *pup_c = (pup_amp != NULL) ? (pup_amp + (uint64_t) bc * chan_stride) : NULL;
-            const float *wf_c  = (wf_in != NULL) ? (wf_in + (uint64_t) bc * chan_stride) : NULL;
-            const float  opd_to_rad = CACAOSIM_TWO_PI_F / ctx->lam_um[c];
+            uint32_t m0 = 0u;
+            uint32_t m1 = 0u;
+            float    al = 0.0f;
+            fpcam_resolve_poly_bracket(ctx, c, beam_nlam, &m0, &m1, &al);
 
-            fpcam_build_epup_cpu(pup_c, atm_amp, wf_c, dm_opd, ncpa_opd, wf_to_opd, opd_to_rad,
-                                 ctx->npix_wf, ctx->cpu_epup_cplx);
+            fpcam_build_epup_poly_cpu(pup_amp, atm_amp, wf_in, m0, m1, al, chan_stride, dm_opd,
+                                      ncpa_opd, wf_to_opd, ctx->k_rad[c], ctx->npix_wf,
+                                      ctx->cpu_epup_cplx);
 
             const float *Uc = &ctx->mft_U_cplx[(size_t) c * ncam * nwf * 2u];
             const float *Vc = &ctx->mft_V_cplx[(size_t) c * nwf * ncam * 2u];
+            const float  wc = ctx->strehl_w[c];
 
-            /* T [ncam x nwf] = Uc [ncam x nwf] * Epup [nwf x nwf] */
             cblas_cgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, (int) ncam, (int) nwf,
                         (int) nwf, c_one, Uc, (int) nwf, ctx->cpu_epup_cplx, (int) nwf, c_zero,
                         ctx->cpu_mft_tmp_cplx, (int) nwf);
 
-            /* Efoc [ncam x ncam] = T [ncam x nwf] * Vc [nwf x ncam] */
             cblas_cgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, (int) ncam, (int) ncam,
                         (int) nwf, c_one, ctx->cpu_mft_tmp_cplx, (int) nwf, Vc, (int) ncam,
                         c_zero, ctx->cpu_efoc_cplx, (int) ncam);
 
-            /* Incoherent broadband sum; Uc and Vc already carry `1 / sqrt(pup_sum_amp)` */
             const float *__restrict ef = MILK_ASSUME_ALIGNED(ctx->cpu_efoc_cplx);
 #pragma omp simd
             for (uint64_t i = 0; i < npix_cam; i++)
             {
                 float re = ef[2u * i];
                 float im = ef[2u * i + 1u];
-                acc[i] += inv_nlam * (re * re + im * im);
+                acc[i] += wc * (re * re + im * im);
             }
         }
     }
     else
     {
         /*
-         * Zero-padded 2D FFT crop centered on DC at `(ncam/2, ncam/2)`. Unnormalized DFT peak for
-         * an unaberrated clear pupil equals `pup_sum_amp`, so `inv_s2` normalizes to Strehl [0..1].
+         * Zero-padded 2D FFT with 2D bilinear lambda/D rescaling around bore-sight `(ncam/2,
+         * ncam/2)` so geometric tilts stay achromatic while diffraction rings scale by `lam_c /
+         * lam0` identically to `PROP_MFT`.
          */
         const uint32_t nfft   = ctx->nfft;
-        const float    inv_s2 = inv_nlam / (ctx->pup_sum_amp * ctx->pup_sum_amp);
+        const int32_t  nf     = (int32_t) nfft;
+        const float    inv_s2 = 1.0f / (ctx->pup_sum_amp * ctx->pup_sum_amp);
         const int32_t  half_c = (int32_t) (ncam / 2u);
 
         for (int32_t c = 0; c < ctx->eff_nlam; c++)
         {
-            uint32_t bc = (beam_nlam <= 1u)
-                              ? 0u
-                              : ((beam_nlam == (uint32_t) ctx->eff_nlam)
-                                     ? (uint32_t) c
-                                     : (((uint32_t) c * beam_nlam) / (uint32_t) ctx->eff_nlam));
-            const float *pup_c = (pup_amp != NULL) ? (pup_amp + (uint64_t) bc * chan_stride) : NULL;
-            const float *wf_c  = (wf_in != NULL) ? (wf_in + (uint64_t) bc * chan_stride) : NULL;
-            const float  opd_to_rad = CACAOSIM_TWO_PI_F / ctx->lam_um[c];
+            uint32_t m0 = 0u;
+            uint32_t m1 = 0u;
+            float    al = 0.0f;
+            fpcam_resolve_poly_bracket(ctx, c, beam_nlam, &m0, &m1, &al);
 
-            fpcam_build_epup_cpu(pup_c, atm_amp, wf_c, dm_opd, ncpa_opd, wf_to_opd, opd_to_rad,
-                                 ctx->npix_wf, ctx->cpu_epup_cplx);
+            fpcam_build_epup_poly_cpu(pup_amp, atm_amp, wf_in, m0, m1, al, chan_stride, dm_opd,
+                                      ncpa_opd, wf_to_opd, ctx->k_rad[c], ctx->npix_wf,
+                                      ctx->cpu_epup_cplx);
 
-            /* Embed [nwf x nwf] pupil in top-left corner; intensity |DFT|^2 is shift-invariant */
             __builtin_memset(ctx->cpu_fft_in_cplx, 0, ctx->npix_fft * 2u * sizeof(float));
             for (uint32_t yp = 0; yp < nwf; yp++)
             {
@@ -338,21 +421,38 @@ static void MILK_HOT fpcam_accum_poly_cpu(
 
             fftwf_execute((fftwf_plan) ctx->fftw_plan_fwd);
 
-            /* Modularly wrap signed offsets (dx, dy) around DFT DC bin (0, 0) onto camera center */
             const float *__restrict fo = ctx->cpu_fft_out_cplx;
+            const float             sc = ctx->scale_c[c];
+            const float             wc = ctx->strehl_w[c] * inv_s2;
+
             for (uint32_t yf = 0; yf < ncam; yf++)
             {
-                int32_t  dy = (int32_t) yf - half_c;
-                uint32_t ky = (uint32_t) ((dy % (int32_t) nfft + (int32_t) nfft) % (int32_t) nfft);
+                int32_t  dy   = (int32_t) yf - half_c;
+                float    sy_f = (float) dy * sc;
+                int32_t  iy0  = (int32_t) floorf(sy_f);
+                float    fy   = sy_f - (float) iy0;
+                uint32_t ky0  = (uint32_t) ((iy0 % nf + nf) % nf);
+                uint32_t ky1  = (uint32_t) (((iy0 + 1) % nf + nf) % nf);
+                const float *r0 = &fo[(size_t) ky0 * nfft * 2u];
+                const float *r1 = &fo[(size_t) ky1 * nfft * 2u];
+
                 for (uint32_t xf = 0; xf < ncam; xf++)
                 {
-                    int32_t  dx = (int32_t) xf - half_c;
-                    uint32_t kx = (uint32_t) ((dx % (int32_t) nfft + (int32_t) nfft) %
-                                              (int32_t) nfft);
-                    size_t   k  = ((size_t) ky * nfft + kx) * 2u;
-                    float    re = fo[k];
-                    float    im = fo[k + 1u];
-                    acc[(size_t) yf * ncam + xf] += inv_s2 * (re * re + im * im);
+                    int32_t  dx   = (int32_t) xf - half_c;
+                    float    sx_f = (float) dx * sc;
+                    int32_t  ix0  = (int32_t) floorf(sx_f);
+                    float    fx   = sx_f - (float) ix0;
+                    uint32_t kx0  = (uint32_t) ((ix0 % nf + nf) % nf);
+                    uint32_t kx1  = (uint32_t) (((ix0 + 1) % nf + nf) % nf);
+
+                    float i00 = r0[2u * kx0] * r0[2u * kx0] + r0[2u * kx0 + 1u] * r0[2u * kx0 + 1u];
+                    float i10 = r0[2u * kx1] * r0[2u * kx1] + r0[2u * kx1 + 1u] * r0[2u * kx1 + 1u];
+                    float i01 = r1[2u * kx0] * r1[2u * kx0] + r1[2u * kx0 + 1u] * r1[2u * kx0 + 1u];
+                    float i11 = r1[2u * kx1] * r1[2u * kx1] + r1[2u * kx1 + 1u] * r1[2u * kx1 + 1u];
+
+                    float v0 = (1.0f - fx) * i00 + fx * i10;
+                    float v1 = (1.0f - fx) * i01 + fx * i11;
+                    acc[(size_t) yf * ncam + xf] += wc * ((1.0f - fy) * v0 + fy * v1);
                 }
             }
         }
@@ -448,39 +548,46 @@ int MILK_COLD cacaosim_fpcam_init(
     ctx->pup_sum_amp  = (float) sum_a;
     ctx->pup_sum_amp2 = (float) sum_a2;
 
-    /* Resolve spectral channel centers from explicit upstream array or uniform top-hat bandpass */
+    /* Resolve spectral channel centers and photon weights from explicit tables or bandpass */
     float   lam0 = (cfg->lambda_um > 0.05f) ? cfg->lambda_um : 1.65f;
     float   bw   = (cfg->bw_frac > 0.0f) ? cfg->bw_frac : 0.0f;
-    int32_t nlam = cfg->nlambda;
+    int32_t nlam = cacaosim_resolve_nlambda(cfg->nlambda, 1u, bw);
+    if (nlam > CACAOSIM_FPCAM_MAX_LAMBDA)
+    {
+        nlam = CACAOSIM_FPCAM_MAX_LAMBDA;
+    }
+
+    float init_w[CACAOSIM_FPCAM_MAX_LAMBDA];
     if (cfg->has_ext_lam && nlam >= 1)
     {
-        if (nlam > CACAOSIM_FPCAM_MAX_LAMBDA)
-        {
-            nlam = CACAOSIM_FPCAM_MAX_LAMBDA;
-        }
         ctx->eff_nlam = nlam;
         for (int32_t c = 0; c < nlam; c++)
         {
             ctx->lam_um[c] = (cfg->ext_lam_um[c] > 0.05f) ? cfg->ext_lam_um[c] : lam0;
+            init_w[c]      = cfg->has_ext_weight ? cfg->ext_weight[c] : 1.0f;
         }
     }
     else
     {
-        if (nlam < 1 || bw <= 1e-6f)
+        if (bw <= 1e-6f)
         {
             nlam = 1;
         }
-        if (nlam > CACAOSIM_FPCAM_MAX_LAMBDA)
-        {
-            nlam = CACAOSIM_FPCAM_MAX_LAMBDA;
-        }
         ctx->eff_nlam = nlam;
-
-        for (int32_t c = 0; c < nlam; c++)
+        cacaosim_spec_sample_band(NULL, lam0, bw, nlam, 0.001f, 1.0f, ctx->lam_um, init_w, NULL);
+        if (cfg->has_ext_weight)
         {
-            float u        = (nlam > 1) ? (((float) c + 0.5f) / (float) nlam - 0.5f) : 0.0f;
-            ctx->lam_um[c] = lam0 * (1.0f + bw * u);
+            for (int32_t c = 0; c < nlam; c++)
+            {
+                init_w[c] = cfg->ext_weight[c];
+            }
         }
+    }
+
+    for (int32_t c = 0; c < nlam; c++)
+    {
+        ctx->scale_c[c] = lam0 / ctx->lam_um[c];
+        ctx->k_rad[c]   = CACAOSIM_TWO_PI_F / ctx->lam_um[c];
     }
 
     float dpix = cfg->pup_diam * (float) cfg->nwf;
@@ -494,20 +601,15 @@ int MILK_COLD cacaosim_fpcam_init(
     }
 
     /*
-     * Infinite-plane Parseval energy so `flux_ph` equals total clear-pupil incident photons:
-     * Over a full Nyquist period `n_per_axis = dpix * sc`, an unnormalized DFT of `pup_amp` has
-     * total squared modulus `n_per_axis^2 * sum_a2`; dividing by `sum_a^2` converts to Strehl.
+     * Dual Strehl + Infinite-Plane Parseval calibration:
+     * Base clear-pupil Strehl integral at `lam0` is `E0 = (dpix * ps0)^2 * sum_a2 / sum_a^2`.
+     * Weighting channel `c` by `strehl_w[c] = w_c * (lam0/lam_c)^2 / sum_j(w_j * (lam0/lam_j)^2)`
+     * and setting `inf_flux_norm = E0 / sum_j(w_j * (lam0/lam_j)^2)` keeps broadband clear-pupil
+     * peak identically `1.0` while depositing exact photon fraction `w_c` per sub-band.
      */
-    double inf_acc = 0.0;
-    for (int32_t c = 0; c < nlam; c++)
-    {
-        double sc = (cfg->prop_mode == CACAOSIM_FPCAM_PROP_MFT)
-                        ? ((double) ctx->eff_pixscale_ld * (double) ctx->lam_um[c] / (double) lam0)
-                        : (double) ctx->eff_pixscale_ld;
-        double n_per_axis = (double) dpix * sc;
-        inf_acc += (n_per_axis * n_per_axis * sum_a2) / (sum_a * sum_a);
-    }
-    ctx->inf_flux_norm = (float) (inf_acc / (double) nlam);
+    double n_axis0     = (double) dpix * (double) ctx->eff_pixscale_ld;
+    ctx->base_inf_norm = (float) ((n_axis0 * n_axis0 * sum_a2) / (sum_a * sum_a));
+    cacaosim_fpcam_set_weights(ctx, init_w);
 
     ctx->cpu_epup_cplx = (float *) cacaosim_aligned_calloc(ctx->npix_wf * 2u, sizeof(float));
     ctx->cpu_sub_int   = (float *) cacaosim_aligned_calloc(ctx->npix_cam, sizeof(float));
@@ -637,6 +739,52 @@ void cacaosim_fpcam_reset_long(cacaosim_fpcam_ctx_t *ctx)
     __builtin_memset(ctx->cpu_long_int, 0, ctx->npix_cam * sizeof(float));
     ctx->long_cnt         = 0;
     ctx->long_strehl_peak = 0.0f;
+}
+
+void cacaosim_fpcam_set_weights(
+    cacaosim_fpcam_ctx_t *ctx,
+    const float          *weights)
+{
+    if (ctx == NULL || weights == NULL || ctx->eff_nlam < 1)
+    {
+        return;
+    }
+    int32_t nlam = ctx->eff_nlam;
+    double  wsum = 0.0;
+    for (int32_t c = 0; c < nlam; c++)
+    {
+        wsum += (weights[c] > 0.0f) ? (double) weights[c] : 0.0;
+    }
+    double jsum = 0.0;
+    for (int32_t c = 0; c < nlam; c++)
+    {
+        float nw      = (wsum > 1e-20)
+                            ? (float) (((weights[c] > 0.0f) ? (double) weights[c] : 0.0) / wsum)
+                            : (1.0f / (float) nlam);
+        ctx->chan_w[c] = nw;
+        double sc      = (double) ctx->scale_c[c];
+        jsum += (double) nw * sc * sc;
+    }
+    if (jsum <= 1e-20)
+    {
+        jsum = 1.0;
+    }
+    int changed = 0;
+    for (int32_t c = 0; c < nlam; c++)
+    {
+        double sc = (double) ctx->scale_c[c];
+        float  sw = (float) (((double) ctx->chan_w[c] * sc * sc) / jsum);
+        if (fabsf(sw - ctx->strehl_w[c]) > 1e-6f)
+        {
+            changed = 1;
+        }
+        ctx->strehl_w[c] = sw;
+    }
+    ctx->inf_flux_norm = (float) ((double) ctx->base_inf_norm / jsum);
+    if (changed && ctx->use_cuda)
+    {
+        cacaosim_fpcam_cuda_upload_weights(ctx);
+    }
 }
 
 /**

@@ -53,10 +53,10 @@ extern "C" {
 /*
  * Fixed gather-stencil tap count per wavefront pixel (4x4 nearest-actuator neighborhood
  * spanning +-2 actuator pitches, where Gaussian coupling <= 0.45^4 < 4.1% at boundary)
- * and circular command history depth supporting up to 62 frames of fractional transport delay.
+ * and circular command history depth supporting up to 254 sub-ticks of fractional transport delay.
  */
 #define CACAOSIM_DM_STENCIL      16u
-#define CACAOSIM_DM_MAX_DELAY    64u
+#define CACAOSIM_DM_MAX_DELAY    256u
 
 /**
  * @brief Static geometry, drive electronics, and temporal dynamics configuration for a DM/TTM.
@@ -77,7 +77,9 @@ typedef struct
     float    tau_sec;      /**< 1st-order exponential 1/e settling time constant [s] (mode == 1) */
     float    f0_hz;        /**< 2nd-order undamped natural resonance frequency [Hz] (mode == 2) */
     float    zeta;         /**< 2nd-order viscous damping ratio (mode == 2; <1, ==1, >1 valid) */
-    float    delay_frames; /**< Pure transport latency [frames] in `[0, 62]`, fractional OK */
+    float    delay_frames; /**< Pure transport latency [frames] in `[0, 254]`, fractional OK */
+    float    delay_sec;    /**< Physical pure transport latency [s] (>0 overrides delay_frames) */
+    int32_t  no_zoh_mean;  /**< 0 (default) = render analytical ZOH subframe mean; 1 = endpoint */
     int32_t  dm_mode;      /**< Mirror architecture: 0 = 2D zonal DM, 1 = 2-axis Tip-Tilt (2x1) */
     float    shift_x;      /**< Lateral DM-to-pupil X shift [wavefront pixels] */
     float    shift_y;      /**< Lateral DM-to-pupil Y shift [wavefront pixels] */
@@ -99,13 +101,16 @@ typedef struct
     uint32_t          nact_total; /**< Total actuator count `nact_x * nact_y` (`2` in TTM mode) */
     uint64_t          npix_wf;    /**< Total 2D wavefront pixel count `nwf * nwf` */
     int32_t           use_cuda;   /**< Non-zero when CUDA device buffers & stream are active */
+    int32_t           opd_valid;  /**< 1 once d_opd_out matches prev_pos_render (skip static) */
 
     /* Ring buffer [CACAOSIM_DM_MAX_DELAY * nact_total] + actuator kinematics */
     float            *cmd_ring;        /**< Circular history of conditioned commands [um] */
     uint32_t          ring_head;       /**< Next write slot index in `[0, CACAOSIM_DM_MAX_DELAY)` */
     uint32_t          ring_filled;     /**< Number of populated history slots (up to MAX_DELAY) */
     float            *act_cmd_delayed; /**< Fractionally delayed command driving ZOH plant [um] */
-    float            *act_pos;         /**< Instantaneous mechanical actuator displacement [um] */
+    float            *act_pos;         /**< End-of-step mechanical actuator displacement [um] */
+    float            *act_pos_render;  /**< Subframe-averaged (ZOH mean) stroke rendered [um] */
+    float            *prev_pos_render; /**< Last actuator stroke vector rendered to d_opd_out */
     float            *act_vel;         /**< Instantaneous actuator velocity [um/s] (dyn_mode==2) */
     uint8_t          *dead_mask;       /**< Per-actuator stuck-zero fault mask (`!= 0` -> 0 um) */
 

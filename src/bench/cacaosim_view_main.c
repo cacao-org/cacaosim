@@ -1097,6 +1097,10 @@ int main(int argc, char **argv)
         {
             popts.rate_override = strtof(argv[++i], NULL);
         }
+        else if (strcmp(a, "--oversample") == 0 && i + 1 < argc)
+        {
+            popts.oversample_override = (uint32_t) strtoul(argv[++i], NULL, 10);
+        }
         else if (strcmp(a, "--backend") == 0 && i + 1 < argc)
         {
             popts.backend = atoi(argv[++i]);

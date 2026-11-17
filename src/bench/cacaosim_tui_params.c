@@ -151,6 +151,7 @@ enum
     PID_S_NCAM = 500,
     PID_S_LAMBDA,
     PID_S_BW_FRAC,
+    PID_S_NLAMBDA,
     PID_S_NAVG,
     PID_S_RATE_HZ,
     PID_S_QE,
@@ -612,7 +613,8 @@ int cs_params_build(
             add_pd(out, &n, max_out, PID_CO_BW_FRAC, "bw_frac", "Bandwidth dL/L", "",
                    CS_PTYPE_FLOAT, 0.0, 0.60, 0.02, "Polychromatic fractional bandwidth dLambda/L");
             add_pd(out, &n, max_out, PID_CO_NLAMBDA, "nlambda", "Spectral Slices", "ch",
-                   CS_PTYPE_INT, 1, 32, 1, "Polychromatic slices (auto-adopted from 3D mask cube)");
+                   CS_PTYPE_INT, 0, 32, 1,
+                   "Polychromatic slices (0 = auto -> 2 if bw_frac > 0, or 3D mask)");
             add_enum_pd(out, &n, max_out, PID_CO_PHA_UNIT, "pha_unit", "Mask Phase Unit", 2, "rad",
                         "um", NULL, NULL, "Unit of custom phase masks: 0 = radians, 1 = OPD [um]");
             /* Tailor focal-mask geometry rows to active analytic/vortex/MFT/FFT propagator */
@@ -720,7 +722,9 @@ int cs_params_build(
             add_pd(out, &n, max_out, PID_S_LAMBDA, "lambda_um", "Center Lambda", "um",
                    CS_PTYPE_FLOAT, 0.40, 2.40, 0.05, "Sensing central wavelength [um]");
             add_pd(out, &n, max_out, PID_S_BW_FRAC, "bw_frac", "Bandwidth dL/L", "", CS_PTYPE_FLOAT,
-                   0.02, 0.60, 0.02, "Fractional spectral filter width dLambda/Lambda");
+                   0.0, 0.60, 0.02, "Fractional spectral filter width dLambda/Lambda (0 = mono)");
+            add_pd(out, &n, max_out, PID_S_NLAMBDA, "nlambda", "Spectral Slices", "ch",
+                   CS_PTYPE_INT, 0, 32, 1, "Polychromatic slices (0 = auto -> 2 when bw_frac > 0)");
             add_pd(out, &n, max_out, PID_PYR_MOD_RAD, "mod_rad", "Modulation Rad", "l/D",
                    CS_PTYPE_FLOAT, 0.0, 16.0, 0.5, "Tip-tilt circular modulation radius [l/D]");
             add_pd(out, &n, max_out, PID_PYR_MOD_NPTS, "mod_npts", "Modulation Pts", "pts",
@@ -739,7 +743,9 @@ int cs_params_build(
             add_pd(out, &n, max_out, PID_S_LAMBDA, "lambda_um", "Center Lambda", "um",
                    CS_PTYPE_FLOAT, 0.40, 2.40, 0.05, "Sensing central wavelength [um]");
             add_pd(out, &n, max_out, PID_S_BW_FRAC, "bw_frac", "Bandwidth dL/L", "", CS_PTYPE_FLOAT,
-                   0.02, 0.60, 0.02, "Fractional spectral filter width dLambda/Lambda");
+                   0.0, 0.60, 0.02, "Fractional spectral filter width dLambda/Lambda (0 = mono)");
+            add_pd(out, &n, max_out, PID_S_NLAMBDA, "nlambda", "Spectral Slices", "ch",
+                   CS_PTYPE_INT, 0, 32, 1, "Polychromatic slices (0 = auto -> 2 when bw_frac > 0)");
             add_pd(out, &n, max_out, PID_S_PAD_FACTOR, "pad_factor", "Subap FFT Pad", "x",
                    CS_PTYPE_UINT, 1, 4, 1, "Subaperture Nyquist FFT padding factor");
         }
@@ -750,7 +756,9 @@ int cs_params_build(
             add_pd(out, &n, max_out, PID_S_LAMBDA, "lambda_um", "Center Lambda", "um",
                    CS_PTYPE_FLOAT, 0.40, 2.40, 0.05, "Sensing central wavelength [um]");
             add_pd(out, &n, max_out, PID_S_BW_FRAC, "bw_frac", "Bandwidth dL/L", "", CS_PTYPE_FLOAT,
-                   0.02, 0.60, 0.02, "Fractional spectral filter width dLambda/Lambda");
+                   0.0, 0.60, 0.02, "Fractional spectral filter width dLambda/Lambda (0 = mono)");
+            add_pd(out, &n, max_out, PID_S_NLAMBDA, "nlambda", "Spectral Slices", "ch",
+                   CS_PTYPE_INT, 0, 32, 1, "Polychromatic slices (0 = auto -> 2 when bw_frac > 0)");
             add_pd(out, &n, max_out, PID_ZW_DIMPLE_LD, "dimple_ld", "Dimple Diam", "l/D",
                    CS_PTYPE_FLOAT, 0.4, 4.0, 0.04, "Phase-contrast dimple diameter [lambda/D]");
             add_pd(out, &n, max_out, PID_ZW_DIMPLE_RAD, "dimple_rad", "Dimple Phase", "rad",
@@ -767,9 +775,9 @@ int cs_params_build(
             add_pd(out, &n, max_out, PID_S_LAMBDA, "lambda_um", "Center Lambda", "um",
                    CS_PTYPE_FLOAT, 0.40, 2.40, 0.05, "Science filter central wavelength [um]");
             add_pd(out, &n, max_out, PID_S_BW_FRAC, "bw_frac", "Bandwidth dL/L", "", CS_PTYPE_FLOAT,
-                   0.01, 0.50, 0.02, "Fractional filter bandwidth dLambda/Lambda");
-            add_pd(out, &n, max_out, PID_FP_NLAMBDA, "nlambda", "Spectral Slices", "", CS_PTYPE_INT,
-                   1, 15, 2, "Polychromatic wavelengths integrated per frame");
+                   0.0, 0.60, 0.02, "Fractional filter bandwidth dLambda/Lambda (0 = mono)");
+            add_pd(out, &n, max_out, PID_S_NLAMBDA, "nlambda", "Spectral Slices", "ch",
+                   CS_PTYPE_INT, 0, 32, 1, "Polychromatic slices (0 = auto -> 2 when bw_frac > 0)");
             add_pd(out, &n, max_out, PID_FP_PIXSCALE, "pixscale_ld", "Sampling", "px/lD",
                    CS_PTYPE_FLOAT, 1.0, 10.0, 0.25, "Detector pixels per lambda/D (MFT mode)");
         }
@@ -1115,7 +1123,7 @@ void cs_param_format_val(
         snprintf(buf, cap, "%.3f", nd->coro.bw_frac);
         break;
     case PID_CO_NLAMBDA:
-        snprintf(buf, cap, "%d", (nd->coro.nlambda > 0) ? nd->coro.nlambda : 1);
+        snprintf(buf, cap, "%d", (nd->coro.nlambda >= 0) ? nd->coro.nlambda : 0);
         break;
     case PID_CO_PHA_UNIT:
         snprintf(buf, cap, "%s", (nd->coro.mask_pha_unit == 1) ? "um" : "rad");
@@ -1196,6 +1204,16 @@ void cs_param_format_val(
     case PID_S_BW_FRAC:
         snprintf(buf, cap, "%.3f", nd->bw_frac);
         break;
+    case PID_S_NLAMBDA:
+    case PID_FP_NLAMBDA:
+        snprintf(buf, cap, "%d",
+                 (nd->kind == CACAOSIM_NODE_PYRWFS)
+                     ? nd->pyrwfs.nlambda
+                     : (nd->kind == CACAOSIM_NODE_SHWFS
+                            ? nd->shwfs.nlambda
+                            : (nd->kind == CACAOSIM_NODE_ZWFS ? nd->zwfs.nlambda
+                                                              : nd->fpcam.nlambda)));
+        break;
     case PID_S_NAVG:
         snprintf(buf, cap, "%u", nd->navg);
         break;
@@ -1255,9 +1273,6 @@ void cs_param_format_val(
         break;
     case PID_FP_PIXSCALE:
         snprintf(buf, cap, "%.2f", nd->fpcam.pixscale_ld);
-        break;
-    case PID_FP_NLAMBDA:
-        snprintf(buf, cap, "%d", nd->fpcam.nlambda);
         break;
     case PID_WFE_RMS_NM:
         snprintf(buf, cap, "%.1f", nd->wfe_rms_nm);
@@ -1776,9 +1791,31 @@ int cs_param_set_str(
         }
         break;
     case PID_S_BW_FRAC:
-        /* Mirror sensor photometric bandpass into `fpcam.bw_frac` for polychromatic PSFs */
-        nd->bw_frac       = (float) dv;
-        nd->fpcam.bw_frac = nd->bw_frac;
+        /* Mirror sensor photometric bandpass into per-sensor polychromatic optical configs */
+        nd->bw_frac        = (float) dv;
+        nd->pyrwfs.bw_frac = nd->bw_frac;
+        nd->shwfs.bw_frac  = nd->bw_frac;
+        nd->zwfs.bw_frac   = nd->bw_frac;
+        nd->fpcam.bw_frac  = nd->bw_frac;
+        break;
+    case PID_S_NLAMBDA:
+    case PID_FP_NLAMBDA:
+        if (nd->kind == CACAOSIM_NODE_PYRWFS)
+        {
+            nd->pyrwfs.nlambda = iv;
+        }
+        else if (nd->kind == CACAOSIM_NODE_SHWFS)
+        {
+            nd->shwfs.nlambda = iv;
+        }
+        else if (nd->kind == CACAOSIM_NODE_ZWFS)
+        {
+            nd->zwfs.nlambda = iv;
+        }
+        else
+        {
+            nd->fpcam.nlambda = iv;
+        }
         break;
     case PID_S_NAVG:
         nd->navg = (uint32_t) iv;
@@ -1839,9 +1876,6 @@ int cs_param_set_str(
         break;
     case PID_FP_PIXSCALE:
         nd->fpcam.pixscale_ld = (float) dv;
-        break;
-    case PID_FP_NLAMBDA:
-        nd->fpcam.nlambda = iv;
         break;
     case PID_WFE_RMS_NM:
         nd->wfe_rms_nm = (float) dv;

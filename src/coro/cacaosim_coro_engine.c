@@ -48,6 +48,7 @@
 
 #include "milkDebugTools.h"
 #include "milk_compiler.h"
+#include "common/cacaosim_beam.h"
 #include "common/cacaosim_cuda.h"
 #include "coro/cacaosim_coro.h"
 #include "pupil/cacaosim_pupil.h"
@@ -440,11 +441,12 @@ static void coro_precompute_fft_mask(
                 /* Fold 1/nfft^2 round-trip inverse-FFT normalization into focal mask weights */
                 fmsk[idx]      = inv_nfft2 * mr;
                 fmsk[idx + 1u] = inv_nfft2 * mi;
-                if (c == (ctx->eff_nlam / 2) && ctx->fft_refl_w != NULL)
+                if (ctx->fft_refl_w != NULL)
                 {
                     float t2 = mr * mr + mi * mi;
                     float rw = (t2 < 1.0f) ? sqrtf(fmaxf(0.0f, 1.0f - t2)) : 0.0f;
-                    ctx->fft_refl_w[(size_t) jy * nfft + ix] = inv_nfft2 * rw;
+                    ctx->fft_refl_w[((size_t) c * ctx->npix_fft) + (size_t) jy * nfft + ix] =
+                        inv_nfft2 * rw;
                 }
             }
         }
@@ -495,7 +497,6 @@ void MILK_HOT cacaosim_coro_step_poly_cpu(
     const uint32_t nwf      = ctx->cfg.nwf;
     const uint64_t npix_wf  = ctx->npix_wf;
     const int32_t  nlam     = ctx->eff_nlam;
-    const int32_t  c_mid    = nlam / 2;
     const int      lo_lyot  = (ctx->cfg.lowfs_mode == CACAOSIM_LOWFS_LYOT_REFL) ? 1 : 0;
     const float    refl     = (ctx->cfg.lowfs_refl >= 0.0f) ? ctx->cfg.lowfs_refl : 0.95f;
     const float    c_one[2]  = { 1.0f, 0.0f };
@@ -514,7 +515,9 @@ void MILK_HOT cacaosim_coro_step_poly_cpu(
         const float *amp_c     = (in_amp != NULL) ? (in_amp + (uint64_t) ic * in_stride) : NULL;
         float       *out_opd_c = out_opd + (uint64_t) c * out_stride;
         float       *out_amp_c = out_amp + (uint64_t) c * out_stride;
-        const int    do_lo     = (c == c_mid && lowfs_opd != NULL && lowfs_amp != NULL) ? 1 : 0;
+        const int    do_lo     = (lowfs_opd != NULL && lowfs_amp != NULL) ? 1 : 0;
+        float       *lo_opd_c  = do_lo ? (lowfs_opd + (uint64_t) c * out_stride) : NULL;
+        float       *lo_amp_c  = do_lo ? (lowfs_amp + (uint64_t) c * out_stride) : NULL;
 
         const float  lam_c      = ctx->lam_um[c];
         const float  opd_to_rad = CACAOSIM_TWO_PI_F / lam_c;
@@ -576,13 +579,13 @@ void MILK_HOT cacaosim_coro_step_poly_cpu(
                         float lya2   = lyr * lyr + lyi * lyi;
                         float r_ly   = refl * ((lya2 < 1.0f) ? sqrtf(1.0f - lya2) : 0.0f);
                         float la     = r_ly * hypotf(ur, ui);
-                        lowfs_amp[p] = la;
-                        lowfs_opd[p] = (la > 1e-12f) ? (atan2f(ui, ur) * rad_to_opd) : 0.0f;
+                        lo_amp_c[p]  = la;
+                        lo_opd_c[p]  = (la > 1e-12f) ? (atan2f(ui, ur) * rad_to_opd) : 0.0f;
                     }
                     else
                     {
-                        lowfs_amp[p] = 0.0f;
-                        lowfs_opd[p] = 0.0f;
+                        lo_amp_c[p] = 0.0f;
+                        lo_opd_c[p] = 0.0f;
                     }
                 }
             }
@@ -627,12 +630,12 @@ void MILK_HOT cacaosim_coro_step_poly_cpu(
                             ec, (int) nwf);
                 for (uint64_t p = 0; p < npix_wf; p++)
                 {
-                    float cr     = ec[2u * p];
-                    float ci     = ec[2u * p + 1u];
-                    float pm     = (lp_msk != NULL) ? lp_msk[p] : 1.0f;
-                    float la     = refl * pm * hypotf(cr, ci);
-                    lowfs_amp[p] = la;
-                    lowfs_opd[p] = (la > 1e-12f) ? (atan2f(ci, cr) * rad_to_opd) : 0.0f;
+                    float cr    = ec[2u * p];
+                    float ci    = ec[2u * p + 1u];
+                    float pm    = (lp_msk != NULL) ? lp_msk[p] : 1.0f;
+                    float la    = refl * pm * hypotf(cr, ci);
+                    lo_amp_c[p] = la;
+                    lo_opd_c[p] = (la > 1e-12f) ? (atan2f(ci, cr) * rad_to_opd) : 0.0f;
                 }
             }
 
@@ -671,11 +674,11 @@ void MILK_HOT cacaosim_coro_step_poly_cpu(
 
                 if (do_lo && lo_lyot)
                 {
-                    float lya2   = lyr * lyr + lyi * lyi;
-                    float r_ly   = refl * ((lya2 < 1.0f) ? sqrtf(1.0f - lya2) : 0.0f);
-                    float la     = r_ly * hypotf(ur, ui);
-                    lowfs_amp[p] = la;
-                    lowfs_opd[p] = (la > 1e-12f) ? (atan2f(ui, ur) * rad_to_opd) : 0.0f;
+                    float lya2  = lyr * lyr + lyi * lyi;
+                    float r_ly  = refl * ((lya2 < 1.0f) ? sqrtf(1.0f - lya2) : 0.0f);
+                    float la    = r_ly * hypotf(ur, ui);
+                    lo_amp_c[p] = la;
+                    lo_opd_c[p] = (la > 1e-12f) ? (atan2f(ui, ur) * rad_to_opd) : 0.0f;
                 }
             }
         }
@@ -722,7 +725,8 @@ void MILK_HOT cacaosim_coro_step_poly_cpu(
             if (do_lo && !lo_lyot && ctx->cpu_fft_lo_buf != NULL && ctx->fft_refl_w != NULL)
             {
                 float *__restrict       flob = MILK_ASSUME_ALIGNED(ctx->cpu_fft_lo_buf);
-                const float *__restrict frw  = MILK_ASSUME_ALIGNED(ctx->fft_refl_w);
+                const float *__restrict frw =
+                    MILK_ASSUME_ALIGNED(&ctx->fft_refl_w[(size_t) c * ctx->npix_fft]);
 #pragma omp simd
                 for (uint64_t i = 0; i < ctx->npix_fft; i++)
                 {
@@ -755,8 +759,8 @@ void MILK_HOT cacaosim_coro_step_poly_cpu(
                         float    ui    = er * si + ei * sr;
                         float    pm    = (lp_msk != NULL) ? lp_msk[p] : 1.0f;
                         float    la    = refl * pm * hypotf(ur, ui);
-                        lowfs_amp[p]   = la;
-                        lowfs_opd[p]   = (la > 1e-12f) ? (atan2f(ui, ur) * rad_to_opd) : 0.0f;
+                        lo_amp_c[p]    = la;
+                        lo_opd_c[p]    = (la > 1e-12f) ? (atan2f(ui, ur) * rad_to_opd) : 0.0f;
                     }
                 }
             }
@@ -807,11 +811,11 @@ void MILK_HOT cacaosim_coro_step_poly_cpu(
 
                     if (do_lo && lo_lyot)
                     {
-                        float lya2   = lyr * lyr + lyi * lyi;
-                        float r_ly   = refl * ((lya2 < 1.0f) ? sqrtf(1.0f - lya2) : 0.0f);
-                        float la     = r_ly * hypotf(ur, ui);
-                        lowfs_amp[p] = la;
-                        lowfs_opd[p] = (la > 1e-12f) ? (atan2f(ui, ur) * rad_to_opd) : 0.0f;
+                        float lya2  = lyr * lyr + lyi * lyi;
+                        float r_ly  = refl * ((lya2 < 1.0f) ? sqrtf(1.0f - lya2) : 0.0f);
+                        float la    = r_ly * hypotf(ur, ui);
+                        lo_amp_c[p] = la;
+                        lo_opd_c[p] = (la > 1e-12f) ? (atan2f(ui, ur) * rad_to_opd) : 0.0f;
                     }
                 }
             }
@@ -834,8 +838,9 @@ void MILK_HOT cacaosim_coro_step_poly_cpu(
  *
  * Rationale:
  *   When `@ctx` holds multiple spectral channels (`eff_nlam > 1`), writes into internal scratch
- *   cubes `cpu_poly_opd`/`cpu_poly_amp` and copies out the central channel `eff_nlam / 2` so
- *   single-slice `[npix_wf]` output buffers are never overrun.
+ *   cubes `cpu_poly_opd`/`cpu_poly_amp` (and `cpu_poly_lo_opd`/`cpu_poly_lo_amp` if LOWFS is
+ *   requested) and copies out the central channel `eff_nlam / 2` so single-slice `[npix_wf]`
+ *   output buffers are never overrun.
  */
 void MILK_HOT cacaosim_coro_step_cpu(
     cacaosim_coro_ctx_t *ctx,
@@ -848,11 +853,18 @@ void MILK_HOT cacaosim_coro_step_cpu(
 {
     if (ctx->eff_nlam > 1 && ctx->cpu_poly_opd != NULL && ctx->cpu_poly_amp != NULL)
     {
+        float *lo_o = (lowfs_opd != NULL && lowfs_amp != NULL) ? ctx->cpu_poly_lo_opd : NULL;
+        float *lo_a = (lowfs_opd != NULL && lowfs_amp != NULL) ? ctx->cpu_poly_lo_amp : NULL;
         cacaosim_coro_step_poly_cpu(ctx, in_opd, in_amp, 1u, ctx->npix_wf, ctx->cpu_poly_opd,
-                                    ctx->cpu_poly_amp, ctx->npix_wf, lowfs_opd, lowfs_amp);
+                                    ctx->cpu_poly_amp, ctx->npix_wf, lo_o, lo_a);
         size_t off = (size_t) (ctx->eff_nlam / 2) * ctx->npix_wf;
         __builtin_memcpy(out_opd, ctx->cpu_poly_opd + off, ctx->npix_wf * sizeof(float));
         __builtin_memcpy(out_amp, ctx->cpu_poly_amp + off, ctx->npix_wf * sizeof(float));
+        if (lo_o != NULL && lo_a != NULL)
+        {
+            __builtin_memcpy(lowfs_opd, lo_o + off, ctx->npix_wf * sizeof(float));
+            __builtin_memcpy(lowfs_amp, lo_a + off, ctx->npix_wf * sizeof(float));
+        }
         return;
     }
     cacaosim_coro_step_poly_cpu(ctx, in_opd, in_amp, 1u, ctx->npix_wf, out_opd, out_amp,
@@ -978,7 +990,7 @@ int MILK_COLD cacaosim_coro_init_masks(
                           : 0;
     ctx->skip_fpm   = (eff_mode == CACAOSIM_CORO_CUSTOM_MFT && fa == NULL && fp == NULL) ? 1 : 0;
 
-    /* Resolve effective polychromatic channel count from 3D masks or explicit bandpass config */
+    /* Resolve effective polychromatic channel count from 3D masks or bandpass config */
     int32_t nlam = 1;
     if (mask_nz > 1u)
     {
@@ -988,10 +1000,9 @@ int MILK_COLD cacaosim_coro_init_masks(
         }
         nlam = (int32_t) mask_nz;
     }
-    else if (cfg->nlambda > 1 && cfg->bw_frac > 1e-6f)
+    else
     {
-        nlam = (cfg->nlambda <= CACAOSIM_CORO_MAX_LAMBDA) ? cfg->nlambda
-                                                          : CACAOSIM_CORO_MAX_LAMBDA;
+        nlam = cacaosim_resolve_nlambda(cfg->nlambda, 1u, cfg->bw_frac);
     }
     ctx->eff_nlam = nlam;
 
@@ -1060,11 +1071,16 @@ int MILK_COLD cacaosim_coro_init_masks(
 
     if (nlam > 1)
     {
-        ctx->cpu_poly_opd = (float *) cacaosim_aligned_calloc((size_t) nlam * ctx->npix_wf,
-                                                              sizeof(float));
-        ctx->cpu_poly_amp = (float *) cacaosim_aligned_calloc((size_t) nlam * ctx->npix_wf,
-                                                              sizeof(float));
-        if (!ctx->cpu_poly_opd || !ctx->cpu_poly_amp)
+        ctx->cpu_poly_opd    = (float *) cacaosim_aligned_calloc((size_t) nlam * ctx->npix_wf,
+                                                                 sizeof(float));
+        ctx->cpu_poly_amp    = (float *) cacaosim_aligned_calloc((size_t) nlam * ctx->npix_wf,
+                                                                 sizeof(float));
+        ctx->cpu_poly_lo_opd = (float *) cacaosim_aligned_calloc((size_t) nlam * ctx->npix_wf,
+                                                                 sizeof(float));
+        ctx->cpu_poly_lo_amp = (float *) cacaosim_aligned_calloc((size_t) nlam * ctx->npix_wf,
+                                                                 sizeof(float));
+        if (!ctx->cpu_poly_opd || !ctx->cpu_poly_amp || !ctx->cpu_poly_lo_opd ||
+            !ctx->cpu_poly_lo_amp)
         {
             cacaosim_coro_free(ctx);
             return -1;
@@ -1197,7 +1213,8 @@ int MILK_COLD cacaosim_coro_init_masks(
                                                                 sizeof(float));
         ctx->fft_mask_cplx  = (float *) cacaosim_aligned_calloc(
             (size_t) nlam * ctx->npix_fft * 2u, sizeof(float));
-        ctx->fft_refl_w     = (float *) cacaosim_aligned_calloc(ctx->npix_fft, sizeof(float));
+        ctx->fft_refl_w     = (float *) cacaosim_aligned_calloc(
+            (size_t) nlam * ctx->npix_fft, sizeof(float));
         ctx->cpu_fft_buf    = (float *) cacaosim_aligned_calloc(ctx->npix_fft * 2u, sizeof(float));
         ctx->cpu_fft_lo_buf = (float *) cacaosim_aligned_calloc(ctx->npix_fft * 2u, sizeof(float));
 
@@ -1327,6 +1344,8 @@ void MILK_COLD cacaosim_coro_free(cacaosim_coro_ctx_t *ctx)
     free(ctx->cpu_fft_lo_buf);
     free(ctx->cpu_poly_opd);
     free(ctx->cpu_poly_amp);
+    free(ctx->cpu_poly_lo_opd);
+    free(ctx->cpu_poly_lo_amp);
     __builtin_memset(ctx, 0, sizeof(*ctx));
 }
 
@@ -1428,12 +1447,24 @@ void MILK_HOT cacaosim_coro_step_beam(
     {
         if (ctx->use_cuda && ctx->cpu_poly_opd != NULL && ctx->cpu_poly_amp != NULL)
         {
+            float *lo_o = (lowfs_opd != NULL && lowfs_amp != NULL && d_lowfs_opd == NULL)
+                              ? ctx->cpu_poly_lo_opd
+                              : lowfs_opd;
+            float *lo_a = (lowfs_opd != NULL && lowfs_amp != NULL && d_lowfs_opd == NULL)
+                              ? ctx->cpu_poly_lo_amp
+                              : lowfs_amp;
             cacaosim_coro_cuda_step_poly(ctx, in_opd, in_amp, 1u, ctx->npix_wf, ctx->cpu_poly_opd,
-                                         ctx->cpu_poly_amp, ctx->npix_wf, lowfs_opd, lowfs_amp,
-                                         d_in_opd, d_in_amp, NULL, NULL, d_lowfs_opd, d_lowfs_amp);
+                                         ctx->cpu_poly_amp, ctx->npix_wf, lo_o, lo_a, d_in_opd,
+                                         d_in_amp, NULL, NULL, d_lowfs_opd, d_lowfs_amp);
             size_t off = (size_t) (ctx->eff_nlam / 2) * ctx->npix_wf;
             __builtin_memcpy(out_opd, ctx->cpu_poly_opd + off, ctx->npix_wf * sizeof(float));
             __builtin_memcpy(out_amp, ctx->cpu_poly_amp + off, ctx->npix_wf * sizeof(float));
+            if (lowfs_opd != NULL && lowfs_amp != NULL && d_lowfs_opd == NULL && lo_o != NULL &&
+                lo_a != NULL)
+            {
+                __builtin_memcpy(lowfs_opd, lo_o + off, ctx->npix_wf * sizeof(float));
+                __builtin_memcpy(lowfs_amp, lo_a + off, ctx->npix_wf * sizeof(float));
+            }
             return;
         }
         cacaosim_coro_step_cpu(ctx, in_opd, in_amp, out_opd, out_amp, lowfs_opd, lowfs_amp);

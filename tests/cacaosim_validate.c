@@ -53,6 +53,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "milkcacaosim.h"
 
@@ -71,7 +72,7 @@ static int g_fail = 0;
  *
  * Rationale:
  *   Accumulating failures rather than calling `abort()` on the first mismatch allows the entire
- *   14-section suite to run in one shot so engineers can immediately see whether a regression is
+ *   15-section suite to run in one shot so engineers can immediately see whether a regression is
  *   isolated to one optical mode or systemic across CPU/CUDA backends, while `main()` still returns
  *   exit code `1` to CTest if `g_fail > 0`.
  *
@@ -3340,9 +3341,13 @@ static void test_wfstat_cpu_gpu_parity(void)
         cacaosim_cuda_stream_sync(stream);
     }
 
-    double acc[6];
-    int    rc_f = cacaosim_wfstat_gpu_fetch_sums(wg.gpu, wg.sum_wf, wg.sum2_wf, acc);
+    double   acc[6];
+    uint64_t gpu_ts_len = 0;
+    int      rc_f = cacaosim_wfstat_gpu_fetch_sums(wg.gpu, wg.sum_wf, wg.sum2_wf, acc,
+                                                   wg.ts_rms, &gpu_ts_len);
+    wg.ts_len     = gpu_ts_len;
     double max_rel_sum = 0.0, max_rel_acc = 0.0, max_abs_samp = 0.0, max_rel_ptv = 0.0;
+    double max_rel_ts  = 0.0;
     for (int k = 0; k < 3; k++)
     {
         for (uint64_t i = 0; i < npix; i++)
@@ -3354,6 +3359,12 @@ static void test_wfstat_cpu_gpu_parity(void)
         }
         max_rel_acc = fmax(max_rel_acc, fabs(acc[2 * k] - wc.sum_srms[k]) / wc.sum_srms[k]);
         max_rel_acc = fmax(max_rel_acc, fabs(acc[2 * k + 1] - wc.sum_svar[k]) / wc.sum_svar[k]);
+        for (uint32_t f = 0; f < nframes; f++)
+        {
+            double dt = fabs((double) wg.ts_rms[k][f] - (double) wc.ts_rms[k][f]) /
+                        fmax((double) wc.ts_rms[k][f], 1e-9);
+            max_rel_ts = fmax(max_rel_ts, dt);
+        }
         for (int s = 0; s < wc.nsamp; s++)
         {
             max_rel_ptv = fmax(max_rel_ptv, fabs(wg.samp_sptv[s][k] - wc.samp_sptv[s][k]) /
@@ -3367,17 +3378,60 @@ static void test_wfstat_cpu_gpu_parity(void)
         }
     }
     char det[160];
-    snprintf(det, sizeof(det), "frames %lu/%lu, samples %d/%d", (unsigned long) wg.n_frames,
-             (unsigned long) wc.n_frames, wg.nsamp, wc.nsamp);
-    check_cond(rc_f == 0 && wg.n_frames == nframes && wg.nsamp == 5 && wc.nsamp == 5,
-               "wfstat GPU/CPU frame + sample bookkeeping", det);
+    snprintf(det, sizeof(det), "frames %lu/%lu, samples %d/%d, ts %lu/%lu",
+             (unsigned long) wg.n_frames, (unsigned long) wc.n_frames, wg.nsamp, wc.nsamp,
+             (unsigned long) wg.ts_len, (unsigned long) wc.ts_len);
+    check_cond(rc_f == 0 && wg.n_frames == nframes && wg.nsamp == 5 && wc.nsamp == 5 &&
+                   wg.ts_len == nframes && wc.ts_len == nframes,
+               "wfstat GPU/CPU frame + sample + ts bookkeeping", det);
     snprintf(det, sizeof(det), "max rel = %.2e", max_rel_sum);
     check_cond(max_rel_sum < 1e-9, "wfstat per-pixel FP64 sum/sum2 parity", det);
     snprintf(det, sizeof(det), "max rel = %.2e", max_rel_acc);
     check_cond(max_rel_acc < 1e-9, "wfstat per-frame RMS/variance accumulators", det);
+    snprintf(det, sizeof(det), "max rel = %.2e", max_rel_ts);
+    check_cond(max_rel_ts < 1e-6, "wfstat per-frame RMS time-series GPU/CPU parity", det);
     snprintf(det, sizeof(det), "max |dmap| = %.2e nm, max rel dPTV = %.2e", max_abs_samp,
              max_rel_ptv);
     check_cond(max_abs_samp < 1e-3 && max_rel_ptv < 1e-9, "wfstat sample maps + PTV parity", det);
+
+    char tmpd[128], pbuf[256];
+    snprintf(tmpd, sizeof(tmpd), "/tmp/cacaosim_wfstat_ut_%ld", (long) getpid());
+    int rc_w = cacaosim_wfstat_write(&wg, tmpd, 0.0005);
+    snprintf(pbuf, sizeof(pbuf), "%s/wf_timeseries.csv", tmpd);
+    FILE    *cfp   = fopen(pbuf, "r");
+    uint32_t lines = 0;
+    if (cfp != NULL)
+    {
+        char lbuf[256];
+        while (fgets(lbuf, sizeof(lbuf), cfp) != NULL)
+        {
+            lines++;
+        }
+        fclose(cfp);
+    }
+    snprintf(pbuf, sizeof(pbuf), "%s/wf_stats.json", tmpd);
+    FILE *jfp  = fopen(pbuf, "r");
+    int   j_ok = (jfp != NULL);
+    if (jfp != NULL)
+    {
+        fclose(jfp);
+    }
+    snprintf(det, sizeof(det), "write rc=%d, csv lines=%u (expect %u)", rc_w, lines, nframes + 1);
+    check_cond(rc_w == 0 && j_ok && lines == nframes + 1,
+               "wfstat writes wf_stats.json + wf_timeseries.csv", det);
+
+    static const char *const ut_files[] = {
+        "wf_pupil_mask.fits", "wf_stats.json",     "wf_timeseries.csv",
+        "wf_mean_raw.fits",   "wf_std_raw.fits",   "wf_samples_raw.fits",
+        "wf_mean_stg1.fits",  "wf_std_stg1.fits",  "wf_samples_stg1.fits",
+        "wf_mean_final.fits", "wf_std_final.fits", "wf_samples_final.fits",
+    };
+    for (size_t i = 0; i < sizeof(ut_files) / sizeof(ut_files[0]); i++)
+    {
+        snprintf(pbuf, sizeof(pbuf), "%s/%s", tmpd, ut_files[i]);
+        remove(pbuf);
+    }
+    rmdir(tmpd);
 
     cacaosim_wfstat_free(&wc);
     cacaosim_wfstat_free(&wg);
@@ -3388,6 +3442,1500 @@ static void test_wfstat_cpu_gpu_parity(void)
     cacaosim_cuda_stream_destroy(stream);
     free(pup);
     free(h_fr);
+}
+
+/**
+ * @brief Section 15: Validate multi-rate temporal oversampling physics across WFS, DM, & clocks.
+ *
+ * Role:
+ *   Verifies all four temporal-fidelity mechanisms enabled when running the optical simulation at
+ *   `oversample = 2..4x` above the fastest WFS frame rate:
+ *     1. Sub-frame WFS exposure integration: exact `100%, 75%, 50%, 25%, 0%` step-arrival weights
+ *        and `sinc(pi * f * T_exp)` high-frequency temporal roll-off vs `1x` aliasing.
+ *     2. DM analytical ZOH subframe-mean (`act_pos_render`) matching continuum `1 - (tau/T) *
+ *        (1 - exp(-T/tau))` across `K = 1, 2, 4` (eliminating right-endpoint stroke bias) plus
+ *        fractional-frame `delay_us` transport latency (`625 us = 1.25` base frames).
+ *     3. Pyramid WFS subframe modulation (`sync_arc` & `interleaved` vs `full` + `calib_fast`
+ *        static parity on CPU and CUDA, plus physical mid-exposure modulation-phase cross-talk).
+ *     4. Stage-1 / Stage-2 fractional clock offset (`clock_offset_us`), clock drift
+ *        (`clock_drift_ppm`), and CPU/CUDA linear wavefront interpolation (`beam_init_lerp`).
+ *
+ * Rationale:
+ *   Operating at `1x` WFS frame rate collapses detector boxcar integration to an impulse sample,
+ *   evaluates right-endpoint DM settling, quantizes pure delays to integer frames, and forces
+ *   synchronous inter-stage clocks. These deterministic analytical tests guarantee that `2..4x`
+ *   oversampling reproduces exact continuum temporal physics without steady-state bias.
+ */
+static void test_temporal_oversampling_physics(void)
+{
+    printf("\n=== 15. Multi-Rate Temporal Oversampling Physics ===\n");
+
+    char det[192];
+    char err[256];
+
+    /* --- 15a. WFS mid-frame step arrival partitioning & sinc(pi * f * T_exp) roll-off --- */
+    {
+        static const char *const ini_step =
+            "[bench]\n"
+            "nwf = 64\n"
+            "pup_diam = 0.90\n"
+            "master_hz = 1000.0\n"
+            "oversample = 4\n"
+            "atm_interp = 0\n"
+            "out_beam = b_in\n"
+            "wf_unit = 0\n"
+            "backend = cpu\n"
+            "[pyrwfs.wfs]\n"
+            "in = b_in\n"
+            "out_cam = csim_wfs\n"
+            "ncam = 32\n"
+            "lambda_um = 0.75\n"
+            "mod_rad = 3.0\n"
+            "mod_npts = 8\n"
+            "mod_mode = full\n"
+            "flux_ph = 1.0e6\n"
+            "photon_noise = 0\n"
+            "ron_e = 0.0\n"
+            "bias_adu = 0.0\n"
+            "out_dtype = float32\n";
+
+        cacaosim_bench_cfg_t bcfg;
+        cacaosim_bench_ctx_t bctx;
+        int rc = cacaosim_bench_parse_str(ini_step, &bcfg, err, sizeof(err));
+        if (rc == 0)
+        {
+            rc = cacaosim_bench_init(&bctx, &bcfg, NULL, 0, err, sizeof(err));
+        }
+
+        const uint32_t nwf  = 64;
+        const size_t   npix = (size_t) nwf * nwf;
+        const size_t   ncam = 32u * 32u;
+        float *wf_zero      = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+        float *wf_tilt      = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+        float *wf_osc       = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+        float *im_ref       = (float *) calloc(ncam, sizeof(float));
+        float *im_full      = (float *) calloc(ncam, sizeof(float));
+
+        for (uint32_t y = 0; y < nwf; y++)
+        {
+            for (uint32_t x = 0; x < nwf; x++)
+            {
+                float xn                = ((float) x - 31.5f) / 28.8f;
+                wf_tilt[y * nwf + x]    = 0.015f * xn;
+            }
+        }
+
+        int s_wfs = (rc == 0) ? cacaosim_bench_find_sensor(&bctx, "wfs") : -1;
+        if (rc == 0 && s_wfs >= 0)
+        {
+            for (int k = 0; k < 4; k++)
+            {
+                cacaosim_bench_step(&bctx, wf_zero, NULL, 1.0f, NULL);
+            }
+            memcpy(im_ref, cacaosim_bench_sensor_f32(&bctx, s_wfs), ncam * sizeof(float));
+
+            for (int k = 0; k < 4; k++)
+            {
+                cacaosim_bench_step(&bctx, wf_tilt, NULL, 1.0f, NULL);
+            }
+            memcpy(im_full, cacaosim_bench_sensor_f32(&bctx, s_wfs), ncam * sizeof(float));
+
+            double norm2     = 0.0;
+            double max_w_err = 0.0;
+            for (size_t i = 0; i < ncam; i++)
+            {
+                double di = (double) im_full[i] - (double) im_ref[i];
+                norm2 += di * di;
+            }
+
+            double meas_w[5] = { 0 };
+            for (int m = 0; m <= 4; m++)
+            {
+                for (int k = 0; k < 4; k++)
+                {
+                    const float *w = (k >= m) ? wf_tilt : wf_zero;
+                    cacaosim_bench_step(&bctx, w, NULL, 1.0f, NULL);
+                }
+                const float *im_m = cacaosim_bench_sensor_f32(&bctx, s_wfs);
+                double       dot  = 0.0;
+                for (size_t i = 0; i < ncam; i++)
+                {
+                    dot += ((double) im_m[i] - (double) im_ref[i]) *
+                           ((double) im_full[i] - (double) im_ref[i]);
+                }
+                meas_w[m]   = (norm2 > 1e-20) ? (dot / norm2) : -1.0;
+                double w_th = 1.0 - 0.25 * (double) m;
+                max_w_err   = fmax(max_w_err, fabs(meas_w[m] - w_th));
+            }
+            snprintf(det, sizeof(det), "weights=[%.2f,%.2f,%.2f,%.2f,%.2f], max|err|=%.2e",
+                     meas_w[0], meas_w[1], meas_w[2], meas_w[3], meas_w[4], max_w_err);
+            check_cond(max_w_err < 1e-5, "WFS 4x subframe step-arrival weights", det);
+
+            /*
+             * 1 cycle / T_exp sinusoid sampled at midpoint phases pi/4, 3pi/4, 5pi/4, 7pi/4:
+             * Project onto antisymmetric push-pull slope mode 0.5*(I(+w) - I(-w)) so quadratic
+             * intra-frame optical-gain drop (even in w) is separated from linear slope (odd in w).
+             */
+            float *im_neg = (float *) calloc(ncam, sizeof(float));
+            for (size_t i = 0; i < npix; i++)
+            {
+                wf_osc[i] = -wf_tilt[i];
+            }
+            for (int k = 0; k < 4; k++)
+            {
+                cacaosim_bench_step(&bctx, wf_osc, NULL, 1.0f, NULL);
+            }
+            memcpy(im_neg, cacaosim_bench_sensor_f32(&bctx, s_wfs), ncam * sizeof(float));
+
+            double lin_n2 = 0.0;
+            for (size_t i = 0; i < ncam; i++)
+            {
+                double dl = 0.5 * ((double) im_full[i] - (double) im_neg[i]);
+                lin_n2 += dl * dl;
+            }
+
+            for (int k = 0; k < 4; k++)
+            {
+                float s = sinf(2.0f * CACAOSIM_PI_F * ((float) k + 0.5f) * 0.25f);
+                for (size_t i = 0; i < npix; i++)
+                {
+                    wf_osc[i] = s * wf_tilt[i];
+                }
+                cacaosim_bench_step(&bctx, wf_osc, NULL, 1.0f, NULL);
+            }
+            const float *im_osc = cacaosim_bench_sensor_f32(&bctx, s_wfs);
+            double       dot_o  = 0.0;
+            for (size_t i = 0; i < ncam; i++)
+            {
+                double dl = 0.5 * ((double) im_full[i] - (double) im_neg[i]);
+                dot_o += ((double) im_osc[i] - (double) im_ref[i]) * dl;
+            }
+            double gain_4x = (lin_n2 > 1e-20) ? fabs(dot_o / lin_n2) : 1.0;
+
+            /* Compare against 1x impulse sampling at t_0 (phase pi/4 -> sin = 0.7071 alias) */
+            bcfg.oversample = 1;
+            cacaosim_bench_ctx_t bctx_1x;
+            cacaosim_bench_init(&bctx_1x, &bcfg, NULL, 0, err, sizeof(err));
+            float s0 = sinf(0.25f * CACAOSIM_PI_F);
+            for (size_t i = 0; i < npix; i++)
+            {
+                wf_osc[i] = s0 * wf_tilt[i];
+            }
+            cacaosim_bench_step(&bctx_1x, wf_osc, NULL, 1.0f, NULL);
+            const float *im_1x = cacaosim_bench_sensor_f32(&bctx_1x, 0);
+            double       dot_1 = 0.0;
+            for (size_t i = 0; i < ncam; i++)
+            {
+                double dl = 0.5 * ((double) im_full[i] - (double) im_neg[i]);
+                dot_1 += ((double) im_1x[i] - (double) im_ref[i]) * dl;
+            }
+            double gain_1x = (lin_n2 > 1e-20) ? fabs(dot_1 / lin_n2) : 0.0;
+            cacaosim_bench_free(&bctx_1x);
+            free(im_neg);
+
+            snprintf(det, sizeof(det), "|G(f_exp)|: 4x=%.2e vs 1x_alias=%.3f", gain_4x, gain_1x);
+            check_cond(gain_4x < 1e-5 && gain_1x > 0.65,
+                       "WFS sinc(pi*f*T) null vs 1x Nyquist aliasing", det);
+            cacaosim_bench_free(&bctx);
+        }
+        else
+        {
+            check_cond(0, "WFS 4x subframe step-arrival weights", err);
+        }
+
+        free(im_full);
+        free(im_ref);
+        free(wf_osc);
+        free(wf_tilt);
+        free(wf_zero);
+    }
+
+    /* --- 15b. DM analytical ZOH subframe-mean & fractional-frame delay_us invariance --- */
+    {
+        const double T_sec   = 0.0005;
+        const double tau_sec = 0.0002;
+        const double exact_m = 1.0 - (tau_sec / T_sec) * (1.0 - exp(-T_sec / tau_sec));
+        const double r_end   = 1.0 - exp(-T_sec / tau_sec);
+
+        double max_zoh_err = 0.0;
+        double no_mean_1x  = 0.0;
+        const int ks[3]    = { 1, 2, 4 };
+        for (int idx = 0; idx < 3; idx++)
+        {
+            int               K    = ks[idx];
+            cacaosim_dm_cfg_t dcfg = {
+                .nact_x = 4, .nact_y = 4, .nwf = 32, .dm_diam = 0.9f, .if_coupling = 0.2f,
+                .refl_scale = 1.0f, .max_stroke = 10.0f, .dac_bits = 0, .dyn_mode = 1,
+                .dt_sec = (float) (T_sec / (double) K), .tau_sec = (float) tau_sec,
+                .delay_sec = 0.0f, .no_zoh_mean = 0, .backend = CACAOSIM_BACKEND_CPU
+            };
+            cacaosim_dm_ctx_t dm;
+            cacaosim_dm_init(&dm, &dcfg, NULL);
+            float cmd[16];
+            float opd[32 * 32];
+            for (int a = 0; a < 16; a++)
+            {
+                cmd[a] = 1.0f;
+            }
+            double sum_render = 0.0;
+            for (int k = 0; k < K; k++)
+            {
+                cacaosim_dm_step(&dm, cmd, NULL, 0.0f, (float) tau_sec, 10.0f, opd);
+                sum_render += (double) dm.act_pos_render[5];
+            }
+            sum_render /= (double) K;
+            max_zoh_err = fmax(max_zoh_err, fabs(sum_render - exact_m));
+            cacaosim_dm_free(&dm);
+        }
+
+        /* Verify legacy right-endpoint mode (`no_zoh_mean = 1`) reproduces `1 - exp(-T/tau)` */
+        {
+            cacaosim_dm_cfg_t dcfg = {
+                .nact_x = 4, .nact_y = 4, .nwf = 32, .dm_diam = 0.9f, .if_coupling = 0.2f,
+                .refl_scale = 1.0f, .max_stroke = 10.0f, .dac_bits = 0, .dyn_mode = 1,
+                .dt_sec = (float) T_sec, .tau_sec = (float) tau_sec, .no_zoh_mean = 1,
+                .backend = CACAOSIM_BACKEND_CPU
+            };
+            cacaosim_dm_ctx_t dm;
+            cacaosim_dm_init(&dm, &dcfg, NULL);
+            float cmd[16];
+            float opd[32 * 32];
+            for (int a = 0; a < 16; a++)
+            {
+                cmd[a] = 1.0f;
+            }
+            cacaosim_dm_step(&dm, cmd, NULL, 0.0f, (float) tau_sec, 10.0f, opd);
+            no_mean_1x = (double) dm.act_pos_render[5];
+            cacaosim_dm_free(&dm);
+        }
+
+        snprintf(det, sizeof(det), "exact=%.5f, max|err(K=1,2,4)|=%.2e (no_mean=%.5f)", exact_m,
+                 max_zoh_err, no_mean_1x);
+        check_cond(max_zoh_err < 1e-5 && fabs(no_mean_1x - r_end) < 1e-5,
+                   "DM analytical ZOH subframe-mean (K=1,2,4)", det);
+
+        /* Verify 2nd-order underdamped ZOH subframe-mean matches fine K=64 quadrature */
+        double m2_k[2]       = { 0.0, 0.0 };
+        const int ks2[2]     = { 1, 64 };
+        for (int idx = 0; idx < 2; idx++)
+        {
+            int               K    = ks2[idx];
+            cacaosim_dm_cfg_t dcfg = {
+                .nact_x = 4, .nact_y = 4, .nwf = 32, .dm_diam = 0.9f, .if_coupling = 0.2f,
+                .refl_scale = 1.0f, .max_stroke = 10.0f, .dac_bits = 0, .dyn_mode = 2,
+                .dt_sec = (float) (T_sec / (double) K), .f0_hz = 2200.0f, .zeta = 0.55f,
+                .no_zoh_mean = 0, .backend = CACAOSIM_BACKEND_CPU
+            };
+            cacaosim_dm_ctx_t dm;
+            cacaosim_dm_init(&dm, &dcfg, NULL);
+            float cmd[16];
+            float opd[32 * 32];
+            for (int a = 0; a < 16; a++)
+            {
+                cmd[a] = 1.0f;
+            }
+            for (int k = 0; k < K; k++)
+            {
+                cacaosim_dm_step(&dm, cmd, NULL, 0.0f, 0.0001f, 10.0f, opd);
+                m2_k[idx] += (double) dm.act_pos_render[5];
+            }
+            m2_k[idx] /= (double) K;
+            cacaosim_dm_free(&dm);
+        }
+        snprintf(det, sizeof(det), "K=1: %.6f vs K=64: %.6f (|diff|=%.2e)", m2_k[0], m2_k[1],
+                 fabs(m2_k[0] - m2_k[1]));
+        check_cond(fabs(m2_k[0] - m2_k[1]) < 1e-5,
+                   "DM 2nd-order ZOH exact subframe-mean integral", det);
+
+        /* Fractional-frame delay_us = 625 us at 2 kHz x 4 = 8 kHz (5.0 sub-ticks = 1.25 frames) */
+        static const char *const ini_dly =
+            "[bench]\n"
+            "nwf = 64\n"
+            "pup_diam = 0.90\n"
+            "master_hz = 2000.0\n"
+            "oversample = 4\n"
+            "out_beam = b_in\n"
+            "backend = cpu\n"
+            "[dm.dm0]\n"
+            "in = b_in\n"
+            "out = b_dm\n"
+            "in_cmd = dm00disp\n"
+            "nact_x = 8\n"
+            "nact_y = 8\n"
+            "dac_bits = 0\n"
+            "dyn_mode = 0\n"
+            "delay_us = 625.0\n"
+            "[pyrwfs.wfs]\n"
+            "in = b_dm\n"
+            "out_cam = csim_wfs\n"
+            "ncam = 32\n"
+            "lambda_um = 0.75\n"
+            "mod_rad = 3.0\n"
+            "mod_npts = 8\n"
+            "mod_mode = full\n"
+            "flux_ph = 1.0e6\n"
+            "photon_noise = 0\n"
+            "ron_e = 0.0\n"
+            "bias_adu = 0.0\n"
+            "out_dtype = float32\n";
+
+        cacaosim_bench_cfg_t dly_cfg;
+        cacaosim_bench_ctx_t dly_ctx;
+        if (cacaosim_bench_parse_str(ini_dly, &dly_cfg, err, sizeof(err)) == 0 &&
+            cacaosim_bench_init(&dly_ctx, &dly_cfg, NULL, 0, err, sizeof(err)) == 0)
+        {
+            const size_t ncam = 32u * 32u;
+            float *im0        = (float *) calloc(ncam, sizeof(float));
+            float *im_ss      = (float *) calloc(ncam, sizeof(float));
+            float *cmd        = cacaosim_bench_dm_cmd_ptr(&dly_ctx, 0);
+
+            /* Settle zero baseline */
+            for (int k = 0; k < 12; k++)
+            {
+                cacaosim_bench_step(&dly_ctx, NULL, NULL, 0.0f, NULL);
+            }
+            memcpy(im0, cacaosim_bench_sensor_f32(&dly_ctx, 0), ncam * sizeof(float));
+
+            /* Apply small poke at start of frame 0 (sub-tick 0); delay = 5 sub-ticks */
+            cmd[27] = 0.01f;
+            double resp[3] = { 0.0, 0.0, 0.0 };
+            float *fr_buf[3];
+            for (int f = 0; f < 3; f++)
+            {
+                fr_buf[f] = (float *) calloc(ncam, sizeof(float));
+                for (int k = 0; k < 4; k++)
+                {
+                    cacaosim_bench_step(&dly_ctx, NULL, NULL, 0.0f, NULL);
+                }
+                memcpy(fr_buf[f], cacaosim_bench_sensor_f32(&dly_ctx, 0), ncam * sizeof(float));
+            }
+            memcpy(im_ss, fr_buf[2], ncam * sizeof(float));
+
+            double n2 = 0.0;
+            for (size_t i = 0; i < ncam; i++)
+            {
+                double d = (double) im_ss[i] - (double) im0[i];
+                n2 += d * d;
+            }
+            for (int f = 0; f < 3; f++)
+            {
+                double dot = 0.0;
+                for (size_t i = 0; i < ncam; i++)
+                {
+                    dot += ((double) fr_buf[f][i] - (double) im0[i]) *
+                           ((double) im_ss[i] - (double) im0[i]);
+                }
+                resp[f] = (n2 > 1e-20) ? (dot / n2) : -1.0;
+                free(fr_buf[f]);
+            }
+            snprintf(det, sizeof(det), "fr[0..2]=[%.3f, %.3f, %.3f] (expect 0, 0.75, 1)", resp[0],
+                     resp[1], resp[2]);
+            check_cond(fabs(resp[0]) < 1e-5 && fabs(resp[1] - 0.75) < 1e-4 &&
+                           fabs(resp[2] - 1.0) < 1e-5,
+                       "DM delay_us=625us fractional 1.25-frame step", det);
+
+            free(im_ss);
+            free(im0);
+            cacaosim_bench_free(&dly_ctx);
+        }
+    }
+
+    /* --- 15c. Pyramid WFS subframe modulation (`sync_arc`, `interleaved`, `calib_fast`) --- */
+    {
+        const uint32_t nwf  = 64;
+        const uint32_t ncam = 32;
+        const size_t   npix = (size_t) nwf * nwf;
+        const size_t   nc2  = (size_t) ncam * ncam;
+        float *pup          = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+        float *wf_ab        = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+        float *wf_zero      = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+
+        cacaosim_pupil_cfg_t pcfg = { .nwf = nwf, .pup_diam = 0.90f, .cobs = 0.30f };
+        cacaosim_make_pupil(&pcfg, pup);
+        cacaosim_make_ncpa(nwf, 0.90f, pup, 0.07f, 314ULL, wf_ab);
+
+        float *im_ref_full = (float *) calloc(nc2, sizeof(float));
+        float *im_tmp      = (float *) calloc(nc2, sizeof(float));
+
+        int      has_gpu     = cacaosim_cuda_available();
+        int      nb          = has_gpu ? 2 : 1;
+        double   max_rel_mod = 0.0;
+        for (int bi = 0; bi < nb; bi++)
+        {
+            int32_t backend = (bi == 0) ? CACAOSIM_BACKEND_CPU : CACAOSIM_BACKEND_CUDA;
+            for (int mode = 0; mode <= 2; mode++)
+            {
+                cacaosim_pyrwfs_cfg_t p_cfg = {
+                    .nwf = nwf, .pad_factor = 2, .ncam = ncam, .pup_diam = 0.90f,
+                    .lambda_um = 0.75f, .mod_rad_ld = 3.0f, .mod_npts = 16, .pup_sep = 0.50f,
+                    .fstop_frac = 0.45f, .wf_unit = CACAOSIM_WFUNIT_OPD_UM, .ref_lambda = 0.75f,
+                    .mod_subframe_mode = mode, .mod_rev = 1, .mod_subframes = 4u,
+                    .backend = backend,
+                    .det = { .flux_ph = 1.0e5f, .shutter = 1, .photon_noise = 0, .ron_e = 0.0f,
+                             .gain_eadu = 1.0f, .bias_adu = 0.0f, .sat_adu = 1.0e9f,
+                             .out_dtype = 1 }
+                };
+                cacaosim_pyrwfs_ctx_t p_ctx;
+                cacaosim_pyrwfs_init(&p_ctx, &p_cfg, pup, NULL, NULL);
+                for (int k = 0; k < 4; k++)
+                {
+                    cacaosim_pyrwfs_accum_subframe(&p_ctx, pup, NULL, wf_ab, NULL, NULL, NULL,
+                                                   1.0f, 3.0f);
+                }
+                cacaosim_pyrwfs_readout(&p_ctx, &p_cfg.det, NULL, im_tmp);
+
+                if (bi == 0 && mode == 0)
+                {
+                    memcpy(im_ref_full, im_tmp, nc2 * sizeof(float));
+                }
+                else
+                {
+                    double d2 = 0.0, r2 = 0.0;
+                    for (size_t i = 0; i < nc2; i++)
+                    {
+                        double d = (double) im_tmp[i] - (double) im_ref_full[i];
+                        d2 += d * d;
+                        r2 += (double) im_ref_full[i] * (double) im_ref_full[i];
+                    }
+                    max_rel_mod = fmax(max_rel_mod, sqrt(d2 / fmax(r2, 1e-20)));
+                }
+
+                /* Also verify 1-tick `force_full_mod = 1` (used by `.calib_fast`) on `sync_arc` */
+                if (mode == CACAOSIM_PYRMOD_SYNC_ARC)
+                {
+                    p_ctx.force_full_mod = 1;
+                    cacaosim_pyrwfs_accum_subframe(&p_ctx, pup, NULL, wf_ab, NULL, NULL, NULL,
+                                                   1.0f, 3.0f);
+                    cacaosim_pyrwfs_readout(&p_ctx, &p_cfg.det, NULL, im_tmp);
+                    double d2 = 0.0, r2 = 0.0;
+                    for (size_t i = 0; i < nc2; i++)
+                    {
+                        double d = (double) im_tmp[i] - (double) im_ref_full[i];
+                        d2 += d * d;
+                        r2 += (double) im_ref_full[i] * (double) im_ref_full[i];
+                    }
+                    max_rel_mod = fmax(max_rel_mod, sqrt(d2 / fmax(r2, 1e-20)));
+                }
+                cacaosim_pyrwfs_free(&p_ctx);
+            }
+        }
+        snprintf(det, sizeof(det), "max rel L2 (sync_arc/interleaved/calib_fast%s) = %.2e",
+                 has_gpu ? " CPU+CUDA" : " CPU", max_rel_mod);
+        check_cond(max_rel_mod < 1e-5,
+                   "PyWFS sync_arc/interleaved static parity", det);
+
+        /* Half-exposure transient poke: `sync_arc` captures physical piezo-arc cross-talk */
+        float *im_flat = (float *) calloc(nc2, sizeof(float));
+        float *im_sync = (float *) calloc(nc2, sizeof(float));
+        float *im_fhalf = (float *) calloc(nc2, sizeof(float));
+        for (int mode = 0; mode <= 1; mode++)
+        {
+            cacaosim_pyrwfs_cfg_t p_cfg = {
+                .nwf = nwf, .pad_factor = 2, .ncam = ncam, .pup_diam = 0.90f, .lambda_um = 0.75f,
+                .mod_rad_ld = 3.0f, .mod_npts = 16, .pup_sep = 0.50f, .fstop_frac = 0.45f,
+                .wf_unit = CACAOSIM_WFUNIT_OPD_UM, .ref_lambda = 0.75f,
+                .mod_subframe_mode = mode, .mod_rev = 1, .mod_subframes = 4u,
+                .backend = CACAOSIM_BACKEND_CPU,
+                .det = { .flux_ph = 1.0e5f, .shutter = 1, .photon_noise = 0, .ron_e = 0.0f,
+                         .gain_eadu = 1.0f, .bias_adu = 0.0f, .sat_adu = 1.0e9f, .out_dtype = 1 }
+            };
+            cacaosim_pyrwfs_ctx_t p_ctx;
+            cacaosim_pyrwfs_init(&p_ctx, &p_cfg, pup, NULL, NULL);
+            if (mode == 0)
+            {
+                for (int k = 0; k < 4; k++)
+                {
+                    cacaosim_pyrwfs_accum_subframe(&p_ctx, pup, NULL, wf_zero, NULL, NULL, NULL,
+                                                   0.0f, 3.0f);
+                }
+                cacaosim_pyrwfs_readout(&p_ctx, &p_cfg.det, NULL, im_flat);
+            }
+            for (int k = 0; k < 4; k++)
+            {
+                const float *w = (k < 2) ? wf_ab : wf_zero;
+                cacaosim_pyrwfs_accum_subframe(&p_ctx, pup, NULL, w, NULL, NULL, NULL, 1.0f, 3.0f);
+            }
+            cacaosim_pyrwfs_readout(&p_ctx, &p_cfg.det, NULL, (mode == 0) ? im_fhalf : im_sync);
+            cacaosim_pyrwfs_free(&p_ctx);
+        }
+        double diff_xtalk = 0.0, ref_sig = 0.0;
+        for (size_t i = 0; i < nc2; i++)
+        {
+            double ds = (double) im_sync[i] - (double) im_flat[i];
+            double df = (double) im_fhalf[i] - (double) im_flat[i];
+            diff_xtalk += (ds - df) * (ds - df);
+            ref_sig    += df * df;
+        }
+        double rel_xtalk = sqrt(diff_xtalk / fmax(ref_sig, 1e-20));
+        snprintf(det, sizeof(det), "half-frame arc vs full-ring rel L2 = %.3f (> 0.05)",
+                 rel_xtalk);
+        check_cond(rel_xtalk > 0.05, "PyWFS sync_arc captures mid-frame arc cross-talk", det);
+
+        free(im_fhalf);
+        free(im_sync);
+        free(im_flat);
+        free(im_tmp);
+        free(im_ref_full);
+        free(wf_zero);
+        free(wf_ab);
+        free(pup);
+    }
+
+    /* --- 15d. Stage-1/Stage-2 clock skew (`clock_offset_us`), drift, & lerp parity --- */
+    {
+        static const char *const ini_clk =
+            "[bench]\n"
+            "nwf = 64\n"
+            "pup_diam = 0.90\n"
+            "master_hz = 2000.0\n"
+            "oversample = 4\n"
+            "out_beam = b_in\n"
+            "backend = cpu\n"
+            "[splitter.sp]\n"
+            "in = b_in\n"
+            "out_refl = b1\n"
+            "out_trans = b2\n"
+            "mode = gray\n"
+            "r_gray = 0.5\n"
+            "t_gray = 0.5\n"
+            "[pyrwfs.wfs1]\n"
+            "in = b1\n"
+            "out_cam = csim_wfs1\n"
+            "ncam = 32\n"
+            "mod_rad = 0.0\n"
+            "clock_offset_us = 0.0\n"
+            "clock_drift_ppm = 0.0\n"
+            "photon_noise = 0\n"
+            "ron_e = 0.0\n"
+            "out_dtype = float32\n"
+            "[pyrwfs.wfs2]\n"
+            "in = b2\n"
+            "out_cam = csim_wfs2\n"
+            "ncam = 32\n"
+            "mod_rad = 0.0\n"
+            "clock_offset_us = 250.0\n"
+            "clock_drift_ppm = 10000.0\n"
+            "photon_noise = 0\n"
+            "ron_e = 0.0\n"
+            "out_dtype = float32\n";
+
+        cacaosim_bench_cfg_t ccfg;
+        cacaosim_bench_ctx_t cctx;
+        if (cacaosim_bench_parse_str(ini_clk, &ccfg, err, sizeof(err)) == 0 &&
+            cacaosim_bench_init(&cctx, &ccfg, NULL, 0, err, sizeof(err)) == 0)
+        {
+            int s1 = cacaosim_bench_find_sensor(&cctx, "wfs1");
+            int s2 = cacaosim_bench_find_sensor(&cctx, "wfs2");
+            int first_rd1 = -1, first_rd2 = -1;
+            for (int t = 0; t < 400; t++)
+            {
+                uint64_t p1 = cctx.nodes[cctx.sensor_node_idx[s1]].pyrwfs_ctx.frame_seq;
+                uint64_t p2 = cctx.nodes[cctx.sensor_node_idx[s2]].pyrwfs_ctx.frame_seq;
+                cacaosim_bench_step(&cctx, NULL, NULL, 0.0f, NULL);
+                if (first_rd1 < 0 &&
+                    cctx.nodes[cctx.sensor_node_idx[s1]].pyrwfs_ctx.frame_seq > p1)
+                {
+                    first_rd1 = t;
+                }
+                if (first_rd2 < 0 &&
+                    cctx.nodes[cctx.sensor_node_idx[s2]].pyrwfs_ctx.frame_seq > p2)
+                {
+                    first_rd2 = t;
+                }
+            }
+            uint64_t tot1 = cctx.nodes[cctx.sensor_node_idx[s1]].pyrwfs_ctx.frame_seq;
+            uint64_t tot2 = cctx.nodes[cctx.sensor_node_idx[s2]].pyrwfs_ctx.frame_seq;
+            snprintf(det, sizeof(det), "first_tick=(%d vs %d), readouts_100fr=(%lu vs %lu)",
+                     first_rd1, first_rd2, (unsigned long) tot1, (unsigned long) tot2);
+            check_cond(first_rd1 == 3 && first_rd2 == 1 && tot1 == 100u && tot2 == 101u,
+                       "Inter-stage clock_offset_us & clock_drift_ppm", det);
+            cacaosim_bench_free(&cctx);
+        }
+
+        /* Linear wavefront interpolation CPU vs CUDA parity */
+        const uint32_t nwf_l = 64u;
+        const size_t   np    = (size_t) nwf_l * nwf_l;
+        float *pup = (float *) cacaosim_aligned_calloc(np, sizeof(float));
+        float *w0  = (float *) cacaosim_aligned_calloc(np, sizeof(float));
+        float *w1  = (float *) cacaosim_aligned_calloc(np, sizeof(float));
+        float *oc  = (float *) cacaosim_aligned_calloc(np, sizeof(float));
+        float *ac  = (float *) cacaosim_aligned_calloc(np, sizeof(float));
+        for (size_t i = 0; i < np; i++)
+        {
+            pup[i] = 0.85f;
+            w0[i]  = 0.1f * sinf((float) i * 0.03f);
+            w1[i]  = -0.2f * cosf((float) i * 0.05f);
+        }
+        cacaosim_beam_init_lerp_cpu(pup, NULL, w0, w1, 0.375f, NULL, 0.5f, nwf_l, oc, ac);
+        double max_lerp_err = 0.0;
+        for (size_t i = 0; i < np; i++)
+        {
+            double ref = 0.5 * (0.625 * (double) w0[i] + 0.375 * (double) w1[i]);
+            max_lerp_err = fmax(max_lerp_err, fabs((double) oc[i] - ref));
+        }
+        if (cacaosim_cuda_available())
+        {
+            float *dp  = cacaosim_cuda_alloc_f32(np);
+            float *d0  = cacaosim_cuda_alloc_f32(np);
+            float *d1  = cacaosim_cuda_alloc_f32(np);
+            float *do_ = cacaosim_cuda_alloc_f32(np);
+            float *da  = cacaosim_cuda_alloc_f32(np);
+            float *hg  = (float *) calloc(np, sizeof(float));
+            cacaosim_cuda_h2d_f32(dp, pup, np, NULL);
+            cacaosim_cuda_h2d_f32(d0, w0, np, NULL);
+            cacaosim_cuda_h2d_f32(d1, w1, np, NULL);
+            cacaosim_cuda_beam_init_lerp(dp, NULL, d0, d1, 0.375f, NULL, 0.5f, nwf_l, do_, da,
+                                         NULL);
+            cacaosim_cuda_d2h_f32(hg, do_, np, NULL);
+            cacaosim_cuda_stream_sync(NULL);
+            for (size_t i = 0; i < np; i++)
+            {
+                max_lerp_err = fmax(max_lerp_err, fabs((double) hg[i] - (double) oc[i]));
+            }
+            free(hg);
+            cacaosim_cuda_free_f32(da);
+            cacaosim_cuda_free_f32(do_);
+            cacaosim_cuda_free_f32(d1);
+            cacaosim_cuda_free_f32(d0);
+            cacaosim_cuda_free_f32(dp);
+        }
+        snprintf(det, sizeof(det), "max |err| = %.2e", max_lerp_err);
+        check_cond(max_lerp_err < 1e-6, "Sub-tick linear WF interpolation parity", det);
+        free(ac);
+        free(oc);
+        free(w1);
+        free(w0);
+        free(pup);
+    }
+}
+
+/**
+ * @brief Section 16: Validate polychromatic WFS/camera bandwidths, lambda/D scaling & CUDA parity.
+ *
+ * Role:
+ *   Verifies end-to-end chromatic physics across photometry, all four diffractive sensors
+ *   (`pyrwfs`, `shwfs`, `zwfs`, `fpcam` MFT & FFT), polychromatic upstream beam linear phasor
+ *   interpolation, broadband coronagraph + LOWFS pickoff, and CPU vs CUDA parity:
+ *     - 16a: `cacaosim_resolve_nlambda()` (`0 -> 2` default when `bw_frac > 0`, `1` at `0`),
+ *       strict narrowband flux linearity (`bw_frac = 1e-4` vs `0.20`, no `0.15` clamp), and exact
+ *       bolometric sub-band photon conservation + dichroic centroid shift in
+ *       `cacaosim_spec_sample_band()`.
+ *     - 16b: `fpcam` broadband (`bw_frac = 0.30, N = 5`) unaberrated Strehl `== 1.0` in both
+ *       `PROP_MFT` and `PROP_FFT`, `PROP_FFT` 2D bilinear `lambda/D` PSF width scaling (`1.50x`),
+ *       and achromatic geometric tilt pixel landing.
+ *     - 16c: `shwfs` subaperture 2D bilinear `lambda/D` spot width scaling (`1.50x` for
+ *       `0.90 / 0.60 um`) alongside achromatic geometric mirror-tilt spot centroids (`< 0.03 px`).
+ *     - 16d: `pyrwfs` polychromatic default (`eff_nlam == 2`), `nlambda = 1` override with
+ *       identical bandpass photometry, achromatic double-pyramid sub-pupil registration
+ *       (`chrom_sep = 0`), and single-prism chromatic sub-pupil shift (`chrom_sep = 0.20`).
+ *     - 16e: `zwfs` dispersive (`achrom_dimple = 0`) vs achromatic (`achrom_dimple = 1`) dimple
+ *       phase response, and 1D wavelength linear complex-phasor interpolation (`accum_beam_poly`)
+ *       at midpoint `alpha = 0.5` between upstream polychromatic beam channels.
+ *     - 16f: CPU vs CUDA parity (`rel_L2 < 3e-5`) across polychromatic `pyrwfs`, `shwfs`, `zwfs`,
+ *       `fpcam` (MFT & FFT), and a full broadband `coro + out_lowfs + 4-sensor` `.bench` DAG.
+ */
+static void test_chromaticity_and_poly_wfs(void)
+{
+    printf("\n=== 16. Polychromatic Bandwidths, Focal lambda/D Scaling & Interp ===\n");
+    char det[192];
+
+    /* 16a. Channel resolution, narrowband flux linearity & sub-band conservation */
+    {
+        int ok_res = (cacaosim_resolve_nlambda(0, 1u, 0.20f) == 2) &&
+                     (cacaosim_resolve_nlambda(0, 1u, 0.0f) == 1) &&
+                     (cacaosim_resolve_nlambda(0, 5u, 0.20f) == 5) &&
+                     (cacaosim_resolve_nlambda(1, 5u, 0.20f) == 1) &&
+                     (cacaosim_resolve_nlambda(3, 5u, 0.20f) == 3);
+
+        cacaosim_spec_t star_sp;
+        cacaosim_spec_star(&star_sp, 8.2f, 0.30f, 8.0f, 5778.0f, 0.75f);
+
+        float f_zero   = cacaosim_spec_band_flux(&star_sp, 0.75f, 0.0f, 1.0e-3f, 0.80f, NULL);
+        float f_narrow = cacaosim_spec_band_flux(&star_sp, 0.75f, 1.0e-4f, 1.0e-3f, 0.80f, NULL);
+        float f_broad  = cacaosim_spec_band_flux(&star_sp, 0.75f, 0.20f, 1.0e-3f, 0.80f, NULL);
+        double bw_ratio = (f_narrow > 0.0f) ? ((double) f_broad / (double) f_narrow) : 0.0;
+
+        float flat_lam[2] = { 0.0f, 0.0f };
+        float flat_w[2]   = { 0.0f, 0.0f };
+        (void) cacaosim_spec_sample_band(NULL, 0.80f, 0.25f, 2, 1.0e-3f, 1.0f, flat_lam, flat_w,
+                                         NULL);
+        int ok_flat = (fabsf(flat_lam[0] - 0.75f) < 1e-6f) &&
+                      (fabsf(flat_lam[1] - 0.85f) < 1e-6f) &&
+                      (fabsf(flat_w[0] - 0.5f) < 1e-6f) &&
+                      (fabsf(flat_w[1] - 0.5f) < 1e-6f);
+
+        /* Dichroic short-pass reflection (< 0.80 um) sampled across [0.70, 0.90] um */
+        cacaosim_split_cfg_t sp_cfg = {
+            .mode       = CACAOSIM_SPLIT_DICHROIC_LP,
+            .lambda_cut = 0.80f,
+            .roll_um    = 0.01f,
+            .eff_refl   = 0.95f,
+            .eff_trans  = 0.95f,
+        };
+        cacaosim_spec_t vis_sp, nir_sp;
+        cacaosim_spec_split(&star_sp, &sp_cfg, &vis_sp, &nir_sp);
+
+        float    dich_lam[2] = { 0.0f, 0.0f };
+        float    dich_w[2]   = { 0.0f, 0.0f };
+        float    eff_lam     = 0.0f;
+        float    f_tot_ref   = cacaosim_spec_band_flux(&vis_sp, 0.80f, 0.25f, 1.0e-3f, 0.80f, NULL);
+        double   max_part_err = 0.0;
+        const int n_list[4]   = { 1, 2, 5, 9 };
+        for (int k = 0; k < 4; k++)
+        {
+            float lk[9], wk[9];
+            float fk = cacaosim_spec_sample_band(&vis_sp, 0.80f, 0.25f, n_list[k], 1.0e-3f, 0.80f,
+                                                 lk, wk, (n_list[k] == 2) ? &eff_lam : NULL);
+            double wsum = 0.0;
+            for (int c = 0; c < n_list[k]; c++)
+            {
+                wsum += (double) wk[c];
+            }
+            double rel_f = fabs((double) fk - (double) f_tot_ref) / (double) f_tot_ref;
+            max_part_err = fmax(max_part_err, fmax(rel_f, fabs(wsum - 1.0)));
+            if (n_list[k] == 2)
+            {
+                dich_lam[0] = lk[0];
+                dich_lam[1] = lk[1];
+                dich_w[0]   = wk[0];
+                dich_w[1]   = wk[1];
+            }
+        }
+        (void) dich_lam;
+
+        snprintf(det, sizeof(det),
+                 "f0=%.1e, f(0.20)/f(1e-4)=%.1f, part_err=%.2e, dich_w=(%.3f,%.3f), lam_eff=%.3fum",
+                 f_zero, bw_ratio, max_part_err, dich_w[0], dich_w[1], eff_lam);
+        check_cond(ok_res && ok_flat && f_zero == 0.0f && fabs(bw_ratio - 2000.0) < 25.0 &&
+                       max_part_err < 1e-6 && dich_w[0] > 0.90f && eff_lam < 0.765f,
+                   "Sub-band photometry, narrowband & dichroic", det);
+    }
+
+    /* Shared pupil & achromatic linear tilt OPD screen */
+    const uint32_t nwf  = 64u;
+    const uint64_t npix = (uint64_t) nwf * nwf;
+    const float    pdia = 0.875f;
+    float         *pup  = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+    float         *tilt = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+    float         *ab   = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+
+    cacaosim_pupil_cfg_t pcfg = { .nwf = nwf, .pup_diam = pdia, .cobs = 0.0f, .nspider = 0 };
+    cacaosim_make_pupil(&pcfg, pup);
+    cacaosim_make_ncpa(nwf, pdia, pup, 0.09f, 9091ULL, ab);
+
+    const float dpix = pdia * (float) nwf;
+    const float c_wf = 0.5f * (float) (nwf - 1u);
+    /* 1.5 lambda0/D peak-to-valley tilt at lambda0 = 1.65 um -> OPD(x) = 1.5 * 1.65 * (x/D) */
+    for (uint32_t y = 0; y < nwf; y++)
+    {
+        for (uint32_t x = 0; x < nwf; x++)
+        {
+            tilt[(size_t) y * nwf + x] = 1.5f * 1.65f * (((float) x - c_wf) / dpix);
+        }
+    }
+
+    /* 16b. FPCAM (MFT & FFT) broadband Strehl == 1.0, lambda/D scaling & achromatic tilt */
+    {
+        const uint32_t ncam = 96u;
+        float         *psf_b = (float *) cacaosim_aligned_calloc((size_t) ncam * ncam,
+                                                                 sizeof(float));
+        float         *psf_r = (float *) cacaosim_aligned_calloc((size_t) ncam * ncam,
+                                                                 sizeof(float));
+        cacaosim_det_cfg_t clean_det = {
+            .flux_ph      = 1.0e6f,
+            .gain_eadu    = 1.0f,
+            .shutter      = 1,
+            .photon_noise = 0,
+            .sat_adu      = 1.0e12f,
+            .out_dtype    = CACAOSIM_DTYPE_F32,
+        };
+        cacaosim_fpcam_cfg_t fcfg_mft = {
+            .nwf         = nwf,
+            .ncam        = ncam,
+            .prop_mode   = CACAOSIM_FPCAM_PROP_MFT,
+            .pad_factor  = 4u,
+            .pup_diam    = pdia,
+            .lambda_um   = 1.65f,
+            .bw_frac     = 0.30f,
+            .nlambda     = 5,
+            .pixscale_ld = 4.0f,
+            .wf_unit     = CACAOSIM_WFUNIT_OPD_UM,
+            .det         = clean_det,
+            .backend     = CACAOSIM_BACKEND_CPU,
+        };
+        cacaosim_fpcam_cfg_t fcfg_fft = fcfg_mft;
+        fcfg_fft.prop_mode            = CACAOSIM_FPCAM_PROP_FFT;
+
+        cacaosim_fpcam_ctx_t fctx_m, fctx_f;
+        cacaosim_fpcam_init(&fctx_m, &fcfg_mft, pup, NULL, NULL);
+        cacaosim_fpcam_init(&fctx_f, &fcfg_fft, pup, NULL, NULL);
+        cacaosim_fpcam_accum_beam(&fctx_m, NULL, pup, NULL, NULL, NULL);
+        cacaosim_fpcam_readout(&fctx_m, &clean_det, NULL, psf_b, NULL);
+        cacaosim_fpcam_accum_beam(&fctx_f, NULL, pup, NULL, NULL, NULL);
+        cacaosim_fpcam_readout(&fctx_f, &clean_det, NULL, psf_r, NULL);
+        float sr_mft = fctx_m.last_strehl_peak;
+        float sr_fft = fctx_f.last_strehl_peak;
+        cacaosim_fpcam_free(&fctx_m);
+        cacaosim_fpcam_free(&fctx_f);
+
+        /* Compare blue (1.32 um) vs red (1.98 um) inside PROP_FFT camera defined at lam0=1.65 */
+        cacaosim_fpcam_cfg_t fblue = fcfg_fft;
+        fblue.nlambda              = 1;
+        fblue.has_ext_lam          = 1;
+        fblue.ext_lam_um[0]        = 1.32f;
+        cacaosim_fpcam_cfg_t fred  = fblue;
+        fred.ext_lam_um[0]         = 1.98f;
+
+        cacaosim_fpcam_ctx_t xb, xr;
+        cacaosim_fpcam_init(&xb, &fblue, pup, NULL, NULL);
+        cacaosim_fpcam_init(&xr, &fred, pup, NULL, NULL);
+
+        /* Flat-wavefront main-lobe width scaling (I >= 10% peak): w(1.98)/w(1.32) == 1.50 */
+        cacaosim_fpcam_accum_beam(&xb, NULL, pup, NULL, NULL, NULL);
+        cacaosim_fpcam_readout(&xb, &clean_det, NULL, psf_b, NULL);
+        cacaosim_fpcam_accum_beam(&xr, NULL, pup, NULL, NULL, NULL);
+        cacaosim_fpcam_readout(&xr, &clean_det, NULL, psf_r, NULL);
+
+        float pk_b = 0.0f, pk_r = 0.0f;
+        for (size_t k = 0; k < (size_t) ncam * ncam; k++)
+        {
+            if (psf_b[k] > pk_b)
+            {
+                pk_b = psf_b[k];
+            }
+            if (psf_r[k] > pk_r)
+            {
+                pk_r = psf_r[k];
+            }
+        }
+        double       sb = 0.0, sr = 0.0, r2b = 0.0, r2r = 0.0;
+        const double c0 = 0.5 * (double) ncam;
+        for (uint32_t y = 0; y < ncam; y++)
+        {
+            for (uint32_t x = 0; x < ncam; x++)
+            {
+                double dx = (double) x - c0;
+                double dy = (double) y - c0;
+                double r2 = dx * dx + dy * dy;
+                float  vb = psf_b[(size_t) y * ncam + x];
+                float  vr = psf_r[(size_t) y * ncam + x];
+                if (vb >= 0.10f * pk_b)
+                {
+                    sb += (double) vb;
+                    r2b += (double) vb * r2;
+                }
+                if (vr >= 0.10f * pk_r)
+                {
+                    sr += (double) vr;
+                    r2r += (double) vr * r2;
+                }
+            }
+        }
+        double w_ratio = sqrt((r2r / sr) / (r2b / sb));
+
+        /* Achromatic mirror tilt: identical focal centroid pixel across 1.32 um and 1.98 um */
+        cacaosim_fpcam_accum_beam(&xb, tilt, pup, NULL, NULL, NULL);
+        cacaosim_fpcam_readout(&xb, &clean_det, NULL, psf_b, NULL);
+        cacaosim_fpcam_accum_beam(&xr, tilt, pup, NULL, NULL, NULL);
+        cacaosim_fpcam_readout(&xr, &clean_det, NULL, psf_r, NULL);
+
+        pk_b = 0.0f;
+        pk_r = 0.0f;
+        for (size_t k = 0; k < (size_t) ncam * ncam; k++)
+        {
+            if (psf_b[k] > pk_b)
+            {
+                pk_b = psf_b[k];
+            }
+            if (psf_r[k] > pk_r)
+            {
+                pk_r = psf_r[k];
+            }
+        }
+        double fb = 0.0, fr = 0.0, wtb = 0.0, wtr = 0.0, cxb = 0.0, cxr = 0.0;
+        for (uint32_t y = 0; y < ncam; y++)
+        {
+            for (uint32_t x = 0; x < ncam; x++)
+            {
+                float vb = psf_b[(size_t) y * ncam + x];
+                float vr = psf_r[(size_t) y * ncam + x];
+                fb += (double) vb;
+                fr += (double) vr;
+                if (vb >= 0.05f * pk_b)
+                {
+                    wtb += (double) vb;
+                    cxb += (double) vb * (double) x;
+                }
+                if (vr >= 0.05f * pk_r)
+                {
+                    wtr += (double) vr;
+                    cxr += (double) vr * (double) x;
+                }
+            }
+        }
+        cxb /= wtb;
+        cxr /= wtr;
+        double tilt_drift = fabs(cxb - cxr);
+        double flux_diff  = fabs(fb - fr) / (0.5 * (fb + fr));
+
+        cacaosim_fpcam_free(&xr);
+        cacaosim_fpcam_free(&xb);
+        free(psf_r);
+        free(psf_b);
+
+        snprintf(det, sizeof(det),
+                 "SR=(%.5f,%.5f), w_red/w_blue=%.3f (ref 1.50), |dx|=%.3fpx, dFlux=%.3f",
+                 sr_mft, sr_fft, w_ratio, tilt_drift, flux_diff);
+        check_cond(fabsf(sr_mft - 1.0f) < 1e-5f && fabsf(sr_fft - 1.0f) < 1e-5f &&
+                       fabs(w_ratio - 1.50) < 0.08 && tilt_drift < 0.03 && flux_diff < 0.02,
+                   "FPCAM MFT/FFT Strehl=1, l/D scale & tilt", det);
+    }
+
+    /* 16c. SHWFS subaperture 2D bilinear lambda/D spot scaling & achromatic geometric slope */
+    {
+        const uint32_t nsub = 4u;
+        const uint32_t psub = 16u;
+        const uint32_t ncam = nsub * psub;
+        float         *im_b = (float *) cacaosim_aligned_calloc((size_t) ncam * ncam,
+                                                                sizeof(float));
+        float         *im_r = (float *) cacaosim_aligned_calloc((size_t) ncam * ncam,
+                                                                sizeof(float));
+        cacaosim_det_cfg_t clean_det = {
+            .flux_ph      = 1.0e5f,
+            .gain_eadu    = 1.0f,
+            .shutter      = 1,
+            .photon_noise = 0,
+            .sat_adu      = 1.0e12f,
+            .out_dtype    = CACAOSIM_DTYPE_F32,
+        };
+        cacaosim_shwfs_cfg_t scfg_b = {
+            .nwf          = nwf,
+            .n_sub        = nsub,
+            .pix_per_sub  = psub,
+            .pad_factor   = 4u,
+            .pup_diam     = pdia,
+            .lambda_um    = 0.75f,
+            .bw_frac      = 0.0f,
+            .nlambda      = 1,
+            .has_ext_chan = 1,
+            .wf_unit      = CACAOSIM_WFUNIT_OPD_UM,
+            .det          = clean_det,
+            .backend      = CACAOSIM_BACKEND_CPU,
+        };
+        scfg_b.ext_lam_um[0]        = 0.60f;
+        scfg_b.ext_weight[0]        = 1.0f;
+        cacaosim_shwfs_cfg_t scfg_r = scfg_b;
+        scfg_r.ext_lam_um[0]        = 0.90f;
+
+        cacaosim_shwfs_ctx_t sb_ctx, sr_ctx;
+        cacaosim_shwfs_init(&sb_ctx, &scfg_b, pup, NULL, NULL);
+        cacaosim_shwfs_init(&sr_ctx, &scfg_r, pup, NULL, NULL);
+
+        /* Measure main-lobe spot width (I >= 10% peak) on interior subaperture (sx=1, sy=1) */
+        cacaosim_shwfs_accum_beam(&sb_ctx, NULL, pup, NULL, NULL, NULL);
+        cacaosim_shwfs_readout(&sb_ctx, &clean_det, NULL, im_b);
+        cacaosim_shwfs_accum_beam(&sr_ctx, NULL, pup, NULL, NULL, NULL);
+        cacaosim_shwfs_readout(&sr_ctx, &clean_det, NULL, im_r);
+
+        float spk_b = 0.0f, spk_r = 0.0f;
+        for (uint32_t ly = 0; ly < psub; ly++)
+        {
+            for (uint32_t lx = 0; lx < psub; lx++)
+            {
+                float vb = im_b[(size_t) (psub + ly) * ncam + (psub + lx)];
+                float vr = im_r[(size_t) (psub + ly) * ncam + (psub + lx)];
+                if (vb > spk_b)
+                {
+                    spk_b = vb;
+                }
+                if (vr > spk_r)
+                {
+                    spk_r = vr;
+                }
+            }
+        }
+        double       sum_b = 0.0, sum_r = 0.0, m2_b = 0.0, m2_r = 0.0;
+        const double sc0   = 0.5 * (double) (psub - 1u);
+        for (uint32_t ly = 0; ly < psub; ly++)
+        {
+            for (uint32_t lx = 0; lx < psub; lx++)
+            {
+                double dx = (double) lx - sc0;
+                double dy = (double) ly - sc0;
+                double r2 = dx * dx + dy * dy;
+                float  vb = im_b[(size_t) (psub + ly) * ncam + (psub + lx)];
+                float  vr = im_r[(size_t) (psub + ly) * ncam + (psub + lx)];
+                if (vb >= 0.10f * spk_b)
+                {
+                    sum_b += (double) vb;
+                    m2_b += (double) vb * r2;
+                }
+                if (vr >= 0.10f * spk_r)
+                {
+                    sum_r += (double) vr;
+                    m2_r += (double) vr * r2;
+                }
+            }
+        }
+        double sh_w_ratio = sqrt((m2_r / sum_r) / (m2_b / sum_b));
+
+        /* Measure subaperture spot centroid shift under achromatic mirror tilt */
+        cacaosim_shwfs_accum_beam(&sb_ctx, tilt, pup, NULL, NULL, NULL);
+        cacaosim_shwfs_readout(&sb_ctx, &clean_det, NULL, im_b);
+        cacaosim_shwfs_accum_beam(&sr_ctx, tilt, pup, NULL, NULL, NULL);
+        cacaosim_shwfs_readout(&sr_ctx, &clean_det, NULL, im_r);
+
+        double tb = 0.0, tr = 0.0, cxb = 0.0, cxr = 0.0;
+        for (uint32_t ly = 0; ly < psub; ly++)
+        {
+            for (uint32_t lx = 0; lx < psub; lx++)
+            {
+                double vb = (double) im_b[(size_t) (psub + ly) * ncam + (psub + lx)];
+                double vr = (double) im_r[(size_t) (psub + ly) * ncam + (psub + lx)];
+                tb += vb;
+                tr += vr;
+                cxb += vb * ((double) lx - sc0);
+                cxr += vr * ((double) lx - sc0);
+            }
+        }
+        cxb /= tb;
+        cxr /= tr;
+        double sh_drift = fabs(cxb - cxr);
+
+        cacaosim_shwfs_free(&sr_ctx);
+        cacaosim_shwfs_free(&sb_ctx);
+        free(im_r);
+        free(im_b);
+
+        snprintf(det, sizeof(det), "w_red/w_blue=%.3f (ref 1.50), cx=(%.3f,%.3f) |dcx|=%.3fpx",
+                 sh_w_ratio, cxb, cxr, sh_drift);
+        check_cond(fabs(sh_w_ratio - 1.50) < 0.12 && fabs(cxb) > 0.4 && sh_drift < 0.03,
+                   "SHWFS 2D bilinear l/D spot scale & tilt", det);
+    }
+
+    /* 16d. Pyramid WFS default N=2, focal modulation/roof l/D scaling & prism chrom_sep */
+    {
+        const uint32_t ncam = 64u;
+        float *p_ach_b = (float *) cacaosim_aligned_calloc((size_t) ncam * ncam, sizeof(float));
+        float *p_ach_r = (float *) cacaosim_aligned_calloc((size_t) ncam * ncam, sizeof(float));
+        float *p_chr_b = (float *) cacaosim_aligned_calloc((size_t) ncam * ncam, sizeof(float));
+        float *p_chr_r = (float *) cacaosim_aligned_calloc((size_t) ncam * ncam, sizeof(float));
+
+        cacaosim_det_cfg_t clean_det = {
+            .flux_ph      = 1.0e5f,
+            .gain_eadu    = 1.0f,
+            .shutter      = 1,
+            .photon_noise = 0,
+            .sat_adu      = 1.0e12f,
+            .out_dtype    = CACAOSIM_DTYPE_F32,
+        };
+        cacaosim_pyrwfs_cfg_t pcfg_def = {
+            .nwf        = nwf,
+            .pad_factor = 2u,
+            .ncam       = ncam,
+            .pup_diam   = pdia,
+            .lambda_um  = 0.75f,
+            .bw_frac    = 0.25f,
+            .nlambda    = 0,
+            .mod_rad_ld = 2.0f,
+            .mod_npts   = 12,
+            .pup_sep    = 0.50f,
+            .roof_ld    = 0.60f,
+            .fstop_frac = 0.45f,
+            .chrom_sep  = 0.0f,
+            .wf_unit    = CACAOSIM_WFUNIT_OPD_UM,
+            .det        = clean_det,
+            .backend    = CACAOSIM_BACKEND_CPU,
+        };
+        cacaosim_pyrwfs_cfg_t pcfg_m1 = pcfg_def;
+        pcfg_m1.nlambda               = 1;
+
+        cacaosim_pyrwfs_ctx_t pctx_2, pctx_1;
+        cacaosim_pyrwfs_init(&pctx_2, &pcfg_def, pup, NULL, NULL);
+        cacaosim_pyrwfs_init(&pctx_1, &pcfg_m1, pup, NULL, NULL);
+        int ok_pyr_n = (pctx_2.eff_nlam == 2 && pctx_1.eff_nlam == 1);
+        cacaosim_pyrwfs_accum_beam(&pctx_2, ab, pup, NULL, NULL, NULL, 2.0f);
+        cacaosim_pyrwfs_readout(&pctx_2, &clean_det, NULL, p_ach_b);
+        cacaosim_pyrwfs_accum_beam(&pctx_1, ab, pup, NULL, NULL, NULL, 2.0f);
+        cacaosim_pyrwfs_readout(&pctx_1, &clean_det, NULL, p_ach_r);
+        double pyr_poly_diff = rel_l2_f32(p_ach_b, p_ach_r, (size_t) ncam * ncam);
+        cacaosim_pyrwfs_free(&pctx_1);
+        cacaosim_pyrwfs_free(&pctx_2);
+
+        /* Compare radial sub-pupil offset between 0.60 um and 0.90 um for chrom_sep = 0 vs 0.20 */
+        cacaosim_pyrwfs_cfg_t pb_ach = pcfg_def;
+        pb_ach.nlambda               = 1;
+        pb_ach.roof_ld               = 0.0f;
+        pb_ach.has_ext_chan          = 1;
+        pb_ach.ext_lam_um[0]         = 0.60f;
+        pb_ach.ext_weight[0]         = 1.0f;
+        cacaosim_pyrwfs_cfg_t pr_ach = pb_ach;
+        pr_ach.ext_lam_um[0]         = 0.90f;
+
+        cacaosim_pyrwfs_cfg_t pb_chr = pb_ach;
+        pb_chr.chrom_sep             = 0.20f;
+        cacaosim_pyrwfs_cfg_t pr_chr = pr_ach;
+        pr_chr.chrom_sep             = 0.20f;
+
+        cacaosim_pyrwfs_ctx_t xba, xra, xbc, xrc;
+        cacaosim_pyrwfs_init(&xba, &pb_ach, pup, NULL, NULL);
+        cacaosim_pyrwfs_init(&xra, &pr_ach, pup, NULL, NULL);
+        cacaosim_pyrwfs_init(&xbc, &pb_chr, pup, NULL, NULL);
+        cacaosim_pyrwfs_init(&xrc, &pr_chr, pup, NULL, NULL);
+
+        cacaosim_pyrwfs_accum_beam(&xba, NULL, pup, NULL, NULL, NULL, 3.0f);
+        cacaosim_pyrwfs_readout(&xba, &clean_det, NULL, p_ach_b);
+        cacaosim_pyrwfs_accum_beam(&xra, NULL, pup, NULL, NULL, NULL, 3.0f);
+        cacaosim_pyrwfs_readout(&xra, &clean_det, NULL, p_ach_r);
+        cacaosim_pyrwfs_accum_beam(&xbc, NULL, pup, NULL, NULL, NULL, 3.0f);
+        cacaosim_pyrwfs_readout(&xbc, &clean_det, NULL, p_chr_b);
+        cacaosim_pyrwfs_accum_beam(&xrc, NULL, pup, NULL, NULL, NULL, 3.0f);
+        cacaosim_pyrwfs_readout(&xrc, &clean_det, NULL, p_chr_r);
+
+        float pk_ab = 0.0f, pk_ar = 0.0f, pk_cb = 0.0f, pk_cr = 0.0f;
+        for (size_t k = 0; k < (size_t) ncam * ncam; k++)
+        {
+            if (p_ach_b[k] > pk_ab)
+            {
+                pk_ab = p_ach_b[k];
+            }
+            if (p_ach_r[k] > pk_ar)
+            {
+                pk_ar = p_ach_r[k];
+            }
+            if (p_chr_b[k] > pk_cb)
+            {
+                pk_cb = p_chr_b[k];
+            }
+            if (p_chr_r[k] > pk_cr)
+            {
+                pk_cr = p_chr_r[k];
+            }
+        }
+        const double pc = 0.5 * (double) (ncam - 1u);
+        double       sab = 0.0, sar = 0.0, scb = 0.0, scr = 0.0;
+        double       rab = 0.0, rar = 0.0, rcb = 0.0, rcr = 0.0;
+        for (uint32_t y = 0; y < ncam; y++)
+        {
+            for (uint32_t x = 0; x < ncam; x++)
+            {
+                double r = hypot((double) x - pc, (double) y - pc);
+                size_t k = (size_t) y * ncam + x;
+                if (p_ach_b[k] >= 0.25f * pk_ab)
+                {
+                    sab += 1.0;
+                    rab += r;
+                }
+                if (p_ach_r[k] >= 0.25f * pk_ar)
+                {
+                    sar += 1.0;
+                    rar += r;
+                }
+                if (p_chr_b[k] >= 0.25f * pk_cb)
+                {
+                    scb += 1.0;
+                    rcb += r;
+                }
+                if (p_chr_r[k] >= 0.25f * pk_cr)
+                {
+                    scr += 1.0;
+                    rcr += r;
+                }
+            }
+        }
+        double dr_ach = fabs((rar / sar) - (rab / sab));
+        double dr_chr = (rcr / scr) - (rcb / scb);
+
+        cacaosim_pyrwfs_free(&xrc);
+        cacaosim_pyrwfs_free(&xbc);
+        cacaosim_pyrwfs_free(&xra);
+        cacaosim_pyrwfs_free(&xba);
+        free(p_chr_r);
+        free(p_chr_b);
+        free(p_ach_r);
+        free(p_ach_b);
+
+        snprintf(det, sizeof(det),
+                 "eff_nlam=%d, poly_vs_mono=%.2e, |dr_achrom|=%.3fpx, dr_chrom=%.2fpx",
+                 ok_pyr_n ? 2 : 0, pyr_poly_diff, dr_ach, dr_chr);
+        check_cond(ok_pyr_n && pyr_poly_diff > 1e-3 && dr_ach < 0.06 && dr_chr > 0.80,
+                   "PyrWFS N=2 default, focal l/D & chrom_sep", det);
+    }
+
+    /* 16e. ZWFS dispersive vs achromatic dimple & 1D lambda linear phasor interpolation */
+    {
+        const uint32_t ncam = 64u;
+        float *z_disp = (float *) cacaosim_aligned_calloc((size_t) ncam * ncam, sizeof(float));
+        float *z_achr = (float *) cacaosim_aligned_calloc((size_t) ncam * ncam, sizeof(float));
+        float *z_ref  = (float *) cacaosim_aligned_calloc((size_t) ncam * ncam, sizeof(float));
+
+        cacaosim_det_cfg_t clean_det = {
+            .flux_ph      = 1.0e5f,
+            .gain_eadu    = 1.0f,
+            .shutter      = 1,
+            .photon_noise = 0,
+            .sat_adu      = 1.0e12f,
+            .out_dtype    = CACAOSIM_DTYPE_F32,
+        };
+        cacaosim_zwfs_cfg_t zcfg_d = {
+            .nwf           = nwf,
+            .ncam          = ncam,
+            .n_mft         = 32u,
+            .pup_diam      = pdia,
+            .lambda_um     = 0.75f,
+            .bw_frac       = 0.40f,
+            .nlambda       = 5,
+            .dimple_ld     = 1.06f,
+            .dimple_rad    = 0.5f * CACAOSIM_PI_F,
+            .dimple_amp    = 1.0f,
+            .achrom_dimple = 0,
+            .wf_unit       = CACAOSIM_WFUNIT_OPD_UM,
+            .det           = clean_det,
+            .backend       = CACAOSIM_BACKEND_CPU,
+        };
+        cacaosim_zwfs_cfg_t zcfg_a = zcfg_d;
+        zcfg_a.achrom_dimple       = 1;
+
+        cacaosim_zwfs_ctx_t zctx_d, zctx_a;
+        cacaosim_zwfs_init(&zctx_d, &zcfg_d, pup, NULL, NULL);
+        cacaosim_zwfs_init(&zctx_a, &zcfg_a, pup, NULL, NULL);
+        cacaosim_zwfs_accum_beam(&zctx_d, ab, pup, NULL, NULL, NULL);
+        cacaosim_zwfs_readout(&zctx_d, &clean_det, NULL, z_disp);
+        cacaosim_zwfs_accum_beam(&zctx_a, ab, pup, NULL, NULL, NULL);
+        cacaosim_zwfs_readout(&zctx_a, &clean_det, NULL, z_achr);
+        double zw_disp_diff = rel_l2_f32(z_disp, z_achr, (size_t) ncam * ncam);
+        cacaosim_zwfs_free(&zctx_a);
+        cacaosim_zwfs_free(&zctx_d);
+
+        /* 3-channel upstream polychromatic beam at {1.50, 1.65, 1.80} um interpolated at 1.575 */
+        const float beam_lam[3] = { 1.50f, 1.65f, 1.80f };
+        const float amp_s[3]    = { 0.60f, 1.00f, 1.40f };
+        float      *b_opd       = (float *) cacaosim_aligned_calloc(npix * 3u, sizeof(float));
+        float      *b_amp       = (float *) cacaosim_aligned_calloc(npix * 3u, sizeof(float));
+        float      *m_amp       = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+        for (uint32_t c = 0; c < 3u; c++)
+        {
+            for (uint64_t p = 0; p < npix; p++)
+            {
+                b_opd[(size_t) c * npix + p] = ab[p];
+                b_amp[(size_t) c * npix + p] = pup[p] * amp_s[c];
+            }
+        }
+        /* Exact midpoint alpha = 0.5 between 1.50 (0.60) and 1.65 (1.00) -> 0.80 * pup */
+        for (uint64_t p = 0; p < npix; p++)
+        {
+            m_amp[p] = pup[p] * 0.80f;
+        }
+
+        cacaosim_zwfs_cfg_t zcfg_i = zcfg_d;
+        zcfg_i.lambda_um           = 1.575f;
+        zcfg_i.bw_frac             = 0.0f;
+        zcfg_i.nlambda             = 1;
+        cacaosim_zwfs_ctx_t zctx_i;
+        cacaosim_zwfs_init(&zctx_i, &zcfg_i, pup, NULL, NULL);
+
+        cacaosim_zwfs_accum_beam_poly(&zctx_i, b_opd, b_amp, beam_lam, 3u, npix, NULL, NULL, NULL);
+        cacaosim_zwfs_readout(&zctx_i, &clean_det, NULL, z_disp);
+        cacaosim_zwfs_accum_beam(&zctx_i, ab, m_amp, NULL, NULL, NULL);
+        cacaosim_zwfs_readout(&zctx_i, &clean_det, NULL, z_ref);
+        double interp_err = rel_l2_f32(z_disp, z_ref, (size_t) ncam * ncam);
+
+        cacaosim_zwfs_free(&zctx_i);
+        free(m_amp);
+        free(b_amp);
+        free(b_opd);
+        free(z_ref);
+        free(z_achr);
+        free(z_disp);
+
+        snprintf(det, sizeof(det), "disp_vs_achrom rel_L2=%.3e, poly_lerp_err=%.2e",
+                 zw_disp_diff, interp_err);
+        check_cond(zw_disp_diff > 1e-2 && interp_err < 1e-6,
+                   "ZWFS dispersive dimple & 1D lambda phasor lerp", det);
+    }
+
+    /* 16f. Polychromatic CPU vs CUDA parity across all 4 sensors + broadband .bench DAG */
+    {
+        const char *bench_txt =
+            "[bench]\n"
+            "name = \"chrom_dag\"\n"
+            "nwf = 64\n"
+            "pup_diam = 0.875\n"
+            "cobs = 0.28\n"
+            "nspider = 4\n"
+            "tel_diam_m = 8.2\n"
+            "star_mag = 7.0\n"
+            "master_hz = 1000\n"
+            "out_beam = \"b_in\"\n"
+            "[splitter.sp0]\n"
+            "in = \"b_in\"\n"
+            "out_refl = \"b_vis\"\n"
+            "out_trans = \"b_nir\"\n"
+            "mode = \"dichroic_lp\"\n"
+            "lambda_cut = 1.00\n"
+            "[pyrwfs.ho]\n"
+            "in = \"b_vis\"\n"
+            "out_cam = \"pyr_cam\"\n"
+            "ncam = 64\n"
+            "lambda_um = 0.75\n"
+            "bw_frac = 0.22\n"
+            "mod_rad = 2.5\n"
+            "mod_npts = 12\n"
+            "photon_noise = 0\n"
+            "ron_e = 0.0\n"
+            "bias_adu = 0.0\n"
+            "out_dtype = \"float32\"\n"
+            "[coro.c0]\n"
+            "in = \"b_nir\"\n"
+            "out = \"b_sci\"\n"
+            "out_lowfs = \"b_lo\"\n"
+            "mode = \"lyot_spot\"\n"
+            "lambda_um = 1.65\n"
+            "dlambda_um = 0.33\n"
+            "fpm_rad_ld = 2.8\n"
+            "fpm_amp = 0.10\n"
+            "lowfs_mode = \"fpm_refl\"\n"
+            "lowfs_refl = 0.95\n"
+            "[zwfs.lo]\n"
+            "in = \"b_lo\"\n"
+            "out_cam = \"lo_cam\"\n"
+            "ncam = 64\n"
+            "lambda_um = 1.65\n"
+            "bw_frac = 0.20\n"
+            "photon_noise = 0\n"
+            "ron_e = 0.0\n"
+            "bias_adu = 0.0\n"
+            "out_dtype = \"float32\"\n"
+            "[shwfs.aux]\n"
+            "in = \"b_vis\"\n"
+            "out_cam = \"sh_cam\"\n"
+            "n_sub = 8\n"
+            "pix_per_sub = 8\n"
+            "lambda_um = 0.80\n"
+            "dlambda_um = 0.16\n"
+            "nlambda = 3\n"
+            "photon_noise = 0\n"
+            "ron_e = 0.0\n"
+            "bias_adu = 0.0\n"
+            "out_dtype = \"float32\"\n"
+            "[fpcam.sci]\n"
+            "in = \"b_sci\"\n"
+            "out_cam = \"sci_cam\"\n"
+            "ncam = 64\n"
+            "prop_mode = \"fft\"\n"
+            "pad_factor = 2\n"
+            "lambda_um = 1.65\n"
+            "bw_frac = 0.20\n"
+            "nlambda = 3\n"
+            "photon_noise = 0\n"
+            "ron_e = 0.0\n"
+            "bias_adu = 0.0\n"
+            "out_dtype = \"float32\"\n";
+
+        char                 err[256];
+        cacaosim_bench_cfg_t cfg_c, cfg_rt;
+        int ok_p = (cacaosim_bench_parse_str(bench_txt, &cfg_c, err, sizeof(err)) == 0);
+        cfg_c.backend = CACAOSIM_BACKEND_CPU;
+
+        char fmt_buf[8192];
+        cacaosim_bench_format_str(&cfg_c, fmt_buf, sizeof(fmt_buf));
+        int ok_rt = (cacaosim_bench_parse_str(fmt_buf, &cfg_rt, err, sizeof(err)) == 0);
+
+        cacaosim_bench_ctx_t ctx_c;
+        int ok_ic = ok_p && (cacaosim_bench_init(&ctx_c, &cfg_c, pup, 0, err, sizeof(err)) == 0);
+        int ok_ch = 0;
+        if (ok_ic)
+        {
+            /* Verify auto N=2 on pyrwfs, coro, zwfs and explicit N=3 on shwfs, fpcam */
+            ok_ch = 1;
+            for (uint32_t i = 0; i < ctx_c.n_nodes; i++)
+            {
+                const cacaosim_bench_node_t *nd = &ctx_c.nodes[i];
+                if (strcmp(nd->cfg.id, "ho") == 0 && nd->eff_nlam != 2)
+                {
+                    ok_ch = 0;
+                }
+                else if (strcmp(nd->cfg.id, "c0") == 0 &&
+                         (nd->coro_ctx.eff_nlam != 2 ||
+                          ctx_c.beams[nd->lowfs_idx].nlam != 2u))
+                {
+                    ok_ch = 0;
+                }
+                else if (strcmp(nd->cfg.id, "lo") == 0 && nd->eff_nlam != 2)
+                {
+                    ok_ch = 0;
+                }
+                else if (strcmp(nd->cfg.id, "aux") == 0 && nd->eff_nlam != 3)
+                {
+                    ok_ch = 0;
+                }
+                else if (strcmp(nd->cfg.id, "sci") == 0 && nd->eff_nlam != 3)
+                {
+                    ok_ch = 0;
+                }
+            }
+            cacaosim_bench_step(&ctx_c, ab, NULL, 1.0f, NULL);
+        }
+
+        double max_gpu_err = 0.0;
+        double mft_gpu_err = 0.0;
+        if (cacaosim_cuda_available() && ok_ic)
+        {
+            cacaosim_bench_cfg_t cfg_g = cfg_rt;
+            cfg_g.backend              = CACAOSIM_BACKEND_CUDA;
+            cacaosim_bench_ctx_t ctx_g;
+            if (cacaosim_bench_init(&ctx_g, &cfg_g, pup, 0, err, sizeof(err)) == 0)
+            {
+                cacaosim_bench_step(&ctx_g, ab, NULL, 1.0f, NULL);
+                for (uint32_t s = 0; s < ctx_c.n_sensors; s++)
+                {
+                    double e = rel_l2_f32(cacaosim_bench_sensor_f32(&ctx_c, s),
+                                          cacaosim_bench_sensor_f32(&ctx_g, s), 64u * 64u);
+                    max_gpu_err = fmax(max_gpu_err, e);
+                }
+                cacaosim_bench_free(&ctx_g);
+            }
+            else
+            {
+                max_gpu_err = 1.0;
+            }
+
+            /* Also check FPCAM PROP_MFT 3-channel broadband CPU vs CUDA parity */
+            cfg_c.nodes[5].fpcam.prop_mode = CACAOSIM_FPCAM_PROP_MFT;
+            cfg_g                          = cfg_c;
+            cfg_g.backend                  = CACAOSIM_BACKEND_CUDA;
+            cacaosim_bench_ctx_t mc, mg;
+            if (cacaosim_bench_init(&mc, &cfg_c, pup, 0, err, sizeof(err)) == 0 &&
+                cacaosim_bench_init(&mg, &cfg_g, pup, 0, err, sizeof(err)) == 0)
+            {
+                cacaosim_bench_step(&mc, ab, NULL, 1.0f, NULL);
+                cacaosim_bench_step(&mg, ab, NULL, 1.0f, NULL);
+                mft_gpu_err = rel_l2_f32(cacaosim_bench_sensor_f32(&mc, 3),
+                                         cacaosim_bench_sensor_f32(&mg, 3), 64u * 64u);
+                cacaosim_bench_free(&mg);
+                cacaosim_bench_free(&mc);
+            }
+            else
+            {
+                mft_gpu_err = 1.0;
+            }
+        }
+
+        if (ok_ic)
+        {
+            cacaosim_bench_free(&ctx_c);
+        }
+
+        snprintf(det, sizeof(det),
+                 "ok_ch=%d, ok_rt=%d, max_4sens_GPU_L2=%.2e, fpcam_MFT_L2=%.2e",
+                 ok_ch, ok_rt, max_gpu_err, mft_gpu_err);
+        check_cond(ok_ic && ok_rt && ok_ch && max_gpu_err < 3e-5 && mft_gpu_err < 3e-5,
+                   "Polychromatic 4-sensor DAG & CPU/CUDA parity", det);
+    }
+
+    free(ab);
+    free(tilt);
+    free(pup);
 }
 
 int main(void)
@@ -3411,6 +4959,8 @@ int main(void)
     test_custom_coro_masks_and_poly_cube();
     test_coro_lowfs_wfe_and_scales();
     test_wfstat_cpu_gpu_parity();
+    test_temporal_oversampling_physics();
+    test_chromaticity_and_poly_wfs();
 
     printf("\n======================================================================\n");
     printf("  Summary: %d passed, %d failed\n", g_pass, g_fail);

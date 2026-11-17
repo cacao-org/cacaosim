@@ -362,6 +362,29 @@ static int parse_lowfs_mode(const char *v)
 }
 
 /**
+ * parse_pyrmod_mode() - Resolve Pyramid WFS subframe modulation partitioning token
+ * @v: Trimmed value string (must not be NULL).
+ *
+ * Return: `cacaosim_pyrmod_mode_t` value (`FULL`, `SYNC_ARC`, or `INTERLEAVED`).
+ */
+static int parse_pyrmod_mode(const char *v)
+{
+    if (strcasecmp(v, "full") == 0)
+    {
+        return CACAOSIM_PYRMOD_FULL;
+    }
+    if (strcasecmp(v, "sync_arc") == 0 || strcasecmp(v, "sync") == 0 || strcasecmp(v, "arc") == 0)
+    {
+        return CACAOSIM_PYRMOD_SYNC_ARC;
+    }
+    if (strcasecmp(v, "interleaved") == 0 || strcasecmp(v, "strided") == 0)
+    {
+        return CACAOSIM_PYRMOD_INTERLEAVED;
+    }
+    return atoi(v);
+}
+
+/**
  * init_det_defaults() - Populate baseline CMOS/EMCCD/sCMOS detector readout parameters
  * @det:  Destination detector configuration struct (must not be NULL).
  * @flux: Fallback manual photon count per frame [photons] when `use_beam_flux == 0`.
@@ -484,7 +507,7 @@ static void init_node_defaults(
         nd->coro.lyot_spider_deg = 45.0f;
         nd->coro.fpm_pixscale_ld = 8.0f;
         nd->coro.bw_frac         = 0.0f;
-        nd->coro.nlambda         = 1;
+        nd->coro.nlambda         = 0;
         nd->coro.mask_pha_unit   = 0;
     }
     else if (kind == CACAOSIM_NODE_WFE)
@@ -501,15 +524,21 @@ static void init_node_defaults(
     {
         /* Visible (0.75 um) 4-sided Pyramid WFS with 3 lambda/D 16-point circular modulation */
         snprintf(nd->out_cam, sizeof(nd->out_cam), "%s_cam", id);
-        nd->pyrwfs.pad_factor = 2u;
-        nd->pyrwfs.ncam       = 64u;
-        nd->pyrwfs.lambda_um  = 0.75f;
-        nd->pyrwfs.mod_rad_ld = 3.0f;
-        nd->pyrwfs.mod_npts   = 16;
-        nd->pyrwfs.pup_sep    = 0.50f;
-        nd->pyrwfs.roof_ld    = 0.0f;
-        nd->pyrwfs.fstop_frac = 0.45f;
-        nd->pyrwfs.rng_seed   = seed_base;
+        nd->pyrwfs.pad_factor        = 2u;
+        nd->pyrwfs.ncam              = 64u;
+        nd->pyrwfs.lambda_um         = 0.75f;
+        nd->pyrwfs.bw_frac           = nd->bw_frac;
+        nd->pyrwfs.nlambda           = 0;
+        nd->pyrwfs.mod_rad_ld        = 3.0f;
+        nd->pyrwfs.mod_npts          = 16;
+        nd->pyrwfs.mod_subframe_mode = CACAOSIM_PYRMOD_SYNC_ARC;
+        nd->pyrwfs.mod_rev           = 1;
+        nd->pyrwfs.mod_phase_deg     = 0.0f;
+        nd->pyrwfs.pup_sep           = 0.50f;
+        nd->pyrwfs.roof_ld           = 0.0f;
+        nd->pyrwfs.fstop_frac        = 0.45f;
+        nd->pyrwfs.chrom_sep         = 0.0f;
+        nd->pyrwfs.rng_seed          = seed_base;
         init_det_defaults(&nd->pyrwfs.det, 100000.0f, 0.5f);
     }
     else if (kind == CACAOSIM_NODE_SHWFS)
@@ -520,6 +549,8 @@ static void init_node_defaults(
         nd->shwfs.pix_per_sub = 8u;
         nd->shwfs.pad_factor  = 2u;
         nd->shwfs.lambda_um   = 0.75f;
+        nd->shwfs.bw_frac     = nd->bw_frac;
+        nd->shwfs.nlambda     = 0;
         nd->shwfs.rng_seed    = seed_base;
         init_det_defaults(&nd->shwfs.det, 100000.0f, 0.5f);
     }
@@ -527,13 +558,16 @@ static void init_node_defaults(
     {
         /* Zernike phase-contrast WFS with 1.06 lambda/D pi/2 phase dimple */
         snprintf(nd->out_cam, sizeof(nd->out_cam), "%s_cam", id);
-        nd->zwfs.ncam       = 64u;
-        nd->zwfs.n_mft      = 32u;
-        nd->zwfs.lambda_um  = 0.75f;
-        nd->zwfs.dimple_ld  = 1.06f;
-        nd->zwfs.dimple_rad = 0.5f * CACAOSIM_PI_F;
-        nd->zwfs.dimple_amp = 1.0f;
-        nd->zwfs.rng_seed   = seed_base;
+        nd->zwfs.ncam          = 64u;
+        nd->zwfs.n_mft         = 32u;
+        nd->zwfs.lambda_um     = 0.75f;
+        nd->zwfs.bw_frac       = nd->bw_frac;
+        nd->zwfs.nlambda       = 0;
+        nd->zwfs.dimple_ld     = 1.06f;
+        nd->zwfs.dimple_rad    = 0.5f * CACAOSIM_PI_F;
+        nd->zwfs.dimple_amp    = 1.0f;
+        nd->zwfs.achrom_dimple = 0;
+        nd->zwfs.rng_seed      = seed_base;
         init_det_defaults(&nd->zwfs.det, 100000.0f, 0.5f);
     }
     else if (kind == CACAOSIM_NODE_FPCAM)
@@ -546,8 +580,8 @@ static void init_node_defaults(
         nd->fpcam.prop_mode   = CACAOSIM_FPCAM_PROP_MFT;
         nd->fpcam.pad_factor  = 2u;
         nd->fpcam.lambda_um   = 1.65f;
-        nd->fpcam.bw_frac     = 0.0f;
-        nd->fpcam.nlambda     = 1;
+        nd->fpcam.bw_frac     = nd->bw_frac;
+        nd->fpcam.nlambda     = 0;
         nd->fpcam.pixscale_ld = 3.0f;
         nd->fpcam.rng_seed    = seed_base;
         init_det_defaults(&nd->fpcam.det, 1000000.0f, 1.0f);
@@ -610,8 +644,11 @@ void cacaosim_bench_cfg_defaults(cacaosim_bench_cfg_t *cfg)
     cfg->tel_diam_m = 8.2f;
     cfg->star_mag   = 8.0f;
     cfg->star_teff  = 5778.0f;
-    cfg->tput_tel   = 0.75f;
-    cfg->master_hz  = 2000.0f;
+    cfg->tput_tel         = 0.75f;
+    cfg->master_hz        = 2000.0f;
+    cfg->oversample       = 1u;
+    cfg->atm_interp       = 1;
+    cfg->telemetry_stride = 0u;
     copy_str(cfg->in_wf, sizeof(cfg->in_wf), "outarraypha");
     copy_str(cfg->in_pup, sizeof(cfg->in_pup), "csim_pup");
     copy_str(cfg->out_beam, sizeof(cfg->out_beam), "b_pup");
@@ -761,6 +798,19 @@ static int apply_bench_kv(cacaosim_bench_cfg_t *cfg, const char *k, const char *
     else if (strcmp(k, "master_hz") == 0 || strcmp(k, "frame_rate") == 0)
     {
         cfg->master_hz = strtof(v, NULL);
+    }
+    else if (strcmp(k, "oversample") == 0)
+    {
+        uint32_t ov     = (uint32_t) strtoul(v, NULL, 10);
+        cfg->oversample = (ov >= 1u) ? ov : 1u;
+    }
+    else if (strcmp(k, "atm_interp") == 0)
+    {
+        cfg->atm_interp = parse_bool(v);
+    }
+    else if (strcmp(k, "telemetry_stride") == 0)
+    {
+        cfg->telemetry_stride = (uint32_t) strtoul(v, NULL, 10);
     }
     else if (strcmp(k, "in_wf") == 0)
     {
@@ -966,6 +1016,19 @@ static int apply_node_kv(cacaosim_node_cfg_t *nd, const char *k, const char *v)
         else if (strcmp(k, "delay_frames") == 0)
         {
             nd->dm.delay_frames = strtof(v, NULL);
+            nd->dm.delay_sec    = 0.0f;
+        }
+        else if (strcmp(k, "delay_us") == 0)
+        {
+            nd->dm.delay_sec = strtof(v, NULL) * 1.0e-6f;
+        }
+        else if (strcmp(k, "delay_sec") == 0)
+        {
+            nd->dm.delay_sec = strtof(v, NULL);
+        }
+        else if (strcmp(k, "zoh_mean") == 0)
+        {
+            nd->dm.no_zoh_mean = parse_bool(v) ? 0 : 1;
         }
         else
         {
@@ -1122,6 +1185,13 @@ static int apply_node_kv(cacaosim_node_cfg_t *nd, const char *k, const char *v)
             nd->coro.bw_frac = strtof(v, NULL);
             nd->bw_frac      = nd->coro.bw_frac;
         }
+        else if (strcmp(k, "dlambda_um") == 0)
+        {
+            float dl         = strtof(v, NULL);
+            float l0         = (nd->coro.lambda_um > 0.05f) ? nd->coro.lambda_um : 1.65f;
+            nd->coro.bw_frac = (dl > 0.0f) ? (dl / l0) : 0.0f;
+            nd->bw_frac      = nd->coro.bw_frac;
+        }
         else if (strcmp(k, "nlambda") == 0)
         {
             nd->coro.nlambda = atoi(v);
@@ -1255,10 +1325,85 @@ static int apply_node_kv(cacaosim_node_cfg_t *nd, const char *k, const char *v)
         nd->rate_hz = strtof(v, NULL);
         return 0;
     }
+    if (strcmp(k, "clock_offset_us") == 0)
+    {
+        nd->clock_offset_us = strtof(v, NULL);
+        return 0;
+    }
+    if (strcmp(k, "clock_drift_ppm") == 0)
+    {
+        nd->clock_drift_ppm = strtof(v, NULL);
+        return 0;
+    }
+    if (strcmp(k, "subframe_stride") == 0)
+    {
+        nd->subframe_stride = (uint32_t) strtoul(v, NULL, 10);
+        return 0;
+    }
+    if (strcmp(k, "sim_hz") == 0)
+    {
+        nd->sim_hz = strtof(v, NULL);
+        return 0;
+    }
     if (strcmp(k, "bw_frac") == 0)
     {
-        nd->bw_frac       = strtof(v, NULL);
-        nd->fpcam.bw_frac = nd->bw_frac;
+        nd->bw_frac        = strtof(v, NULL);
+        nd->pyrwfs.bw_frac = nd->bw_frac;
+        nd->shwfs.bw_frac  = nd->bw_frac;
+        nd->zwfs.bw_frac   = nd->bw_frac;
+        nd->fpcam.bw_frac  = nd->bw_frac;
+        return 0;
+    }
+    if (strcmp(k, "dlambda_um") == 0)
+    {
+        float dl = strtof(v, NULL);
+        float l0 = 0.75f;
+        if (nd->kind == CACAOSIM_NODE_PYRWFS)
+        {
+            l0 = nd->pyrwfs.lambda_um;
+        }
+        else if (nd->kind == CACAOSIM_NODE_SHWFS)
+        {
+            l0 = nd->shwfs.lambda_um;
+        }
+        else if (nd->kind == CACAOSIM_NODE_ZWFS)
+        {
+            l0 = nd->zwfs.lambda_um;
+        }
+        else if (nd->kind == CACAOSIM_NODE_FPCAM)
+        {
+            l0 = nd->fpcam.lambda_um;
+        }
+        nd->bw_frac        = (l0 > 0.05f && dl > 0.0f) ? (dl / l0) : 0.0f;
+        nd->pyrwfs.bw_frac = nd->bw_frac;
+        nd->shwfs.bw_frac  = nd->bw_frac;
+        nd->zwfs.bw_frac   = nd->bw_frac;
+        nd->fpcam.bw_frac  = nd->bw_frac;
+        return 0;
+    }
+    if (strcmp(k, "nlambda") == 0)
+    {
+        int32_t nl = atoi(v);
+        if (nd->kind == CACAOSIM_NODE_PYRWFS)
+        {
+            nd->pyrwfs.nlambda = nl;
+        }
+        else if (nd->kind == CACAOSIM_NODE_SHWFS)
+        {
+            nd->shwfs.nlambda = nl;
+        }
+        else if (nd->kind == CACAOSIM_NODE_ZWFS)
+        {
+            nd->zwfs.nlambda = nl;
+        }
+        else if (nd->kind == CACAOSIM_NODE_FPCAM)
+        {
+            nd->fpcam.nlambda = nl;
+        }
+        else
+        {
+            return -1;
+        }
         return 0;
     }
     if (strcmp(k, "qe") == 0)
@@ -1298,6 +1443,18 @@ static int apply_node_kv(cacaosim_node_cfg_t *nd, const char *k, const char *v)
         {
             nd->pyrwfs.mod_npts = atoi(v);
         }
+        else if (strcmp(k, "mod_mode") == 0 || strcmp(k, "mod_subframe_mode") == 0)
+        {
+            nd->pyrwfs.mod_subframe_mode = parse_pyrmod_mode(v);
+        }
+        else if (strcmp(k, "mod_rev") == 0)
+        {
+            nd->pyrwfs.mod_rev = atoi(v);
+        }
+        else if (strcmp(k, "mod_phase_deg") == 0)
+        {
+            nd->pyrwfs.mod_phase_deg = strtof(v, NULL);
+        }
         else if (strcmp(k, "pup_sep") == 0)
         {
             nd->pyrwfs.pup_sep = strtof(v, NULL);
@@ -1309,6 +1466,10 @@ static int apply_node_kv(cacaosim_node_cfg_t *nd, const char *k, const char *v)
         else if (strcmp(k, "fstop_frac") == 0)
         {
             nd->pyrwfs.fstop_frac = strtof(v, NULL);
+        }
+        else if (strcmp(k, "chrom_sep") == 0)
+        {
+            nd->pyrwfs.chrom_sep = strtof(v, NULL);
         }
         else
         {
@@ -1376,6 +1537,10 @@ static int apply_node_kv(cacaosim_node_cfg_t *nd, const char *k, const char *v)
         {
             nd->zwfs.dimple_amp = strtof(v, NULL);
         }
+        else if (strcmp(k, "achrom_dimple") == 0)
+        {
+            nd->zwfs.achrom_dimple = parse_bool(v);
+        }
         else
         {
             return -1;
@@ -1409,10 +1574,6 @@ static int apply_node_kv(cacaosim_node_cfg_t *nd, const char *k, const char *v)
         else if (strcmp(k, "lambda_um") == 0)
         {
             nd->fpcam.lambda_um = strtof(v, NULL);
-        }
-        else if (strcmp(k, "nlambda") == 0)
-        {
-            nd->fpcam.nlambda = atoi(v);
         }
         else if (strcmp(k, "pixscale_ld") == 0 || strcmp(k, "pixscale") == 0)
         {
@@ -1848,6 +2009,51 @@ static const char *dyn_mode_str(int32_t m)
 }
 
 /**
+ * pyrmod_mode_str() - Convert Pyramid WFS subframe modulation mode to canonical `.bench` string
+ * @m: `cacaosim_pyrmod_mode_t` value.
+ *
+ * Return: Static NUL-terminated mode name string.
+ */
+static const char *pyrmod_mode_str(int32_t m)
+{
+    switch (m)
+    {
+    case CACAOSIM_PYRMOD_FULL:
+        return "full";
+    case CACAOSIM_PYRMOD_INTERLEAVED:
+        return "interleaved";
+    case CACAOSIM_PYRMOD_SYNC_ARC:
+    default:
+        return "sync_arc";
+    }
+}
+
+/**
+ * cw_write_sensor_timing() - Emit non-default sensor clock skew, drift, and subframe stride keys
+ * @w:  Active formatting cursor (must not be NULL).
+ * @nd: Sensor node configuration to inspect (must not be NULL).
+ */
+static void cw_write_sensor_timing(cfg_writer_t *w, const cacaosim_node_cfg_t *nd)
+{
+    if (fabsf(nd->clock_offset_us) > 1e-5f)
+    {
+        cw_printf(w, "clock_offset_us = %.5g\n", nd->clock_offset_us);
+    }
+    if (fabsf(nd->clock_drift_ppm) > 1e-5f)
+    {
+        cw_printf(w, "clock_drift_ppm = %.5g\n", nd->clock_drift_ppm);
+    }
+    if (nd->sim_hz > 0.1f)
+    {
+        cw_printf(w, "sim_hz        = %.6g\n", nd->sim_hz);
+    }
+    else if (nd->subframe_stride > 0u)
+    {
+        cw_printf(w, "subframe_stride = %u\n", nd->subframe_stride);
+    }
+}
+
+/**
  * cw_write_reg() - Emit non-identity 2D pupil-registration keys (`shift_x/y`, `rot_deg`, `scale`)
  * @w:   Active formatting cursor (must not be NULL).
  * @reg: 2D affine pupil registration descriptor to inspect (must not be NULL).
@@ -1977,6 +2183,18 @@ int cacaosim_bench_format_str(
     cw_printf(&w, "star_teff  = %.5g\n", cfg->star_teff);
     cw_printf(&w, "tput_tel   = %.4g\n", cfg->tput_tel);
     cw_printf(&w, "master_hz  = %.6g\n", cfg->master_hz);
+    if (cfg->oversample > 1u)
+    {
+        cw_printf(&w, "oversample = %u\n", cfg->oversample);
+    }
+    if (cfg->atm_interp == 0)
+    {
+        cw_printf(&w, "atm_interp = 0\n");
+    }
+    if (cfg->telemetry_stride > 0u)
+    {
+        cw_printf(&w, "telemetry_stride = %u\n", cfg->telemetry_stride);
+    }
     cw_printf(&w, "in_wf      = \"%s\"\n", cfg->in_wf);
     if (cfg->in_amp[0] != '\0')
     {
@@ -2060,7 +2278,18 @@ int cacaosim_bench_format_str(
                 cw_printf(&w, "f0_hz         = %.5g\n", nd->dm.f0_hz);
                 cw_printf(&w, "zeta          = %.4g\n", nd->dm.zeta);
             }
-            cw_printf(&w, "delay_frames  = %.4g\n", nd->dm.delay_frames);
+            if (nd->dm.delay_sec > 0.0f)
+            {
+                cw_printf(&w, "delay_us      = %.5g\n", nd->dm.delay_sec * 1.0e6f);
+            }
+            else
+            {
+                cw_printf(&w, "delay_frames  = %.4g\n", nd->dm.delay_frames);
+            }
+            if (nd->dm.no_zoh_mean)
+            {
+                cw_printf(&w, "zoh_mean      = 0\n");
+            }
             cw_write_reg(&w, &nd->reg);
         }
         else if (nd->kind == CACAOSIM_NODE_SPLITTER)
@@ -2183,7 +2412,7 @@ int cacaosim_bench_format_str(
             {
                 cw_printf(&w, "bw_frac       = %.4g\n", nd->coro.bw_frac);
             }
-            if (nd->coro.nlambda > 1)
+            if (nd->coro.nlambda > 0)
             {
                 cw_printf(&w, "nlambda       = %d\n", nd->coro.nlambda);
             }
@@ -2276,6 +2505,19 @@ int cacaosim_bench_format_str(
             cw_printf(&w, "lambda_um     = %.4g\n", nd->pyrwfs.lambda_um);
             cw_printf(&w, "mod_rad       = %.4g\n", nd->pyrwfs.mod_rad_ld);
             cw_printf(&w, "mod_npts      = %d\n", nd->pyrwfs.mod_npts);
+            if (nd->pyrwfs.mod_subframe_mode != CACAOSIM_PYRMOD_SYNC_ARC)
+            {
+                cw_printf(&w, "mod_mode      = \"%s\"\n",
+                          pyrmod_mode_str(nd->pyrwfs.mod_subframe_mode));
+            }
+            if (nd->pyrwfs.mod_rev > 1)
+            {
+                cw_printf(&w, "mod_rev       = %d\n", nd->pyrwfs.mod_rev);
+            }
+            if (fabsf(nd->pyrwfs.mod_phase_deg) > 1e-5f)
+            {
+                cw_printf(&w, "mod_phase_deg = %.4g\n", nd->pyrwfs.mod_phase_deg);
+            }
             if (fabsf(nd->pyrwfs.pup_sep - 0.50f) > 1e-5f)
             {
                 cw_printf(&w, "pup_sep       = %.4g\n", nd->pyrwfs.pup_sep);
@@ -2288,7 +2530,15 @@ int cacaosim_bench_format_str(
             {
                 cw_printf(&w, "fstop_frac    = %.4g\n", nd->pyrwfs.fstop_frac);
             }
+            if (fabsf(nd->pyrwfs.chrom_sep) > 1e-5f)
+            {
+                cw_printf(&w, "chrom_sep     = %.4g\n", nd->pyrwfs.chrom_sep);
+            }
             cw_printf(&w, "bw_frac       = %.4g\n", nd->bw_frac);
+            if (nd->pyrwfs.nlambda > 0)
+            {
+                cw_printf(&w, "nlambda       = %d\n", nd->pyrwfs.nlambda);
+            }
             cw_printf(&w, "qe            = %.4g\n", nd->qe);
             cw_printf(&w, "use_beam_flux = %d\n", nd->use_beam_flux ? 1 : 0);
             if (nd->rate_hz > 0.0f)
@@ -2303,6 +2553,7 @@ int cacaosim_bench_format_str(
             {
                 cw_printf(&w, "tput          = %.4g\n", nd->tput);
             }
+            cw_write_sensor_timing(&w, nd);
             cw_write_det(&w, &nd->pyrwfs.det, nd->use_beam_flux);
             cw_write_reg(&w, &nd->reg);
         }
@@ -2323,6 +2574,10 @@ int cacaosim_bench_format_str(
             }
             cw_printf(&w, "lambda_um     = %.4g\n", nd->shwfs.lambda_um);
             cw_printf(&w, "bw_frac       = %.4g\n", nd->bw_frac);
+            if (nd->shwfs.nlambda > 0)
+            {
+                cw_printf(&w, "nlambda       = %d\n", nd->shwfs.nlambda);
+            }
             cw_printf(&w, "qe            = %.4g\n", nd->qe);
             cw_printf(&w, "use_beam_flux = %d\n", nd->use_beam_flux ? 1 : 0);
             if (nd->rate_hz > 0.0f)
@@ -2337,6 +2592,7 @@ int cacaosim_bench_format_str(
             {
                 cw_printf(&w, "tput          = %.4g\n", nd->tput);
             }
+            cw_write_sensor_timing(&w, nd);
             cw_write_det(&w, &nd->shwfs.det, nd->use_beam_flux);
             cw_write_reg(&w, &nd->reg);
         }
@@ -2364,7 +2620,15 @@ int cacaosim_bench_format_str(
             {
                 cw_printf(&w, "dimple_amp    = %.4g\n", nd->zwfs.dimple_amp);
             }
+            if (nd->zwfs.achrom_dimple != 0)
+            {
+                cw_printf(&w, "achrom_dimple = %d\n", nd->zwfs.achrom_dimple ? 1 : 0);
+            }
             cw_printf(&w, "bw_frac       = %.4g\n", nd->bw_frac);
+            if (nd->zwfs.nlambda > 0)
+            {
+                cw_printf(&w, "nlambda       = %d\n", nd->zwfs.nlambda);
+            }
             cw_printf(&w, "qe            = %.4g\n", nd->qe);
             cw_printf(&w, "use_beam_flux = %d\n", nd->use_beam_flux ? 1 : 0);
             if (nd->rate_hz > 0.0f)
@@ -2379,6 +2643,7 @@ int cacaosim_bench_format_str(
             {
                 cw_printf(&w, "tput          = %.4g\n", nd->tput);
             }
+            cw_write_sensor_timing(&w, nd);
             cw_write_det(&w, &nd->zwfs.det, nd->use_beam_flux);
             cw_write_reg(&w, &nd->reg);
         }
@@ -2403,7 +2668,7 @@ int cacaosim_bench_format_str(
                 cw_printf(&w, "pad_factor    = %u\n", nd->fpcam.pad_factor);
             }
             cw_printf(&w, "lambda_um     = %.4g\n", nd->fpcam.lambda_um);
-            if (nd->fpcam.nlambda > 1)
+            if (nd->fpcam.nlambda > 0)
             {
                 cw_printf(&w, "nlambda       = %d\n", nd->fpcam.nlambda);
             }
@@ -2423,6 +2688,7 @@ int cacaosim_bench_format_str(
             {
                 cw_printf(&w, "tput          = %.4g\n", nd->tput);
             }
+            cw_write_sensor_timing(&w, nd);
             cw_write_det(&w, &nd->fpcam.det, nd->use_beam_flux);
             cw_write_reg(&w, &nd->reg);
         }

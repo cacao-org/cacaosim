@@ -229,7 +229,7 @@ typedef struct
  * @fpm_refl_w:      Real FPM reflected amplitude weight `sqrt(1 - |T|^2)` `[eff_nlam * npix_mft]`.
  * @shift_1d_cplx:   Concatenated X and Y 1D half-bin pupil shift phasors `[2 * nfft * 2]`.
  * @fft_mask_cplx:   Pre-normalized (`1/nfft^2`) complex FFT focal mask `[eff_nlam * npix_fft * 2]`.
- * @fft_refl_w:      Pre-normalized (`1/nfft^2`) central-channel FPM reflection weight `[npix_fft]`.
+ * @fft_refl_w:      Pre-normalized (`1/nfft^2`) FPM reflection weight `[eff_nlam * npix_fft]`.
  * @cpu_epup_cplx:   Scratch complex entrance pupil field `[npix_wf * 2]`.
  * @cpu_ecore_cplx:  Scratch complex inverse-MFT pupil perturbation `[npix_wf * 2]`.
  * @cpu_tmp_cplx:    Scratch intermediate MFT matrix product `[max(nx_mft, ny_mft) * nwf * 2]`.
@@ -239,6 +239,8 @@ typedef struct
  * @cpu_fft_lo_buf:  In-place FFTW3f inverse complex buffer for `fpm_refl` LOWFS `[npix_fft * 2]`.
  * @cpu_poly_opd:    Scratch polychromatic OPD cube `[eff_nlam * npix_wf]` for single-beam collapse.
  * @cpu_poly_amp:    Scratch polychromatic Amp cube `[eff_nlam * npix_wf]` for single-beam collapse.
+ * @cpu_poly_lo_opd: Scratch polychromatic LOWFS OPD cube `[eff_nlam * npix_wf]` for 2D collapse.
+ * @cpu_poly_lo_amp: Scratch polychromatic LOWFS Amp cube `[eff_nlam * npix_wf]` for 2D collapse.
  * @fftw_fwd:        Opaque `fftwf_plan` for in-place 2D forward FFT on `cpu_fft_buf`.
  * @fftw_inv:        Opaque `fftwf_plan` for in-place 2D backward FFT on `cpu_fft_buf`.
  * @fftw_lo_inv:     Opaque `fftwf_plan` for in-place 2D backward FFT on `cpu_fft_lo_buf`.
@@ -284,7 +286,7 @@ typedef struct
     /* Full-plane FFT half-bin shift [nfft] & focal mask cube [eff_nlam * npix_fft] */
     float              *shift_1d_cplx;
     float              *fft_mask_cplx;
-    float              *fft_refl_w;     /**< Central-lam FFT FPM reflection weight [npix_fft] */
+    float              *fft_refl_w;     /**< Per-lam FFT FPM refl weight [eff_nlam * npix_fft] */
 
     /* CPU work buffers */
     float              *cpu_epup_cplx;
@@ -296,6 +298,8 @@ typedef struct
     float              *cpu_fft_lo_buf;
     float              *cpu_poly_opd;
     float              *cpu_poly_amp;
+    float              *cpu_poly_lo_opd;
+    float              *cpu_poly_lo_amp;
     void               *fftw_fwd;
     void               *fftw_inv;
     void               *fftw_lo_inv;

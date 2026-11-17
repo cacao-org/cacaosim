@@ -811,6 +811,239 @@ static void bench_dag_file(const char *rel_path, const char *label, int32_t back
 }
 
 /**
+ * @brief Benchmark per-base-WFS-frame latency of an INI bench across 1x/2x/4x oversampling.
+ *
+ * Role:
+ *   Parses `@ini_text` (or loads `@rel_path` when `@ini_text == NULL`), overrides `cfg.oversample`
+ *   and `cfg.backend`, and times `K = ctx.eff_oversample` consecutive `cacaosim_bench_step()`
+ *   sub-ticks per sample so reported latencies and kHz throughputs represent full base-AO WFS
+ *   frames on an apples-to-apples basis across `K = 1, 2, 4`.
+ *
+ * Rationale:
+ *   Directly quantifies the net wall-clock cost of `2..4x` temporal oversampling when combined
+ *   with `sync_arc` Pyramid modulation slicing, reverse DAG liveness pruning, `FPCAM` subframe
+ *   striding, and unchanged-DM OPD skip.
+ *
+ * @param[in] rel_path    Relative `.bench` path under `$CACAOSIM_SRC_DIR`, or `NULL`.
+ * @param[in] ini_text    Inline `.bench` INI string when `@rel_path == NULL`.
+ * @param[in] label       Row label (`<= 38` chars) printed in the benchmark summary table.
+ * @param[in] oversample  Master temporal oversampling factor (`1`, `2`, or `4`).
+ * @param[in] backend     Requested compute backend (`CACAOSIM_BACKEND_CPU` or `CUDA`).
+ * @param[in] nframes     Number of timed base WFS exposures to record after warm-up.
+ */
+static void bench_dag_oversample(const char *rel_path, const char *ini_text, const char *label,
+                                 uint32_t oversample, int32_t backend, int nframes)
+{
+    char                 err[256];
+    cacaosim_bench_cfg_t cfg;
+    if (rel_path != NULL)
+    {
+        const char *src_dir = getenv("CACAOSIM_SRC_DIR");
+        if (src_dir == NULL || src_dir[0] == '\0')
+        {
+            src_dir = ".";
+        }
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s", src_dir, rel_path);
+        if (cacaosim_bench_load_file(path, &cfg, err, sizeof(err)) != 0)
+        {
+            return;
+        }
+    }
+    else if (ini_text != NULL)
+    {
+        if (cacaosim_bench_parse_str(ini_text, &cfg, err, sizeof(err)) != 0)
+        {
+            return;
+        }
+    }
+    else
+    {
+        return;
+    }
+
+    cfg.oversample = oversample;
+    cfg.backend    = backend;
+
+    cacaosim_bench_ctx_t ctx;
+    if (cacaosim_bench_init(&ctx, &cfg, NULL, 0, err, sizeof(err)) != 0)
+    {
+        return;
+    }
+    if (backend == CACAOSIM_BACKEND_CUDA && !ctx.use_cuda)
+    {
+        cacaosim_bench_free(&ctx);
+        return;
+    }
+
+    float *wf   = (float *) cacaosim_aligned_calloc(ctx.npix_wf, sizeof(float));
+    float *d_wf = NULL;
+    cacaosim_make_ncpa(ctx.nwf, cfg.pup_diam, ctx.pup_ptr, 0.25f, 123ULL, wf);
+    if (ctx.use_cuda)
+    {
+        d_wf = cacaosim_cuda_alloc_f32(ctx.npix_wf);
+        cacaosim_cuda_h2d_f32(d_wf, wf, ctx.npix_wf, ctx.cuda_stream);
+        cacaosim_cuda_stream_sync(ctx.cuda_stream);
+    }
+
+    uint32_t K   = (ctx.eff_oversample >= 1u) ? ctx.eff_oversample : 1u;
+    double  *lat = (double *) calloc((size_t) nframes, sizeof(double));
+    for (int f = -20; f < nframes; f++)
+    {
+        uint64_t t0 = cacaosim_now_ns();
+        for (uint32_t s = 0; s < K; s++)
+        {
+            cacaosim_bench_step(&ctx, ctx.use_cuda ? NULL : wf, d_wf, 1.0f, NULL);
+        }
+        if (ctx.use_cuda)
+        {
+            cacaosim_cuda_stream_sync(ctx.cuda_stream);
+        }
+        if (f >= 0)
+        {
+            lat[f] = (double) (cacaosim_now_ns() - t0) * 1e-3;
+        }
+    }
+
+    print_stats(label, ctx.use_cuda ? "CUDA" : "CPU", lat, nframes);
+
+    cacaosim_cuda_free_f32(d_wf);
+    free(lat);
+    free(wf);
+    cacaosim_bench_free(&ctx);
+}
+
+/** Inline 256x256 2-stage AO3k (64^2, 1 kHz) + SCExAO (50^2, 2 kHz) + 6x broadband MFT FPcam. */
+static const char *const g_ao3k_scexao_bench_ini =
+    "[bench]\n"
+    "name = ao3k_scexao_256\n"
+    "nwf = 256\n"
+    "pup_diam = 0.9375\n"
+    "cobs = 0.30\n"
+    "nspider = 4\n"
+    "spider_w = 0.012\n"
+    "tel_diam_m = 8.2\n"
+    "star_mag = 6.0\n"
+    "master_hz = 2000.0\n"
+    "out_beam = b_pup\n"
+    "[fpcam.vis_raw]\n"
+    "in = b_pup\n"
+    "out_cam = psf_vis_raw\n"
+    "ncam = 256\n"
+    "prop_mode = mft\n"
+    "lambda_um = 0.75\n"
+    "bw_frac = 0.15\n"
+    "nlambda = 3\n"
+    "rate_hz = 100.0\n"
+    "out_dtype = float32\n"
+    "[fpcam.nir_raw]\n"
+    "in = b_pup\n"
+    "out_cam = psf_nir_raw\n"
+    "ncam = 256\n"
+    "prop_mode = mft\n"
+    "lambda_um = 1.65\n"
+    "bw_frac = 0.18\n"
+    "nlambda = 3\n"
+    "rate_hz = 100.0\n"
+    "out_dtype = float32\n"
+    "[dm.ao3k]\n"
+    "in = b_pup\n"
+    "out = b_post_stg1\n"
+    "in_cmd = dm01disp\n"
+    "nact_x = 64\n"
+    "nact_y = 64\n"
+    "dyn_mode = 1\n"
+    "tau_us = 200.0\n"
+    "delay_us = 1000.0\n"
+    "[fpcam.vis_stg1]\n"
+    "in = b_post_stg1\n"
+    "out_cam = psf_vis_stg1\n"
+    "ncam = 256\n"
+    "prop_mode = mft\n"
+    "lambda_um = 0.75\n"
+    "bw_frac = 0.15\n"
+    "nlambda = 3\n"
+    "rate_hz = 100.0\n"
+    "out_dtype = float32\n"
+    "[fpcam.nir_stg1]\n"
+    "in = b_post_stg1\n"
+    "out_cam = psf_nir_stg1\n"
+    "ncam = 256\n"
+    "prop_mode = mft\n"
+    "lambda_um = 1.65\n"
+    "bw_frac = 0.18\n"
+    "nlambda = 3\n"
+    "rate_hz = 100.0\n"
+    "out_dtype = float32\n"
+    "[splitter.dichroic_stg1]\n"
+    "in = b_post_stg1\n"
+    "out_refl = b_nir_wfs\n"
+    "out_trans = b_stg2_in\n"
+    "mode = dichroic_bp\n"
+    "lambda_cut = 1.22\n"
+    "band_width = 0.30\n"
+    "[pyrwfs.wfs_nir]\n"
+    "in = b_nir_wfs\n"
+    "out_cam = csim_wfs_nir\n"
+    "ncam = 160\n"
+    "lambda_um = 1.22\n"
+    "rate_hz = 1000.0\n"
+    "mod_rad = 3.0\n"
+    "mod_npts = 16\n"
+    "out_dtype = float32\n"
+    "[dm.scexao]\n"
+    "in = b_stg2_in\n"
+    "out = b_post_stg2\n"
+    "in_cmd = dm02disp\n"
+    "nact_x = 50\n"
+    "nact_y = 50\n"
+    "dyn_mode = 1\n"
+    "tau_us = 60.0\n"
+    "delay_us = 500.0\n"
+    "[splitter.dichroic_stg2]\n"
+    "in = b_post_stg2\n"
+    "out_refl = b_vis_arm\n"
+    "out_trans = b_nir_sci\n"
+    "mode = dichroic_lp\n"
+    "lambda_cut = 1.00\n"
+    "[splitter.vis_pickoff]\n"
+    "in = b_vis_arm\n"
+    "out_refl = b_vis_wfs\n"
+    "out_trans = b_vis_sci\n"
+    "mode = gray\n"
+    "r_gray = 0.90\n"
+    "t_gray = 0.10\n"
+    "[pyrwfs.wfs_vis]\n"
+    "in = b_vis_wfs\n"
+    "out_cam = csim_wfs_vis\n"
+    "ncam = 120\n"
+    "lambda_um = 0.75\n"
+    "rate_hz = 2000.0\n"
+    "mod_rad = 3.0\n"
+    "mod_npts = 16\n"
+    "out_dtype = float32\n"
+    "[fpcam.vis_final]\n"
+    "in = b_vis_sci\n"
+    "out_cam = psf_vis_final\n"
+    "ncam = 256\n"
+    "prop_mode = mft\n"
+    "lambda_um = 0.75\n"
+    "bw_frac = 0.15\n"
+    "nlambda = 3\n"
+    "rate_hz = 100.0\n"
+    "out_dtype = float32\n"
+    "[fpcam.nir_final]\n"
+    "in = b_nir_sci\n"
+    "out_cam = psf_nir_final\n"
+    "ncam = 256\n"
+    "prop_mode = mft\n"
+    "lambda_um = 1.65\n"
+    "bw_frac = 0.18\n"
+    "nlambda = 3\n"
+    "rate_hz = 100.0\n"
+    "out_dtype = float32\n";
+
+/**
  * @brief Entry point running all unit and full-DAG latency/throughput benchmarks.
  *
  * Role:
@@ -882,6 +1115,27 @@ int main(void)
                    CACAOSIM_BACKEND_CPU, 120);
     bench_dag_file("examples/exao_coro_lowfs.bench", "ExAO DAG (TTM+DM+SH+Coro+ZWFS+FP)",
                    CACAOSIM_BACKEND_CUDA, 400);
+
+    /* 7. Multi-rate temporal oversampling (1x vs 2x vs 4x per base WFS exposure) */
+    printf("----------------------------------------------------------------------------------\n");
+    bench_dag_oversample("examples/two_stage_ao.bench", NULL, "2-Stage 128^2 (1x / base WFS frame)",
+                         1u, CACAOSIM_BACKEND_CPU, 90);
+    bench_dag_oversample("examples/two_stage_ao.bench", NULL, "2-Stage 128^2 (2x oversample / WFS)",
+                         2u, CACAOSIM_BACKEND_CPU, 90);
+    bench_dag_oversample("examples/two_stage_ao.bench", NULL, "2-Stage 128^2 (4x oversample / WFS)",
+                         4u, CACAOSIM_BACKEND_CPU, 90);
+    bench_dag_oversample("examples/two_stage_ao.bench", NULL, "2-Stage 128^2 (1x / base WFS frame)",
+                         1u, CACAOSIM_BACKEND_CUDA, 300);
+    bench_dag_oversample("examples/two_stage_ao.bench", NULL, "2-Stage 128^2 (2x oversample / WFS)",
+                         2u, CACAOSIM_BACKEND_CUDA, 300);
+    bench_dag_oversample("examples/two_stage_ao.bench", NULL, "2-Stage 128^2 (4x oversample / WFS)",
+                         4u, CACAOSIM_BACKEND_CUDA, 300);
+    bench_dag_oversample(NULL, g_ao3k_scexao_bench_ini, "AO3k+SCExAO 256^2 (1x / 2kHz frame)", 1u,
+                         CACAOSIM_BACKEND_CUDA, 200);
+    bench_dag_oversample(NULL, g_ao3k_scexao_bench_ini, "AO3k+SCExAO 256^2 (2x / 2kHz frame)", 2u,
+                         CACAOSIM_BACKEND_CUDA, 200);
+    bench_dag_oversample(NULL, g_ao3k_scexao_bench_ini, "AO3k+SCExAO 256^2 (4x / 2kHz frame)", 4u,
+                         CACAOSIM_BACKEND_CUDA, 200);
 
     printf("==================================================================================\n");
     return 0;

@@ -36,65 +36,71 @@
 #include <math.h>
 #include <stdlib.h>
 
+#include "common/cacaosim_beam.h"
 #include "common/cacaosim_cuda.h"
 #include "shwfs/cacaosim_shwfs.h"
+
+typedef struct
+{
+    uint32_t m0[CACAOSIM_MAX_LAMBDA];
+    uint32_t m1[CACAOSIM_MAX_LAMBDA];
+    float    alpha[CACAOSIM_MAX_LAMBDA];
+} shwfs_poly_map_t;
 
 /**
  * @brief Private GPU execution state (`ctx->cuda_priv`) for the Diffractive Shack-Hartmann WFS.
  *
  * Holds the CUDA execution stream, batched 2D `cufftHandle`, uploaded lenslet pupil partitions and
- * 1D half-bin centering phasor, contiguous subaperture complex batch buffer, camera accumulators,
- * and typed ADU readout buffers.
+ * 1D half-bin centering phasor, per-channel wavenumbers/focal-scales/weights, contiguous
+ * subaperture complex batch buffer (`eff_nlam * nbatch * npix_sub_fft`), camera accumulators, and
+ * typed ADU readout buffers.
  */
 typedef struct
 {
-    cudaStream_t    stream;      /**< Execution CUDA stream (private or shared `htsim` stream) */
-    int             owns_stream; /**< 1 if `stream` was created here and must be destroyed */
-    cufftHandle     plan_batch;  /**< Batched 2D C2C forward cuFFT plan (`nbatch` x `nfft_sub^2`) */
-    int             has_plan;    /**< Non-zero once `plan_batch` has been created */
+    cudaStream_t    stream;       /**< Execution CUDA stream (private or shared `htsim` stream) */
+    int             owns_stream;  /**< 1 if `stream` was created here and must be destroyed */
+    cufftHandle     plan_batch;   /**< Batched 2D C2C forward cuFFT plan (`nlam*nbatch*nfft^2`) */
+    int             has_plan;     /**< Non-zero once `plan_batch` has been created */
 
-    float          *d_pup_amp;   /**< Static uploaded 2D pupil amplitude `[npix_wf]` */
-    float          *d_dyn_pup;   /**< Staging buffer for dynamic host beam amplitude `[npix_wf]` */
-    float          *d_ncpa_opd;  /**< Optional static WFS-arm NCPA OPD `[npix_wf]` [um] */
-    float          *d_atm_amp;   /**< Staging buffer for host atmospheric amplitude `[npix_wf]` */
-    float          *d_wf_in;     /**< Staging buffer for host wavefront/beam OPD `[npix_wf]` */
-    float          *d_dm_opd;    /**< Staging buffer for host DM OPD `[npix_wf]` [um] */
-    uint32_t       *d_sub_off;   /**< Uploaded subaperture start indices `[n_sub]` */
-    uint32_t       *d_sub_len;   /**< Uploaded subaperture widths `[n_sub]` */
-    cuFloatComplex *d_shift_1d;  /**< Uploaded 1D half-bin centering phasor `[nfft_sub]` */
-    cuFloatComplex *d_patches;   /**< Batched lenslet complex planes `[nbatch * npix_sub_fft]` */
-    float          *d_cam_int;   /**< Single-subframe stitched camera intensity `[npix_cam]` */
-    float          *d_accum_int; /**< Multi-subframe (`navg > 1`) intensity accumulator */
-    uint16_t       *d_out_u16;   /**< Device uint16 ADU readout buffer `[npix_cam]` */
-    float          *d_out_f32;   /**< Device float32 readout buffer `[npix_cam]` */
+    float          *d_pup_amp;    /**< Static uploaded 2D pupil amplitude `[npix_wf]` */
+    float          *d_dyn_pup;    /**< Staging buffer for dynamic host beam amplitude `[npix_wf]` */
+    float          *d_ncpa_opd;   /**< Optional static WFS-arm NCPA OPD `[npix_wf]` [um] */
+    float          *d_atm_amp;    /**< Staging buffer for host atmospheric amplitude `[npix_wf]` */
+    float          *d_wf_in;      /**< Staging buffer for host wavefront/beam OPD `[npix_wf]` */
+    float          *d_dm_opd;     /**< Staging buffer for host DM OPD `[npix_wf]` [um] */
+    float          *d_k_rad;      /**< Per-channel optical wavenumbers `2*pi/lam_c` `[eff_nlam]` */
+    float          *d_scale_c;    /**< Per-channel focal scales `lam0/lam_c` `[eff_nlam]` */
+    float          *d_chan_w_jac; /**< Per-channel `chan_w * scale_c^2` weights `[eff_nlam]` */
+    float          *d_poly_opd;   /**< Host-cube staging OPD `[2 * eff_nlam * npix_wf]` */
+    float          *d_poly_amp;   /**< Host-cube staging Amp `[2 * eff_nlam * npix_wf]` */
+    uint32_t       *d_sub_off;    /**< Uploaded subaperture start indices `[n_sub]` */
+    uint32_t       *d_sub_len;    /**< Uploaded subaperture widths `[n_sub]` */
+    cuFloatComplex *d_shift_1d;   /**< Uploaded 1D half-bin centering phasor `[nfft_sub]` */
+    cuFloatComplex *d_patches;    /**< Batched lenslet planes `[eff_nlam*nbatch*npix_sub_fft]` */
+    float          *d_cam_int;    /**< Single-subframe stitched camera intensity `[npix_cam]` */
+    float          *d_accum_int;  /**< Multi-subframe (`navg > 1`) intensity accumulator */
+    uint16_t       *d_out_u16;    /**< Device uint16 ADU readout buffer `[npix_cam]` */
+    float          *d_out_f32;    /**< Device float32 readout buffer `[npix_cam]` */
 } shwfs_cuda_state_t;
 
 /**
- * k_shwfs_build_patches() - Assemble zero-padded, half-bin centered complex lenslet patches on GPU
- * @pup_amp:    Device 2D pupil/beam amplitude `[nwf * nwf]` (NULL -> 1.0)
- * @atm_amp:    Optional device 2D atmospheric amplitude `[nwf * nwf]` (NULL -> 1.0)
- * @wf_in:      Optional device 2D wavefront/beam OPD `[nwf * nwf]` (NULL -> 0.0)
- * @dm_opd:     Optional device 2D DM OPD `[nwf * nwf]` in microns, subtracted (NULL -> 0.0)
- * @ncpa_opd:   Optional device 2D static NCPA OPD `[nwf * nwf]` in microns, added (NULL -> 0.0)
- * @sub_off:    Device subaperture start offsets `[n_sub]`
- * @sub_len:    Device subaperture pixel lengths `[n_sub]`
- * @shift_1d:   Device 1D half-bin centering phasor `[nfft]`
- * @wf_to_opd:  Scale converting `@wf_in` to microns OPD
- * @opd_to_rad: Optical wavenumber `2 * pi / lambda_um` [rad / um]
- * @nwf:        Input pupil grid dimension [pixels]
- * @n_sub:      Number of lenslets per pupil side
- * @nfft:       Padded subaperture 2D FFT dimension (`nfft_sub`)
- * @nbatch:     Total number of lenslets (`n_sub * n_sub`)
- * @patches:    Output contiguous complex batch `[nbatch * nfft * nfft]`
- *
- * Role:
- *   First hot-loop GPU stage slicing the 2D pupil complex field into `nbatch` independent
- *   zero-padded subaperture FFT tiles in a single kernel launch.
- *
- * Rationale:
- *   Threads outside `[0..nx) x [0..ny)` or on dark pupil pixels write `(0, 0)` directly without
- *   needing a separate `cudaMemsetAsync` pass, while illuminated threads fuse `__sincosf` phasor
- *   synthesis with separable `shift_1d[lx] * shift_1d[ly]` spot centering in registers.
+ * k_shwfs_build_patches() - Assemble polychromatic zero-padded complex lenslet patches on GPU
+ * @pup_amp:   Device 2D pupil/beam amplitude `[nwf * nwf]` (NULL -> 1.0)
+ * @atm_amp:   Optional device 2D atmospheric amplitude `[nwf * nwf]` (NULL -> 1.0)
+ * @wf_in:     Optional device 2D wavefront/beam OPD `[nwf * nwf]` (NULL -> 0.0)
+ * @dm_opd:    Optional device 2D DM OPD `[nwf * nwf]` in microns, subtracted (NULL -> 0.0)
+ * @ncpa_opd:  Optional device 2D static NCPA OPD `[nwf * nwf]` in microns, added (NULL -> 0.0)
+ * @sub_off:   Device subaperture start offsets `[n_sub]`
+ * @sub_len:   Device subaperture pixel lengths `[n_sub]`
+ * @shift_1d:  Device 1D half-bin centering phasor `[nfft]`
+ * @k_rad:     Device per-channel optical wavenumbers `2*pi/lam_c` `[nlam]`
+ * @wf_to_opd: Scale converting `@wf_in` to microns OPD
+ * @nwf:       Input pupil grid dimension [pixels]
+ * @n_sub:     Number of lenslets per pupil side
+ * @nfft:      Padded subaperture 2D FFT dimension (`nfft_sub`)
+ * @nbatch:    Total number of lenslets (`n_sub * n_sub`)
+ * @nlam:      Active spectral slices (`eff_nlam`)
+ * @patches:   Output contiguous complex batch `[nlam * nbatch * nfft * nfft]`
  */
 __global__ static void k_shwfs_build_patches(
     const float *__restrict__          pup_amp,
@@ -105,12 +111,13 @@ __global__ static void k_shwfs_build_patches(
     const uint32_t *__restrict__       sub_off,
     const uint32_t *__restrict__       sub_len,
     const cuFloatComplex *__restrict__ shift_1d,
+    const float *__restrict__          k_rad,
     float                              wf_to_opd,
-    float                              opd_to_rad,
     uint32_t                           nwf,
     uint32_t                           n_sub,
     uint32_t                           nfft,
     uint32_t                           nbatch,
+    int32_t                            nlam,
     cuFloatComplex *__restrict__       patches)
 {
     uint64_t idx   = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -121,7 +128,6 @@ __global__ static void k_shwfs_build_patches(
         return;
     }
 
-    /* Decode flat batch index into lenslet (sx, sy) and local subaperture coordinate (lx, ly) */
     uint32_t b   = (uint32_t) (idx / sfft2);
     uint32_t rem = (uint32_t) (idx % sfft2);
     uint32_t lx  = rem % nfft;
@@ -129,12 +135,14 @@ __global__ static void k_shwfs_build_patches(
     uint32_t sx  = b % n_sub;
     uint32_t sy  = b / n_sub;
 
-    /* Zero-pad samples outside the subaperture's [nx x ny] pupil footprint */
     uint32_t nx = sub_len[sx];
     uint32_t ny = sub_len[sy];
     if (lx >= nx || ly >= ny)
     {
-        patches[idx] = make_cuFloatComplex(0.0f, 0.0f);
+        for (int32_t c = 0; c < nlam; c++)
+        {
+            patches[((uint64_t) c * nbatch + b) * sfft2 + rem] = make_cuFloatComplex(0.0f, 0.0f);
+        }
         return;
     }
 
@@ -148,7 +156,10 @@ __global__ static void k_shwfs_build_patches(
     }
     if (amp <= 0.0f)
     {
-        patches[idx] = make_cuFloatComplex(0.0f, 0.0f);
+        for (int32_t c = 0; c < nlam; c++)
+        {
+            patches[((uint64_t) c * nbatch + b) * sfft2 + rem] = make_cuFloatComplex(0.0f, 0.0f);
+        }
         return;
     }
 
@@ -166,47 +177,143 @@ __global__ static void k_shwfs_build_patches(
         opd += ncpa_opd[p];
     }
 
-    float phi = opd * opd_to_rad;
-    float si  = 0.0f;
-    float co  = 1.0f;
-    __sincosf(phi, &si, &co);
-    float pr = amp * co;
-    float pi = amp * si;
-
-    /* Apply separable 2D half-bin Fourier shift ramp to center flat-WF spots on quad-cells */
     cuFloatComplex sx_c = shift_1d[lx];
     cuFloatComplex sy_c = shift_1d[ly];
     float          sr   = sx_c.x * sy_c.x - sx_c.y * sy_c.y;
     float          sm   = sx_c.x * sy_c.y + sx_c.y * sy_c.x;
 
-    patches[idx] = make_cuFloatComplex(pr * sr - pi * sm, pr * sm + pi * sr);
+    for (int32_t c = 0; c < nlam; c++)
+    {
+        float phi = opd * k_rad[c];
+        float si  = 0.0f;
+        float co  = 1.0f;
+        __sincosf(phi, &si, &co);
+        float pr = amp * co;
+        float pi = amp * si;
+        patches[((uint64_t) c * nbatch + b) * sfft2 + rem] =
+            make_cuFloatComplex(pr * sr - pi * sm, pr * sm + pi * sr);
+    }
 }
 
 /**
- * k_shwfs_extract_spots() - FFT-shift, crop, and tile subaperture focal spots into camera mosaic
- * @patches:   Post-cuFFT complex focal subaperture batch `[nbatch * nfft * nfft]`
- * @n_sub:     Number of lenslets per side
- * @psub:      Extracted detector pixels per lenslet side (`pix_per_sub`)
- * @ncam:      Output square camera dimension (`n_sub * psub`)
- * @nfft:      Subaperture FFT grid dimension (`nfft_sub`)
- * @inv_nfft2: Parseval normalization factor `1.0f / (nfft * nfft)`
- * @cam_int:   Output stitched 2D camera optical intensity `[ncam * ncam]`
- *
- * Role:
- *   Final optical GPU stage converting unshifted complex subaperture DFTs into centered `psub x
- *   psub` intensity sub-windows tiled across `cam_int`.
- *
- * Rationale:
- *   Indexing threads by output camera pixel `cid` maps consecutive threads in a warp to adjacent
- *   columns `cx` of `cam_int` for coalesced float32 writes while wrapping signed focal offsets
- *   `(dx, dy) in [-psub/2, +psub/2)` modulo `nfft` in registers.
+ * k_shwfs_build_patches_poly() - Linearly interpolate upstream polychromatic beam into patches
+ */
+__global__ static void k_shwfs_build_patches_poly(
+    const float *__restrict__          beam_opd,
+    const float *__restrict__          beam_amp,
+    const float *__restrict__          ncpa_opd,
+    const uint32_t *__restrict__       sub_off,
+    const uint32_t *__restrict__       sub_len,
+    const cuFloatComplex *__restrict__ shift_1d,
+    const float *__restrict__          k_rad,
+    shwfs_poly_map_t                   map,
+    uint64_t                           chan_stride,
+    uint32_t                           nwf,
+    uint32_t                           n_sub,
+    uint32_t                           nfft,
+    uint32_t                           nbatch,
+    int32_t                            nlam,
+    cuFloatComplex *__restrict__       patches)
+{
+    uint64_t idx   = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t sfft2 = (uint64_t) nfft * nfft;
+    uint64_t total = (uint64_t) nbatch * sfft2;
+    if (idx >= total)
+    {
+        return;
+    }
+
+    uint32_t b   = (uint32_t) (idx / sfft2);
+    uint32_t rem = (uint32_t) (idx % sfft2);
+    uint32_t lx  = rem % nfft;
+    uint32_t ly  = rem / nfft;
+    uint32_t sx  = b % n_sub;
+    uint32_t sy  = b / n_sub;
+
+    uint32_t nx = sub_len[sx];
+    uint32_t ny = sub_len[sy];
+    if (lx >= nx || ly >= ny)
+    {
+        for (int32_t c = 0; c < nlam; c++)
+        {
+            patches[((uint64_t) c * nbatch + b) * sfft2 + rem] = make_cuFloatComplex(0.0f, 0.0f);
+        }
+        return;
+    }
+
+    uint32_t       px   = sub_off[sx] + lx;
+    uint32_t       py   = sub_off[sy] + ly;
+    uint64_t       p    = (uint64_t) py * nwf + px;
+    float          nc   = (ncpa_opd != NULL) ? ncpa_opd[p] : 0.0f;
+    cuFloatComplex sx_c = shift_1d[lx];
+    cuFloatComplex sy_c = shift_1d[ly];
+    float          sr   = sx_c.x * sy_c.x - sx_c.y * sy_c.y;
+    float          sm   = sx_c.x * sy_c.y + sx_c.y * sy_c.x;
+
+    for (int32_t c = 0; c < nlam; c++)
+    {
+        uint32_t m0 = map.m0[c];
+        uint32_t m1 = map.m1[c];
+        float    w1 = map.alpha[c];
+        float    w0 = 1.0f - w1;
+        float    kc = k_rad[c];
+
+        uint64_t off0 = (uint64_t) m0 * chan_stride + p;
+        uint64_t off1 = (uint64_t) m1 * chan_stride + p;
+        float    amp0 = (beam_amp != NULL) ? beam_amp[off0] : 1.0f;
+        float    amp1 = (beam_amp != NULL) ? beam_amp[off1] : 1.0f;
+        if (amp0 <= 0.0f && amp1 <= 0.0f)
+        {
+            patches[((uint64_t) c * nbatch + b) * sfft2 + rem] = make_cuFloatComplex(0.0f, 0.0f);
+            continue;
+        }
+
+        float p0  = (((beam_opd != NULL) ? beam_opd[off0] : 0.0f) + nc) * kc;
+        float si0 = 0.0f;
+        float co0 = 1.0f;
+        __sincosf(p0, &si0, &co0);
+        float pr = w0 * amp0 * co0;
+        float pi = w0 * amp0 * si0;
+
+        if (m1 != m0 && w1 > 0.0f)
+        {
+            float p1  = (((beam_opd != NULL) ? beam_opd[off1] : 0.0f) + nc) * kc;
+            float si1 = 0.0f;
+            float co1 = 1.0f;
+            __sincosf(p1, &si1, &co1);
+            pr += w1 * amp1 * co1;
+            pi += w1 * amp1 * si1;
+        }
+
+        patches[((uint64_t) c * nbatch + b) * sfft2 + rem] =
+            make_cuFloatComplex(pr * sr - pi * sm, pr * sm + pi * sr);
+    }
+}
+
+/**
+ * k_shwfs_extract_spots() - 2D bilinear lambda/D-rescaled focal spot extraction and channel sum
+ * @patches:    Post-cuFFT complex focal subaperture batch `[nlam * nbatch * nfft * nfft]`
+ * @scale_c:    Device per-channel focal magnification `lam0 / lam_c` `[nlam]`
+ * @chan_w_jac: Device per-channel `chan_w * scale_c^2` Jacobian-weighted factors `[nlam]`
+ * @n_sub:      Number of lenslets per side
+ * @psub:       Extracted detector pixels per lenslet side (`pix_per_sub`)
+ * @ncam:       Output square camera dimension (`n_sub * psub`)
+ * @nfft:       Subaperture FFT grid dimension (`nfft_sub`)
+ * @nbatch:     Total lenslet count (`n_sub * n_sub`)
+ * @nlam:       Active spectral slices (`eff_nlam`)
+ * @inv_nfft2:  Parseval normalization factor `1.0f / (nfft * nfft)`
+ * @cam_int:    Output stitched 2D camera optical intensity `[ncam * ncam]`
  */
 __global__ static void k_shwfs_extract_spots(
     const cuFloatComplex *__restrict__ patches,
+    const float *__restrict__          scale_c,
+    const float *__restrict__          chan_w_jac,
     uint32_t                           n_sub,
     uint32_t                           psub,
     uint32_t                           ncam,
     uint32_t                           nfft,
+    uint32_t                           nbatch,
+    int32_t                            nlam,
     float                              inv_nfft2,
     float *__restrict__                cam_int)
 {
@@ -217,21 +324,49 @@ __global__ static void k_shwfs_extract_spots(
         return;
     }
 
-    uint32_t cx     = cid % ncam;
-    uint32_t cy     = cid / ncam;
-    uint32_t sx     = cx / psub;
-    uint32_t sy     = cy / psub;
-    uint32_t lx     = cx % psub;
-    uint32_t ly     = cy % psub;
-    int32_t  half_p = (int32_t) (psub / 2u);
-    int32_t  dx     = (int32_t) lx - half_p;
-    int32_t  dy     = (int32_t) ly - half_p;
-    uint32_t kx     = (uint32_t) ((dx % (int32_t) nfft + (int32_t) nfft) % (int32_t) nfft);
-    uint32_t ky     = (uint32_t) ((dy % (int32_t) nfft + (int32_t) nfft) % (int32_t) nfft);
-    uint32_t b      = sy * n_sub + sx;
+    uint32_t      cx       = cid % ncam;
+    uint32_t      cy       = cid / ncam;
+    uint32_t      sx       = cx / psub;
+    uint32_t      sy       = cy / psub;
+    uint32_t      lx       = cx % psub;
+    uint32_t      ly       = cy % psub;
+    uint32_t      b        = sy * n_sub + sx;
+    const float   c0       = 0.5f * (float) (psub - 1u);
+    const float   half_bin = ((psub & 1u) == 0u) ? 0.5f : 0.0f;
+    const int32_t nf       = (int32_t) nfft;
+    const uint64_t sfft2   = (uint64_t) nfft * nfft;
 
-    cuFloatComplex z = patches[((uint64_t) b * nfft + ky) * nfft + kx];
-    cam_int[cid]     = inv_nfft2 * (z.x * z.x + z.y * z.y);
+    float acc = 0.0f;
+    for (int32_t c = 0; c < nlam; c++)
+    {
+        float    sc   = scale_c[c];
+        float    sx_f = ((float) lx - c0) * sc - half_bin;
+        float    sy_f = ((float) ly - c0) * sc - half_bin;
+        int32_t  ix0  = (int32_t) floorf(sx_f);
+        int32_t  iy0  = (int32_t) floorf(sy_f);
+        float    fx   = sx_f - (float) ix0;
+        float    fy   = sy_f - (float) iy0;
+        uint32_t kx0  = (uint32_t) ((ix0 % nf + nf) % nf);
+        uint32_t kx1  = (uint32_t) (((ix0 + 1) % nf + nf) % nf);
+        uint32_t ky0  = (uint32_t) ((iy0 % nf + nf) % nf);
+        uint32_t ky1  = (uint32_t) (((iy0 + 1) % nf + nf) % nf);
+
+        const cuFloatComplex *tile = &patches[((uint64_t) c * nbatch + b) * sfft2];
+        cuFloatComplex        z00  = tile[(uint64_t) ky0 * nfft + kx0];
+        cuFloatComplex        z10  = tile[(uint64_t) ky0 * nfft + kx1];
+        cuFloatComplex        z01  = tile[(uint64_t) ky1 * nfft + kx0];
+        cuFloatComplex        z11  = tile[(uint64_t) ky1 * nfft + kx1];
+
+        float i00 = inv_nfft2 * (z00.x * z00.x + z00.y * z00.y);
+        float i10 = inv_nfft2 * (z10.x * z10.x + z10.y * z10.y);
+        float i01 = inv_nfft2 * (z01.x * z01.x + z01.y * z01.y);
+        float i11 = inv_nfft2 * (z11.x * z11.x + z11.y * z11.y);
+
+        float v0 = (1.0f - fx) * i00 + fx * i10;
+        float v1 = (1.0f - fx) * i01 + fx * i11;
+        acc += chan_w_jac[c] * ((1.0f - fy) * v0 + fy * v1);
+    }
+    cam_int[cid] = acc;
 }
 
 /**
@@ -331,18 +466,26 @@ extern "C" int cacaosim_shwfs_cuda_init(
         cs->owns_stream = 1;
     }
 
-    size_t wf_bytes  = (size_t) ctx->npix_wf * sizeof(float);
-    size_t sub_bytes = (size_t) ctx->cfg.n_sub * sizeof(uint32_t);
-    size_t sh_bytes  = (size_t) ctx->nfft_sub * sizeof(cuFloatComplex);
-    size_t bat_bytes = (size_t) ctx->nbatch * ctx->npix_sub_fft * sizeof(cuFloatComplex);
-    size_t cam_f     = (size_t) ctx->npix_cam * sizeof(float);
-    size_t cam_u     = (size_t) ctx->npix_cam * sizeof(uint16_t);
+    int32_t nlam       = (ctx->eff_nlam >= 1) ? ctx->eff_nlam : 1;
+    size_t  wf_bytes   = (size_t) ctx->npix_wf * sizeof(float);
+    size_t  lam_bytes  = (size_t) nlam * sizeof(float);
+    size_t  poly_bytes = (size_t) (2 * nlam) * wf_bytes;
+    size_t  sub_bytes  = (size_t) ctx->cfg.n_sub * sizeof(uint32_t);
+    size_t  sh_bytes   = (size_t) ctx->nfft_sub * sizeof(cuFloatComplex);
+    size_t  bat_bytes  = (size_t) nlam * ctx->nbatch * ctx->npix_sub_fft * sizeof(cuFloatComplex);
+    size_t  cam_f      = (size_t) ctx->npix_cam * sizeof(float);
+    size_t  cam_u      = (size_t) ctx->npix_cam * sizeof(uint16_t);
 
     if (cudaMalloc((void **) &cs->d_pup_amp, wf_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_dyn_pup, wf_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_atm_amp, wf_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_wf_in, wf_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_dm_opd, wf_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_k_rad, lam_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_scale_c, lam_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_chan_w_jac, lam_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_poly_opd, poly_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_poly_amp, poly_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_sub_off, sub_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_sub_len, sub_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_shift_1d, sh_bytes) != cudaSuccess ||
@@ -367,6 +510,10 @@ extern "C" int cacaosim_shwfs_cuda_init(
     }
 
     cudaMemcpyAsync(cs->d_pup_amp, pup_amp, wf_bytes, cudaMemcpyHostToDevice, cs->stream);
+    cudaMemcpyAsync(cs->d_k_rad, ctx->k_rad, lam_bytes, cudaMemcpyHostToDevice, cs->stream);
+    cudaMemcpyAsync(cs->d_scale_c, ctx->scale_c, lam_bytes, cudaMemcpyHostToDevice, cs->stream);
+    cudaMemcpyAsync(cs->d_chan_w_jac, ctx->chan_w_jac, lam_bytes, cudaMemcpyHostToDevice,
+                    cs->stream);
     cudaMemcpyAsync(cs->d_sub_off, ctx->sub_off, sub_bytes, cudaMemcpyHostToDevice, cs->stream);
     cudaMemcpyAsync(cs->d_sub_len, ctx->sub_len, sub_bytes, cudaMemcpyHostToDevice, cs->stream);
     cudaMemcpyAsync(cs->d_shift_1d, ctx->shift_1d_cplx, sh_bytes, cudaMemcpyHostToDevice,
@@ -376,7 +523,7 @@ extern "C" int cacaosim_shwfs_cuda_init(
     int inembed[2] = { n[0], n[1] };
     int idist      = (int) ctx->npix_sub_fft;
     if (cufftPlanMany(&cs->plan_batch, 2, n, inembed, 1, idist, inembed, 1, idist, CUFFT_C2C,
-                      (int) ctx->nbatch) != CUFFT_SUCCESS ||
+                      nlam * (int) ctx->nbatch) != CUFFT_SUCCESS ||
         cufftSetStream(cs->plan_batch, cs->stream) != CUFFT_SUCCESS)
     {
         cacaosim_shwfs_cuda_free(ctx);
@@ -388,16 +535,6 @@ extern "C" int cacaosim_shwfs_cuda_init(
     return 0;
 }
 
-/**
- * cacaosim_shwfs_cuda_free() - Release batched cuFFT plan, device buffers, and owned CUDA stream
- * @ctx: Shack-Hartmann WFS context whose `cuda_priv` state will be destroyed
- *
- * Role:
- *   Cold-path GPU teardown routine releasing all device memory and cuFFT state owned by `@ctx`.
- *
- * Rationale:
- *   Leaves borrowed `ext_stream` handles intact while destroying privately created streams.
- */
 extern "C" void cacaosim_shwfs_cuda_free(cacaosim_shwfs_ctx_t *ctx)
 {
     shwfs_cuda_state_t *cs = (shwfs_cuda_state_t *) ctx->cuda_priv;
@@ -415,6 +552,11 @@ extern "C" void cacaosim_shwfs_cuda_free(cacaosim_shwfs_ctx_t *ctx)
     cudaFree(cs->d_atm_amp);
     cudaFree(cs->d_wf_in);
     cudaFree(cs->d_dm_opd);
+    cudaFree(cs->d_k_rad);
+    cudaFree(cs->d_scale_c);
+    cudaFree(cs->d_chan_w_jac);
+    cudaFree(cs->d_poly_opd);
+    cudaFree(cs->d_poly_amp);
     cudaFree(cs->d_sub_off);
     cudaFree(cs->d_sub_len);
     cudaFree(cs->d_shift_1d);
@@ -431,27 +573,17 @@ extern "C" void cacaosim_shwfs_cuda_free(cacaosim_shwfs_ctx_t *ctx)
     ctx->cuda_priv = NULL;
 }
 
-/**
- * cacaosim_shwfs_cuda_accum() - Run batched GPU lenslet patch synthesis, cuFFT, and spot tiling
- * @ctx:           Active SHWFS context (`use_cuda == 1`)
- * @dyn_pup_amp:   Optional dynamic host pupil/beam amplitude `[npix_wf]`
- * @atm_amp:       Optional host atmospheric amplitude `[npix_wf]`
- * @wf_in:         Optional host wavefront or beam OPD `[npix_wf]`
- * @dm_opd:        Optional host DM OPD `[npix_wf]` in microns
- * @d_pup_amp_ext: Optional resident device pupil/beam amplitude pointer `[npix_wf]`
- * @d_wf_opd_ext:  Optional resident device wavefront/beam OPD pointer `[npix_wf]`
- * @d_dm_opd_ext:  Optional resident device DM OPD pointer `[npix_wf]`
- * @wf_to_opd:     Scale converting `@wf_in` / `@d_wf_opd_ext` to microns OPD
- *
- * Role:
- *   Hot-loop GPU subframe propagator queuing optional H2D staging, `k_shwfs_build_patches`,
- *   in-place batched `cufftExecC2C`, `k_shwfs_extract_spots`, and lazy `navg > 1` accumulation
- *   asynchronously on `cs->stream`.
- *
- * Rationale:
- *   Supports zero-PCIe-copy device pointer forwarding in fused `htsim` benches while pipelining
- *   multiple `navg` subframes asynchronously without host synchronization until camera readout.
- */
+extern "C" void cacaosim_shwfs_cuda_upload_weights(cacaosim_shwfs_ctx_t *ctx)
+{
+    shwfs_cuda_state_t *cs = (shwfs_cuda_state_t *) ctx->cuda_priv;
+    if (cs == NULL || ctx->eff_nlam < 1)
+    {
+        return;
+    }
+    cudaMemcpyAsync(cs->d_chan_w_jac, ctx->chan_w_jac, (size_t) ctx->eff_nlam * sizeof(float),
+                    cudaMemcpyHostToDevice, cs->stream);
+}
+
 extern "C" void cacaosim_shwfs_cuda_accum(
     cacaosim_shwfs_ctx_t *ctx,
     const float          *dyn_pup_amp,
@@ -465,6 +597,7 @@ extern "C" void cacaosim_shwfs_cuda_accum(
 {
     shwfs_cuda_state_t *cs       = (shwfs_cuda_state_t *) ctx->cuda_priv;
     size_t              wf_bytes = (size_t) ctx->npix_wf * sizeof(float);
+    int32_t             nlam     = (ctx->eff_nlam >= 1) ? ctx->eff_nlam : 1;
 
     const float *d_pup = cs->d_pup_amp;
     if (d_pup_amp_ext != NULL)
@@ -506,29 +639,127 @@ extern "C" void cacaosim_shwfs_cuda_accum(
         d_dm = cs->d_dm_opd;
     }
 
-    /* Lazily seed multi-subframe accumulator only when a second subframe arrives (navg > 1) */
     if (ctx->subframe_cnt == 1u)
     {
         cudaMemcpyAsync(cs->d_accum_int, cs->d_cam_int, (size_t) ctx->npix_cam * sizeof(float),
                         cudaMemcpyDeviceToDevice, cs->stream);
     }
 
-    float    lam        = (ctx->cfg.lambda_um > 0.1f) ? ctx->cfg.lambda_um : 0.75f;
-    float    opd_to_rad = CACAOSIM_TWO_PI_F / lam;
-    uint64_t total_pat  = (uint64_t) ctx->nbatch * ctx->npix_sub_fft;
-    uint32_t bl_pat     = (uint32_t) ((total_pat + 255ULL) / 256ULL);
+    uint64_t total_pat = (uint64_t) ctx->nbatch * ctx->npix_sub_fft;
+    uint32_t bl_pat    = (uint32_t) ((total_pat + 255ULL) / 256ULL);
 
     k_shwfs_build_patches<<<bl_pat, 256, 0, cs->stream>>>(
         d_pup, d_amp, d_wf, d_dm, cs->d_ncpa_opd, cs->d_sub_off, cs->d_sub_len, cs->d_shift_1d,
-        wf_to_opd, opd_to_rad, ctx->cfg.nwf, ctx->cfg.n_sub, ctx->nfft_sub, ctx->nbatch,
+        cs->d_k_rad, wf_to_opd, ctx->cfg.nwf, ctx->cfg.n_sub, ctx->nfft_sub, ctx->nbatch, nlam,
         cs->d_patches);
 
     cufftExecC2C(cs->plan_batch, cs->d_patches, cs->d_patches, CUFFT_FORWARD);
 
     uint32_t bl_cam = (uint32_t) ((ctx->npix_cam + 255ULL) / 256ULL);
     k_shwfs_extract_spots<<<bl_cam, 256, 0, cs->stream>>>(
-        cs->d_patches, ctx->cfg.n_sub, ctx->cfg.pix_per_sub, ctx->ncam, ctx->nfft_sub,
-        1.0f / (float) ctx->npix_sub_fft, cs->d_cam_int);
+        cs->d_patches, cs->d_scale_c, cs->d_chan_w_jac, ctx->cfg.n_sub, ctx->cfg.pix_per_sub,
+        ctx->ncam, ctx->nfft_sub, ctx->nbatch, nlam, 1.0f / (float) ctx->npix_sub_fft,
+        cs->d_cam_int);
+
+    if (ctx->subframe_cnt >= 1u)
+    {
+        k_shwfs_add_accum<<<bl_cam, 256, 0, cs->stream>>>(
+            cs->d_cam_int, ctx->npix_cam, cs->d_accum_int);
+    }
+}
+
+extern "C" void cacaosim_shwfs_cuda_accum_poly(
+    cacaosim_shwfs_ctx_t *ctx,
+    const float          *beam_opd,
+    const float          *beam_amp,
+    const float          *beam_lam_um,
+    uint32_t              beam_nlam,
+    uint64_t              chan_stride,
+    const float          *d_beam_opd,
+    const float          *d_beam_amp)
+{
+    shwfs_cuda_state_t *cs       = (shwfs_cuda_state_t *) ctx->cuda_priv;
+    size_t              wf_bytes = (size_t) ctx->npix_wf * sizeof(float);
+    int32_t             nlam     = (ctx->eff_nlam >= 1) ? ctx->eff_nlam : 1;
+
+    float lam0   = (ctx->cfg.lambda_um > 0.05f) ? ctx->cfg.lambda_um : 0.75f;
+    float bw     = (ctx->cfg.bw_frac > 0.0f) ? ctx->cfg.bw_frac : 0.20f;
+    float def_l0 = lam0 * (1.0f - 0.5f * bw);
+    float def_l1 = lam0 * (1.0f + 0.5f * bw);
+
+    shwfs_poly_map_t map        = { { 0 }, { 0 }, { 0.0f } };
+    const float     *d_opd_use  = d_beam_opd;
+    const float     *d_amp_use  = d_beam_amp;
+    uint64_t         stride_use = chan_stride;
+
+    for (int32_t c = 0; c < nlam; c++)
+    {
+        uint32_t m0 = 0u;
+        uint32_t m1 = 0u;
+        float    al = 0.0f;
+        cacaosim_poly_interp_bracket(ctx->lam_um[c], beam_lam_um, beam_nlam, def_l0, def_l1, &m0,
+                                     &m1, &al);
+        if (d_beam_opd == NULL && beam_opd != NULL)
+        {
+            uint32_t s0 = (uint32_t) (2 * c);
+            uint32_t s1 = (m1 == m0) ? s0 : (s0 + 1u);
+            cudaMemcpyAsync(cs->d_poly_opd + (uint64_t) s0 * ctx->npix_wf,
+                            beam_opd + (uint64_t) m0 * chan_stride, wf_bytes,
+                            cudaMemcpyHostToDevice, cs->stream);
+            if (s1 != s0)
+            {
+                cudaMemcpyAsync(cs->d_poly_opd + (uint64_t) s1 * ctx->npix_wf,
+                                beam_opd + (uint64_t) m1 * chan_stride, wf_bytes,
+                                cudaMemcpyHostToDevice, cs->stream);
+            }
+            if (beam_amp != NULL)
+            {
+                cudaMemcpyAsync(cs->d_poly_amp + (uint64_t) s0 * ctx->npix_wf,
+                                beam_amp + (uint64_t) m0 * chan_stride, wf_bytes,
+                                cudaMemcpyHostToDevice, cs->stream);
+                if (s1 != s0)
+                {
+                    cudaMemcpyAsync(cs->d_poly_amp + (uint64_t) s1 * ctx->npix_wf,
+                                    beam_amp + (uint64_t) m1 * chan_stride, wf_bytes,
+                                    cudaMemcpyHostToDevice, cs->stream);
+                }
+            }
+            map.m0[c]    = s0;
+            map.m1[c]    = s1;
+            map.alpha[c] = al;
+            d_opd_use    = cs->d_poly_opd;
+            d_amp_use    = (beam_amp != NULL) ? cs->d_poly_amp : NULL;
+            stride_use   = ctx->npix_wf;
+        }
+        else
+        {
+            map.m0[c]    = m0;
+            map.m1[c]    = m1;
+            map.alpha[c] = al;
+        }
+    }
+
+    if (ctx->subframe_cnt == 1u)
+    {
+        cudaMemcpyAsync(cs->d_accum_int, cs->d_cam_int, (size_t) ctx->npix_cam * sizeof(float),
+                        cudaMemcpyDeviceToDevice, cs->stream);
+    }
+
+    uint64_t total_pat = (uint64_t) ctx->nbatch * ctx->npix_sub_fft;
+    uint32_t bl_pat    = (uint32_t) ((total_pat + 255ULL) / 256ULL);
+
+    k_shwfs_build_patches_poly<<<bl_pat, 256, 0, cs->stream>>>(
+        d_opd_use, d_amp_use, cs->d_ncpa_opd, cs->d_sub_off, cs->d_sub_len, cs->d_shift_1d,
+        cs->d_k_rad, map, stride_use, ctx->cfg.nwf, ctx->cfg.n_sub, ctx->nfft_sub, ctx->nbatch,
+        nlam, cs->d_patches);
+
+    cufftExecC2C(cs->plan_batch, cs->d_patches, cs->d_patches, CUFFT_FORWARD);
+
+    uint32_t bl_cam = (uint32_t) ((ctx->npix_cam + 255ULL) / 256ULL);
+    k_shwfs_extract_spots<<<bl_cam, 256, 0, cs->stream>>>(
+        cs->d_patches, cs->d_scale_c, cs->d_chan_w_jac, ctx->cfg.n_sub, ctx->cfg.pix_per_sub,
+        ctx->ncam, ctx->nfft_sub, ctx->nbatch, nlam, 1.0f / (float) ctx->npix_sub_fft,
+        cs->d_cam_int);
 
     if (ctx->subframe_cnt >= 1u)
     {

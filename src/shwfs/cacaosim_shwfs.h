@@ -65,7 +65,12 @@ typedef struct
     uint32_t           pix_per_sub; /**< Detector pixels per lenslet side (>= 2; ncam = n_sub*P) */
     uint32_t           pad_factor;  /**< Subaperture FFT oversampling factor (>= 2, default: 2) */
     float              pup_diam;    /**< Clear pupil diameter fraction of nwf (default: 0.9375) */
-    float              lambda_um;   /**< Monochromatic sensing wavelength [um] (default: 0.75) */
+    float              lambda_um;   /**< Central sensing wavelength [um] (default: 0.75) */
+    float              bw_frac;     /**< Fractional bandpass dlambda/lambda0 (0 = monochromatic) */
+    int32_t            nlambda;     /**< Spectral slices (0 = auto -> 2 if bw_frac > 0) */
+    int32_t            has_ext_chan;/**< 1 to use ext_lam_um / ext_weight channel tables */
+    float              ext_lam_um[CACAOSIM_MAX_LAMBDA]; /**< Optional channel wavelengths [um] */
+    float              ext_weight[CACAOSIM_MAX_LAMBDA]; /**< Optional channel photon weights */
     int32_t            wf_unit;     /**< Input WF unit: 0 = OPD [um], 1 = phase [rad] */
     float              ref_lambda;  /**< Reference wavelength [um] when wf_unit == 1 */
     uint64_t           rng_seed;    /**< Base 64-bit PRNG seed for photon/readout noise */
@@ -91,6 +96,13 @@ typedef struct
     uint64_t             npix_wf;       /**< Total input pupil pixels (`nwf * nwf`) */
     uint64_t             npix_sub_fft;  /**< Complex samples per padded lenslet (`nfft_sub^2`) */
     uint64_t             npix_cam;      /**< Total output camera pixels (`ncam * ncam`) */
+    int32_t              eff_nlam;      /**< Active spectral slices [1..CACAOSIM_MAX_LAMBDA] */
+    float                lam_um[CACAOSIM_MAX_LAMBDA];        /**< Channel wavelengths [um] */
+    float                chan_w[CACAOSIM_MAX_LAMBDA];        /**< Normalized channel weights */
+    float                k_rad[CACAOSIM_MAX_LAMBDA];         /**< 2*pi / lam_um[c] [rad/um] */
+    float                scale_c[CACAOSIM_MAX_LAMBDA];       /**< Focal scale lam0 / lam_um[c] */
+    float                chan_w_jac[CACAOSIM_MAX_LAMBDA];    /**< chan_w[c] * scale_c[c]^2 */
+    float                chan_flat_norm[CACAOSIM_MAX_LAMBDA];/**< Per-channel flat intensity */
     float                flat_flux_norm;/**< Unaberrated total camera intensity for photometry */
     int32_t              use_cuda;      /**< 1 when batched cuFFT GPU backend is active, else 0 */
     uint32_t             subframe_cnt;  /**< Optical subframes accumulated in current exposure */
@@ -104,6 +116,7 @@ typedef struct
     /* CPU per-thread L1 FFT buffers and plans */
     int32_t              cpu_nth;       /**< Capped OpenMP thread count (<= 16) */
     float               *cpu_thr_cplx;  /**< L1-resident thread FFT tiles [cpu_nth*nfft_sub^2*2] */
+    float               *cpu_thr_int;   /**< L1-resident thread spot intensity [cpu_nth*nfft^2] */
     void               **fftw_plans;    /**< Per-thread in-place 2D forward `fftwf_plan` handles */
     float               *cpu_cam_int;   /**< Single-subframe stitched spot image [npix_cam] */
     float               *cpu_accum_int; /**< Multi-subframe intensity accumulator [npix_cam] */
@@ -211,6 +224,38 @@ void cacaosim_shwfs_accum_beam(
     const float          *d_beam_amp);
 
 /**
+ * cacaosim_shwfs_accum_beam_poly() - Propagate 1 or M polychromatic beam channels into SHWFS
+ * @ctx:         Initialized Shack-Hartmann WFS context (non-NULL)
+ * @beam_opd:    Host beam OPD cube (`@beam_nlam` planes separated by `@chan_stride`)
+ * @beam_amp:    Host beam amplitude cube (`@beam_nlam` planes separated by `@chan_stride`)
+ * @beam_lam_um: Optional array `[beam_nlam]` of upstream channel wavelengths `[um]`
+ * @beam_nlam:   Number of coherent upstream channels (`1` delegates to `accum_beam`)
+ * @chan_stride: Float stride between consecutive input beam channels
+ * @ncpa_opd:    Optional host 2D static WFS-arm NCPA OPD `[nwf * nwf]` in `[um]`
+ * @d_beam_opd:  Optional device beam OPD cube (`@beam_nlam` planes at `@chan_stride`)
+ * @d_beam_amp:  Optional device beam amplitude cube
+ */
+void cacaosim_shwfs_accum_beam_poly(
+    cacaosim_shwfs_ctx_t *ctx,
+    const float          *beam_opd,
+    const float          *beam_amp,
+    const float          *beam_lam_um,
+    uint32_t              beam_nlam,
+    uint64_t              chan_stride,
+    const float          *ncpa_opd,
+    const float          *d_beam_opd,
+    const float          *d_beam_amp);
+
+/**
+ * cacaosim_shwfs_set_weights() - Update incoherent channel weights from live beam spectrum
+ * @ctx:     Initialized Shack-Hartmann WFS context (non-NULL)
+ * @weights: Array `[ctx->eff_nlam]` of positive photon weights (renormalized internally)
+ */
+void cacaosim_shwfs_set_weights(
+    cacaosim_shwfs_ctx_t *ctx,
+    const float          *weights);
+
+/**
  * cacaosim_shwfs_readout() - Finalize accumulated SHWFS exposure and run detector readout
  * @ctx:      Initialized Shack-Hartmann WFS context with `subframe_cnt >= 1` (no-op if 0)
  * @det_live: Optional live detector configuration override (NULL uses `ctx->cfg.det`)
@@ -304,6 +349,15 @@ int  cacaosim_shwfs_cuda_init(cacaosim_shwfs_ctx_t *ctx,
  *   Frees all GPU allocations while preserving externally borrowed streams in fused bench mode.
  */
 void cacaosim_shwfs_cuda_free(cacaosim_shwfs_ctx_t *ctx);
+void cacaosim_shwfs_cuda_upload_weights(cacaosim_shwfs_ctx_t *ctx);
+void cacaosim_shwfs_cuda_accum_poly(cacaosim_shwfs_ctx_t *ctx,
+                                    const float          *beam_opd,
+                                    const float          *beam_amp,
+                                    const float          *beam_lam_um,
+                                    uint32_t              beam_nlam,
+                                    uint64_t              chan_stride,
+                                    const float          *d_beam_opd,
+                                    const float          *d_beam_amp);
 
 /**
  * cacaosim_shwfs_cuda_accum() - Run batched GPU lenslet patch synthesis, cuFFT, and spot tiling

@@ -929,6 +929,103 @@ extern "C" void cacaosim_cuda_beam_init(
 }
 
 /**
+ * kernel_beam_init_lerp() - GPU pupil beam synthesis with linear two-screen WF interpolation
+ * @pup_amp:  Device static pupil amplitude `[npix]` (`NULL` -> `1.0f`)
+ * @atm_amp:  Optional device scintillation amplitude `[npix]` (`NULL` -> `1.0f`)
+ * @wf_prev:  Optional device previous wavefront screen `[npix]`
+ * @wf_curr:  Optional device current wavefront screen `[npix]`
+ * @w0:       Pre-scaled `(1 - wf_alpha) * wf_to_opd` weight
+ * @w1:       Pre-scaled `wf_alpha * wf_to_opd` weight
+ * @wf_scale: Raw `wf_to_opd` scale when only one screen pointer is non-NULL
+ * @ncpa_opd: Optional device static NCPA OPD `[npix]` in `[um]`
+ * @npix:     Total pupil pixels (`nwf * nwf`)
+ * @out_opd:  Device output OPD `[npix]` in `[um]`
+ * @out_amp:  Device output amplitude `[npix]`
+ */
+__global__ void kernel_beam_init_lerp(
+    const float *__restrict__ pup_amp,
+    const float *__restrict__ atm_amp,
+    const float *             wf_prev,
+    const float *             wf_curr,
+    float                     w0,
+    float                     w1,
+    float                     wf_scale,
+    const float *__restrict__ ncpa_opd,
+    uint32_t                  npix,
+    float *__restrict__       out_opd,
+    float *__restrict__       out_amp)
+{
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= npix)
+    {
+        return;
+    }
+    float a = (pup_amp != NULL) ? pup_amp[idx] : 1.0f;
+    if (atm_amp != NULL)
+    {
+        a *= atm_amp[idx];
+    }
+    float o = 0.0f;
+    if (wf_prev != NULL && wf_curr != NULL)
+    {
+        o = w0 * wf_prev[idx] + w1 * wf_curr[idx];
+    }
+    else if (wf_curr != NULL)
+    {
+        o = wf_scale * wf_curr[idx];
+    }
+    else if (wf_prev != NULL)
+    {
+        o = wf_scale * wf_prev[idx];
+    }
+    if (ncpa_opd != NULL)
+    {
+        o += ncpa_opd[idx];
+    }
+    out_opd[idx] = o;
+    out_amp[idx] = a;
+}
+
+/**
+ * cacaosim_cuda_beam_init_lerp() - Host launcher for `kernel_beam_init_lerp`
+ * @d_pup_amp:   Device static pupil amplitude `[nwf * nwf]`
+ * @d_atm_amp:   Optional device scintillation amplitude `[nwf * nwf]`
+ * @d_wf_prev:   Optional device previous wavefront `[nwf * nwf]`
+ * @d_wf_curr:   Optional device current wavefront `[nwf * nwf]`
+ * @wf_alpha:    Sub-tick linear blend weight in `[0, 1]`
+ * @d_ncpa_opd:  Optional device entrance NCPA OPD `[nwf * nwf]` in `[um]`
+ * @wf_to_opd:   Scale converting wavefront units to `[um]` OPD
+ * @nwf:         Square pupil grid dimension `[pixels]`
+ * @d_out_opd:   Device output OPD `[nwf * nwf]` in `[um]`
+ * @d_out_amp:   Device output amplitude `[nwf * nwf]`
+ * @cuda_stream: Target `cudaStream_t` (`NULL` -> stream `0`)
+ */
+extern "C" void cacaosim_cuda_beam_init_lerp(
+    const float *d_pup_amp,
+    const float *d_atm_amp,
+    const float *d_wf_prev,
+    const float *d_wf_curr,
+    float        wf_alpha,
+    const float *d_ncpa_opd,
+    float        wf_to_opd,
+    uint32_t     nwf,
+    float       *d_out_opd,
+    float       *d_out_amp,
+    void        *cuda_stream)
+{
+    uint32_t     npix    = nwf * nwf;
+    uint32_t     threads = 256u;
+    uint32_t     blocks  = (npix + threads - 1u) / threads;
+    cudaStream_t st      = (cudaStream_t) cuda_stream;
+    float        w0      = (1.0f - wf_alpha) * wf_to_opd;
+    float        w1      = wf_alpha * wf_to_opd;
+
+    kernel_beam_init_lerp<<<blocks, threads, 0, st>>>(
+        d_pup_amp, d_atm_amp, d_wf_prev, d_wf_curr, w0, w1, wf_to_opd, d_ncpa_opd, npix,
+        d_out_opd, d_out_amp);
+}
+
+/**
  * cacaosim_cuda_beam_apply_dm() - Host launcher for `kernel_beam_apply_dm`
  * @d_in_opd:    Device input OPD `[nwf * nwf]` in `[um]`
  * @d_in_amp:    Device input amplitude `[nwf * nwf]`

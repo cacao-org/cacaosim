@@ -29,7 +29,9 @@
  */
 
 #include <cuda_runtime.h>
+#include <math.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "dm/cacaosim_dm.h"
 
@@ -181,16 +183,17 @@ extern "C" void cacaosim_dm_cuda_free(cacaosim_dm_ctx_t *ctx)
 }
 
 /**
- * cacaosim_dm_cuda_render() - Asynchronously upload `act_pos` and render 2D DM OPD on GPU
- * @ctx:          Active CUDA-enabled DM context with updated `ctx->act_pos`
+ * cacaosim_dm_cuda_render() - Asynchronously upload `act_pos_render` and render 2D DM OPD on GPU
+ * @ctx:          Active CUDA-enabled DM context with updated `ctx->act_pos_render`
  * @host_opd_out: Optional host destination buffer `[npix_wf]` [um]; NULL skips D2H & sync
  *
  * Role:
  *   Hot-path CUDA execution wrapper called per frame from `cacaosim_dm_step()`.
  *
  * Rationale:
- *   Enqueues the compact H2D actuator upload and `kernel_dm_gather_opd` launch on
- *   `ctx->cuda_stream`. Only performs a D2H copy and `cudaStreamSynchronize()` when
+ *   Skips H2D upload and `kernel_dm_gather_opd` altogether when `ctx->opd_valid` is set and the
+ *   rendered actuator stroke vector has settled (`max |act_pos_render - prev_pos_render| <= 1e-7`),
+ *   reusing `ctx->d_opd_out` in VRAM. Only performs a D2H copy and `cudaStreamSynchronize()` when
  *   a host SHM buffer (`host_opd_out != NULL`) requires immediate CPU visibility.
  */
 extern "C" void cacaosim_dm_cuda_render(
@@ -198,14 +201,39 @@ extern "C" void cacaosim_dm_cuda_render(
     float             *host_opd_out)
 {
     cudaStream_t st         = (cudaStream_t) ctx->cuda_stream;
-    size_t       nact_bytes = (size_t) ctx->nact_total * sizeof(float);
-    uint32_t     threads    = 256u;
-    uint32_t     blocks     = (uint32_t) ((ctx->npix_wf + threads - 1ULL) / threads);
+    const float *pos_ren    = ctx->act_pos_render;
+    uint32_t     nact       = ctx->nact_total;
+    int          need_k     = !ctx->opd_valid;
 
-    cudaMemcpyAsync(ctx->d_act_pos, ctx->act_pos, nact_bytes, cudaMemcpyHostToDevice, st);
+    if (!need_k)
+    {
+        float max_d = 0.0f;
+        for (uint32_t a = 0; a < nact; a++)
+        {
+            float d = fabsf(pos_ren[a] - ctx->prev_pos_render[a]);
+            if (d > max_d)
+            {
+                max_d = d;
+            }
+        }
+        if (max_d > 1.0e-7f)
+        {
+            need_k = 1;
+        }
+    }
 
-    kernel_dm_gather_opd<<<blocks, threads, 0, st>>>(
-        ctx->d_act_pos, ctx->d_stencil_idx, ctx->d_stencil_w, ctx->npix_wf, ctx->d_opd_out);
+    if (need_k)
+    {
+        size_t   nact_bytes = (size_t) nact * sizeof(float);
+        uint32_t threads    = 256u;
+        uint32_t blocks     = (uint32_t) ((ctx->npix_wf + threads - 1ULL) / threads);
+
+        memcpy(ctx->prev_pos_render, pos_ren, nact_bytes);
+        cudaMemcpyAsync(ctx->d_act_pos, pos_ren, nact_bytes, cudaMemcpyHostToDevice, st);
+        kernel_dm_gather_opd<<<blocks, threads, 0, st>>>(
+            ctx->d_act_pos, ctx->d_stencil_idx, ctx->d_stencil_w, ctx->npix_wf, ctx->d_opd_out);
+        ctx->opd_valid = 1;
+    }
 
     if (host_opd_out != NULL)
     {

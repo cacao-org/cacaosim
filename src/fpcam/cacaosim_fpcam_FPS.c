@@ -86,8 +86,8 @@ static int32_t  param_prop_mode                              = 0;
 static uint32_t param_pad_factor                             = 2;
 static float    param_pup_diam                               = 0.9375f;
 static float    param_lambda_um                              = 1.65f;
-static float    param_bw_frac                                = 0.0f;
-static int32_t  param_nlambda                                = 1;
+static float    param_bw_frac                                = 0.18f;
+static int32_t  param_nlambda                                = 0;
 static float    param_pixscale_ld                            = 3.0f;
 static float    param_qe                                     = 0.85f;
 static float    param_dt_exp                                 = 0.001f;
@@ -155,9 +155,9 @@ static float    param_strehl_ave                             = 0.0f;
     X(".lambda_um", &param_lambda_um, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,          \
       "Central science wavelength [um] (default: 1.65)")                                \
     X(".bw_frac", &param_bw_frac, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,              \
-      "Fractional bandpass dlambda/lambda0 (default: 0.0)")                             \
+      "Fractional bandpass dlambda/lambda0 (default: 0.18)")                            \
     X(".nlambda", &param_nlambda, FPTYPE_INT32, 0, FPFLAG_DEFAULT_INPUT,                \
-      "Polychromatic spectral channels (1..32, default: 1)")                            \
+      "Polychromatic spectral slices (0 = auto -> 2 if bw>0, 1..32, default: 0)")       \
     X(".pixscale_ld", &param_pixscale_ld, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,      \
       "Focal sampling [pixels per lambda0/D] in MFT mode (default: 3.0)")               \
     X(".qe", &param_qe, FPTYPE_FLOAT32, 0,                                              \
@@ -382,6 +382,10 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
     if (param_out_long[0] != '\0')
     {
         img_long = stream_connect_create_2Df32(param_out_long, param_ncam, param_ncam);
+        if (img_long.ID != -1)
+        {
+            cacaosim_fpcam_shm_write_kw(img_long.im, 0.0f, 0.0f, 0.0f, 0ULL);
+        }
     }
 
     const float *ncpa_ptr = (img_ncpa.ID != -1 && img_ncpa.md->datatype == _DATATYPE_FLOAT &&
@@ -418,9 +422,9 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
 
     /*
      * Auto-discover polychromatic channel count and endpoints (`CSIM_NWL`, `CSIM_WL0`, `CSIM_WL1`)
-     * from upstream `cacaosim.coro` when `in_beam` is multi-slice and `.nlambda` was left at 1.
+     * plus upstream 32-bin stellar spectrum (`CSIM_BM`) when `in_beam` is connected.
      */
-    if (img_beam.ID != -1 && cfg.nlambda <= 1)
+    if (img_beam.ID != -1)
     {
         uint32_t b_nwl = 1u;
         float    b_wl0 = 0.0f;
@@ -431,18 +435,40 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
             {
                 b_nwl = CACAOSIM_FPCAM_MAX_LAMBDA;
             }
-            cfg.nlambda     = (int32_t) b_nwl;
-            cfg.has_ext_lam = 1;
+            cfg.has_in_lam = 1;
             for (uint32_t c = 0; c < b_nwl; c++)
             {
-                float t = (b_nwl > 1u) ? ((float) c / (float) (b_nwl - 1u)) : 0.0f;
-                cfg.ext_lam_um[c] =
-                    (b_wl0 > 0.05f && b_wl1 > 0.05f) ? (b_wl0 + (b_wl1 - b_wl0) * t)
-                                                     : param_lambda_um;
+                float t           = (b_nwl > 1u) ? ((float) c / (float) (b_nwl - 1u)) : 0.0f;
+                cfg.in_lam_um[c]  = (b_wl0 > 0.05f && b_wl1 > 0.05f)
+                                        ? (b_wl0 + (b_wl1 - b_wl0) * t)
+                                        : param_lambda_um;
+            }
+            if (cfg.nlambda <= 0)
+            {
+                cfg.nlambda     = (int32_t) b_nwl;
+                cfg.has_ext_lam = 1;
+                for (uint32_t c = 0; c < b_nwl; c++)
+                {
+                    cfg.ext_lam_um[c] = cfg.in_lam_um[c];
+                }
             }
             if (cfg.lambda_um <= 0.05f && b_wl0 > 0.05f && b_wl1 > 0.05f)
             {
                 cfg.lambda_um = 0.5f * (b_wl0 + b_wl1);
+            }
+        }
+        cacaosim_spec_t init_spec;
+        if (param_use_beam_flux && cacaosim_beam_shm_read_spec(img_beam.im, &init_spec))
+        {
+            int32_t nl         = cacaosim_resolve_nlambda(cfg.nlambda, b_nwl, cfg.bw_frac);
+            cfg.nlambda        = nl;
+            cfg.has_ext_weight = 1;
+            float *lam_dst     = cfg.has_ext_lam ? NULL : cfg.ext_lam_um;
+            cacaosim_spec_sample_band(&init_spec, cfg.lambda_um, cfg.bw_frac, nl, 0.001f, param_qe,
+                                      lam_dst, cfg.ext_weight, NULL);
+            if (!cfg.has_ext_lam)
+            {
+                cfg.has_ext_lam = 1;
             }
         }
     }
@@ -489,6 +515,10 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
         if (param_reset_long)
         {
             cacaosim_fpcam_reset_long(&fp_ctx);
+            if (img_long.ID != -1)
+            {
+                cacaosim_fpcam_shm_write_kw(img_long.im, 0.0f, 0.0f, 0.0f, 0ULL);
+            }
             param_reset_long = 0;
         }
 
@@ -533,9 +563,6 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
                 b_opd = reg_buf;
                 b_amp = reg_buf + npix;
             }
-            cacaosim_fpcam_accum_beam_poly(&fp_ctx, b_opd, b_amp, b_nwl, b_stride, ncpa_ptr, NULL,
-                                           NULL);
-
             /* Integrate upstream 32-bin photon spectrum over camera filter, `navg * dts`, and QE */
             cacaosim_spec_t b_spec;
             if (param_use_beam_flux && param_flux_ph >= 0.0f &&
@@ -545,10 +572,14 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
                 float    dts = (param_frame_rate > 0.1f)
                                    ? (1.0f / param_frame_rate)
                                    : ((param_dt_exp > 1e-7f) ? param_dt_exp : 0.001f);
-                float    bw  = (param_bw_frac > 0.01f) ? param_bw_frac : 0.18f;
-                eff_flux     = cacaosim_spec_band_flux(&b_spec, param_lambda_um, bw,
-                                                       dts * (float) nav, param_qe, NULL);
+                float    dyn_w[CACAOSIM_FPCAM_MAX_LAMBDA];
+                eff_flux = cacaosim_spec_sample_band(&b_spec, param_lambda_um, param_bw_frac,
+                                                     fp_ctx.eff_nlam, dts * (float) nav, param_qe,
+                                                     NULL, dyn_w, NULL);
+                cacaosim_fpcam_set_weights(&fp_ctx, dyn_w);
             }
+            cacaosim_fpcam_accum_beam_poly(&fp_ctx, b_opd, b_amp, b_nwl, b_stride, ncpa_ptr, NULL,
+                                           NULL);
         }
         else
         {
@@ -607,6 +638,9 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
             processinfo_update_output_stream(processinfo, img_cam.im, trig_src);
             if (img_long.ID != -1)
             {
+                cacaosim_fpcam_shm_write_kw(img_long.im, fp_ctx.long_strehl_peak,
+                                            fp_ctx.last_strehl_peak, fp_ctx.last_strehl_axis,
+                                            fp_ctx.long_cnt);
                 processinfo_update_output_stream(processinfo, img_long.im, trig_src);
             }
         }

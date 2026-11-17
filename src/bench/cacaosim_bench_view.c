@@ -1735,9 +1735,10 @@ static void render_sensor_inline(
     const cacaosim_bench_ctx_t  *ctx,
     const cacaosim_bench_node_t *nd)
 {
-    const char *sep = ev->ascii ? " | " : " │ ";
-    const char *arr = ev->ascii ? " --> " : " ──▶ ";
-    float       hz  = (nd->eff_navg > 0) ? (ctx->cfg.master_hz / (float) nd->eff_navg) : 0.0f;
+    const char *sep  = ev->ascii ? " | " : " │ ";
+    const char *arr  = ev->ascii ? " --> " : " ──▶ ";
+    float       m_hz = (ctx->eff_master_hz > 0.1f) ? ctx->eff_master_hz : ctx->cfg.master_hz;
+    float       hz   = (nd->eff_navg > 0) ? (m_hz / (float) nd->eff_navg) : 0.0f;
 
     /* Select sensor-class glyph and semantic accent color (green=zonal/slope WFS, purple=ZWFS,
      * gold=focal-plane science camera) */
@@ -2769,10 +2770,25 @@ void cacaosim_bench_render(
             sb_puts(&ln, "Clock/In : ");
             sb_bold(&ln, ev.lvl);
             sb_fg(&ln, ev.lvl, ev.pal->fg_accent);
-            sb_printf(&ln, "%.1f Hz", ctx->cfg.master_hz);
+            if (ctx->eff_oversample > 1u)
+            {
+                sb_printf(&ln, "%.1f Hz x%u", ctx->cfg.master_hz, ctx->eff_oversample);
+            }
+            else
+            {
+                sb_printf(&ln, "%.1f Hz", ctx->cfg.master_hz);
+            }
             sb_rst(&ln, ev.lvl);
             sb_fg(&ln, ev.lvl, ev.pal->fg_muted);
-            sb_printf(&ln, " (dt=%.0f us)%swf=", ctx->dt_master_s * 1.0e6f, sep);
+            if (ctx->eff_oversample > 1u)
+            {
+                sb_printf(&ln, " (%.1fkHz, dt=%.0f us)%swf=", ctx->eff_master_hz * 1.0e-3f,
+                          ctx->dt_master_s * 1.0e6f, sep);
+            }
+            else
+            {
+                sb_printf(&ln, " (dt=%.0f us)%swf=", ctx->dt_master_s * 1.0e6f, sep);
+            }
             sb_stream_tag(&ln, &ev, ctx->cfg.in_wf);
             sb_fg(&ln, ev.lvl, ev.pal->fg_muted);
             sb_puts(&ln, "  pup=");
@@ -2898,19 +2914,27 @@ void cacaosim_bench_render(
                 {
                     snprintf(dac, sizeof(dac), "f32");
                 }
-                if (nd->cfg.dm.dyn_mode == 1)
+                char dly_s[24];
+                if (nd->cfg.dm.delay_sec > 0.0f)
                 {
-                    snprintf(dyn, sizeof(dyn), "RC %.0fus, %.1ffr", nd->cfg.dm.tau_sec * 1.0e6f,
-                             nd->cfg.dm.delay_frames);
-                }
-                else if (nd->cfg.dm.dyn_mode == 2)
-                {
-                    snprintf(dyn, sizeof(dyn), "2nd %.0fHz, %.1ffr", nd->cfg.dm.f0_hz,
-                             nd->cfg.dm.delay_frames);
+                    snprintf(dly_s, sizeof(dly_s), "%.0fus", nd->cfg.dm.delay_sec * 1.0e6f);
                 }
                 else
                 {
-                    snprintf(dyn, sizeof(dyn), "inst, %.1ffr", nd->cfg.dm.delay_frames);
+                    snprintf(dly_s, sizeof(dly_s), "%.1ffr", nd->cfg.dm.delay_frames);
+                }
+                if (nd->cfg.dm.dyn_mode == 1)
+                {
+                    snprintf(dyn, sizeof(dyn), "RC %.0fus, %s", nd->cfg.dm.tau_sec * 1.0e6f,
+                             dly_s);
+                }
+                else if (nd->cfg.dm.dyn_mode == 2)
+                {
+                    snprintf(dyn, sizeof(dyn), "2nd %.0fHz, %s", nd->cfg.dm.f0_hz, dly_s);
+                }
+                else
+                {
+                    snprintf(dyn, sizeof(dyn), "inst, %s", dly_s);
                 }
 
                 sbuf_t rline;
@@ -2994,9 +3018,9 @@ void cacaosim_bench_render(
 
                 /* Classify detector SNR regime assuming ~25% effective illuminated pixel fill:
                  * Shot-limited if Poisson noise > 2*RON, Mixed if N_ph > RON^2, else RON-limited */
-                float hz     = (nd->eff_navg > 0)
-                                   ? (ctx->cfg.master_hz / (float) nd->eff_navg)
-                                   : 0.0f;
+                float m_hz   = (ctx->eff_master_hz > 0.1f) ? ctx->eff_master_hz
+                                                           : ctx->cfg.master_hz;
+                float hz     = (nd->eff_navg > 0) ? (m_hz / (float) nd->eff_navg) : 0.0f;
                 float bw     = (nd->cfg.bw_frac > 0.0f) ? nd->cfg.bw_frac : 0.15f;
                 float ph_pix = nd->eff_flux_ph /
                                (float) ((nd->ncam > 0) ? (nd->ncam * nd->ncam / 4u + 1u) : 256u);

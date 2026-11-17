@@ -270,6 +270,41 @@ void cacaosim_cuda_beam_init(
     void        *cuda_stream);
 
 /**
+ * cacaosim_cuda_beam_init_lerp() - Synthesize `[OPD, Amp]` beam on GPU with linear WF interpolation
+ * @d_pup_amp:   Device static pupil amplitude `[nwf * nwf]` (`NULL` -> `1.0f`)
+ * @d_atm_amp:   Optional device scintillation amplitude `[nwf * nwf]` (`NULL` -> `1.0f`)
+ * @d_wf_prev:   Optional device previous base-rate wavefront `[nwf * nwf]`
+ * @d_wf_curr:   Optional device current base-rate wavefront `[nwf * nwf]`
+ * @wf_alpha:    Sub-tick linear blend weight in `[0, 1]` (`0` = `@d_wf_prev`, `1` = `@d_wf_curr`)
+ * @d_ncpa_opd:  Optional device entrance NCPA OPD `[nwf * nwf]` in `[um]` (`NULL` -> `0.0f`)
+ * @wf_to_opd:   Scale converting wavefront units to `[um]` OPD
+ * @nwf:         Square pupil grid dimension `[pixels]`
+ * @d_out_opd:   Device output OPD `[nwf * nwf]` in `[um]`
+ * @d_out_amp:   Device output amplitude `[nwf * nwf]`
+ * @cuda_stream: Optional `cudaStream_t` handle
+ *
+ * Role:
+ *   GPU counterpart to `cacaosim_beam_init_lerp_cpu()`, blending two device-resident `1x`
+ *   turbulence screens across `K` oversampled sub-ticks with zero extra PCIe transfers.
+ *
+ * Rationale:
+ *   Uploads each new `outarraypha` screen once per base period and evaluates all `K` sub-ticks
+ *   purely in VRAM bandwidth (`< 2 us` for `256 x 256`).
+ */
+void cacaosim_cuda_beam_init_lerp(
+    const float *d_pup_amp,
+    const float *d_atm_amp,
+    const float *d_wf_prev,
+    const float *d_wf_curr,
+    float        wf_alpha,
+    const float *d_ncpa_opd,
+    float        wf_to_opd,
+    uint32_t     nwf,
+    float       *d_out_opd,
+    float       *d_out_amp,
+    void        *cuda_stream);
+
+/**
  * cacaosim_cuda_beam_apply_dm() - Subtract reflective DM OPD surface from a beam on GPU
  * @d_in_opd:    Device input beam OPD `[nwf * nwf]` in `[um]` (`NULL` -> `0.0f`)
  * @d_in_amp:    Device input beam amplitude `[nwf * nwf]` (`NULL` -> `1.0f`)

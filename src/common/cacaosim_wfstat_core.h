@@ -31,9 +31,35 @@
 extern "C" {
 #endif
 
-#define CACAOSIM_WFSTAT_NB_LOC   3
-#define CACAOSIM_WFSTAT_NB_SAMP  5
-#define CACAOSIM_WFSTAT_NB_EXTRA 14
+#define CACAOSIM_WFSTAT_NB_LOC    3
+#define CACAOSIM_WFSTAT_NB_SAMP   5
+#define CACAOSIM_WFSTAT_NB_EXTRA  14
+#define CACAOSIM_WFSTAT_NB_STREHL 7
+
+/**
+ * struct cacaosim_wfstat_strehl_t - Per-camera Strehl time-series capture track
+ * @img:       Connected `out_long` SHM stream (`ID == -1` if absent).
+ * @last_cnt0: Last observed `img.md->cnt0` counter to detect new camera exposures.
+ * @cap:       Allocated capacity of time-series arrays.
+ * @len:       Number of captured exposures.
+ * @frame:     Master tick index (`ws->n_frames`) of each captured exposure `[cap]`.
+ * @sr_inst:   Short-exposure peak Strehl ratio `[0..1]` `[cap]`.
+ * @sr_long:   Cumulative long-exposure peak Strehl ratio `[0..1]` `[cap]`.
+ * @sr_axis:   Short-exposure on-axis Strehl ratio `[0..1]` `[cap]`.
+ * @active:    1 when the stream is connected and arrays are allocated.
+ */
+typedef struct
+{
+    IMGID     img;
+    uint64_t  last_cnt0;
+    uint64_t  cap;
+    uint64_t  len;
+    uint64_t *frame;
+    float    *sr_inst;
+    float    *sr_long;
+    float    *sr_axis;
+    int       active;
+} cacaosim_wfstat_strehl_t;
 
 /**
  * struct cacaosim_wfstat_extra_t - One optional 2D diagnostic stream snapshot track
@@ -87,8 +113,12 @@ typedef struct
     int      nsamp;
     int      cur_is_samp;
 
-    int                     snap_extra;
-    cacaosim_wfstat_extra_t extras[CACAOSIM_WFSTAT_NB_EXTRA];
+    int                      snap_extra;
+    cacaosim_wfstat_extra_t  extras[CACAOSIM_WFSTAT_NB_EXTRA];
+    uint64_t                 ts_cap;
+    uint64_t                 ts_len;
+    float                   *ts_rms[CACAOSIM_WFSTAT_NB_LOC];
+    cacaosim_wfstat_strehl_t strehl[CACAOSIM_WFSTAT_NB_STREHL];
 
     int   use_cuda;
     void *gpu;
@@ -143,6 +173,7 @@ void *cacaosim_wfstat_gpu_create(
     const double *h_weights,
     uint64_t      npix,
     uint32_t      nloc,
+    uint64_t      ts_cap,
     void         *cuda_stream);
 void cacaosim_wfstat_gpu_free(void *gpu);
 void cacaosim_wfstat_gpu_accum(void *gpu, const float *const d_opd[]);
@@ -151,7 +182,9 @@ int  cacaosim_wfstat_gpu_fetch_sums(
     void         *gpu,
     double *const h_sum[],
     double *const h_sum2[],
-    double       *h_acc);
+    double       *h_acc,
+    float *const  h_ts_rms[],
+    uint64_t     *out_ts_len);
 
 #ifdef __cplusplus
 }

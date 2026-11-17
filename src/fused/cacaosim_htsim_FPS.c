@@ -40,6 +40,7 @@
  *     deterministic offline replay and latency benchmarking.
  */
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,6 +51,7 @@
 #include "COREMOD_memory/COREMOD_memory.h"
 #include "bench/cacaosim_bench.h"
 #include "bench/cacaosim_bench_view.h"
+#include "common/cacaosim_beam.h"
 #include "common/cacaosim_time.h"
 #include "common/cacaosim_wfstat_core.h"
 #include "dm/cacaosim_dm.h"
@@ -70,9 +72,15 @@ static int64_t  param_wfstat_enable                              = 0;
 static char     param_wfstat_beams[FUNCTION_PARAMETER_STRMAXLEN] = "b_pup,b_post_stg1,b_post_stg2";
 static char     param_wfstat_outdir[FUNCTION_PARAMETER_STRMAXLEN] = ".";
 static uint64_t param_wfstat_ticks                                = 20000;
+static uint32_t param_wfstat_stride                               = 0;
 static int64_t  param_wfstat_extra                                = 1;
 static uint64_t param_wfstat_frames                               = 0;
-static char     param_in_dmcmd[FUNCTION_PARAMETER_STRMAXLEN]     = "aol0_dmC";
+static int64_t  param_calib_fast                                  = 0;
+static int64_t  param_calib_temporal                              = 0;
+static float    param_calib_poke_offset                           = 0.0f;
+static char     param_calib_trig[FUNCTION_PARAMETER_STRMAXLEN]    = "none";
+static char     param_calib_wfs[FUNCTION_PARAMETER_STRMAXLEN]     = "none";
+static char     param_in_dmcmd[FUNCTION_PARAMETER_STRMAXLEN]      = "aol0_dmC";
 static char     param_out_wfscam[FUNCTION_PARAMETER_STRMAXLEN] = "aol0_wfsim";
 static char     param_out_dmopd[FUNCTION_PARAMETER_STRMAXLEN]  = "";
 static int64_t  param_enable_fpcam                             = 1;
@@ -155,11 +163,29 @@ static float    param_strehl_ave                               = 0.0f;
     X(".wfstat_ticks", &param_wfstat_ticks, FPTYPE_UINT64, 0,                           \
       FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
       "Frames to accumulate before auto-writing (0 = until disabled)")                  \
+    X(".wfstat_stride", &param_wfstat_stride, FPTYPE_UINT32, 0,                         \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Master-tick stride between wfstat samples (0 = auto oversample)")                \
     X(".wfstat_extra", &param_wfstat_extra, FPTYPE_ONOFF, 0,                            \
       FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
       "Snapshot WFS/DM/PSF diagnostic streams at the 5 sample instants")                \
     X(".wfstat_frames", &param_wfstat_frames, FPTYPE_UINT64, 0, FPFLAG_DEFAULT_OUTPUT,  \
       "Frames accumulated by the current/last in-DAG wavefront stats run")              \
+    X(".calib_fast", &param_calib_fast, FPTYPE_ONOFF, 0,                                \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Lockstep calibration: skip fpcam/DM dynamics & force WFS navg=1")                \
+    X(".calib_temporal", &param_calib_temporal, FPTYPE_ONOFF, 0,                        \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Step real DM dynamics & oversampled WFS subframes during .calib_fast")           \
+    X(".calib_poke_offset", &param_calib_poke_offset, FPTYPE_FLOAT32, 0,                \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "DM poke arrival offset [us] relative to WFS frame start in .calib_temporal")     \
+    X(".calib_trig", param_calib_trig, FPTYPE_STREAMNAME, 0,                            \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "DM stream triggering step in .calib_fast mode (\"none\" = disabled)")           \
+    X(".calib_wfs", param_calib_wfs, FPTYPE_STREAMNAME, 0,                              \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Target WFS cam/id during .calib_fast (\"none\" = all WFS)")                      \
     X(".in_dmcmd", param_in_dmcmd, FPTYPE_STREAMNAME, 1,                                \
       FPFLAG_DEFAULT_INPUT | FPFLAG_TRIGGER_STREAM,                                     \
       "Input 2D DM actuator command stream (auto-created if missing)")                  \
@@ -293,7 +319,9 @@ static MILK_COLD errno_t htsim_confcheck(void)
             ".export_enable", ".delay_frames", ".tau_us",      ".max_stroke", ".mod_rad",
             ".wfs_flux",      ".wfs_ron",      ".wfs_shutter", ".fp_navg",    ".fp_flux",
             ".fp_ron",        ".reset_long",   ".photon_noise", ".turb_gain", ".frame_rate",
-            ".wfstat_enable", ".wfstat_outdir", ".wfstat_ticks", ".wfstat_extra"
+            ".wfstat_enable", ".wfstat_outdir", ".wfstat_ticks", ".wfstat_stride",
+            ".wfstat_extra",  ".calib_fast",    ".calib_temporal", ".calib_poke_offset",
+            ".calib_trig",    ".calib_wfs"
         };
         for (size_t i = 0; i < sizeof(live_keys) / sizeof(live_keys[0]); i++)
         {
@@ -433,6 +461,54 @@ static void htsim_wfstat_frame(cacaosim_wfstat_t *ws, const cacaosim_bench_ctx_t
  *
  * Return: `RETURN_SUCCESS` on clean loop termination, or `RETURN_FAILURE` on parse/compile error.
  */
+/* Find sorted node index of DM matching spec (id or in_cmd), else -1 */
+static int htsim_find_dm_node_idx(const cacaosim_bench_ctx_t *bctx, const char *spec)
+{
+    if (spec == NULL || spec[0] == '\0' || strcmp(spec, "none") == 0)
+    {
+        return -1;
+    }
+    for (uint32_t i = 0; i < bctx->n_nodes; i++)
+    {
+        const cacaosim_bench_node_t *nd = &bctx->nodes[i];
+        if (nd->cfg.kind != CACAOSIM_NODE_DM)
+        {
+            continue;
+        }
+        if (strcmp(nd->cfg.in_cmd, spec) == 0 || strcmp(nd->cfg.id, spec) == 0)
+        {
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
+/* Resolve target WFS eff_navg for temporal calibration stepping */
+static uint32_t htsim_calib_wfs_navg(const cacaosim_bench_ctx_t *bctx, const char *spec)
+{
+    uint32_t best = 1u;
+    for (uint32_t i = 0; i < bctx->n_nodes; i++)
+    {
+        const cacaosim_bench_node_t *nd = &bctx->nodes[i];
+        if (nd->cfg.kind < CACAOSIM_NODE_PYRWFS || nd->cfg.kind >= CACAOSIM_NODE_FPCAM)
+        {
+            continue;
+        }
+        if (spec != NULL && spec[0] != '\0' && strcmp(spec, "none") != 0)
+        {
+            if (strcmp(nd->cfg.out_cam, spec) == 0 || strcmp(nd->cfg.id, spec) == 0)
+            {
+                return (nd->eff_navg >= 1u) ? nd->eff_navg : 1u;
+            }
+        }
+        else if (nd->eff_navg > best)
+        {
+            best = nd->eff_navg;
+        }
+    }
+    return best;
+}
+
 static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
 {
     cacaosim_bench_cfg_t bcfg;
@@ -447,13 +523,6 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
         return RETURN_FAILURE;
     }
 
-    /*
-     * Reconcile FPS parameters with `[bench]` file defaults. In FPS daemon mode
-     * (`dcfpsptr != NULL`) the physical master clock always comes from the staged `.bench`
-     * (`cacaosim.deploy --rate` already writes overrides there): `.frame_rate` only paces
-     * wall-clock time, so free-running at e.g. 160 or 640 Hz never alters simulated exposure
-     * times, WFS cadences, or DM dynamics. `.turb_gain` live FPS edits always win.
-     */
     if (param_backend != 0)
     {
         bcfg.backend = param_backend;
@@ -467,10 +536,6 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
         if (param_frame_rate != 2000.0f)
         {
             bcfg.master_hz = param_frame_rate;
-        }
-        else
-        {
-            param_frame_rate = bcfg.master_hz;
         }
         if (param_turb_gain != 1.0f)
         {
@@ -488,6 +553,10 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
         fprintf(stderr, "[cacaosim.htsim] .bench init error: %s\n", err_buf);
         return RETURN_FAILURE;
     }
+    if (dcfpsptr == NULL && param_frame_rate == 2000.0f)
+    {
+        param_frame_rate = bctx.eff_master_hz;
+    }
 
     if (param_export_beams[0] != '\0')
     {
@@ -499,6 +568,20 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
             return RETURN_FAILURE;
         }
     }
+
+    /* Pre-allocate scratch buffers for sub-tick poke interpolation in .calib_temporal mode */
+    uint32_t max_nact = 1u;
+    for (uint32_t d = 0; d < bctx.n_dms; d++)
+    {
+        const cacaosim_bench_node_t *nd = &bctx.nodes[bctx.dm_node_idx[d]];
+        uint32_t                     na = nd->cfg.dm.nact_x * nd->cfg.dm.nact_y;
+        if (na > max_nact)
+        {
+            max_nact = na;
+        }
+    }
+    float *cal_prev_cmd  = (float *) cacaosim_aligned_calloc(max_nact, sizeof(float));
+    float *cal_blend_cmd = (float *) cacaosim_aligned_calloc(max_nact, sizeof(float));
 
     /* Emit full ANSI box-drawing schematic on interactive TTYs; plain summary when piped to logs */
     if (isatty(STDOUT_FILENO))
@@ -521,76 +604,259 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
     int               wfs_bidx[CACAOSIM_WFSTAT_NB_LOC] = { 0 };
     memset(&wfs, 0, sizeof(wfs));
 
+    IMAGE   *cal_im                                 = NULL;
+    int      cal_sem                                = -1;
+    int      cal_dm_node                            = -1;
+    uint32_t cal_dm_nact                            = 0u;
+    char     cal_bound[FUNCTION_PARAMETER_STRMAXLEN] = "";
+    int      prev_cal_fast                          = 0;
+
     MILK_PROCINFO_INIT(self)
     MILK_PROCINFO_LOOPSTART(self)
     {
-        /* Drift-free absolute monotonic pacing when `.frame_rate > 0.1 Hz` */
-        if (param_frame_rate > 0.1f)
+        int      do_step          = 1;
+        int      cal_fast         = param_calib_fast ? 1 : 0;
+        int      cal_temp         = (cal_fast && param_calib_temporal != 0) ? 1 : 0;
+        int      trig_stream_mode = (processinfo != NULL && processinfo->triggermode == 3);
+        uint32_t n_substeps       = 1u;
+
+        /* Manage lockstep calibration trigger binding transitions safely */
+        if (!cal_fast && prev_cal_fast)
         {
+            if (cal_im != NULL && cal_sem >= 0)
+            {
+                cal_im->semReadPID[cal_sem] = 0;
+            }
+            cal_im       = NULL;
+            cal_sem      = -1;
+            cal_dm_node  = -1;
+            cal_dm_nact  = 0u;
+            cal_bound[0] = '\0';
+            cacaosim_bench_reset_wfs_accum(&bctx);
+            clock_gettime(CLOCK_MONOTONIC, &deadline);
+        }
+        else if (cal_fast && (!prev_cal_fast || strcmp(cal_bound, param_calib_trig) != 0))
+        {
+            if (cal_im != NULL && cal_sem >= 0)
+            {
+                cal_im->semReadPID[cal_sem] = 0;
+            }
+            cal_im      = cacaosim_bench_find_dm_stream(&bctx, param_calib_trig);
+            cal_dm_node = htsim_find_dm_node_idx(&bctx, param_calib_trig);
+            cal_dm_nact = (cal_dm_node >= 0)
+                              ? (bctx.nodes[cal_dm_node].cfg.dm.nact_x *
+                                 bctx.nodes[cal_dm_node].cfg.dm.nact_y)
+                              : 0u;
+            if (cal_im != NULL && cal_prev_cmd != NULL && cal_dm_nact > 0u)
+            {
+                memcpy(cal_prev_cmd, cal_im->array.F, cal_dm_nact * sizeof(float));
+            }
+            cal_sem = (cal_im != NULL) ? ImageStreamIO_getsemwaitindex(cal_im, -1) : -1;
+            if (cal_im != NULL && cal_sem >= 0)
+            {
+                ImageStreamIO_semflush(cal_im, cal_sem);
+            }
+            snprintf(cal_bound, sizeof(cal_bound), "%s", param_calib_trig);
+            cacaosim_bench_reset_wfs_accum(&bctx);
+        }
+        prev_cal_fast = cal_fast;
+
+        if (cal_fast && cal_im != NULL && cal_sem >= 0)
+        {
+            /* Wait synchronously on DM poke instead of wall-clock deadline sleep */
+            struct timespec ts_wait;
+            clock_gettime(CLOCK_REALTIME, &ts_wait);
+            cacaosim_timespec_add_ns(&ts_wait, 50000000ULL);
+            if (ImageStreamIO_semtimedwait(cal_im, cal_sem, &ts_wait) == 0)
+            {
+                ImageStreamIO_semflush(cal_im, cal_sem);
+                if (processinfo != NULL)
+                {
+                    processinfo_exec_start(processinfo);
+                }
+                n_substeps = cal_temp ? htsim_calib_wfs_navg(&bctx, param_calib_wfs) : 1u;
+            }
+            else
+            {
+                do_step = 0;
+            }
+        }
+        else if (trig_stream_mode && bctx.cfg.atm_interp && bctx.eff_oversample > 1u)
+        {
+            /*
+             * 1:K lockstep mode triggered by base-rate `outarraypha` (`triggermode == 3`):
+             * advance all `K = eff_oversample` sub-ticks per turbulence screen, spacing sub-ticks
+             * by `1 / param_frame_rate` when `.frame_rate > 0.1 Hz` so closed-loop DM commands
+             * arriving mid-exposure are sampled at exact sub-frame instants.
+             */
+            n_substeps = bctx.eff_oversample;
+            clock_gettime(CLOCK_MONOTONIC, &deadline);
+        }
+        else if (param_frame_rate > 0.1f)
+        {
+            /* Drift-free absolute monotonic pacing when `.frame_rate > 0.1 Hz` */
             uint64_t period_ns = (uint64_t) (1.0e9f / param_frame_rate);
             cacaosim_timespec_add_ns(&deadline, period_ns);
             cacaosim_sleep_until(&deadline);
         }
 
-        /* One-shot reset of cumulative long-exposure PSFs across every FPCAM node in the DAG */
-        if (param_reset_long)
+        if (do_step)
         {
-            for (uint32_t i = 0; i < bctx.n_nodes; i++)
+            uint32_t eff_ws_st = (param_wfstat_stride >= 1u) ? param_wfstat_stride
+                                                             : bctx.eff_oversample;
+            if (eff_ws_st < 1u)
             {
-                if (bctx.nodes[i].cfg.kind == CACAOSIM_NODE_FPCAM)
+                eff_ws_st = 1u;
+            }
+            float off_ticks = (param_calib_poke_offset * 1.0e-6f) / bctx.dt_master_s;
+
+            for (uint32_t sub = 0u; sub < n_substeps; sub++)
+            {
+                if (sub > 0u && !cal_fast && trig_stream_mode && param_frame_rate > 0.1f)
                 {
-                    cacaosim_fpcam_reset_long(&bctx.nodes[i].fpcam_ctx);
+                    if (processinfo != NULL && processinfo->loopstat == 4)
+                    {
+                        break;
+                    }
+                    uint64_t sub_ns = (uint64_t) (1.0e9f / param_frame_rate);
+                    cacaosim_timespec_add_ns(&deadline, sub_ns);
+                    cacaosim_sleep_until(&deadline);
+                }
+
+                bctx.calib_fast     = cal_fast;
+                bctx.calib_temporal = cal_temp;
+                snprintf(bctx.calib_wfs_out, sizeof(bctx.calib_wfs_out), "%s", param_calib_wfs);
+
+                if (cal_temp && cal_dm_node >= 0 && cal_im != NULL && cal_prev_cmd != NULL &&
+                    cal_blend_cmd != NULL)
+                {
+                    const float *cmd_now = cal_im->array.F;
+                    bctx.calib_dm_node   = cal_dm_node;
+                    if ((float) (sub + 1u) <= off_ticks)
+                    {
+                        bctx.calib_cmd_override = cal_prev_cmd;
+                    }
+                    else if ((float) sub >= off_ticks)
+                    {
+                        bctx.calib_cmd_override = cmd_now;
+                    }
+                    else
+                    {
+                        float frac = off_ticks - (float) sub;
+                        float inv  = 1.0f - frac;
+                        for (uint32_t a = 0u; a < cal_dm_nact; a++)
+                        {
+                            cal_blend_cmd[a] = frac * cal_prev_cmd[a] + inv * cmd_now[a];
+                        }
+                        bctx.calib_cmd_override = cal_blend_cmd;
+                    }
+                }
+                else
+                {
+                    bctx.calib_dm_node      = -1;
+                    bctx.calib_cmd_override = NULL;
+                }
+
+                /* One-shot reset of cumulative long-exposure PSFs across every FPCAM node in DAG */
+                if (param_reset_long)
+                {
+                    for (uint32_t i = 0; i < bctx.n_nodes; i++)
+                    {
+                        if (bctx.nodes[i].cfg.kind == CACAOSIM_NODE_FPCAM)
+                        {
+                            cacaosim_fpcam_reset_long(&bctx.nodes[i].fpcam_ctx);
+                            if (bctx.connect_shm && bctx.nodes[i].img_long.ID != -1)
+                            {
+                                cacaosim_fpcam_shm_write_kw(bctx.nodes[i].img_long.im, 0.0f, 0.0f,
+                                                            0.0f, 0ULL);
+                            }
+                        }
+                    }
+                    param_reset_long = 0;
+                }
+
+                /* Start in-DAG wavefront/Strehl telemetry before stepping so tick #1 is captured */
+                if (param_wfstat_enable && !wfs_active)
+                {
+                    param_wfstat_frames = 0;
+                    if (htsim_wfstat_start(&wfs, &bctx, wfs_bidx) == 0)
+                    {
+                        wfs_active = 1;
+                    }
+                    else
+                    {
+                        param_wfstat_enable = 0;
+                    }
+                }
+
+                int sample_ws = (!cal_fast && wfs_active && param_wfstat_enable &&
+                                 ((bctx.tick_cnt % eff_ws_st) == 0ULL));
+                bctx.wfstat_step_active = sample_ws;
+                for (int k = 0; k < CACAOSIM_WFSTAT_NB_LOC; k++)
+                {
+                    bctx.wfstat_beam_idx[k] = wfs_bidx[k];
+                }
+
+                /* Advance entire multi-rate bench by one master tick and publish Strehl */
+                bctx.export_beams_active =
+                    (param_export_beams[0] != '\0' && param_export_enable != 0) ? 1 : 0;
+                cacaosim_bench_step(&bctx, NULL, NULL, param_turb_gain, processinfo);
+                param_strehl_inst       = bctx.last_strehl_inst;
+                param_strehl_ave        = bctx.last_strehl_ave;
+                bctx.wfstat_step_active = 0;
+
+                /* In-DAG wavefront statistics on device beams (decimated by eff_ws_st) */
+                if (wfs_active)
+                {
+                    if (sample_ws)
+                    {
+                        htsim_wfstat_frame(&wfs, &bctx, wfs_bidx);
+                        param_wfstat_frames = wfs.n_frames;
+                        if (param_wfstat_ticks > 0 && wfs.n_frames >= param_wfstat_ticks)
+                        {
+                            param_wfstat_enable = 0;
+                        }
+                    }
+                    if (!param_wfstat_enable)
+                    {
+                        cacaosim_wfstat_write(&wfs, param_wfstat_outdir,
+                                              (double) bctx.dt_master_s * (double) eff_ws_st);
+                        cacaosim_wfstat_free(&wfs);
+                        wfs_active = 0;
+                    }
                 }
             }
-            param_reset_long = 0;
-        }
 
-        /* Advance entire multi-rate bench by one master tick and publish Strehl telemetry */
-        bctx.export_beams_active =
-            (param_export_beams[0] != '\0' && param_export_enable != 0) ? 1 : 0;
-        cacaosim_bench_step(&bctx, NULL, NULL, param_turb_gain, processinfo);
-        param_strehl_inst = bctx.last_strehl_inst;
-        param_strehl_ave  = bctx.last_strehl_ave;
-
-        /* In-DAG wavefront statistics on device beams (replaces SHM export + csim_wfstat) */
-        if (param_wfstat_enable && !wfs_active)
-        {
-            param_wfstat_frames = 0;
-            if (htsim_wfstat_start(&wfs, &bctx, wfs_bidx) == 0)
+            if (cal_temp && cal_dm_node >= 0 && cal_im != NULL && cal_prev_cmd != NULL &&
+                cal_dm_nact > 0u)
             {
-                wfs_active = 1;
+                memcpy(cal_prev_cmd, cal_im->array.F, cal_dm_nact * sizeof(float));
             }
-            else
-            {
-                param_wfstat_enable = 0;
-            }
-        }
-        if (wfs_active)
-        {
-            if (param_wfstat_enable)
-            {
-                htsim_wfstat_frame(&wfs, &bctx, wfs_bidx);
-                param_wfstat_frames = wfs.n_frames;
-                if (param_wfstat_ticks > 0 && wfs.n_frames >= param_wfstat_ticks)
-                {
-                    param_wfstat_enable = 0;
-                }
-            }
-            if (!param_wfstat_enable)
-            {
-                cacaosim_wfstat_write(&wfs, param_wfstat_outdir, (double) bctx.dt_master_s);
-                cacaosim_wfstat_free(&wfs);
-                wfs_active = 0;
-            }
+            bctx.calib_dm_node      = -1;
+            bctx.calib_cmd_override = NULL;
         }
     }
     MILK_PROCINFO_END(self)
 
+    if (cal_im != NULL && cal_sem >= 0)
+    {
+        cal_im->semReadPID[cal_sem] = 0;
+    }
+
     if (wfs_active)
     {
-        cacaosim_wfstat_write(&wfs, param_wfstat_outdir, (double) bctx.dt_master_s);
+        uint32_t eff_ws_st = (param_wfstat_stride >= 1u) ? param_wfstat_stride
+                                                         : bctx.eff_oversample;
+        if (eff_ws_st < 1u)
+        {
+            eff_ws_st = 1u;
+        }
+        cacaosim_wfstat_write(&wfs, param_wfstat_outdir,
+                              (double) bctx.dt_master_s * (double) eff_ws_st);
         cacaosim_wfstat_free(&wfs);
     }
+    free(cal_blend_cmd);
+    free(cal_prev_cmd);
     cacaosim_bench_free(&bctx);
     return RETURN_SUCCESS;
 }
@@ -715,6 +981,10 @@ static MILK_HOT errno_t htsim_compute(const MILK_RUNNABLE *self)
         {
             img_fplong = stream_connect_create_2Df32(param_out_fplong, param_fp_ncam,
                                                      param_fp_ncam);
+            if (img_fplong.ID != -1)
+            {
+                cacaosim_fpcam_shm_write_kw(img_fplong.im, 0.0f, 0.0f, 0.0f, 0ULL);
+            }
         }
     }
     if (param_in_wf[0] != '\0')
@@ -922,6 +1192,10 @@ static MILK_HOT errno_t htsim_compute(const MILK_RUNNABLE *self)
             if (param_reset_long)
             {
                 cacaosim_fpcam_reset_long(&fp_ctx);
+                if (img_fplong.ID != -1)
+                {
+                    cacaosim_fpcam_shm_write_kw(img_fplong.im, 0.0f, 0.0f, 0.0f, 0ULL);
+                }
                 param_reset_long = 0;
             }
             cacaosim_fpcam_accum_subframe(&fp_ctx, pup_ptr, amp_ptr, wf_ptr, host_dm_src, NULL,
@@ -957,6 +1231,9 @@ static MILK_HOT errno_t htsim_compute(const MILK_RUNNABLE *self)
                 processinfo_update_output_stream(NULL, img_fpcam.im, img_cmd.im);
                 if (img_fplong.ID != -1)
                 {
+                    cacaosim_fpcam_shm_write_kw(img_fplong.im, fp_ctx.long_strehl_peak,
+                                                fp_ctx.last_strehl_peak, fp_ctx.last_strehl_axis,
+                                                fp_ctx.long_cnt);
                     processinfo_update_output_stream(NULL, img_fplong.im, img_cmd.im);
                 }
             }

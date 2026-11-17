@@ -335,10 +335,97 @@ void cacaosim_spec_split(
 }
 
 /**
+ * spec_integrate_interval() - Integrate piecewise-linear spectral photon density on `[l_lo, l_hi]`
+ * @spec:     Incident 32-bin photon-rate spectrum `[photons/s]` (non-NULL)
+ * @l_lo:     Lower passband bound `[um]`
+ * @l_hi:     Upper passband bound `[um]`
+ * @out_rate: Output integrated photon arrival rate `[photons/s]` across `[l_lo, l_hi]`
+ * @out_wlam: Output first wavelength moment `int lam * S_lambda(lam) dlam` `[photons * um / s]`
+ *
+ * Role:
+ *   Analytical quadrature primitive backing both `cacaosim_spec_band_flux()` and
+ *   `cacaosim_spec_sample_band()`.
+ *
+ * Rationale:
+ *   Models spectral photon density `S_lambda(lam)` `[ph / (s * um)]` as continuous and piecewise
+ *   linear between bin midpoints `lam_b = 0.40 + (b + 0.5) * dl` (`D_b = ph_s[b] / dl`) with
+ *   flat half-bin extensions over `[0.40, lam_0]` and `[lam_31, 2.40]`. This representation:
+ *     1. Conserves 100% of bolometric photons (`int_{0.40}^{2.40} S_lambda dlam == sum ph_s[b]`);
+ *     2. Evaluates zeroth and first moments in `double` precision so contiguous sub-band sums
+ *        equal the full-band integral to machine precision;
+ *     3. Eliminates derivative kinks at bin edges when sweeping narrowband filters.
+ */
+static void spec_integrate_interval(
+    const cacaosim_spec_t *spec,
+    double                 l_lo,
+    double                 l_hi,
+    double                *out_rate,
+    double                *out_wlam)
+{
+    *out_rate = 0.0;
+    *out_wlam = 0.0;
+    if (spec == NULL || !(l_hi > l_lo))
+    {
+        return;
+    }
+
+    const double dl     = (double) CACAOSIM_SPEC_DL_UM;
+    const double inv_dl = 1.0 / dl;
+    const double l0_grid = (double) CACAOSIM_SPEC_L0_UM;
+    const double l1_grid = (double) CACAOSIM_SPEC_L1_UM;
+
+    double sum_r = 0.0;
+    double sum_w = 0.0;
+
+    /* 33 piecewise-linear segments: left half-bin, 31 midpoint-to-midpoint spans, right half-bin */
+    for (int seg = 0; seg <= CACAOSIM_NSPEC; seg++)
+    {
+        double x0, x1, d0, d1;
+        if (seg == 0)
+        {
+            x0 = l0_grid;
+            x1 = l0_grid + 0.5 * dl;
+            d0 = (double) spec->ph_s[0] * inv_dl;
+            d1 = d0;
+        }
+        else if (seg == CACAOSIM_NSPEC)
+        {
+            x0 = l1_grid - 0.5 * dl;
+            x1 = l1_grid;
+            d0 = (double) spec->ph_s[CACAOSIM_NSPEC - 1] * inv_dl;
+            d1 = d0;
+        }
+        else
+        {
+            x0 = l0_grid + ((double) seg - 0.5) * dl;
+            x1 = x0 + dl;
+            d0 = (double) spec->ph_s[seg - 1] * inv_dl;
+            d1 = (double) spec->ph_s[seg] * inv_dl;
+        }
+
+        double a = (l_lo > x0) ? l_lo : x0;
+        double b = (l_hi < x1) ? l_hi : x1;
+        if (b > a)
+        {
+            double span  = x1 - x0;
+            double slope = (span > 0.0) ? ((d1 - d0) / span) : 0.0;
+            double sa    = d0 + slope * (a - x0);
+            double sb    = d0 + slope * (b - x0);
+            double h     = b - a;
+            sum_r += 0.5 * h * (sa + sb);
+            sum_w += (h / 6.0) * ((2.0 * a + b) * sa + (a + 2.0 * b) * sb);
+        }
+    }
+
+    *out_rate = sum_r;
+    *out_wlam = sum_w;
+}
+
+/**
  * cacaosim_spec_band_flux() - Integrate detected photoevents and centroid wavelength in a bandpass
  * @spec:       Incident 32-bin photon-rate spectrum `[photons/s]` (`NULL` returns `0.0f`)
  * @lambda0_um: Filter central wavelength `[um]`
- * @bw_frac:    Fractional filter width `dlambda / lambda0` (`<= 1e-3f` defaults to `0.15`)
+ * @bw_frac:    Fractional filter width `dlambda / lambda0` (`<= 0.0f` returns `0.0f`)
  * @dt_exp_s:   Exposure duration `[s]` (`<= 0` defaults to `0.0005 s` = 2 kHz)
  * @qe:         Detector quantum efficiency `[0..1]` (`<= 0` defaults to `1.0`)
  * @eff_lambda: Optional output receiving flux-weighted effective wavelength `[um]`
@@ -348,9 +435,9 @@ void cacaosim_spec_split(
  *   spectral beam, as well as photon-per-frame tables in `.bench` TUI/CLI diagnostics.
  *
  * Rationale:
- *   Intersects `[lmin, lmax]` continuously with each bin `[b0, b1]` (`frac = (hi - lo) / dl`) and
- *   weights each sub-interval by its exact midpoint `0.5 * (lo + hi)`, preventing quantization
- *   steps when sweeping narrowband filters across the `0.0625 um` spectral grid.
+ *   Delegates directly to `cacaosim_spec_sample_band(..., nlambda = 1, ...)` so total bandpass
+ *   photometry and multi-wavelength sub-band weights share a single identical analytical integral
+ *   without any narrowband minimum-bandwidth clamp.
  *
  * Return: Integrated photoevents (`sum_rate * dt_exp_s * qe`) over the exposure.
  */
@@ -362,44 +449,142 @@ float cacaosim_spec_band_flux(
     float                  qe,
     float                 *eff_lambda)
 {
-    if (spec == NULL)
+    return cacaosim_spec_sample_band(spec, lambda0_um, bw_frac, 1, dt_exp_s, qe, NULL, NULL,
+                                     eff_lambda);
+}
+
+/**
+ * cacaosim_spec_sample_band() - Partition a sensor bandpass into flux-consistent spectral channels
+ * @spec:           Optional incident 32-bin photon-rate spectrum (`NULL` -> flat uniform SED)
+ * @lambda0_um:     Filter central wavelength `[um]`
+ * @bw_frac:        Fractional filter full width `dlambda / lambda0` (`<= 0` -> monochromatic)
+ * @nlambda:        Number of discrete propagation wavelengths (`1 .. CACAOSIM_MAX_LAMBDA`)
+ * @dt_exp_s:       Camera exposure duration `[seconds]` (`<= 0` -> `0.0005 s`)
+ * @qe:             Detector quantum efficiency `[0..1]` (`<= 0` -> `1.0`, `> 1` -> `1.0`)
+ * @out_lam_um:     Optional output channel flux-centroid wavelengths `[nlambda]` in `[um]`
+ * @out_weights:    Optional output normalized channel optical weights `[nlambda]` (`sum == 1.0f`)
+ * @out_eff_lambda: Optional output overall flux-weighted effective wavelength `[um]`
+ *
+ * Role:
+ *   Computes exact sub-band photon fluxes, normalized channel weights `w_c`, and flux-weighted
+ *   channel wavelengths `lam_c` across `@nlambda` contiguous sub-bands of `[lmin, lmax]`.
+ *
+ * Rationale:
+ *   Guarantees `Phi_tot = sum_c Phi_c` and `w_c = Phi_c / Phi_tot` (`sum_c w_c == 1`), falling back
+ *   cleanly to uniform `1 / nlambda` weights and sub-band midpoints when `@spec == NULL`,
+ *   `@bw_frac <= 0`, or the upstream spectrum is completely extinguished across the filter.
+ *
+ * Return: Total detected photoevents `Phi_tot` across the full passband.
+ */
+float cacaosim_spec_sample_band(
+    const cacaosim_spec_t *spec,
+    float                  lambda0_um,
+    float                  bw_frac,
+    int32_t                nlambda,
+    float                  dt_exp_s,
+    float                  qe,
+    float                 *out_lam_um,
+    float                 *out_weights,
+    float                 *out_eff_lambda)
+{
+    int32_t nl = (nlambda >= 1) ? ((nlambda <= CACAOSIM_MAX_LAMBDA) ? nlambda : CACAOSIM_MAX_LAMBDA)
+                                : 1;
+    double lam0 = (lambda0_um > 0.05f) ? (double) lambda0_um : 0.75;
+    double bw   = (bw_frac > 0.0f) ? (double) bw_frac : 0.0;
+    double dt   = (dt_exp_s > 0.0f) ? (double) dt_exp_s : 0.0005;
+    double q    = (qe > 0.0f) ? ((qe <= 1.0f) ? (double) qe : 1.0) : 1.0;
+
+    if (bw <= 0.0)
     {
-        if (eff_lambda != NULL)
+        float inv_n = 1.0f / (float) nl;
+        for (int32_t c = 0; c < nl; c++)
         {
-            *eff_lambda = lambda0_um;
+            if (out_lam_um != NULL)
+            {
+                out_lam_um[c] = (float) lam0;
+            }
+            if (out_weights != NULL)
+            {
+                out_weights[c] = inv_n;
+            }
+        }
+        if (out_eff_lambda != NULL)
+        {
+            *out_eff_lambda = (float) lam0;
         }
         return 0.0f;
     }
-    float bw   = (bw_frac > 1e-3f) ? bw_frac : 0.15f;
-    float lmin = lambda0_um * (1.0f - 0.5f * bw);
-    float lmax = lambda0_um * (1.0f + 0.5f * bw);
-    float dt   = (dt_exp_s > 0.0f) ? dt_exp_s : 0.0005f;
-    float q    = (qe > 0.0f) ? ((qe <= 1.0f) ? qe : 1.0f) : 1.0f;
 
-    float sum_rate = 0.0f;
-    float sum_wlam = 0.0f;
-
-    /* Accumulate fractional bin overlap and first wavelength moment across all 32 bins */
-    for (int b = 0; b < CACAOSIM_NSPEC; b++)
+    double lmin  = lam0 * (1.0 - 0.5 * bw);
+    double lmax  = lam0 * (1.0 + 0.5 * bw);
+    if (lmin < 0.05)
     {
-        float b0 = CACAOSIM_SPEC_L0_UM + (float) b * CACAOSIM_SPEC_DL_UM;
-        float b1 = b0 + CACAOSIM_SPEC_DL_UM;
-        float lo = (b0 > lmin) ? b0 : lmin;
-        float hi = (b1 < lmax) ? b1 : lmax;
-        if (hi > lo)
+        lmin = 0.05;
+    }
+    double sub_w = (lmax - lmin) / (double) nl;
+
+    double sub_rate[CACAOSIM_MAX_LAMBDA];
+    double sub_lam[CACAOSIM_MAX_LAMBDA];
+    double tot_rate = 0.0;
+    double tot_wlam = 0.0;
+
+    for (int32_t c = 0; c < nl; c++)
+    {
+        double c_lo = lmin + (double) c * sub_w;
+        double c_hi = (c + 1 == nl) ? lmax : (c_lo + sub_w);
+        double mid  = 0.5 * (c_lo + c_hi);
+        double r    = 0.0;
+        double wl   = 0.0;
+
+        if (spec != NULL)
         {
-            float frac = (hi - lo) / CACAOSIM_SPEC_DL_UM;
-            float r    = frac * spec->ph_s[b];
-            sum_rate += r;
-            sum_wlam += r * 0.5f * (lo + hi);
+            spec_integrate_interval(spec, c_lo, c_hi, &r, &wl);
+        }
+        sub_rate[c] = r;
+        sub_lam[c]  = (r > 1e-30) ? (wl / r) : mid;
+        tot_rate += r;
+        tot_wlam += wl;
+    }
+
+    if (tot_rate > 1e-30)
+    {
+        for (int32_t c = 0; c < nl; c++)
+        {
+            if (out_lam_um != NULL)
+            {
+                out_lam_um[c] = (float) sub_lam[c];
+            }
+            if (out_weights != NULL)
+            {
+                out_weights[c] = (float) (sub_rate[c] / tot_rate);
+            }
+        }
+        if (out_eff_lambda != NULL)
+        {
+            *out_eff_lambda = (float) (tot_wlam / tot_rate);
+        }
+    }
+    else
+    {
+        float inv_n = 1.0f / (float) nl;
+        for (int32_t c = 0; c < nl; c++)
+        {
+            if (out_lam_um != NULL)
+            {
+                out_lam_um[c] = (float) sub_lam[c];
+            }
+            if (out_weights != NULL)
+            {
+                out_weights[c] = inv_n;
+            }
+        }
+        if (out_eff_lambda != NULL)
+        {
+            *out_eff_lambda = (float) lam0;
         }
     }
 
-    if (eff_lambda != NULL)
-    {
-        *eff_lambda = (sum_rate > 1e-20f) ? (sum_wlam / sum_rate) : lambda0_um;
-    }
-    return sum_rate * dt * q;
+    return (float) (tot_rate * dt * q);
 }
 
 /**
@@ -441,6 +626,72 @@ void MILK_HOT cacaosim_beam_init_cpu(
             a *= atm_amp[p];
         }
         float o = (wf_in != NULL) ? (wf_to_opd * wf_in[p]) : 0.0f;
+        if (ncpa_opd != NULL)
+        {
+            o += ncpa_opd[p];
+        }
+        out_opd[p] = o;
+        out_amp[p] = a;
+    }
+}
+
+/**
+ * cacaosim_beam_init_lerp_cpu() - Synthesize `[OPD, Amp]` beam with linear temporal WF lerp on CPU
+ * @pup_amp:   Static telescope pupil amplitude `[nwf * nwf]` (`NULL` -> `1.0f`)
+ * @atm_amp:   Optional scintillation amplitude `[nwf * nwf]` (`NULL` -> `1.0f`)
+ * @wf_prev:   Previous base-rate turbulence map `[nwf * nwf]` (`NULL` -> `@wf_curr`)
+ * @wf_curr:   Current base-rate turbulence map `[nwf * nwf]` (`NULL` -> `0.0f`)
+ * @wf_alpha:  Sub-tick interpolation weight in `[0, 1]`
+ * @ncpa_opd:  Optional static entrance NCPA OPD `[nwf * nwf]` in `[um]` (`NULL` -> `0.0f`)
+ * @wf_to_opd: Scale converting wavefront units to `[um]` OPD
+ * @nwf:       Pupil grid dimension `[pixels]`
+ * @out_opd:   Destination OPD array `[nwf * nwf]` in `[um]`
+ * @out_amp:   Destination amplitude array `[nwf * nwf]`
+ *
+ * Role:
+ *   Hot-path (`MILK_HOT`) CPU sub-tick turbulence interpolator and pupil beam constructor.
+ *
+ * Rationale:
+ *   Fuses `(1 - alpha) * wf_prev + alpha * wf_curr`, unit conversion, NCPA addition, and pupil
+ *   amplitude multiplication into a single SIMD sweep.
+ */
+void MILK_HOT cacaosim_beam_init_lerp_cpu(
+    const float *__restrict pup_amp,
+    const float *__restrict atm_amp,
+    const float *           wf_prev,
+    const float *           wf_curr,
+    float                   wf_alpha,
+    const float *__restrict ncpa_opd,
+    float                   wf_to_opd,
+    uint32_t                nwf,
+    float *__restrict       out_opd,
+    float *__restrict       out_amp)
+{
+    const uint64_t npix = (uint64_t) nwf * nwf;
+    const float    w0   = (1.0f - wf_alpha) * wf_to_opd;
+    const float    w1   = wf_alpha * wf_to_opd;
+
+#pragma omp parallel for simd schedule(static) if (npix >= 262144)
+    for (uint64_t p = 0; p < npix; p++)
+    {
+        float a = (pup_amp != NULL) ? pup_amp[p] : 1.0f;
+        if (atm_amp != NULL)
+        {
+            a *= atm_amp[p];
+        }
+        float o = 0.0f;
+        if (wf_prev != NULL && wf_curr != NULL)
+        {
+            o = w0 * wf_prev[p] + w1 * wf_curr[p];
+        }
+        else if (wf_curr != NULL)
+        {
+            o = wf_to_opd * wf_curr[p];
+        }
+        else if (wf_prev != NULL)
+        {
+            o = wf_to_opd * wf_prev[p];
+        }
         if (ncpa_opd != NULL)
         {
             o += ncpa_opd[p];
@@ -1025,4 +1276,109 @@ int cacaosim_beam_shm_read_poly_kw(
         *wl1_out = l1;
     }
     return (kw_n > 1u) ? 1 : 0;
+}
+
+/**
+ * cacaosim_fpcam_shm_write_kw() - Update fixed-slot Strehl keywords on an `out_long` SHM stream
+ * @im:       Target 2D long-exposure PSF `IMAGE` (`NBkw >= 4`; no-op if NULL or undersized)
+ * @sr_long:  Cumulative long-exposure peak Strehl ratio `[0..1]` (`kw[0]`: `STREHL`)
+ * @sr_inst:  Short-exposure peak Strehl ratio `[0..1]` (`kw[1]`: `SR_INST`)
+ * @sr_axis:  Short-exposure on-axis Strehl ratio `[0..1]` (`kw[2]`: `SR_AXIS`)
+ * @long_cnt: Number of exposures integrated into the long-exposure PSF (`kw[3]`: `LONGC`)
+ *
+ * Role:
+ *   Lazily initializes keyword descriptors `kw[0..3]` on first call (or after stream recreate)
+ *   and updates `.value` fields in O(1) time before `processinfo_update_output_stream()`.
+ *
+ * Rationale:
+ *   Keeping `kw[0]` named `"STREHL"` (`'D'`) preserves backward compatibility with shell/milk
+ *   pollers while adding `SR_INST`, `SR_AXIS`, and `LONGC` for time-series telemetry capture.
+ */
+void MILK_HOT cacaosim_fpcam_shm_write_kw(
+    IMAGE   *im,
+    float    sr_long,
+    float    sr_inst,
+    float    sr_axis,
+    uint64_t long_cnt)
+{
+    if (im == NULL || im->md == NULL || im->kw == NULL || im->md->NBkw < 4)
+    {
+        return;
+    }
+    if (im->kw[0].type != 'D' || strcmp(im->kw[0].name, "STREHL") != 0 ||
+        im->kw[1].type != 'D' || strcmp(im->kw[1].name, "SR_INST") != 0)
+    {
+        snprintf(im->kw[0].name, KEYWORD_MAX_STRING, "STREHL");
+        im->kw[0].type = 'D';
+        snprintf(im->kw[0].comment, KEYWORD_MAX_COMMENT, "Cumulative long-exposure Strehl ratio");
+
+        snprintf(im->kw[1].name, KEYWORD_MAX_STRING, "SR_INST");
+        im->kw[1].type = 'D';
+        snprintf(im->kw[1].comment, KEYWORD_MAX_COMMENT, "Short-exposure peak Strehl ratio");
+
+        snprintf(im->kw[2].name, KEYWORD_MAX_STRING, "SR_AXIS");
+        im->kw[2].type = 'D';
+        snprintf(im->kw[2].comment, KEYWORD_MAX_COMMENT, "Short-exposure on-axis Strehl ratio");
+
+        snprintf(im->kw[3].name, KEYWORD_MAX_STRING, "LONGC");
+        im->kw[3].type = 'L';
+        snprintf(im->kw[3].comment, KEYWORD_MAX_COMMENT, "Cumulative long-exposure frame count");
+    }
+    im->kw[0].value.numf = (double) sr_long;
+    im->kw[1].value.numf = (double) sr_inst;
+    im->kw[2].value.numf = (double) sr_axis;
+    im->kw[3].value.numl = (int64_t) long_cnt;
+}
+
+/**
+ * cacaosim_fpcam_shm_read_kw() - Read Strehl ratio keywords from an `out_long` SHM stream
+ * @im:      Source 2D long-exposure PSF `IMAGE` (`NULL` returns `0`)
+ * @sr_long: Optional output for cumulative long-exposure peak Strehl ratio
+ * @sr_inst: Optional output for short-exposure peak Strehl ratio (falls back to `@sr_long`)
+ * @sr_axis: Optional output for short-exposure on-axis Strehl ratio (falls back to `@sr_long`)
+ *
+ * Role:
+ *   Reads O(1) keyword slots `kw[0..2]` when `kw[0]` is a valid `STREHL` double keyword.
+ *
+ * Rationale:
+ *   Falling back to `srl` when `SR_INST`/`SR_AXIS` are absent maintains compatibility with streams
+ *   populated only with the legacy `kw[0]` `STREHL` keyword.
+ *
+ * Return: `1` if `STREHL` metadata was read, `0` otherwise.
+ */
+int cacaosim_fpcam_shm_read_kw(
+    const IMAGE *im,
+    double      *sr_long,
+    double      *sr_inst,
+    double      *sr_axis)
+{
+    if (im == NULL || im->md == NULL || im->kw == NULL || im->md->NBkw < 1)
+    {
+        return 0;
+    }
+    if (im->kw[0].type != 'D' || strcmp(im->kw[0].name, "STREHL") != 0)
+    {
+        return 0;
+    }
+    double srl = im->kw[0].value.numf;
+    double sri = srl;
+    double sra = srl;
+    if (im->md->NBkw >= 3 && im->kw[1].type == 'D' && strcmp(im->kw[1].name, "SR_INST") == 0)
+    {
+        sri = im->kw[1].value.numf;
+        sra = im->kw[2].value.numf;
+    }
+    if (sr_long != NULL)
+    {
+        *sr_long = srl;
+    }
+    if (sr_inst != NULL)
+    {
+        *sr_inst = sri;
+    }
+    if (sr_axis != NULL)
+    {
+        *sr_axis = sra;
+    }
+    return 1;
 }

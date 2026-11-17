@@ -250,13 +250,16 @@ int MILK_COLD cacaosim_dm_init(
         (float *) cacaosim_aligned_calloc(CACAOSIM_DM_MAX_DELAY * nact, sizeof(float));
     ctx->act_cmd_delayed = (float *) cacaosim_aligned_calloc(nact, sizeof(float));
     ctx->act_pos         = (float *) cacaosim_aligned_calloc(nact, sizeof(float));
+    ctx->act_pos_render  = (float *) cacaosim_aligned_calloc(nact, sizeof(float));
+    ctx->prev_pos_render = (float *) cacaosim_aligned_calloc(nact, sizeof(float));
     ctx->act_vel         = (float *) cacaosim_aligned_calloc(nact, sizeof(float));
     ctx->dead_mask       = (uint8_t *) cacaosim_aligned_calloc(nact, sizeof(uint8_t));
     ctx->stencil_idx     = (int32_t *) cacaosim_aligned_calloc(ntap, sizeof(int32_t));
     ctx->stencil_w       = (float *) cacaosim_aligned_calloc(ntap, sizeof(float));
 
-    if (!ctx->cmd_ring || !ctx->act_cmd_delayed || !ctx->act_pos || !ctx->act_vel ||
-        !ctx->dead_mask || !ctx->stencil_idx || !ctx->stencil_w)
+    if (!ctx->cmd_ring || !ctx->act_cmd_delayed || !ctx->act_pos || !ctx->act_pos_render ||
+        !ctx->prev_pos_render || !ctx->act_vel || !ctx->dead_mask || !ctx->stencil_idx ||
+        !ctx->stencil_w)
     {
         cacaosim_dm_free(ctx);
         return -1;
@@ -301,9 +304,12 @@ void MILK_COLD cacaosim_dm_reset(cacaosim_dm_ctx_t *ctx)
     __builtin_memset(ctx->cmd_ring, 0, CACAOSIM_DM_MAX_DELAY * nact * sizeof(float));
     __builtin_memset(ctx->act_cmd_delayed, 0, nact * sizeof(float));
     __builtin_memset(ctx->act_pos, 0, nact * sizeof(float));
+    __builtin_memset(ctx->act_pos_render, 0, nact * sizeof(float));
+    __builtin_memset(ctx->prev_pos_render, 0, nact * sizeof(float));
     __builtin_memset(ctx->act_vel, 0, nact * sizeof(float));
     ctx->ring_head   = 0;
     ctx->ring_filled = 0;
+    ctx->opd_valid   = 0;
 }
 
 /**
@@ -331,6 +337,8 @@ void MILK_COLD cacaosim_dm_free(cacaosim_dm_ctx_t *ctx)
     free(ctx->cmd_ring);
     free(ctx->act_cmd_delayed);
     free(ctx->act_pos);
+    free(ctx->act_pos_render);
+    free(ctx->prev_pos_render);
     free(ctx->act_vel);
     free(ctx->dead_mask);
     free(ctx->stencil_idx);
@@ -449,25 +457,52 @@ void MILK_HOT cacaosim_dm_step_actuators(
         ctx->ring_filled++;
     }
 
-    /* 3. Exact discrete Zero-Order Hold (ZOH) actuator kinematics */
-    float *__restrict pos = MILK_ASSUME_ALIGNED(ctx->act_pos);
-    float *__restrict vel = MILK_ASSUME_ALIGNED(ctx->act_vel);
-    const int32_t mode    = ctx->cfg.dyn_mode;
-    const float   dt      = ctx->cfg.dt_sec;
+    /* 3. Exact discrete Zero-Order Hold (ZOH) actuator kinematics & subframe-mean stroke */
+    float *__restrict pos     = MILK_ASSUME_ALIGNED(ctx->act_pos);
+    float *__restrict pos_ren = MILK_ASSUME_ALIGNED(ctx->act_pos_render);
+    float *__restrict vel     = MILK_ASSUME_ALIGNED(ctx->act_vel);
+    const int32_t     mode    = ctx->cfg.dyn_mode;
+    const int32_t     do_mean = !ctx->cfg.no_zoh_mean;
+    const float       dt      = ctx->cfg.dt_sec;
 
     if (mode == 0)
     {
         /* Mode 0: Infinite-bandwidth instantaneous settling */
         __builtin_memcpy(pos, del, nact * sizeof(float));
+        __builtin_memcpy(pos_ren, del, nact * sizeof(float));
     }
     else if (mode == 1)
     {
-        /* Mode 1: Exact 1st-order RC step response x(t+dt) = u + exp(-dt/tau) * (x(t) - u) */
-        float alpha = (tau_sec > 1e-7f) ? expf(-dt / tau_sec) : 0.0f;
+        /*
+         * Mode 1: Exact 1st-order RC step response x(t+dt) = u + exp(-dt/tau)*(x0 - u), paired
+         * with analytical ZOH subframe mean x_bar = u + (tau/dt)*(1 - exp(-dt/tau))*(x0 - u).
+         */
+        float alpha  = 0.0f;
+        float mean_c = 0.0f;
+        if (tau_sec > 1e-7f)
+        {
+            float r = dt / tau_sec;
+            alpha   = expf(-r);
+            if (!do_mean)
+            {
+                mean_c = alpha;
+            }
+            else if (r < 1e-3f)
+            {
+                mean_c = 1.0f - 0.5f * r + (1.0f / 6.0f) * r * r;
+            }
+            else
+            {
+                mean_c = (1.0f - alpha) / r;
+            }
+        }
 #pragma omp simd
         for (uint32_t a = 0; a < nact; a++)
         {
-            pos[a] = del[a] + alpha * (pos[a] - del[a]);
+            float u    = del[a];
+            float e0   = pos[a] - u;
+            pos_ren[a] = u + mean_c * e0;
+            pos[a]     = u + alpha * e0;
         }
     }
     else
@@ -475,6 +510,8 @@ void MILK_HOT cacaosim_dm_step_actuators(
         /*
          * Mode 2: Exact 2nd-order damped oscillator e'' + 2*zeta*w0*e' + w0^2*e = 0
          * in tracking-error state coordinates e(t) = pos(t) - u, v(t) = vel(t).
+         * Integrating e'' = -w0^2*e - 2*zeta*w0*e' over [0, dt] yields exact subframe mean:
+         *   e_bar = -((v(dt) - v0) + 2*zeta*w0*(e(dt) - e0)) / (w0^2 * dt).
          */
         const float f0   = (ctx->cfg.f0_hz > 1.0f) ? ctx->cfg.f0_hz : 2500.0f;
         const float zeta = (ctx->cfg.zeta > 0.001f) ? ctx->cfg.zeta : 0.7f;
@@ -523,21 +560,43 @@ void MILK_HOT cacaosim_dm_step_actuators(
             a_vv = (r1v * E1 - r2v * E2) * inv;
         }
 
+        float m_ee = a_ee;
+        float m_ev = a_ev;
+        if (do_mean)
+        {
+            float wdt = w0 * dt;
+            if (wdt < 0.02f)
+            {
+                /* 3rd-order Taylor series avoids catastrophic cancellation when w0*dt << 1 */
+                m_ee = 1.0f - (1.0f / 6.0f) * wdt * wdt +
+                       (1.0f / 12.0f) * zeta * wdt * wdt * wdt;
+                m_ev = dt * (0.5f - (1.0f / 3.0f) * zeta * wdt +
+                             (1.0f / 24.0f) * (4.0f * zeta * zeta - 1.0f) * wdt * wdt);
+            }
+            else
+            {
+                float inv_denom = 1.0f / (w0 * w0 * dt);
+                m_ee            = -(a_ve + 2.0f * zeta * w0 * (a_ee - 1.0f)) * inv_denom;
+                m_ev            = -((a_vv - 1.0f) + 2.0f * zeta * w0 * a_ev) * inv_denom;
+            }
+        }
+
 #pragma omp simd
         for (uint32_t a = 0; a < nact; a++)
         {
-            float u  = del[a];
-            float e0 = pos[a] - u;
-            float v0 = vel[a];
-            pos[a]   = u + a_ee * e0 + a_ev * v0;
-            vel[a]   = a_ve * e0 + a_vv * v0;
+            float u    = del[a];
+            float e0   = pos[a] - u;
+            float v0   = vel[a];
+            pos_ren[a] = u + m_ee * e0 + m_ev * v0;
+            pos[a]     = u + a_ee * e0 + a_ev * v0;
+            vel[a]     = a_ve * e0 + a_vv * v0;
         }
     }
 }
 
 /**
  * cacaosim_dm_render_opd_cpu() - Synthesize 2D DM OPD surface on CPU via 16-tap gather
- * @ctx:      Active DM context with updated `ctx->act_pos`
+ * @ctx:      Active DM context with updated `ctx->act_pos_render`
  * @flat_opd: Optional static DM flat/figure OPD map `[npix_wf]` in `[um]` (NULL -> `0`)
  * @opd_out:  Destination host 2D reflective OPD buffer `[npix_wf]` in microns `[um]`
  *
@@ -561,7 +620,7 @@ void MILK_HOT cacaosim_dm_render_opd_cpu(
     }
 
     const uint64_t          npix = ctx->npix_wf;
-    const float *__restrict pos  = MILK_ASSUME_ALIGNED(ctx->act_pos);
+    const float *__restrict pos  = MILK_ASSUME_ALIGNED(ctx->act_pos_render);
     const int32_t *__restrict sidx = MILK_ASSUME_ALIGNED(ctx->stencil_idx);
     const float *__restrict   sw   = MILK_ASSUME_ALIGNED(ctx->stencil_w);
     const int nth = (npix >= 16384ULL) ? omp_get_max_threads() : 1;

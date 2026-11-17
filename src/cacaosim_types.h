@@ -47,6 +47,7 @@ extern "C" {
  * plus single-precision pi and 2*pi constants avoiding double-precision promotion in float kernels.
  */
 #define CACAOSIM_ALIGN_BYTES 64u
+#define CACAOSIM_MAX_LAMBDA  32
 #define CACAOSIM_PI_F        3.14159265358979323846f
 #define CACAOSIM_TWO_PI_F    6.28318530717958647692f
 

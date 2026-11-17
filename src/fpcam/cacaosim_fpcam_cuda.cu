@@ -45,12 +45,21 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cufft.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "common/cacaosim_beam.h"
 #include "common/cacaosim_cuda.h"
 #include "fpcam/cacaosim_fpcam.h"
+
+typedef struct
+{
+    uint32_t m0[CACAOSIM_FPCAM_MAX_LAMBDA];
+    uint32_t m1[CACAOSIM_FPCAM_MAX_LAMBDA];
+    float    alpha[CACAOSIM_FPCAM_MAX_LAMBDA];
+} fpcam_poly_map_t;
 
 /**
  * struct fpcam_cuda_priv_t - Opaque resident GPU state owned by `cacaosim_fpcam_ctx_t::cuda_priv`
@@ -96,6 +105,8 @@ typedef struct
     float         *d_wf_in;
     float         *d_dm_opd;
     float         *d_lam_um;
+    float         *d_strehl_w;
+    float         *d_scale_c;
 
     cuComplex     *d_mft_U;
     cuComplex     *d_mft_V;
@@ -112,34 +123,11 @@ typedef struct
     float         *d_out_f32;
 } fpcam_cuda_priv_t;
 
-/**
- * k_fpcam_build_epup_batch() - Synthesize `[nlam x npix_wf]` complex pupil phasors across channels
- * @pup_amp:     Device pupil/beam amplitude (`[beam_nlam]` at `chan_stride`), or NULL for `1.0f`
- * @atm_amp:     Optional achromatic atmospheric amplitude `[npix_wf]`, or NULL
- * @wf_in:       Optional wavefront/beam OPD (`[beam_nlam]` at `chan_stride`), or NULL
- * @beam_nlam:   Number of spectral slices in `pup_amp` and `wf_in` (`1` = achromatic)
- * @chan_stride: Float element stride between consecutive input spectral slices
- * @dm_opd:      Optional DM OPD `[npix_wf]` [um] (subtracted), or NULL
- * @ncpa_opd:    Optional static science-arm NCPA OPD `[npix_wf]` [um] (added), or NULL
- * @lam_um:      Device spectral channel wavelengths `[nlam]` [um]
- * @wf_to_opd:   Conversion factor mapping `wf_in` units to OPD [um]
- * @npix_wf:     Pupil pixel count (`nwf * nwf`)
- * @nlam:        Number of active camera spectral channels (`eff_nlam`)
- * @epup_batch:  Output contiguous complex pupil batch `[nlam * npix_wf]`
- *
- * Role: 2D-grid GPU kernel (`blockIdx.x` = pixel block, `blockIdx.y` = wavelength channel `c`)
- * launched once per subframe in `PROP_MFT` mode to populate all `nlam` complex pupil slices prior
- * to `cublasCgemmStridedBatched`.
- *
- * Rationale: Fusing all `nlam` spectral channels into a single 2D launch eliminates per-channel
- * kernel launch latency, reuses shared L2 cache lines for achromatic maps (`atm_amp`, `dm_opd`,
- * `ncpa_opd`), and uses hardware SFU `__sincosf()` while early-exiting masked (`amp <= 0`) pixels.
- */
 __global__ static void k_fpcam_build_epup_batch(
     const float *__restrict__ pup_amp,
     const float *__restrict__ atm_amp,
     const float *__restrict__ wf_in,
-    uint32_t                  beam_nlam,
+    fpcam_poly_map_t          map,
     uint64_t                  chan_stride,
     const float *__restrict__ dm_opd,
     const float *__restrict__ ncpa_opd,
@@ -156,66 +144,119 @@ __global__ static void k_fpcam_build_epup_batch(
         return;
     }
 
-    /* Map camera wavelength slice `c` onto corresponding upstream beam slice `bc` */
-    uint32_t bc = (beam_nlam <= 1u)
-                      ? 0u
-                      : ((beam_nlam == (uint32_t) nlam)
-                             ? (uint32_t) c
-                             : (((uint32_t) c * beam_nlam) / (uint32_t) nlam));
-    uint64_t b_idx = (uint64_t) bc * chan_stride + p;
-
-    float amp = (pup_amp != NULL) ? pup_amp[b_idx] : 1.0f;
-    if (atm_amp != NULL)
-    {
-        amp *= atm_amp[p];
-    }
+    uint32_t m0      = map.m0[c];
+    uint32_t m1      = map.m1[c];
+    float    w1      = map.alpha[c];
+    float    w0      = 1.0f - w1;
+    uint64_t b0      = (uint64_t) m0 * chan_stride + p;
+    uint64_t b1      = (uint64_t) m1 * chan_stride + p;
+    float    at      = (atm_amp != NULL) ? atm_amp[p] : 1.0f;
+    float    amp0    = ((pup_amp != NULL) ? pup_amp[b0] : 1.0f) * at;
+    float    amp1    = ((pup_amp != NULL) ? pup_amp[b1] : 1.0f) * at;
     uint64_t out_idx = (uint64_t) c * npix_wf + p;
-    if (amp <= 0.0f)
+    if (amp0 <= 0.0f && amp1 <= 0.0f)
     {
         epup_batch[out_idx] = make_cuComplex(0.0f, 0.0f);
         return;
     }
 
-    float opd = 0.0f;
-    if (wf_in != NULL)
-    {
-        opd += wf_to_opd * wf_in[b_idx];
-    }
-    if (dm_opd != NULL)
-    {
-        opd -= dm_opd[p];
-    }
-    if (ncpa_opd != NULL)
-    {
-        opd += ncpa_opd[p];
-    }
+    float common = ((ncpa_opd != NULL) ? ncpa_opd[p] : 0.0f) -
+                   ((dm_opd != NULL) ? dm_opd[p] : 0.0f);
+    float kc  = CACAOSIM_TWO_PI_F / lam_um[c];
+    float p0  = (((wf_in != NULL) ? (wf_to_opd * wf_in[b0]) : 0.0f) + common) * kc;
+    float s0  = 0.0f;
+    float co0 = 1.0f;
+    __sincosf(p0, &s0, &co0);
+    float re = w0 * amp0 * co0;
+    float im = w0 * amp0 * s0;
 
-    float phi = opd * (CACAOSIM_TWO_PI_F / lam_um[c]);
-    float s   = 0.0f;
-    float co  = 1.0f;
-    __sincosf(phi, &s, &co);
-    epup_batch[out_idx] = make_cuComplex(amp * co, amp * s);
+    if (m1 != m0 && w1 > 0.0f)
+    {
+        float p1  = (((wf_in != NULL) ? (wf_to_opd * wf_in[b1]) : 0.0f) + common) * kc;
+        float s1  = 0.0f;
+        float co1 = 1.0f;
+        __sincosf(p1, &s1, &co1);
+        re += w1 * amp1 * co1;
+        im += w1 * amp1 * s1;
+    }
+    epup_batch[out_idx] = make_cuComplex(re, im);
 }
 
-/**
- * k_fpcam_accum_mft_batch() - Reduce polychromatic MFT focal amplitudes into broadband intensity
- * @efoc_batch: Batched complex focal fields `[nlam * npix_cam]` from `cublasCgemmStridedBatched`
- * @npix_cam:   Detector pixel count (`ncam * ncam`)
- * @nlam:       Number of spectral slices in `@efoc_batch`
- * @inv_nlam:   Reciprocal channel count `1.0f / nlam`
- * @accum_int:  In/out running Strehl-normalized subframe intensity accumulator `[npix_cam]`
- *
- * Role: Post-MFT reduction kernel that sums `|Efoc_c(idx)|^2` incoherently across `[0 .. nlam - 1]`
- * and accumulates `inv_nlam * sum` into `accum_int[idx]`.
- *
- * Rationale: Assigning one thread per focal pixel `idx` avoids atomic contention across spectral
- * channels and performs only a single read-modify-write to `accum_int[idx]` per subframe.
- */
+__global__ static void k_fpcam_build_fft_batch(
+    const float *__restrict__ pup_amp,
+    const float *__restrict__ atm_amp,
+    const float *__restrict__ wf_in,
+    fpcam_poly_map_t          map,
+    uint64_t                  chan_stride,
+    const float *__restrict__ dm_opd,
+    const float *__restrict__ ncpa_opd,
+    const float *__restrict__ lam_um,
+    float                     wf_to_opd,
+    uint32_t                  nwf,
+    uint32_t                  nfft,
+    int32_t                   nlam,
+    cufftComplex *__restrict__ fft_in)
+{
+    uint64_t idx      = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t  c        = (int32_t) blockIdx.y;
+    uint64_t npix_fft = (uint64_t) nfft * nfft;
+    if (idx >= npix_fft || c >= nlam)
+    {
+        return;
+    }
+
+    uint64_t out_idx = (uint64_t) c * npix_fft + idx;
+    uint32_t x       = (uint32_t) (idx % nfft);
+    uint32_t y       = (uint32_t) (idx / nfft);
+    if (x >= nwf || y >= nwf)
+    {
+        fft_in[out_idx] = make_cuFloatComplex(0.0f, 0.0f);
+        return;
+    }
+
+    uint64_t p    = (uint64_t) y * nwf + x;
+    uint32_t m0   = map.m0[c];
+    uint32_t m1   = map.m1[c];
+    float    w1   = map.alpha[c];
+    float    w0   = 1.0f - w1;
+    uint64_t b0   = (uint64_t) m0 * chan_stride + p;
+    uint64_t b1   = (uint64_t) m1 * chan_stride + p;
+    float    at   = (atm_amp != NULL) ? atm_amp[p] : 1.0f;
+    float    amp0 = ((pup_amp != NULL) ? pup_amp[b0] : 1.0f) * at;
+    float    amp1 = ((pup_amp != NULL) ? pup_amp[b1] : 1.0f) * at;
+    if (amp0 <= 0.0f && amp1 <= 0.0f)
+    {
+        fft_in[out_idx] = make_cuFloatComplex(0.0f, 0.0f);
+        return;
+    }
+
+    float common = ((ncpa_opd != NULL) ? ncpa_opd[p] : 0.0f) -
+                   ((dm_opd != NULL) ? dm_opd[p] : 0.0f);
+    float kc  = CACAOSIM_TWO_PI_F / lam_um[c];
+    float p0  = (((wf_in != NULL) ? (wf_to_opd * wf_in[b0]) : 0.0f) + common) * kc;
+    float s0  = 0.0f;
+    float co0 = 1.0f;
+    __sincosf(p0, &s0, &co0);
+    float re = w0 * amp0 * co0;
+    float im = w0 * amp0 * s0;
+
+    if (m1 != m0 && w1 > 0.0f)
+    {
+        float p1  = (((wf_in != NULL) ? (wf_to_opd * wf_in[b1]) : 0.0f) + common) * kc;
+        float s1  = 0.0f;
+        float co1 = 1.0f;
+        __sincosf(p1, &s1, &co1);
+        re += w1 * amp1 * co1;
+        im += w1 * amp1 * s1;
+    }
+    fft_in[out_idx] = make_cuFloatComplex(re, im);
+}
+
 __global__ static void k_fpcam_accum_mft_batch(
     const cuComplex *__restrict__ efoc_batch,
+    const float *__restrict__     strehl_w,
     uint64_t                      npix_cam,
     int32_t                       nlam,
-    float                         inv_nlam,
     float *__restrict__           accum_int)
 {
     uint64_t idx = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -227,32 +268,19 @@ __global__ static void k_fpcam_accum_mft_batch(
     for (int32_t c = 0; c < nlam; c++)
     {
         cuComplex z = efoc_batch[(uint64_t) c * npix_cam + idx];
-        sum += z.x * z.x + z.y * z.y;
+        sum += strehl_w[c] * (z.x * z.x + z.y * z.y);
     }
-    accum_int[idx] += inv_nlam * sum;
+    accum_int[idx] += sum;
 }
 
-/**
- * k_fpcam_accum_fft_crop() - Modularly center, crop, and accumulate 2D FFT focal intensity
- * @fft_out:   Unshifted `[nfft x nfft]` complex output from `cufftExecC2C`
- * @nfft:      Zero-padded 2D FFT dimension (`nwf * pad_factor`)
- * @ncam:      Science camera grid dimension
- * @scale_i:   Strehl + spectral weight `1.0f / (nlam * pup_sum_amp^2)`
- * @accum_int: In/out running Strehl-normalized subframe intensity accumulator `[ncam * ncam]`
- *
- * Role: 2D focal-plane kernel launched per channel in `PROP_FFT` mode to map unshifted cuFFT bins
- * `(kx, ky)` around DC `(0, 0)` onto camera center `(ncam / 2, ncam / 2)` and accumulate scaled
- * squared modulus `scale_i * |fft_out(kx, ky)|^2`.
- *
- * Rationale: Modular index wrapping `((d % nfft) + nfft) % nfft` combines `fftshift`, central ROI
- * cropping (or periodic wrapping if `ncam > nfft`), modulus-squared evaluation, and Strehl
- * normalization into one memory-coalesced pass over `[ncam x ncam]`.
- */
 __global__ static void k_fpcam_accum_fft_crop(
     const cufftComplex *__restrict__ fft_out,
+    const float *__restrict__        scale_c,
+    const float *__restrict__        strehl_w,
     uint32_t                         nfft,
     uint32_t                         ncam,
-    float                            scale_i,
+    int32_t                          nlam,
+    float                            inv_s2,
     float *__restrict__              accum_int)
 {
     uint32_t xf = blockIdx.x * blockDim.x + threadIdx.x;
@@ -261,13 +289,43 @@ __global__ static void k_fpcam_accum_fft_crop(
     {
         return;
     }
-    int32_t      half_c = (int32_t) (ncam / 2u);
-    int32_t      dx     = (int32_t) xf - half_c;
-    int32_t      dy     = (int32_t) yf - half_c;
-    uint32_t     kx     = (uint32_t) ((dx % (int32_t) nfft + (int32_t) nfft) % (int32_t) nfft);
-    uint32_t     ky     = (uint32_t) ((dy % (int32_t) nfft + (int32_t) nfft) % (int32_t) nfft);
-    cufftComplex z      = fft_out[(uint64_t) ky * nfft + kx];
-    accum_int[(uint64_t) yf * ncam + xf] += scale_i * (z.x * z.x + z.y * z.y);
+    int32_t  half_c   = (int32_t) (ncam / 2u);
+    int32_t  dx       = (int32_t) xf - half_c;
+    int32_t  dy       = (int32_t) yf - half_c;
+    int32_t  nf       = (int32_t) nfft;
+    uint64_t npix_fft = (uint64_t) nfft * nfft;
+    float    sum      = 0.0f;
+
+    for (int32_t c = 0; c < nlam; c++)
+    {
+        float    sc   = scale_c[c];
+        float    sx_f = (float) dx * sc;
+        float    sy_f = (float) dy * sc;
+        int32_t  ix0  = (int32_t) floorf(sx_f);
+        int32_t  iy0  = (int32_t) floorf(sy_f);
+        float    fx   = sx_f - (float) ix0;
+        float    fy   = sy_f - (float) iy0;
+        uint32_t kx0  = (uint32_t) ((ix0 % nf + nf) % nf);
+        uint32_t kx1  = (uint32_t) (((ix0 + 1) % nf + nf) % nf);
+        uint32_t ky0  = (uint32_t) ((iy0 % nf + nf) % nf);
+        uint32_t ky1  = (uint32_t) (((iy0 + 1) % nf + nf) % nf);
+
+        const cufftComplex *fo  = &fft_out[(uint64_t) c * npix_fft];
+        cufftComplex        z00 = fo[(uint64_t) ky0 * nfft + kx0];
+        cufftComplex        z10 = fo[(uint64_t) ky0 * nfft + kx1];
+        cufftComplex        z01 = fo[(uint64_t) ky1 * nfft + kx0];
+        cufftComplex        z11 = fo[(uint64_t) ky1 * nfft + kx1];
+
+        float i00 = z00.x * z00.x + z00.y * z00.y;
+        float i10 = z10.x * z10.x + z10.y * z10.y;
+        float i01 = z01.x * z01.x + z01.y * z01.y;
+        float i11 = z11.x * z11.x + z11.y * z11.y;
+
+        float v0 = (1.0f - fx) * i00 + fx * i10;
+        float v1 = (1.0f - fx) * i01 + fx * i11;
+        sum += strehl_w[c] * inv_s2 * ((1.0f - fy) * v0 + fy * v1);
+    }
+    accum_int[(uint64_t) yf * ncam + xf] += sum;
 }
 
 /**
@@ -314,6 +372,59 @@ __global__ static void k_fpcam_scale_exposure(
  *
  * Return: `0` on success, `-1` on any CUDA/cuBLAS/cuFFT allocation or plan failure (auto-cleaned).
  */
+static void fpcam_cuda_resolve_map(
+    const cacaosim_fpcam_ctx_t *ctx,
+    uint32_t                    beam_nlam,
+    fpcam_poly_map_t           *map,
+    int                        *identity_match)
+{
+    int32_t nlam = ctx->eff_nlam;
+    int     id   = (beam_nlam == (uint32_t) nlam) ? 1 : 0;
+    if (beam_nlam <= 1u)
+    {
+        for (int32_t c = 0; c < nlam; c++)
+        {
+            map->m0[c]    = 0u;
+            map->m1[c]    = 0u;
+            map->alpha[c] = 0.0f;
+        }
+        if (identity_match != NULL)
+        {
+            *identity_match = 0;
+        }
+        return;
+    }
+
+    const float *in_lam = NULL;
+    if (ctx->cfg.has_in_lam)
+    {
+        in_lam = ctx->cfg.in_lam_um;
+    }
+    else if (ctx->cfg.has_ext_lam && beam_nlam == (uint32_t) nlam)
+    {
+        in_lam = ctx->lam_um;
+    }
+    float lam0   = (ctx->cfg.lambda_um > 0.05f) ? ctx->cfg.lambda_um : 1.65f;
+    float bw     = (ctx->cfg.bw_frac > 0.0f) ? ctx->cfg.bw_frac : 0.20f;
+    float span   = 0.5f * bw * ((float) (beam_nlam - 1u) / (float) beam_nlam);
+    float def_l0 = lam0 * (1.0f - span);
+    float def_l1 = lam0 * (1.0f + span);
+
+    for (int32_t c = 0; c < nlam; c++)
+    {
+        cacaosim_poly_interp_bracket(ctx->lam_um[c], in_lam, beam_nlam, def_l0, def_l1,
+                                     &map->m0[c], &map->m1[c], &map->alpha[c]);
+        if (map->m0[c] != (uint32_t) c || map->m1[c] != (uint32_t) c || map->alpha[c] > 1e-6f)
+        {
+            id = 0;
+        }
+    }
+    if (identity_match != NULL)
+    {
+        *identity_match = id;
+    }
+}
+
 extern "C" int cacaosim_fpcam_cuda_init(
     cacaosim_fpcam_ctx_t *ctx,
     const float          *pup_amp,
@@ -342,18 +453,20 @@ extern "C" int cacaosim_fpcam_cuda_init(
         p->owns_stream = 1;
     }
 
-    const uint64_t npix_wf  = ctx->npix_wf;
-    const uint64_t npix_cam = ctx->npix_cam;
-    const int32_t  nlam     = ctx->eff_nlam;
+    const uint64_t npix_wf   = ctx->npix_wf;
+    const uint64_t npix_cam  = ctx->npix_cam;
+    const int32_t  nlam      = ctx->eff_nlam;
+    const size_t   lam_bytes = (size_t) nlam * sizeof(float);
+    const size_t   stg_bytes = (size_t) (2 * nlam) * npix_wf * sizeof(float);
 
     if (cudaMalloc((void **) &p->d_pup_amp, npix_wf * sizeof(float)) != cudaSuccess ||
-        cudaMalloc((void **) &p->d_dyn_pup, (size_t) nlam * npix_wf * sizeof(float)) !=
-            cudaSuccess ||
+        cudaMalloc((void **) &p->d_dyn_pup, stg_bytes) != cudaSuccess ||
         cudaMalloc((void **) &p->d_atm_amp, npix_wf * sizeof(float)) != cudaSuccess ||
-        cudaMalloc((void **) &p->d_wf_in, (size_t) nlam * npix_wf * sizeof(float)) !=
-            cudaSuccess ||
+        cudaMalloc((void **) &p->d_wf_in, stg_bytes) != cudaSuccess ||
         cudaMalloc((void **) &p->d_dm_opd, npix_wf * sizeof(float)) != cudaSuccess ||
-        cudaMalloc((void **) &p->d_lam_um, (size_t) nlam * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void **) &p->d_lam_um, lam_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &p->d_strehl_w, lam_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &p->d_scale_c, lam_bytes) != cudaSuccess ||
         cudaMalloc((void **) &p->d_accum_int, npix_cam * sizeof(float)) != cudaSuccess ||
         cudaMalloc((void **) &p->d_exp_int, npix_cam * sizeof(float)) != cudaSuccess ||
         cudaMalloc((void **) &p->d_out_u16, npix_cam * sizeof(uint16_t)) != cudaSuccess ||
@@ -365,8 +478,9 @@ extern "C" int cacaosim_fpcam_cuda_init(
 
     cudaMemcpyAsync(p->d_pup_amp, pup_amp, npix_wf * sizeof(float), cudaMemcpyHostToDevice,
                     p->stream);
-    cudaMemcpyAsync(p->d_lam_um, ctx->lam_um, (size_t) nlam * sizeof(float),
-                    cudaMemcpyHostToDevice, p->stream);
+    cudaMemcpyAsync(p->d_lam_um, ctx->lam_um, lam_bytes, cudaMemcpyHostToDevice, p->stream);
+    cudaMemcpyAsync(p->d_strehl_w, ctx->strehl_w, lam_bytes, cudaMemcpyHostToDevice, p->stream);
+    cudaMemcpyAsync(p->d_scale_c, ctx->scale_c, lam_bytes, cudaMemcpyHostToDevice, p->stream);
     cudaMemsetAsync(p->d_accum_int, 0, npix_cam * sizeof(float), p->stream);
 
     if (ncpa_opd != NULL)
@@ -409,15 +523,18 @@ extern "C" int cacaosim_fpcam_cuda_init(
     }
     else
     {
-        size_t fft_bytes = ctx->npix_fft * sizeof(cufftComplex);
+        size_t fft_bytes = (size_t) nlam * ctx->npix_fft * sizeof(cufftComplex);
         if (cudaMalloc((void **) &p->d_fft_in, fft_bytes) != cudaSuccess ||
             cudaMalloc((void **) &p->d_fft_out, fft_bytes) != cudaSuccess)
         {
             cacaosim_fpcam_cuda_free(ctx);
             return -1;
         }
-        int n = (int) ctx->nfft;
-        if (cufftPlan2d(&p->fft_fwd, n, n, CUFFT_C2C) != CUFFT_SUCCESS ||
+        int n_arr[2]   = { (int) ctx->nfft, (int) ctx->nfft };
+        int inembed[2] = { n_arr[0], n_arr[1] };
+        int idist      = (int) ctx->npix_fft;
+        if (cufftPlanMany(&p->fft_fwd, 2, n_arr, inembed, 1, idist, inembed, 1, idist, CUFFT_C2C,
+                          nlam) != CUFFT_SUCCESS ||
             cufftSetStream(p->fft_fwd, p->stream) != CUFFT_SUCCESS)
         {
             cacaosim_fpcam_cuda_free(ctx);
@@ -430,16 +547,6 @@ extern "C" int cacaosim_fpcam_cuda_init(
     return 0;
 }
 
-/**
- * cacaosim_fpcam_cuda_free() - Destroy cuBLAS/cuFFT handles, device buffers, and owned CUDA stream
- * @ctx: Focal-plane camera context owning `cuda_priv` (safe on NULL or partially allocated state)
- *
- * Role: Cold GPU teardown helper invoked by `cacaosim_fpcam_free()` and partial-init rollback
- * paths inside `cacaosim_fpcam_cuda_init()`.
- *
- * Rationale: `cudaFree(NULL)` is a well-defined no-op in the CUDA Runtime API, while `owns_stream`
- * ensures borrowed external streams (`cacaosim.htsim`) are never prematurely destroyed.
- */
 extern "C" void cacaosim_fpcam_cuda_free(cacaosim_fpcam_ctx_t *ctx)
 {
     if (ctx == NULL || ctx->cuda_priv == NULL)
@@ -462,6 +569,8 @@ extern "C" void cacaosim_fpcam_cuda_free(cacaosim_fpcam_ctx_t *ctx)
     cudaFree(p->d_wf_in);
     cudaFree(p->d_dm_opd);
     cudaFree(p->d_lam_um);
+    cudaFree(p->d_strehl_w);
+    cudaFree(p->d_scale_c);
     cudaFree(p->d_mft_U);
     cudaFree(p->d_mft_V);
     cudaFree(p->d_epup_batch);
@@ -482,46 +591,29 @@ extern "C" void cacaosim_fpcam_cuda_free(cacaosim_fpcam_ctx_t *ctx)
     ctx->use_cuda  = 0;
 }
 
-/**
- * cacaosim_fpcam_cuda_reset_accum() - Asynchronously zero device subframe intensity accumulator
- * @ctx: Initialized focal-plane camera context with active `cuda_priv`
- *
- * Role: Enqueues `cudaMemsetAsync` on `p->stream` at the start of a new camera integration
- * (`subframe_cnt == 0`) to clear `d_accum_int`.
- *
- * Rationale: Stream-ordered `cudaMemsetAsync` avoids host-device synchronization stalls between
- * exposures while guaranteeing subsequent `+=` kernel accumulations start cleanly from zero.
- */
+extern "C" void cacaosim_fpcam_cuda_upload_weights(cacaosim_fpcam_ctx_t *ctx)
+{
+    fpcam_cuda_priv_t *p = (fpcam_cuda_priv_t *) ctx->cuda_priv;
+    if (p == NULL || ctx->eff_nlam < 1)
+    {
+        return;
+    }
+    cudaMemcpyAsync(p->d_strehl_w, ctx->strehl_w, (size_t) ctx->eff_nlam * sizeof(float),
+                    cudaMemcpyHostToDevice, p->stream);
+}
+
 extern "C" void cacaosim_fpcam_cuda_reset_accum(cacaosim_fpcam_ctx_t *ctx)
 {
     fpcam_cuda_priv_t *p = (fpcam_cuda_priv_t *) ctx->cuda_priv;
     cudaMemsetAsync(p->d_accum_int, 0, ctx->npix_cam * sizeof(float), p->stream);
 }
 
-/**
- * fpcam_cuda_run_prop() - Enqueue GPU polychromatic Fraunhofer diffraction and intensity sum
- * @ctx:        Initialized focal-plane camera context
- * @d_pup:      Device pupil or dynamic beam amplitude (`[dev_nlam]` at `dev_stride`), or NULL
- * @d_amp:      Optional device atmospheric amplitude `[npix_wf]`, or NULL
- * @d_wf:       Optional device wavefront or beam OPD (`[dev_nlam]` at `dev_stride`), or NULL
- * @dev_nlam:   Number of spectral slices present in `d_pup` and `d_wf` (`1` = achromatic)
- * @dev_stride: Float element stride between consecutive device spectral slices
- * @d_dm:       Optional device DM OPD `[npix_wf]` [um], or NULL
- * @wf_to_opd:  Scale factor mapping `d_wf` units to OPD [um]
- *
- * Role: Shared device-pointer propagation core invoked by both `cacaosim_fpcam_cuda_accum()` and
- * `cacaosim_fpcam_cuda_accum_poly()` once inputs are resident in GPU memory.
- *
- * Rationale: Centralizing MFT vs FFT dispatch over device pointers lets standalone host-staged
- * SHM loops and zero-copy fused `cacaosim.htsim` pipelines execute the exact same sequence of
- * CUDA kernels and cuBLAS/cuFFT operations without code duplication.
- */
 static void fpcam_cuda_run_prop(
     cacaosim_fpcam_ctx_t *ctx,
     const float          *d_pup,
     const float          *d_amp,
     const float          *d_wf,
-    uint32_t              dev_nlam,
+    fpcam_poly_map_t      map,
     uint64_t              dev_stride,
     const float          *d_dm,
     float                 wf_to_opd)
@@ -538,7 +630,7 @@ static void fpcam_cuda_run_prop(
         dim3 blk(256, 1, 1);
         dim3 grd((unsigned int) ((npix_wf + 255u) / 256u), (unsigned int) nlam, 1);
         k_fpcam_build_epup_batch<<<grd, blk, 0, p->stream>>>(
-            d_pup, d_amp, d_wf, dev_nlam, dev_stride, d_dm, p->d_ncpa_opd, p->d_lam_um, wf_to_opd,
+            d_pup, d_amp, d_wf, map, dev_stride, d_dm, p->d_ncpa_opd, p->d_lam_um, wf_to_opd,
             npix_wf, nlam, p->d_epup_batch);
 
         const cuComplex one       = make_cuComplex(1.0f, 0.0f);
@@ -547,74 +639,40 @@ static void fpcam_cuda_run_prop(
         long long int   stride_uv = (long long int) ncam * nwf;
         long long int   stride_ef = (long long int) npix_cam;
 
-        /*
-         * Row-major T[ncam x nwf] = U[ncam x nwf] * Epup[nwf x nwf] is identical in memory to
-         * column-major T^T[nwf x ncam] = Epup^T[nwf x nwf] * U^T[nwf x ncam] (lda=nwf, ldb=nwf).
-         */
         cublasCgemmStridedBatched(p->cublas, CUBLAS_OP_N, CUBLAS_OP_N, (int) nwf, (int) ncam,
                                   (int) nwf, &one, p->d_epup_batch, (int) nwf, stride_ep,
                                   p->d_mft_U, (int) nwf, stride_uv, &zero, p->d_mft_tmp, (int) nwf,
                                   stride_uv, nlam);
 
-        /*
-         * Row-major Efoc[ncam x ncam] = T[ncam x nwf] * V[nwf x ncam] is identical in memory to
-         * column-major Efoc^T[ncam x ncam] = V^T[ncam x nwf] * T^T[nwf x ncam] (lda=ncam, ldb=nwf).
-         */
         cublasCgemmStridedBatched(p->cublas, CUBLAS_OP_N, CUBLAS_OP_N, (int) ncam, (int) ncam,
                                   (int) nwf, &one, p->d_mft_V, (int) ncam, stride_uv, p->d_mft_tmp,
                                   (int) nwf, stride_uv, &zero, p->d_efoc_batch, (int) ncam,
                                   stride_ef, nlam);
 
         uint32_t g1d = (uint32_t) ((npix_cam + 255u) / 256u);
-        k_fpcam_accum_mft_batch<<<g1d, 256, 0, p->stream>>>(p->d_efoc_batch, npix_cam, nlam,
-                                                            1.0f / (float) nlam, p->d_accum_int);
+        k_fpcam_accum_mft_batch<<<g1d, 256, 0, p->stream>>>(
+            p->d_efoc_batch, p->d_strehl_w, npix_cam, nlam, p->d_accum_int);
     }
     else
     {
-        /* Normalize unnormalized 2D cuFFT peak (`pup_sum_amp`) into Strehl units `[0..1]` */
-        const float scale_i = 1.0f / ((float) nlam * ctx->pup_sum_amp * ctx->pup_sum_amp);
-        dim3        b2d(16, 16);
-        dim3        g2d((ncam + 15u) / 16u, (ncam + 15u) / 16u);
+        const float inv_s2 = 1.0f / (ctx->pup_sum_amp * ctx->pup_sum_amp);
+        dim3        blk1(256, 1, 1);
+        dim3        grd1((unsigned int) ((ctx->npix_fft + 255u) / 256u), (unsigned int) nlam, 1);
 
-        for (int32_t c = 0; c < nlam; c++)
-        {
-            uint32_t bc = (dev_nlam <= 1u)
-                              ? 0u
-                              : ((dev_nlam == (uint32_t) nlam)
-                                     ? (uint32_t) c
-                                     : (((uint32_t) c * dev_nlam) / (uint32_t) nlam));
-            const float *d_pup_c = (d_pup != NULL) ? (d_pup + (uint64_t) bc * dev_stride) : NULL;
-            const float *d_wf_c  = (d_wf != NULL) ? (d_wf + (uint64_t) bc * dev_stride) : NULL;
-            float        opd_to_rad = CACAOSIM_TWO_PI_F / ctx->lam_um[c];
-            cacaosim_cuda_build_pupil_padded(d_pup_c, d_amp, d_wf_c, d_dm, p->d_ncpa_opd,
-                                             wf_to_opd, opd_to_rad, nwf, ctx->nfft, p->d_fft_in,
-                                             p->stream);
-            cufftExecC2C(p->fft_fwd, p->d_fft_in, p->d_fft_out, CUFFT_FORWARD);
-            k_fpcam_accum_fft_crop<<<g2d, b2d, 0, p->stream>>>(p->d_fft_out, ctx->nfft, ncam,
-                                                               scale_i, p->d_accum_int);
-        }
+        k_fpcam_build_fft_batch<<<grd1, blk1, 0, p->stream>>>(
+            d_pup, d_amp, d_wf, map, dev_stride, d_dm, p->d_ncpa_opd, p->d_lam_um, wf_to_opd, nwf,
+            ctx->nfft, nlam, p->d_fft_in);
+
+        cufftExecC2C(p->fft_fwd, p->d_fft_in, p->d_fft_out, CUFFT_FORWARD);
+
+        dim3 b2d(16, 16);
+        dim3 g2d((ncam + 15u) / 16u, (ncam + 15u) / 16u);
+        k_fpcam_accum_fft_crop<<<g2d, b2d, 0, p->stream>>>(
+            p->d_fft_out, p->d_scale_c, p->d_strehl_w, ctx->nfft, ncam, nlam, inv_s2,
+            p->d_accum_int);
     }
 }
 
-/**
- * cacaosim_fpcam_cuda_accum() - Stage optional host/device AO planes and accumulate one subframe
- * @ctx:           Initialized focal-plane camera context
- * @dyn_pup_amp:   Optional host dynamic pupil amplitude `[npix_wf]`, or NULL for resident pupil
- * @atm_amp:       Optional host atmospheric scintillation amplitude `[npix_wf]`, or NULL
- * @wf_in:         Optional host wavefront map `[npix_wf]`, or NULL
- * @dm_opd:        Optional host DM OPD `[npix_wf]` [um], or NULL
- * @d_pup_amp_ext: Optional resident device pupil amplitude `[npix_wf]`, or NULL
- * @d_wf_opd_ext:  Optional resident device wavefront/OPD `[npix_wf]`, or NULL
- * @d_dm_opd_ext:  Optional resident device DM OPD `[npix_wf]` [um], or NULL
- * @wf_to_opd:     Scale factor mapping `wf_in` / `d_wf_opd_ext` units to OPD [um]
- *
- * Role: GPU accumulation entry point for classical achromatic AO wavefronts, prioritizing external
- * resident device pointers (`d_*_ext`) when non-NULL and falling back to asynchronous H2D staging
- * (`cudaMemcpyAsync`) for host SHM pointers.
- *
- * Rationale: Allows hybrid benches (e.g., host SHM turbulence combined with GPU-resident DM OPD)
- * to copy only host-sourced arrays across PCIe while leaving resident device arrays untouched.
- */
 extern "C" void cacaosim_fpcam_cuda_accum(
     cacaosim_fpcam_ctx_t *ctx,
     const float          *dyn_pup_amp,
@@ -628,6 +686,7 @@ extern "C" void cacaosim_fpcam_cuda_accum(
 {
     fpcam_cuda_priv_t *p       = (fpcam_cuda_priv_t *) ctx->cuda_priv;
     const uint64_t     npix_wf = ctx->npix_wf;
+    fpcam_poly_map_t   map     = { { 0 }, { 0 }, { 0.0f } };
 
     const float *d_pup = p->d_pup_amp;
     const float *d_amp = NULL;
@@ -672,29 +731,9 @@ extern "C" void cacaosim_fpcam_cuda_accum(
         d_dm = p->d_dm_opd;
     }
 
-    fpcam_cuda_run_prop(ctx, d_pup, d_amp, d_wf, 1u, npix_wf, d_dm, wf_to_opd);
+    fpcam_cuda_run_prop(ctx, d_pup, d_amp, d_wf, map, npix_wf, d_dm, wf_to_opd);
 }
 
-/**
- * cacaosim_fpcam_cuda_accum_poly() - Stage or consume polychromatic `[OPD, Amp]` beam on GPU
- * @ctx:         Initialized focal-plane camera context
- * @beam_opd:    Host OPD slices `[beam_nlam]` [um] at `chan_stride`, or NULL
- * @beam_amp:    Host amplitude slices `[beam_nlam]` at `chan_stride`, or NULL
- * @beam_nlam:   Number of spectral channels in the input beam (`1` = collapsed, `>= 2` = poly)
- * @chan_stride: Float element stride between consecutive input spectral slices
- * @d_beam_opd:  Optional resident device OPD slices (`[beam_nlam]` at `chan_stride`), or NULL
- * @d_beam_amp:  Optional resident device amplitude slices (`[beam_nlam]` at `chan_stride`), or NULL
- *
- * Role: GPU entry point for dynamic `[OPD_um, Amplitude]` optical beams (e.g., post-coronagraphic
- * `out_beam` cubes from `cacaosim.coro`). Bypasses all H2D copies when `d_beam_opd` or
- * `d_beam_amp` is provided, or packs strided host SHM slices into contiguous `d_dyn_pup` /
- * `d_wf_in` device buffers before calling `fpcam_cuda_run_prop()`.
- *
- * Rationale: Selects the fastest DMA transfer topology for every host layout: single-block
- * `cudaMemcpyAsync` when contiguous (`beam_nlam == 1` or `chan_stride == npix_wf`), pitched 2D
- * `cudaMemcpy2DAsync` when interleaved SHM `[OPD_c, Amp_c]` matches `nlam` (`chan_stride = 2 *
- * npix_wf`), and nearest-slice gather copies when upstream `beam_nlam` differs from `nlam`.
- */
 extern "C" void cacaosim_fpcam_cuda_accum_poly(
     cacaosim_fpcam_ctx_t *ctx,
     const float          *beam_opd,
@@ -709,82 +748,108 @@ extern "C" void cacaosim_fpcam_cuda_accum_poly(
     const size_t       wf_bytes = (size_t) npix_wf * sizeof(float);
     const int32_t      nlam     = ctx->eff_nlam;
 
-    /* Fast zero-copy path for fused GPU benches (`cacaosim.htsim`) */
+    fpcam_poly_map_t map            = { { 0 }, { 0 }, { 0.0f } };
+    int              identity_match = 0;
+    uint32_t         bn             = (beam_nlam >= 1u) ? beam_nlam : 1u;
+    fpcam_cuda_resolve_map(ctx, bn, &map, &identity_match);
+
     if (d_beam_opd != NULL || d_beam_amp != NULL)
     {
         const float *d_pup = (d_beam_amp != NULL) ? d_beam_amp : p->d_pup_amp;
-        uint32_t     dn    = (beam_nlam >= 1u) ? beam_nlam : 1u;
-        fpcam_cuda_run_prop(ctx, d_pup, NULL, d_beam_opd, dn, chan_stride, NULL, 1.0f);
+        fpcam_cuda_run_prop(ctx, d_pup, NULL, d_beam_opd, map, chan_stride, NULL, 1.0f);
         return;
     }
 
-    const float *d_pup    = p->d_pup_amp;
-    const float *d_wf     = NULL;
-    uint32_t     dev_nlam = (beam_nlam <= 1u) ? 1u : (uint32_t) nlam;
+    const float     *d_pup      = p->d_pup_amp;
+    const float     *d_wf       = NULL;
+    fpcam_poly_map_t staged_map = map;
 
-    if (beam_amp != NULL)
+    if (bn <= 1u)
     {
-        if (beam_nlam <= 1u)
+        if (beam_amp != NULL)
         {
             cudaMemcpyAsync(p->d_dyn_pup, beam_amp, wf_bytes, cudaMemcpyHostToDevice, p->stream);
+            d_pup = p->d_dyn_pup;
         }
-        else if (beam_nlam == (uint32_t) nlam && chan_stride == npix_wf)
-        {
-            cudaMemcpyAsync(p->d_dyn_pup, beam_amp, (size_t) nlam * wf_bytes,
-                            cudaMemcpyHostToDevice, p->stream);
-        }
-        else if (beam_nlam == (uint32_t) nlam)
-        {
-            /* Gather strided SHM amplitude slices `[0 .. nlam-1]` in a single 2D DMA transaction */
-            cudaMemcpy2DAsync(p->d_dyn_pup, wf_bytes, beam_amp,
-                              (size_t) chan_stride * sizeof(float), wf_bytes, (size_t) nlam,
-                              cudaMemcpyHostToDevice, p->stream);
-        }
-        else
-        {
-            for (int32_t c = 0; c < nlam; c++)
-            {
-                uint32_t bc = ((uint32_t) c * beam_nlam) / (uint32_t) nlam;
-                cudaMemcpyAsync(p->d_dyn_pup + (size_t) c * npix_wf,
-                                beam_amp + (uint64_t) bc * chan_stride, wf_bytes,
-                                cudaMemcpyHostToDevice, p->stream);
-            }
-        }
-        d_pup = p->d_dyn_pup;
-    }
-
-    if (beam_opd != NULL)
-    {
-        if (beam_nlam <= 1u)
+        if (beam_opd != NULL)
         {
             cudaMemcpyAsync(p->d_wf_in, beam_opd, wf_bytes, cudaMemcpyHostToDevice, p->stream);
+            d_wf = p->d_wf_in;
         }
-        else if (beam_nlam == (uint32_t) nlam && chan_stride == npix_wf)
+    }
+    else if (identity_match)
+    {
+        if (beam_amp != NULL)
         {
-            cudaMemcpyAsync(p->d_wf_in, beam_opd, (size_t) nlam * wf_bytes, cudaMemcpyHostToDevice,
-                            p->stream);
-        }
-        else if (beam_nlam == (uint32_t) nlam)
-        {
-            /* Gather strided SHM OPD slices `[0 .. nlam-1]` in a single 2D DMA transaction */
-            cudaMemcpy2DAsync(p->d_wf_in, wf_bytes, beam_opd,
-                              (size_t) chan_stride * sizeof(float), wf_bytes, (size_t) nlam,
-                              cudaMemcpyHostToDevice, p->stream);
-        }
-        else
-        {
-            for (int32_t c = 0; c < nlam; c++)
+            if (chan_stride == npix_wf)
             {
-                uint32_t bc = ((uint32_t) c * beam_nlam) / (uint32_t) nlam;
-                cudaMemcpyAsync(p->d_wf_in + (size_t) c * npix_wf,
-                                beam_opd + (uint64_t) bc * chan_stride, wf_bytes,
+                cudaMemcpyAsync(p->d_dyn_pup, beam_amp, (size_t) nlam * wf_bytes,
                                 cudaMemcpyHostToDevice, p->stream);
             }
+            else
+            {
+                cudaMemcpy2DAsync(p->d_dyn_pup, wf_bytes, beam_amp,
+                                  (size_t) chan_stride * sizeof(float), wf_bytes, (size_t) nlam,
+                                  cudaMemcpyHostToDevice, p->stream);
+            }
+            d_pup = p->d_dyn_pup;
         }
-        d_wf = p->d_wf_in;
+        if (beam_opd != NULL)
+        {
+            if (chan_stride == npix_wf)
+            {
+                cudaMemcpyAsync(p->d_wf_in, beam_opd, (size_t) nlam * wf_bytes,
+                                cudaMemcpyHostToDevice, p->stream);
+            }
+            else
+            {
+                cudaMemcpy2DAsync(p->d_wf_in, wf_bytes, beam_opd,
+                                  (size_t) chan_stride * sizeof(float), wf_bytes, (size_t) nlam,
+                                  cudaMemcpyHostToDevice, p->stream);
+            }
+            d_wf = p->d_wf_in;
+        }
+    }
+    else
+    {
+        for (int32_t c = 0; c < nlam; c++)
+        {
+            uint32_t m0 = map.m0[c];
+            uint32_t m1 = map.m1[c];
+            uint32_t s0 = (uint32_t) (2 * c);
+            uint32_t s1 = (m1 == m0) ? s0 : (s0 + 1u);
+            if (beam_amp != NULL)
+            {
+                cudaMemcpyAsync(p->d_dyn_pup + (uint64_t) s0 * npix_wf,
+                                beam_amp + (uint64_t) m0 * chan_stride, wf_bytes,
+                                cudaMemcpyHostToDevice, p->stream);
+                if (s1 != s0)
+                {
+                    cudaMemcpyAsync(p->d_dyn_pup + (uint64_t) s1 * npix_wf,
+                                    beam_amp + (uint64_t) m1 * chan_stride, wf_bytes,
+                                    cudaMemcpyHostToDevice, p->stream);
+                }
+                d_pup = p->d_dyn_pup;
+            }
+            if (beam_opd != NULL)
+            {
+                cudaMemcpyAsync(p->d_wf_in + (uint64_t) s0 * npix_wf,
+                                beam_opd + (uint64_t) m0 * chan_stride, wf_bytes,
+                                cudaMemcpyHostToDevice, p->stream);
+                if (s1 != s0)
+                {
+                    cudaMemcpyAsync(p->d_wf_in + (uint64_t) s1 * npix_wf,
+                                    beam_opd + (uint64_t) m1 * chan_stride, wf_bytes,
+                                    cudaMemcpyHostToDevice, p->stream);
+                }
+                d_wf = p->d_wf_in;
+            }
+            staged_map.m0[c] = s0;
+            staged_map.m1[c] = s1;
+        }
     }
 
-    fpcam_cuda_run_prop(ctx, d_pup, NULL, d_wf, dev_nlam, npix_wf, NULL, 1.0f);
+    fpcam_cuda_run_prop(ctx, d_pup, NULL, d_wf, staged_map, npix_wf, NULL, 1.0f);
 }
 
 /**
