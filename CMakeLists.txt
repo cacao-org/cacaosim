@@ -112,6 +112,7 @@ set(INCLUDEFILES
 set(SCRIPTS
     scripts/cacaosim-bench
     scripts/cacaosim-ao-report
+    scripts/cacaosim-gui-screenshot
 )
 
 set(USE_CUDA_ACCEL OFF)

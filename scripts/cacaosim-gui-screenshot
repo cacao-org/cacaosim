@@ -1,0 +1,921 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Olivier Guyon et al
+# SPDX-License-Identifier: LGPL-3.0-or-later
+"""Capture TrueColor PNG screenshots of the cacaosim-CTRL hardware simulator GUI."""
+
+import argparse
+import ctypes
+import fcntl
+import os
+from pathlib import Path
+import pty
+import select
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+
+
+def _ensure_pil_python() -> None:
+    try:
+        import PIL  # noqa: F401
+        return
+    except ImportError:
+        pass
+    cands = [
+        os.environ.get("PYTHON_BIN", ""),
+        os.path.expanduser("~/miniforge3/bin/python3"),
+        os.path.expanduser("~/.local/envs/cacao/bin/python3"),
+    ]
+    for cand in cands:
+        if (
+            cand
+            and os.path.isfile(cand)
+            and os.path.realpath(cand) != os.path.realpath(sys.executable)
+        ):
+            os.execv(cand, [cand] + sys.argv)
+
+
+_ensure_pil_python()
+from PIL import Image, ImageDraw, ImageFont  # noqa: E402
+
+DEFAULT_FG = (214, 222, 235)
+DEFAULT_BG = (22, 24, 32)
+OUTER_BG = (13, 17, 23)
+WIN_BG = (22, 24, 32)
+WIN_BORDER = (52, 62, 80)
+TITLE_FG = (198, 208, 224)
+
+VIEW_KEYS = {
+    "builder": ("", b""),
+    "schematic": ("--schematic", b""),
+    "tables": ("", b"\x1bOS"),
+    "status": ("--status", b""),
+    "source": ("", b"\x1b[17~"),
+}
+
+
+def find_cacaosim_ctrl() -> str:
+    """Locate the cacaosim-CTRL executable across PATH, MILK_ROOT, and build dirs."""
+    hit = shutil.which("cacaosim-CTRL")
+    if hit:
+        return hit
+    script_dir = Path(__file__).resolve().parent
+    cands = [
+        Path(os.environ.get("MILK_INSTALL_ROOT", "")) / "bin" / "cacaosim-CTRL",
+        Path(os.environ.get("MILK_ROOT", "")) / "bin" / "cacaosim-CTRL",
+        script_dir / "cacaosim-CTRL",
+        script_dir.parent / "_build" / "cacaosim-CTRL",
+    ]
+    for cand in cands:
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    raise FileNotFoundError("cacaosim-CTRL binary not found on PATH or build prefix")
+
+
+def find_libmilkcacaosim(ctrl_bin: str) -> str | None:
+    """Locate libmilkcacaosim.so next to cacaosim-CTRL for fast layout auto-sizing."""
+    bin_dir = Path(ctrl_bin).resolve().parent
+    cands = [
+        bin_dir / "libmilkcacaosim.so",
+        bin_dir.parent / "lib" / "libmilkcacaosim.so",
+        Path(__file__).resolve().parent.parent / "_build" / "libmilkcacaosim.so",
+    ]
+    for cand in cands:
+        if cand.is_file():
+            return str(cand)
+    return None
+
+
+def find_mono_fonts(px_size: int) -> tuple[ImageFont.FreeTypeFont, ImageFont.FreeTypeFont]:
+    """Load regular and bold monospace TrueType fonts."""
+    reg_cands = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    ]
+    bold_cands = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+        "/usr/share/fonts/TTF/DejaVuSansMono-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
+    ]
+    reg_p = next((p for p in reg_cands if os.path.isfile(p)), None)
+    bold_p = next((p for p in bold_cands if os.path.isfile(p)), reg_p)
+    if reg_p is None:
+        dflt = ImageFont.load_default()
+        return dflt, dflt
+    return ImageFont.truetype(reg_p, px_size), ImageFont.truetype(bold_p, px_size)
+
+
+def probe_bench_layout(bench_path: Path, ctrl_bin: str) -> dict[str, int]:
+    """Inspect .bench sections and headless DAG bounds to pick tight terminal sizes."""
+    txt = bench_path.read_text(encoding="utf-8", errors="replace")
+    n_dm = 0
+    n_sens = 0
+    n_misc = 0
+    first_dm_idx = 0
+    node_idx = 0
+    for raw in txt.splitlines():
+        line = raw.strip()
+        if not line.startswith("[") or not line.endswith("]"):
+            continue
+        sec = line[1:-1].strip()
+        if sec == "bench":
+            continue
+        node_idx += 1
+        kind = sec.split(".", 1)[0].strip().lower()
+        if kind in ("dm", "ttm"):
+            n_dm += 1
+            if first_dm_idx == 0:
+                first_dm_idx = node_idx
+        elif kind in ("pyrwfs", "shwfs", "zwfs", "fpcam"):
+            n_sens += 1
+        elif kind in ("splitter", "coro", "wfe"):
+            n_misc += 1
+
+    dag_w = 152
+    dag_h = 26
+    n_beams = max(4, n_misc * 2 + n_dm + 1)
+
+    lib_path = find_libmilkcacaosim(ctrl_bin)
+    if lib_path:
+        try:
+            lib = ctypes.CDLL(lib_path)
+            cfg_buf = ctypes.create_string_buffer(262144)
+            err_buf = ctypes.create_string_buffer(512)
+            lib.cacaosim_bench_load_file.argtypes = [
+                ctypes.c_char_p,
+                ctypes.c_void_p,
+                ctypes.c_char_p,
+                ctypes.c_size_t,
+            ]
+            lib.cacaosim_bench_load_file.restype = ctypes.c_int
+            if lib.cacaosim_bench_load_file(
+                str(bench_path).encode("utf-8"), cfg_buf, err_buf, 512
+            ) == 0:
+                lib.cacaosim_tui_render_headless.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_char_p,
+                    ctypes.c_size_t,
+                ]
+                lib.cacaosim_tui_render_headless.restype = ctypes.c_int
+                probe_cols, probe_rows = 240, 84
+                out_buf = ctypes.create_string_buffer(655360)
+                n = lib.cacaosim_tui_render_headless(
+                    cfg_buf, 1, probe_cols, probe_rows, 0, out_buf, 655360
+                )
+                if n > 0:
+                    rows_txt = out_buf.value.decode("utf-8", errors="replace").splitlines()
+                    box_end = next(
+                        (
+                            ri
+                            for ri in range(3, len(rows_txt))
+                            if rows_txt[ri].startswith("╚")
+                        ),
+                        probe_rows - 16,
+                    )
+                    max_c = 80
+                    max_r = 8
+                    for ri in range(3, box_end):
+                        inner = rows_txt[ri][1:-1].rstrip()
+                        if inner.strip():
+                            max_r = ri - 2
+                            max_c = max(max_c, len(inner) + 2)
+                    dag_w = max_c
+                    dag_h = max_r
+        except OSError:
+            pass
+
+    deck_h = min(16, max(11, n_beams + 3))
+    schem_cols = max(136, min(210, dag_w + 4))
+    schem_rows = max(30, min(68, dag_h + deck_h + 7))
+
+    bldr_cols = max(154, min(206, max(dag_w + 38, 168)))
+    bldr_rows = max(38, min(48, max(node_idx + 22, 42)))
+
+    tbl_cols = 134
+    tbl_rows = max(24, min(52, n_dm + n_sens + n_misc + 16))
+
+    n_exp_streams = 2 + n_dm * 2 + n_sens * 2
+    stat_top = n_exp_streams + 6
+    stat_rows = max(30, min(48, int(stat_top / 0.58) + 2))
+    stat_cols = 148
+
+    return {
+        "schematic_cols": schem_cols,
+        "schematic_rows": schem_rows,
+        "builder_cols": bldr_cols,
+        "builder_rows": bldr_rows,
+        "tables_cols": tbl_cols,
+        "tables_rows": tbl_rows,
+        "status_cols": stat_cols,
+        "status_rows": stat_rows,
+        "source_cols": 124,
+        "source_rows": 44,
+        "first_dm_idx": first_dm_idx,
+    }
+
+
+class AnsiCellGrid:
+    """Minimal TrueColor VT/ANSI alternate-screen parser tailored for cacaosim-CTRL."""
+
+    def __init__(self, cols: int, rows: int) -> None:
+        self.cols = cols
+        self.rows = rows
+        self.cx = 0
+        self.cy = 0
+        self.fg = DEFAULT_FG
+        self.bg = DEFAULT_BG
+        self.attrs = 0
+        self.in_alt = True
+        self.grid = [
+            [(" ", DEFAULT_FG, DEFAULT_BG, 0) for _ in range(cols)]
+            for _ in range(rows)
+        ]
+
+    def _reset_sgr(self) -> None:
+        self.fg = DEFAULT_FG
+        self.bg = DEFAULT_BG
+        self.attrs = 0
+
+    def _apply_sgr(self, params_str: str) -> None:
+        if not params_str:
+            self._reset_sgr()
+            return
+        parts = [int(p) if p.isdigit() else 0 for p in params_str.split(";")]
+        i = 0
+        n = len(parts)
+        while i < n:
+            code = parts[i]
+            if code == 0:
+                self._reset_sgr()
+            elif code == 1:
+                self.attrs |= 1
+            elif code == 2:
+                self.attrs |= 2
+            elif code == 4:
+                self.attrs |= 4
+            elif code == 7:
+                self.attrs |= 8
+            elif code == 22:
+                self.attrs &= ~3
+            elif code == 24:
+                self.attrs &= ~4
+            elif code == 27:
+                self.attrs &= ~8
+            elif code == 39:
+                self.fg = DEFAULT_FG
+            elif code == 49:
+                self.bg = DEFAULT_BG
+            elif code == 38 and i + 4 < n and parts[i + 1] == 2:
+                self.fg = (parts[i + 2], parts[i + 3], parts[i + 4])
+                i += 4
+            elif code == 48 and i + 4 < n and parts[i + 1] == 2:
+                self.bg = (parts[i + 2], parts[i + 3], parts[i + 4])
+                i += 4
+            i += 1
+
+    def feed(self, text: str) -> None:
+        i = 0
+        n = len(text)
+        while i < n:
+            ch = text[i]
+            if ch == "\x1b":
+                if i + 1 < n and text[i + 1] == "[":
+                    j = i + 2
+                    while j < n and not ("@" <= text[j] <= "~"):
+                        j += 1
+                    if j < n:
+                        body = text[i + 2 : j]
+                        cmd = text[j]
+                        if body.startswith("?"):
+                            if body == "?1049" and cmd == "h":
+                                self.in_alt = True
+                            elif body == "?1049" and cmd == "l":
+                                self.in_alt = False
+                        elif self.in_alt:
+                            if cmd in ("H", "f"):
+                                if not body:
+                                    self.cy, self.cx = 0, 0
+                                else:
+                                    rc = body.split(";")
+                                    r = int(rc[0]) if rc[0].isdigit() else 1
+                                    c = (
+                                        int(rc[1])
+                                        if len(rc) > 1 and rc[1].isdigit()
+                                        else 1
+                                    )
+                                    self.cy = max(0, min(self.rows - 1, r - 1))
+                                    self.cx = max(0, min(self.cols - 1, c - 1))
+                            elif cmd == "m":
+                                self._apply_sgr(body)
+                            elif cmd == "J" and body in ("2", ""):
+                                for r in range(self.rows):
+                                    for c in range(self.cols):
+                                        self.grid[r][c] = (
+                                            " ",
+                                            DEFAULT_FG,
+                                            DEFAULT_BG,
+                                            0,
+                                        )
+                        i = j + 1
+                        continue
+                i += 1
+                continue
+
+            if not self.in_alt:
+                i += 1
+                continue
+
+            if ch == "\r":
+                self.cx = 0
+            elif ch == "\n":
+                self.cy = min(self.rows - 1, self.cy + 1)
+            elif ord(ch) >= 32:
+                if 0 <= self.cy < self.rows and 0 <= self.cx < self.cols:
+                    fg, bg = self.fg, self.bg
+                    if self.attrs & 8:
+                        fg, bg = bg, fg
+                    if self.attrs & 2:
+                        fg = (
+                            (fg[0] * 2 + bg[0]) // 3,
+                            (fg[1] * 2 + bg[1]) // 3,
+                            (fg[2] * 2 + bg[2]) // 3,
+                        )
+                    self.grid[self.cy][self.cx] = (ch, fg, bg, self.attrs)
+                self.cx += 1
+            i += 1
+
+
+def capture_tui_grid(
+    ctrl_bin: str,
+    bench_path: Path,
+    view: str,
+    cols: int,
+    rows: int,
+    extra_keys: bytes,
+    wait_s: float,
+    env: dict[str, str],
+) -> AnsiCellGrid:
+    """Run cacaosim-CTRL inside a sized PTY, send optional keys, and capture cells."""
+    cli_flag, view_key = VIEW_KEYS[view]
+    cmd = [ctrl_bin, "--pretty"]
+    if cli_flag:
+        cmd.append(cli_flag)
+    cmd.append(bench_path.name)
+
+    master_fd, slave_fd = pty.openpty()
+    winsz = struct.pack("HHHH", rows, cols, cols * 16, rows * 32)
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsz)
+
+    child_env = env.copy()
+    child_env["TERM"] = "xterm-256color"
+    child_env["COLORTERM"] = "truecolor"
+    child_env["LANG"] = child_env.get("LANG", "C.UTF-8") or "C.UTF-8"
+    child_env["COLUMNS"] = str(cols)
+    child_env["LINES"] = str(rows)
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        cwd=str(bench_path.parent),
+        env=child_env,
+        close_fds=True,
+        start_new_session=True,
+    )
+    os.close(slave_fd)
+
+    raw_chunks: list[bytes] = []
+
+    def drain_for(duration: float) -> None:
+        deadline = time.monotonic() + duration
+        while True:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                break
+            rlist, _, _ = select.select([master_fd], [], [], min(0.05, rem))
+            if rlist:
+                try:
+                    data = os.read(master_fd, 65536)
+                    if not data:
+                        break
+                    raw_chunks.append(data)
+                except OSError:
+                    break
+
+    try:
+        drain_for(max(0.08, wait_s * 0.5))
+        if view_key:
+            os.write(master_fd, view_key)
+            drain_for(0.06)
+        if extra_keys:
+            os.write(master_fd, extra_keys)
+            drain_for(0.06)
+        drain_for(max(0.08, wait_s * 0.6))
+        os.write(master_fd, b"q")
+        drain_for(0.15)
+    finally:
+        try:
+            proc.wait(timeout=1.5)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+        os.close(master_fd)
+
+    screen = AnsiCellGrid(cols, rows)
+    screen.feed(b"".join(raw_chunks).decode("utf-8", errors="replace"))
+    return screen
+
+
+def _draw_box_or_block(
+    draw: ImageDraw.ImageDraw,
+    ch: str,
+    x0: int,
+    y0: int,
+    cw: int,
+    ch_px: int,
+    fg: tuple[int, int, int],
+) -> bool:
+    """Render box-drawing, block-element, and arrow glyphs with seamless geometry."""
+    cp = ord(ch)
+    mx = x0 + cw // 2
+    my = y0 + ch_px // 2
+    x1 = x0 + cw
+    y1 = y0 + ch_px
+    lw = max(2, cw // 7)
+
+    # Lower 1/8 .. 8/8 blocks (U+2581..U+2588) & upper half block (U+2580)
+    if cp == 0x2580:
+        draw.rectangle([x0, y0, x1 - 1, my - 1], fill=fg)
+        return True
+    if 0x2581 <= cp <= 0x2588:
+        frac = (cp - 0x2580) / 8.0
+        top = int(round(y1 - frac * ch_px))
+        draw.rectangle([x0, top, x1 - 1, y1 - 1], fill=fg)
+        return True
+    if 0x2589 <= cp <= 0x258F:
+        frac = (0x2590 - cp) / 8.0
+        right = int(round(x0 + frac * cw))
+        draw.rectangle([x0, y0, max(x0, right - 1), y1 - 1], fill=fg)
+        return True
+    if cp == 0x2590:
+        draw.rectangle([mx, y0, x1 - 1, y1 - 1], fill=fg)
+        return True
+
+    # Single-line box drawing: (left, right, up, down)
+    single_map = {
+        "─": (1, 1, 0, 0),
+        "━": (1, 1, 0, 0),
+        "│": (0, 0, 1, 1),
+        "┃": (0, 0, 1, 1),
+        "┌": (0, 1, 0, 1),
+        "┐": (1, 0, 0, 1),
+        "└": (0, 1, 1, 0),
+        "┘": (1, 0, 1, 0),
+        "├": (0, 1, 1, 1),
+        "┤": (1, 0, 1, 1),
+        "┬": (1, 1, 0, 1),
+        "┴": (1, 1, 1, 0),
+        "┼": (1, 1, 1, 1),
+    }
+    if ch in single_map:
+        lf, rt, up, dn = single_map[ch]
+        w = lw + (1 if ch in ("━", "┃") else 0)
+        if lf:
+            draw.rectangle([x0, my - w // 2, mx + w // 2, my + (w - 1) // 2], fill=fg)
+        if rt:
+            draw.rectangle([mx - w // 2, my - w // 2, x1 - 1, my + (w - 1) // 2], fill=fg)
+        if up:
+            draw.rectangle([mx - w // 2, y0, mx + (w - 1) // 2, my + w // 2], fill=fg)
+        if dn:
+            draw.rectangle([mx - w // 2, my - w // 2, mx + (w - 1) // 2, y1 - 1], fill=fg)
+        return True
+
+    # Rounded corners (╭ ╮ ╯ ╰)
+    if ch in ("╭", "╮", "╯", "╰"):
+        r = min(cw // 2, ch_px // 2)
+        if ch == "╭":
+            draw.line([(mx, y1), (mx, my + r // 2), (mx + r // 2, my), (x1, my)], fill=fg, width=lw)
+        elif ch == "╮":
+            draw.line([(mx, y1), (mx, my + r // 2), (mx - r // 2, my), (x0, my)], fill=fg, width=lw)
+        elif ch == "╯":
+            draw.line([(mx, y0), (mx, my - r // 2), (mx - r // 2, my), (x0, my)], fill=fg, width=lw)
+        elif ch == "╰":
+            draw.line([(mx, y0), (mx, my - r // 2), (mx + r // 2, my), (x1, my)], fill=fg, width=lw)
+        return True
+
+    # Double-line box drawing (═ ║ ╔ ╗ ╚ ╝ ╠ ╣ ╦ ╩ ╬)
+    dbl_off = max(2, cw // 5)
+    if ch == "═":
+        for dy in (-dbl_off, dbl_off):
+            draw.line([(x0, my + dy), (x1, my + dy)], fill=fg, width=max(1, lw - 1))
+        return True
+    if ch == "║":
+        for dx in (-dbl_off, dbl_off):
+            draw.line([(mx + dx, y0), (mx + dx, y1)], fill=fg, width=max(1, lw - 1))
+        return True
+    dbl_corners = {
+        "╔": (1, 1),
+        "╗": (-1, 1),
+        "╚": (1, -1),
+        "╝": (-1, -1),
+    }
+    if ch in dbl_corners:
+        sx, sy = dbl_corners[ch]
+        hx_end = x1 if sx > 0 else x0
+        vy_end = y1 if sy > 0 else y0
+        w1 = max(1, lw - 1)
+        # Outer L
+        ox = mx - sx * dbl_off
+        oy = my - sy * dbl_off
+        draw.line([(ox, vy_end), (ox, oy), (hx_end, oy)], fill=fg, width=w1)
+        # Inner L
+        ix = mx + sx * dbl_off
+        iy = my + sy * dbl_off
+        draw.line([(ix, vy_end), (ix, iy), (hx_end, iy)], fill=fg, width=w1)
+        return True
+
+    # Arrowhead & status dot glyphs
+    if ch == "▶":
+        pad_x = max(2, cw // 6)
+        pad_y = max(5, ch_px // 4)
+        draw.polygon(
+            [(x0 + pad_x, y0 + pad_y), (x1 - pad_x, my), (x0 + pad_x, y1 - pad_y)],
+            fill=fg,
+        )
+        return True
+    if ch == "●":
+        rad = max(3, int(cw * 0.32))
+        draw.ellipse([mx - rad, my - rad, mx + rad, my + rad], fill=fg)
+        return True
+    if ch == "○":
+        rad = max(3, int(cw * 0.32))
+        draw.ellipse(
+            [mx - rad, my - rad, mx + rad, my + rad], outline=fg, width=max(2, lw)
+        )
+        return True
+    if ch == "◆":
+        rad_x = max(3, int(cw * 0.34))
+        rad_y = max(4, int(ch_px * 0.22))
+        draw.polygon(
+            [(mx, my - rad_y), (mx + rad_x, my), (mx, my + rad_y), (mx - rad_x, my)],
+            fill=fg,
+        )
+        return True
+    if ch == "·":
+        rad = max(1, cw // 8)
+        draw.ellipse([mx - rad, my - rad, mx + rad, my + rad], fill=fg)
+        return True
+
+    return False
+
+
+def render_grid_to_png(
+    screen: AnsiCellGrid,
+    title: str,
+    out_path: Path,
+    cell_w: int = 14,
+    cell_h: int = 28,
+) -> None:
+    """Render an AnsiCellGrid into a framed terminal window PNG."""
+    font_px = max(12, int(round(cell_h * 0.76)))
+    font_reg, font_bold = find_mono_fonts(font_px)
+    _, title_font = find_mono_fonts(max(12, int(round(cell_h * 0.68))))
+
+    outer_pad = 22
+    inner_pad_x = 16
+    inner_pad_y = 12
+    titlebar_h = 42
+
+    term_w = screen.cols * cell_w + 2 * inner_pad_x
+    term_h = titlebar_h + screen.rows * cell_h + 2 * inner_pad_y
+    img_w = term_w + 2 * outer_pad
+    img_h = term_h + 2 * outer_pad
+
+    img = Image.new("RGB", (img_w, img_h), OUTER_BG)
+    draw = ImageDraw.Draw(img)
+
+    wx0, wy0 = outer_pad, outer_pad
+    wx1, wy1 = wx0 + term_w - 1, wy0 + term_h - 1
+    draw.rounded_rectangle(
+        [wx0, wy0, wx1, wy1],
+        radius=12,
+        fill=WIN_BG,
+        outline=WIN_BORDER,
+        width=2,
+    )
+    draw.line(
+        [(wx0 + 1, wy0 + titlebar_h), (wx1 - 1, wy0 + titlebar_h)],
+        fill=(38, 44, 58),
+        width=1,
+    )
+
+    # Traffic-light window controls + centered command title
+    cy_dot = wy0 + titlebar_h // 2
+    for idx, col in enumerate(((255, 95, 86), (255, 189, 46), (39, 201, 63))):
+        cx_dot = wx0 + 22 + idx * 20
+        draw.ellipse([cx_dot - 6, cy_dot - 6, cx_dot + 6, cy_dot + 6], fill=col)
+
+    tb_box = draw.textbbox((0, 0), title, font=title_font)
+    tw = tb_box[2] - tb_box[0]
+    th = tb_box[3] - tb_box[1]
+    draw.text(
+        (wx0 + (term_w - tw) // 2, wy0 + (titlebar_h - th) // 2 - tb_box[1]),
+        title,
+        font=title_font,
+        fill=TITLE_FG,
+    )
+
+    ox = wx0 + inner_pad_x
+    oy = wy0 + titlebar_h + inner_pad_y
+
+    # Pass 1: cell background rectangles
+    for r in range(screen.rows):
+        y0 = oy + r * cell_h
+        row = screen.grid[r]
+        c = 0
+        while c < screen.cols:
+            bg = row[c][2]
+            c_end = c + 1
+            while c_end < screen.cols and row[c_end][2] == bg:
+                c_end += 1
+            if bg != WIN_BG:
+                draw.rectangle(
+                    [ox + c * cell_w, y0, ox + c_end * cell_w - 1, y0 + cell_h - 1],
+                    fill=bg,
+                )
+            c = c_end
+
+    # Baseline alignment for monospace glyphs
+    ascent, descent = font_reg.getmetrics()
+    text_y_off = (cell_h - (ascent + descent)) // 2
+
+    # Pass 2: foreground box/block primitives and crisp TrueType characters
+    for r in range(screen.rows):
+        y0 = oy + r * cell_h
+        row = screen.grid[r]
+        for c in range(screen.cols):
+            ch, fg, _, attrs = row[c]
+            if ch != " ":
+                x0 = ox + c * cell_w
+                if not _draw_box_or_block(draw, ch, x0, y0, cell_w, cell_h, fg):
+                    fnt = font_bold if (attrs & 1) else font_reg
+                    draw.text((x0, y0 + text_y_off), ch, font=fnt, fill=fg)
+            if attrs & 4:
+                x0 = ox + c * cell_w
+                draw.line(
+                    [(x0, y0 + cell_h - 3), (x0 + cell_w - 1, y0 + cell_h - 3)],
+                    fill=fg,
+                    width=1,
+                )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_path, format="PNG", optimize=True)
+
+
+def has_live_shm_streams(shm_dir: str) -> bool:
+    """Return True if MILK_SHM_DIR exists and contains at least one .im.shm file."""
+    p = Path(shm_dir)
+    if not p.is_dir():
+        return False
+    return any(f.name.endswith(".im.shm") for f in p.iterdir())
+
+
+def capture_report_suite(
+    bench_path: Path,
+    out_dir: Path,
+    include_status: str = "auto",
+    isolate_shm: bool = False,
+    overwrite: bool = True,
+) -> list[Path]:
+    """Capture the standard cacaosim-CTRL GUI screenshot set into an AO report dir."""
+    ctrl_bin = find_cacaosim_ctrl()
+    layout = probe_bench_layout(bench_path, ctrl_bin)
+    bench_lbl = bench_path.name
+
+    tmp_shm = None
+    env = os.environ.copy()
+    shm_dir = env.get("MILK_SHM_DIR", "")
+    live_shm = False
+    if isolate_shm or not shm_dir or shm_dir == "/milk/shm":
+        if not isolate_shm and shm_dir and shm_dir != "/milk/shm":
+            live_shm = has_live_shm_streams(shm_dir)
+        else:
+            tmp_shm = tempfile.TemporaryDirectory(prefix="csim_gui_shot_")
+            env["MILK_SHM_DIR"] = tmp_shm.name
+            live_shm = False
+    else:
+        live_shm = has_live_shm_streams(shm_dir)
+
+    wait_s = 0.42 if live_shm else 0.10
+    want_status = (
+        include_status == "always"
+        or (include_status == "auto" and live_shm)
+    )
+
+    dm_nav = b"j" * layout["first_dm_idx"] if layout["first_dm_idx"] > 0 else b""
+    specs: list[tuple[str, str, int, int, bytes, str]] = [
+        (
+            "cacaosim_gui_schematic.png",
+            "schematic",
+            layout["schematic_cols"],
+            layout["schematic_rows"],
+            b"",
+            f"cacaosim-CTRL --schematic {bench_lbl}",
+        ),
+        (
+            "cacaosim_gui_tables.png",
+            "tables",
+            layout["tables_cols"],
+            layout["tables_rows"],
+            b"",
+            f"cacaosim-CTRL {bench_lbl}  [F4:TABLES]",
+        ),
+        (
+            "cacaosim_gui_builder.png",
+            "builder",
+            layout["builder_cols"],
+            layout["builder_rows"],
+            dm_nav,
+            f"cacaosim-CTRL {bench_lbl}  [F2:BUILDER]",
+        ),
+    ]
+    if want_status:
+        specs.append(
+            (
+                "cacaosim_gui_status.png",
+                "status",
+                layout["status_cols"],
+                layout["status_rows"],
+                b"",
+                f"cacaosim-CTRL --status {bench_lbl}",
+            )
+        )
+
+    written: list[Path] = []
+    try:
+        for fname, view, cols, rows, keys, title in specs:
+            dst = out_dir / fname
+            if dst.is_file() and not overwrite:
+                written.append(dst)
+                continue
+            grid = capture_tui_grid(
+                ctrl_bin, bench_path, view, cols, rows, keys, wait_s, env
+            )
+            render_grid_to_png(grid, title, dst)
+            written.append(dst)
+    finally:
+        if tmp_shm is not None:
+            tmp_shm.cleanup()
+    return written
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Render TrueColor PNG screenshots of cacaosim-CTRL (.bench GUI)."
+    )
+    p.add_argument("bench", nargs="?", default="", help="Path to .bench configuration")
+    p.add_argument("-c", "--config", default="", help="Path to .bench configuration")
+    p.add_argument("-o", "--output", default="", help="Single output PNG path")
+    p.add_argument(
+        "--outdir",
+        default="",
+        help="Generate report GUI screenshot suite into directory",
+    )
+    p.add_argument(
+        "--view",
+        choices=tuple(VIEW_KEYS.keys()),
+        default="schematic",
+        help="Workspace tab for single-output mode (default: schematic)",
+    )
+    p.add_argument("--cols", type=int, default=0, help="Override terminal columns")
+    p.add_argument("--rows", type=int, default=0, help="Override terminal rows")
+    p.add_argument("--title", default="", help="Override window titlebar string")
+    p.add_argument(
+        "--include-status",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="Include F5:STATUS screenshot in --outdir mode (default: auto)",
+    )
+    p.add_argument(
+        "--isolate-shm",
+        action="store_true",
+        help="Use an isolated empty MILK_SHM_DIR instead of probing active SHM",
+    )
+    p.add_argument(
+        "--keep-existing",
+        action="store_true",
+        help="Skip rendering files that already exist in --outdir",
+    )
+    return p
+
+
+def resolve_bench_path(explicit: str) -> Path:
+    cands = [
+        explicit,
+        os.environ.get("CACAOSIM_BENCH_FILE", ""),
+        os.path.join(os.environ.get("MILK_SHM_DIR", ""), "csim_active.bench")
+        if os.environ.get("MILK_SHM_DIR")
+        else "",
+    ]
+    for c in cands:
+        if c and os.path.isfile(c):
+            return Path(c).resolve()
+    raise FileNotFoundError(
+        "No .bench file specified and no active csim_active.bench found"
+    )
+
+
+def main() -> int:
+    if any(a in ("-h1", "--help-oneline") for a in sys.argv[1:]):
+        print("capture TrueColor PNG screenshots of the cacaosim-CTRL hardware GUI")
+        return 0
+    if any(a in ("-h2", "--help-description") for a in sys.argv[1:]):
+        print(
+            "Launch cacaosim-CTRL inside an offscreen pseudo-terminal and rasterize\n"
+            "24-bit TrueColor views (F2:BUILDER, F3:SCHEMATIC, F4:TABLES, F5:STATUS,\n"
+            "F6:SOURCE) into publication-ready PNG screenshots for AO reports."
+        )
+        return 0
+    if any(a in ("-hm", "--help-mono") for a in sys.argv[1:]):
+        build_parser().print_help()
+        return 0
+
+    args = build_parser().parse_args()
+    bench_arg = args.config or args.bench
+    try:
+        bench_path = resolve_bench_path(bench_arg)
+    except FileNotFoundError as exc:
+        print(f"[cacaosim-gui-screenshot] Error: {exc}", file=sys.stderr)
+        return 2
+
+    if args.outdir:
+        out_dir = Path(args.outdir).resolve()
+        written = capture_report_suite(
+            bench_path,
+            out_dir,
+            include_status=args.include_status,
+            isolate_shm=args.isolate_shm,
+            overwrite=not args.keep_existing,
+        )
+        for p in written:
+            print(p)
+        return 0
+
+    out_png = Path(args.output or f"cacaosim_gui_{args.view}.png").resolve()
+    ctrl_bin = find_cacaosim_ctrl()
+    layout = probe_bench_layout(bench_path, ctrl_bin)
+    cols = args.cols or layout.get(f"{args.view}_cols", 160)
+    rows = args.rows or layout.get(f"{args.view}_rows", 42)
+
+    tmp_shm = None
+    env = os.environ.copy()
+    shm_dir = env.get("MILK_SHM_DIR", "")
+    live_shm = False
+    if args.isolate_shm or not shm_dir or shm_dir == "/milk/shm":
+        tmp_shm = tempfile.TemporaryDirectory(prefix="csim_gui_shot_")
+        env["MILK_SHM_DIR"] = tmp_shm.name
+    else:
+        live_shm = has_live_shm_streams(shm_dir)
+
+    extra = (
+        b"j" * layout["first_dm_idx"]
+        if args.view == "builder" and layout["first_dm_idx"] > 0
+        else b""
+    )
+    flag_lbl = VIEW_KEYS[args.view][0]
+    default_title = (
+        f"cacaosim-CTRL {flag_lbl} {bench_path.name}".replace("  ", " ").strip()
+    )
+    try:
+        grid = capture_tui_grid(
+            ctrl_bin,
+            bench_path,
+            args.view,
+            cols,
+            rows,
+            extra,
+            0.42 if live_shm else 0.10,
+            env,
+        )
+        render_grid_to_png(grid, args.title or default_title, out_png)
+    finally:
+        if tmp_shm is not None:
+            tmp_shm.cleanup()
+
+    print(out_png)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

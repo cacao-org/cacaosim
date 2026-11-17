@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -339,6 +340,10 @@ def analyze_selfrm_pair(conf_dir, out_dir, loop_num, tmp_npys):
 
 def load_loop_calib(work_dir, loop_name, loop_num, out_dir, tmp_npys=None):
     conf_dir = os.path.join(work_dir, loop_name, "conf")
+    if not os.path.isdir(conf_dir):
+        alt_conf = os.path.join(work_dir, f"stage{loop_num}")
+        if os.path.isdir(alt_conf):
+            conf_dir = alt_conf
     info = {"loop_name": loop_name, "loop_number": loop_num}
     zresp_p = os.path.join(conf_dir, "zrespC.fits")
     syn_p = os.path.join(conf_dir, "RMsyn_modesDM.fits")
@@ -494,7 +499,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
+from matplotlib.lines import Line2D
 from matplotlib.patches import Circle
+from matplotlib.ticker import MaxNLocator
 
 out_dir, summary_path = sys.argv[1], sys.argv[2]
 with open(summary_path, "r", encoding="utf-8") as fh:
@@ -741,7 +748,7 @@ if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
                     ax.set_title(clabel, fontsize=11, fontweight="bold")
                 if c == 0:
                     ax.set_ylabel(
-                        f"t = {sm['t_phys_s']:.2f} s\ny [m]",
+                        f"S{r + 1} (t = {sm['t_phys_s']:.2f} s)\ny [m]",
                         fontsize=10,
                         fontweight="bold",
                     )
@@ -914,20 +921,22 @@ if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
         for c, (ek, clab, kind) in enumerate(wfs_cols):
             cube = wcubes[ek]
             if kind == "raw":
+                disp_cube = cube
                 vmin = 95.0
-                vmax = max(150.0, float(np.percentile(cube, 99.7)))
+                vmax = max(150.0, float(np.percentile(disp_cube, 99.7)))
                 cmap_w = "magma"
                 cblab = "Detector [ADU]"
             else:
-                lim = max(1e-4, float(np.percentile(np.abs(cube), 99.5)))
+                disp_cube = cube * 1.0e4
+                lim = max(0.5, float(np.percentile(np.abs(disp_cube), 99.5)))
                 vmin, vmax = -lim, lim
                 cmap_w = "RdBu_r"
-                cblab = "Ref-Sub Signal [norm]"
+                cblab = "Ref-Sub Signal [×10⁻⁴ norm]"
             imh = None
             for r, sm in enumerate(samples):
                 ax = axes5[r, c]
                 imh = ax.imshow(
-                    cube[r],
+                    disp_cube[r],
                     origin="lower",
                     cmap=cmap_w,
                     vmin=vmin,
@@ -938,7 +947,7 @@ if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
                     ax.set_title(clab, fontsize=10.5, fontweight="bold")
                 if c == 0:
                     ax.set_ylabel(
-                        f"t = {sm['t_phys_s']:.2f} s\ny [pix]",
+                        f"S{r + 1} (t = {sm['t_phys_s']:.2f} s)\ny [pix]",
                         fontsize=10,
                         fontweight="bold",
                     )
@@ -953,9 +962,12 @@ if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
                         f"Sum = {ex.get('sum_adu', 0.0)/1e3:5.0f} kADU"
                     )
                 else:
+                    frm_f = cube[r].astype(np.float64)
+                    rms_v = float(np.sqrt(np.mean(frm_f**2)))
+                    ptv_v = float(np.max(frm_f) - np.min(frm_f))
                     btxt = (
-                        f"RMS = {ex.get('rms', 0.0)*1e4:5.2f}e-4\n"
-                        f"PTV = {ex.get('ptv', 0.0)*1e3:5.2f}e-3"
+                        f"RMS = {rms_v*1e4:5.2f}e-4\n"
+                        f"PTV = {ptv_v*1e3:5.2f}e-3"
                     )
                 ax.text(
                     0.03,
@@ -979,6 +991,8 @@ if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
                 shrink=0.88,
                 pad=0.02,
             )
+            if kind == "sig":
+                cb.ax.xaxis.set_major_locator(MaxNLocator(5))
             cb.set_label(cblab, fontsize=9.2)
         fig5.savefig(os.path.join(out_dir, "wfs_samples_5x4.png"), dpi=175)
         plt.close(fig5)
@@ -1084,7 +1098,7 @@ if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
                     ax.set_title(clab, fontsize=10.5, fontweight="bold")
                 if c == 0:
                     ax.set_ylabel(
-                        f"t = {sm['t_phys_s']:.2f} s\n{ylab}",
+                        f"S{r + 1} (t = {sm['t_phys_s']:.2f} s)\n{ylab}",
                         fontsize=10,
                         fontweight="bold",
                     )
@@ -1207,7 +1221,7 @@ if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
                     ax.set_title(slab, fontsize=11, fontweight="bold")
                 if c == 0:
                     ax.set_ylabel(
-                        f"t = {sm['t_phys_s']:.2f} s\nΔDec [\"]",
+                        f"S{r + 1} (t = {sm['t_phys_s']:.2f} s)\nΔDec [\"]",
                         fontsize=10,
                         fontweight="bold",
                     )
@@ -1658,6 +1672,293 @@ if lp1.get("selfrm") and lp2.get("selfrm"):
 
     figs.savefig(os.path.join(out_dir, "selfrm_summary_2x4.png"), dpi=180)
     plt.close(figs)
+
+ts_wf_p = os.path.join(out_dir, "ts_wf_plot.npy")
+ts_sr_p = os.path.join(out_dir, "ts_strehl_plot.npy")
+has_wf_ts = os.path.exists(ts_wf_p)
+has_sr_ts = os.path.exists(ts_sr_p)
+if has_wf_ts and has_sr_ts:
+    wf_arr = np.load(ts_wf_p)
+    sr_arr = np.load(ts_sr_p)
+    ts_m = data.get("timeseries_metrics", {})
+    wf_stat = ts_m.get("wf_rms_nm", {})
+    sr_stat = ts_m.get("strehl", {})
+    sa_m = data.get("star_and_atmosphere", {})
+    seeing_v = sa_m.get("seeing_arcsec_500nm", 0.6)
+    phys_t = sa_m.get("physical_time_s", 10.0)
+    nfr_wf = wf_stat.get("final", {}).get("n_frames", wf_arr.shape[0])
+    nexp_sr = sr_stat.get("vis", {}).get("final", {}).get("n_exposures", sr_arr.shape[0])
+
+    def _boxcar_1d(y, win):
+        y = np.asarray(y, dtype=float)
+        if y.size <= 3 or win <= 1:
+            return y
+        w = min(int(win) | 1, y.size if y.size % 2 == 1 else max(1, y.size - 1))
+        if w <= 1:
+            return y
+        pad = w // 2
+        yp = np.pad(y, pad, mode="edge")
+        return np.convolve(yp, np.ones(w) / float(w), mode="valid")
+
+    figt, axest = plt.subplots(
+        4, 1, figsize=(14.5, 12.2), sharex=True, constrained_layout=True
+    )
+    figt.suptitle(
+        "Subaru 8.2 m AO3k + SCExAO — Pupil RMS Wavefront Error & Strehl Ratio vs Time\n"
+        f"(Seeing = {seeing_v:.2f}\", {phys_t:.1f} s physical, {nfr_wf:,d} WF frames, "
+        f"{nexp_sr:,d} PSF exposures)",
+        fontsize=12.8,
+        fontweight="bold",
+    )
+
+    t_wf = wf_arr[:, 1]
+    t_sr = sr_arr[:, 0]
+    samp_list = [
+        sm for sm in (wf_info or {}).get("samples", []) if sm.get("t_phys_s") is not None
+    ]
+    for ax in axest:
+        for sm in samp_list:
+            ax.axvline(
+                float(sm["t_phys_s"]),
+                color="#7c3aed",
+                ls="--",
+                lw=1.35,
+                alpha=0.72,
+                zorder=3,
+            )
+
+    wf_specs = [
+        (2, "raw", "Before Stage 1 (Entrance Pupil)", "#d62728"),
+        (3, "stg1", "Between Stages 1 & 2 (Post-AO3k)", "#ff7f0e"),
+        (4, "final", "After Stage 2 (Post-SCExAO)", "#1f77b4"),
+    ]
+    ax0 = axest[0]
+    for col_i, skey, slab, col_c in wf_specs:
+        y = wf_arr[:, col_i]
+        m = wf_stat.get(skey, {})
+        lbl = (
+            f"{slab}: mean={m.get('mean_nm', 0):.1f}, med={m.get('median_nm', 0):.1f}, "
+            f"P05-95={m.get('p05_nm', 0):.0f}..{m.get('p95_nm', 0):.0f} nm"
+        )
+        if t_wf.size > 20:
+            ax0.plot(t_wf, y, color=col_c, lw=0.5, alpha=0.25)
+            ys = _boxcar_1d(y, 21)
+            ax0.plot(t_wf, ys, color=col_c, lw=1.85, label=lbl)
+        else:
+            ax0.plot(t_wf, y, "o-", color=col_c, lw=1.8, ms=4.5, label=lbl)
+        if samp_list:
+            sx, sy = [], []
+            for sm in samp_list:
+                ts_v = float(sm["t_phys_s"])
+                yv = sm.get(skey, {}).get("rms_nm")
+                if yv is None and t_wf.size > 0:
+                    yv = float(y[int(np.argmin(np.abs(t_wf - ts_v)))])
+                if yv is not None and np.isfinite(yv):
+                    sx.append(ts_v)
+                    sy.append(float(yv))
+            if sx:
+                ax0.scatter(
+                    sx,
+                    sy,
+                    s=46,
+                    facecolor=col_c,
+                    edgecolor="#111827",
+                    linewidths=1.15,
+                    zorder=6,
+                )
+    if samp_list:
+        sec_s = ax0.secondary_xaxis("top", functions=(lambda x: x, lambda x: x))
+        s_ticks = [float(sm["t_phys_s"]) for sm in samp_list]
+        if phys_t >= 1.0:
+            s_labs = [f"S{i + 1} ({tv:.2f} s)" for i, tv in enumerate(s_ticks)]
+        else:
+            s_labs = [f"S{i + 1} ({tv * 1e3:.0f} ms)" for i, tv in enumerate(s_ticks)]
+        sec_s.set_xticks(s_ticks)
+        sec_s.set_xticklabels(s_labs, fontsize=9.0, fontweight="bold", color="#5b21b6")
+        sec_s.tick_params(axis="x", colors="#5b21b6", length=5, width=1.4, pad=2)
+    ax0.set_title(
+        "Pupil Piston-Removed RMS Wavefront Error vs Time (All Optical Planes, 10 ms Smooth)",
+        fontsize=11,
+        fontweight="bold",
+    )
+    ax0.set_ylabel("Pupil RMS WFE [nm]")
+    ymax0 = float(np.nanmax(wf_arr[:, 2])) if np.any(np.isfinite(wf_arr[:, 2])) else 100.0
+    ax0.set_ylim(0.0, max(100.0, ymax0 * 1.25))
+    ax0.grid(True, alpha=0.28)
+    h0, l0 = ax0.get_legend_handles_labels()
+    if samp_list:
+        h0.append(
+            Line2D(
+                [0],
+                [0],
+                color="#7c3aed",
+                ls="--",
+                lw=1.35,
+                marker="o",
+                mfc="white",
+                mec="#111827",
+                mew=1.15,
+                ms=5.8,
+            )
+        )
+        l0.append(f"Sampled Snapshots S1-S{len(samp_list)} (PSF/WF/DM/WFS)")
+    ax0.legend(h0, l0, loc="upper right", fontsize=8.0, framealpha=0.92)
+
+    ax1 = axest[1]
+    for col_i, skey, slab, col_c in wf_specs[1:]:
+        y = wf_arr[:, col_i]
+        m = wf_stat.get(skey, {})
+        lbl = (
+            f"{slab}: mean={m.get('mean_nm', 0):.1f}, med={m.get('median_nm', 0):.1f}, "
+            f"P05-95={m.get('p05_nm', 0):.0f}..{m.get('p95_nm', 0):.0f} nm"
+        )
+        if t_wf.size > 20:
+            ax1.plot(t_wf, y, color=col_c, lw=0.5, alpha=0.26)
+            ys = _boxcar_1d(y, 21)
+            ax1.plot(t_wf, ys, color=col_c, lw=1.9, label=lbl)
+        else:
+            ax1.plot(t_wf, y, "o-", color=col_c, lw=1.8, ms=4.5, label=lbl)
+        if samp_list:
+            sx, sy = [], []
+            for sm in samp_list:
+                ts_v = float(sm["t_phys_s"])
+                yv = sm.get(skey, {}).get("rms_nm")
+                if yv is None and t_wf.size > 0:
+                    yv = float(y[int(np.argmin(np.abs(t_wf - ts_v)))])
+                if yv is not None and np.isfinite(yv):
+                    sx.append(ts_v)
+                    sy.append(float(yv))
+            if sx:
+                ax1.scatter(
+                    sx,
+                    sy,
+                    s=46,
+                    facecolor=col_c,
+                    edgecolor="#111827",
+                    linewidths=1.15,
+                    zorder=6,
+                )
+    ax1.axhline(
+        119.37,
+        color="#6b7280",
+        ls="--",
+        lw=1.0,
+        alpha=0.70,
+        label="1 rad RMS @ 0.75 um (119 nm)",
+    )
+    ax1.axhline(
+        262.61,
+        color="#4b5563",
+        ls="-.",
+        lw=1.0,
+        alpha=0.55,
+        label="1 rad RMS @ 1.65 um (263 nm)",
+    )
+    ax1.set_title(
+        "Closed-Loop Residual RMS Wavefront Error vs Time (Post-AO3k & Post-SCExAO Zoom)",
+        fontsize=11,
+        fontweight="bold",
+    )
+    ax1.set_ylabel("Residual RMS WFE [nm]")
+    cl_vals = np.concatenate([wf_arr[:, 3], wf_arr[:, 4]])
+    cl_vals = cl_vals[np.isfinite(cl_vals)]
+    p99_cl = float(np.percentile(cl_vals, 99.0)) if cl_vals.size else 200.0
+    ax1.set_ylim(0.0, max(150.0, p99_cl * 1.25))
+    ax1.grid(True, alpha=0.28)
+    ax1.legend(loc="upper right", fontsize=8.0, ncol=2, framealpha=0.92)
+
+    sr_band_panels = [
+        (
+            axest[2],
+            "vis",
+            "Visible I-Band (0.75 um)",
+            [(1, 2, "raw"), (3, 4, "stg1"), (5, 6, "final")],
+        ),
+        (
+            axest[3],
+            "nir",
+            "Near-IR H-Band (1.65 um)",
+            [(7, 8, "raw"), (9, 10, "stg1"), (11, 12, "final")],
+        ),
+    ]
+    sr_stage_meta = {
+        "raw": ("Uncorrected (Open-Loop)", "#d62728"),
+        "stg1": ("Stage 1 Only (AO3k)", "#ff7f0e"),
+        "final": ("Stage 1 + 2 (AO3k + SCExAO)", "#1f77b4"),
+    }
+    for ax_s, bkey, blab, cols in sr_band_panels:
+        max_sr = 10.0
+        for ci, cl, skey in cols:
+            slab, col_c = sr_stage_meta[skey]
+            yi = sr_arr[:, ci] * 100.0
+            yl = sr_arr[:, cl] * 100.0
+            ms = sr_stat.get(bkey, {}).get(skey, {})
+            if np.any(np.isfinite(yi)):
+                max_sr = max(max_sr, float(np.nanmax(yi)))
+                lbl_i = (
+                    f"{slab}: short mean={ms.get('inst_mean', 0)*100:.1f}% "
+                    f"(long={ms.get('long_final', 0)*100:.1f}%)"
+                )
+                ax_s.plot(t_sr, yi, color=col_c, lw=1.15, alpha=0.68, label=lbl_i)
+                if samp_list:
+                    sx, sy = [], []
+                    for sm in samp_list:
+                        ts_v = float(sm["t_phys_s"])
+                        sr_pk = (
+                            sm.get("inst_psf", {})
+                            .get(bkey, {})
+                            .get(skey, {})
+                            .get("strehl_peak")
+                        )
+                        if sr_pk is not None and np.isfinite(sr_pk):
+                            yv = float(sr_pk) * 100.0
+                        elif t_sr.size > 0:
+                            cand = np.where(t_sr <= ts_v + 1e-6)[0]
+                            idx_s = (
+                                int(cand[-1])
+                                if cand.size > 0
+                                else int(np.argmin(np.abs(t_sr - ts_v)))
+                            )
+                            yv = float(yi[idx_s])
+                        else:
+                            yv = float("nan")
+                        if np.isfinite(yv):
+                            sx.append(ts_v)
+                            sy.append(yv)
+                    if sx:
+                        ax_s.scatter(
+                            sx,
+                            sy,
+                            s=46,
+                            facecolor=col_c,
+                            edgecolor="#111827",
+                            linewidths=1.15,
+                            zorder=6,
+                        )
+            if np.any(np.isfinite(yl)):
+                max_sr = max(max_sr, float(np.nanmax(yl)))
+                ax_s.plot(t_sr, yl, color=col_c, ls="--", lw=2.2, alpha=0.95)
+        ax_s.set_title(
+            f"{blab} Strehl Ratios vs Time (Solid: 10 ms Short-Exp | Dashed: Cumulative Long-Exp)",
+            fontsize=11,
+            fontweight="bold",
+        )
+        ax_s.set_ylabel(f"{bkey.upper()} Strehl [%]")
+        top_sr = min(118.0, max_sr * 1.26)
+        ax_s.set_ylim(0.0, top_sr)
+        if top_sr > 100.0:
+            ax_s.set_yticks([0, 20, 40, 60, 80, 100])
+        ax_s.grid(True, alpha=0.28)
+        ax_s.legend(loc="upper right", fontsize=8.2, framealpha=0.92)
+
+    xmax = max(
+        float(np.nanmax(t_wf)) if t_wf.size else phys_t,
+        float(np.nanmax(t_sr)) if t_sr.size else phys_t,
+    )
+    axest[3].set_xlim(0.0, max(xmax, 0.1))
+    axest[3].set_xlabel("Physical Simulation Time t [s]", fontsize=10.5)
+    figt.savefig(os.path.join(out_dir, "wf_strehl_timeseries_4x1.png"), dpi=180)
+    plt.close(figt)
 """
     py_exec = sys.executable
     try:
@@ -1673,7 +1974,89 @@ if lp1.get("selfrm") and lp2.get("selfrm"):
         subprocess.run([py_exec, "-c", plotter, out_dir, summary_path], check=True)
 
 
-def write_ao_report_md(out_dir, s):
+def ensure_gui_screenshots(work_dir, out_dir):
+    bench_cands = []
+    if os.path.isdir(out_dir):
+        local_benches = sorted(
+            f for f in os.listdir(out_dir) if f.endswith(".bench")
+        )
+        for fb in local_benches:
+            if fb != "csim_active.bench":
+                bench_cands.append(os.path.join(out_dir, fb))
+        for fb in local_benches:
+            if fb == "csim_active.bench":
+                bench_cands.append(os.path.join(out_dir, fb))
+
+    env_bench = os.environ.get("CACAOSIM_BENCH_FILE", "")
+    if env_bench:
+        bench_cands.append(env_bench)
+    shm_dir = os.environ.get("MILK_SHM_DIR", "")
+    if shm_dir and shm_dir != "/milk/shm":
+        bench_cands.append(os.path.join(shm_dir, "csim_active.bench"))
+    if work_dir:
+        bench_cands.append(os.path.join(work_dir, "csim", "csim_active.bench"))
+
+    cacao_root = os.environ.get("CACAO_WORK_ROOT", "")
+    if cacao_root:
+        bench_cands.append(
+            os.path.join(cacao_root, "benches", "ao3k_scexao", "ao3k_scexao.bench")
+        )
+    cur = os.path.abspath(out_dir)
+    for _ in range(4):
+        cand = os.path.join(cur, "benches", "ao3k_scexao", "ao3k_scexao.bench")
+        bench_cands.append(cand)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+
+    src_bench = next((p for p in bench_cands if p and os.path.isfile(p)), None)
+    if src_bench is None:
+        return None
+
+    base_name = os.path.basename(src_bench)
+    if base_name == "csim_active.bench":
+        base_name = "ao3k_scexao.bench"
+    staged_bench = os.path.join(out_dir, base_name)
+    if os.path.abspath(src_bench) != os.path.abspath(staged_bench):
+        if not os.path.isfile(staged_bench):
+            shutil.copy2(src_bench, staged_bench)
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    shot_cands = [
+        shutil.which("cacaosim-gui-screenshot") or "",
+        os.path.join(script_dir, "cacaosim-gui-screenshot"),
+        os.path.join(
+            os.environ.get("MILK_INSTALL_ROOT", ""), "bin", "cacaosim-gui-screenshot"
+        ),
+        os.path.join(os.environ.get("MILK_ROOT", ""), "bin", "cacaosim-gui-screenshot"),
+    ]
+    shot_bin = next(
+        (p for p in shot_cands if p and os.path.isfile(p) and os.access(p, os.X_OK)),
+        None,
+    )
+    if shot_bin is not None:
+        try:
+            subprocess.run(
+                [
+                    sys.executable,
+                    shot_bin,
+                    "--outdir",
+                    out_dir,
+                    "--keep-existing",
+                    staged_bench,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError:
+            pass
+    return os.path.basename(staged_bench)
+
+
+def write_ao_report_md(out_dir, s, bench_filename=None):
+    tel = s.get("telescope", {})
     sa = s.get("star_and_atmosphere", {})
     lps = s.get("loops", {})
     l1 = lps.get("stage1_ao3k", {})
@@ -1697,12 +2080,62 @@ def write_ao_report_md(out_dir, s):
         f"`{l2.get('n_cm_modes', 0)}` CM modes",
         "",
         "> Companion systems & optimization report: [COMPUTE_REPORT.md](COMPUTE_REPORT.md)",
-        "",
-        "## Long-Exposure PSF Summary",
-        "",
-        "| Band | Stage | Strehl Peak | FWHM [mas] | FWHM [l/D] | EE(1.22 l/D) | r50 [mas] |",
-        "| :--- | :--- | ---: | ---: | ---: | ---: | ---: |",
     ]
+
+    schem_png = os.path.join(out_dir, "cacaosim_gui_schematic.png")
+    has_extra_gui = any(
+        os.path.isfile(os.path.join(out_dir, fn))
+        for fn in (
+            "cacaosim_gui_builder.png",
+            "cacaosim_gui_tables.png",
+            "cacaosim_gui_status.png",
+        )
+    )
+    if os.path.isfile(schem_png) or bench_filename:
+        lines.extend(["", "## Optical Bench & Hardware Configuration (`cacaosim-CTRL`)", ""])
+        if bench_filename and os.path.isfile(os.path.join(out_dir, bench_filename)):
+            nwf_v = tel.get("nwf", 256)
+            diam_v = tel.get("diameter_m", 8.2)
+            cobs_pct = tel.get("cobs", 0.30) * 100.0
+            pscale_v = tel.get("pupil_scale_m_pix", 8.2 / 240.0)
+            mhz_v = sa.get("master_rate_phys_hz", 2000.0) / 1000.0
+            lines.append(
+                f"- **Declarative Bench**: [{bench_filename}]({bench_filename}) "
+                f"(`{nwf_v}x{nwf_v}` grid, `D = {diam_v:.2f} m`, "
+                f"`cobs = {cobs_pct:.0f}%`, `{pscale_v:.4f} m/pix`, `{mhz_v:.1f} kHz` master)"
+            )
+        lines.append(
+            f"- **Optical Relay**: Entrance pupil (`b_pup`) -> Stage-1 AO3k "
+            f"`{l1.get('dm_grid', '64x64')}` DM (`dm01disp`) -> `1.22 um` J-band dichroic "
+            f"(`R` -> `{l1.get('wfs_detector', '160x160')}` NIR PyWFS @ `1 kHz`; `T` -> Stage-2) "
+            f"-> Stage-2 SCExAO `{l2.get('dm_grid', '50x50')}` DM (`dm02disp`) -> `1.00 um` LP "
+            f"dichroic (`T` -> `1.65 um` H-band camera; `R` -> `90/10` Vis splitter -> "
+            f"`{l2.get('wfs_detector', '120x120')}` Vis PyWFS @ `2 kHz` + `0.75 um` Vis camera)"
+        )
+        if has_extra_gui:
+            lines.append(
+                "- **Interactive Simulator Views**: Builder inspector, hardware audit tables, "
+                "and live SHM telemetry in "
+                "[Hardware Simulator GUI (`cacaosim-CTRL`)](#hardware-simulator-gui-cacaosim-ctrl)"
+            )
+        if os.path.isfile(schem_png):
+            lines.extend(
+                [
+                    "",
+                    "![cacaosim-CTRL 2D Optical Bench Schematic, Entrance Pupil & "
+                    "32-Bin Polychromatic Spectra (F3:SCHEMATIC)](cacaosim_gui_schematic.png)",
+                ]
+            )
+
+    lines.extend(
+        [
+            "",
+            "## Long-Exposure PSF Summary",
+            "",
+            "| Band | Stage | Strehl Peak | FWHM [mas] | FWHM [l/D] | EE(1.22 l/D) | r50 [mas] |",
+            "| :--- | :--- | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
     for bkey, bcfg in BANDS.items():
         bm = pm.get(bkey, {})
         for skey, slabel in STAGES:
@@ -1737,20 +2170,347 @@ def write_ao_report_md(out_dir, s):
                     f"{loc['marechal_sr_nir_1650nm']*100:.1f}% |"
                 )
 
-    lines.extend(
-        [
-            "",
-            "## Figures",
-            "",
-            "- ![PSF Comparison](psf_comparison_2x3.png)",
-            "- ![PSF Radial Profiles](psf_radial_profiles.png)",
-            "- ![Wavefront Stats](wf_stats_2x3.png)",
-            "- ![Hardware Latency](mlat_latency_1x2.png)",
-            "- ![selfRM Summary](selfrm_summary_2x4.png)",
-        ]
+    tsm = s.get("timeseries_metrics")
+    samples = wm.get("samples", []) if wm else []
+    if tsm or samples:
+        wf_ts = tsm.get("wf_rms_nm", {}) if tsm else {}
+        sr_ts = tsm.get("strehl", {}) if tsm else {}
+        if wf_ts or sr_ts or samples:
+            lines.extend(["", "## Temporal Evolution Summary"])
+        if wf_ts:
+            lines.extend(
+                [
+                    "",
+                    "### Pupil RMS Wavefront Error vs Time",
+                    "",
+                    "| Optical Plane | Frames | Mean [nm] | Median [nm] | Std [nm] | "
+                    "P05-P95 [nm] | Min-Max [nm] |",
+                    "| :--- | ---: | ---: | ---: | ---: | :---: | :---: |",
+                ]
+            )
+            loc_labels = {
+                "raw": "Before Stage 1 (Entrance Pupil)",
+                "stg1": "Between Stages 1 & 2 (Post-AO3k)",
+                "final": "After Stage 2 (Post-SCExAO)",
+            }
+            for k in ("raw", "stg1", "final"):
+                m = wf_ts.get(k)
+                if m:
+                    lines.append(
+                        f"| {loc_labels[k]} | {m['n_frames']} | {m['mean_nm']:.1f} | "
+                        f"{m['median_nm']:.1f} | {m['std_nm']:.1f} | "
+                        f"{m['p05_nm']:.1f}-{m['p95_nm']:.1f} | "
+                        f"{m['min_nm']:.1f}-{m['max_nm']:.1f} |"
+                    )
+        if sr_ts:
+            lines.extend(
+                [
+                    "",
+                    "### Optical Strehl Ratio vs Time",
+                    "",
+                    "| Band | Stage | Exposures | Mean Short SR | Median Short SR | "
+                    "P05-P95 Short SR | Final Long SR |",
+                    "| :--- | :--- | ---: | ---: | ---: | :---: | ---: |",
+                ]
+            )
+            for bkey, bcfg in BANDS.items():
+                bsr = sr_ts.get(bkey, {})
+                for skey, slabel in STAGES[1:]:
+                    m = bsr.get(skey)
+                    if m:
+                        lines.append(
+                            f"| {bcfg['label']} | {slabel} | {m['n_exposures']} | "
+                            f"{m['inst_mean']*100:.2f}% | {m['inst_median']*100:.2f}% | "
+                            f"{m['inst_p05']*100:.2f}%-{m['inst_p95']*100:.2f}% | "
+                            f"{m['long_final']*100:.2f}% |"
+                        )
+        if samples:
+            lines.extend(
+                [
+                    "",
+                    f"### Sampled Snapshot Instants (S1-S{len(samples)})",
+                    "",
+                    "| Sample | Time [s] | Frame | Raw WFE [nm] | Stg1 WFE [nm] | "
+                    "Final WFE [nm] | DM1 / DM2 OPD [nm] | "
+                    "Vis Short SR (Stg1 / Final) | NIR Short SR (Stg1 / Final) |",
+                    "| :---: | ---: | ---: | ---: | ---: | ---: | "
+                    ":---: | :---: | :---: |",
+                ]
+            )
+            for idx_s, sm in enumerate(samples):
+                ex = sm.get("extra", {})
+                dm1_opd = ex.get("dm_opd_stg1", {}).get("rms_nm")
+                dm2_opd = ex.get("dm_opd_stg2", {}).get("rms_nm")
+                if dm1_opd is not None and dm2_opd is not None:
+                    dm_str = f"{dm1_opd:.1f} / {dm2_opd:.1f}"
+                else:
+                    dm_str = "-"
+                ip = sm.get("inst_psf", {})
+                v1 = ip.get("vis", {}).get("stg1", {}).get("strehl_peak")
+                vf = ip.get("vis", {}).get("final", {}).get("strehl_peak")
+                vs_str = (
+                    f"{v1 * 100:.1f}% / {vf * 100:.1f}%"
+                    if v1 is not None and vf is not None
+                    else "-"
+                )
+                n1 = ip.get("nir", {}).get("stg1", {}).get("strehl_peak")
+                nf = ip.get("nir", {}).get("final", {}).get("strehl_peak")
+                ns_str = (
+                    f"{n1 * 100:.1f}% / {nf * 100:.1f}%"
+                    if n1 is not None and nf is not None
+                    else "-"
+                )
+                raw_w = sm.get("raw", {}).get("rms_nm", 0.0)
+                s1_w = sm.get("stg1", {}).get("rms_nm", 0.0)
+                fn_w = sm.get("final", {}).get("rms_nm", 0.0)
+                lines.append(
+                    f"| S{idx_s + 1} | {sm.get('t_phys_s', 0.0):.2f} | "
+                    f"{sm.get('frame', 0)} | {raw_w:.1f} | {s1_w:.1f} | "
+                    f"{fn_w:.1f} | {dm_str} | {vs_str} | {ns_str} |"
+                )
+        csv_links = []
+        for cname in ("wf_timeseries.csv", "strehl_timeseries.csv"):
+            if os.path.isfile(os.path.join(out_dir, cname)):
+                csv_links.append(f"[{cname}]({cname})")
+        if csv_links:
+            lines.extend(["", f"- Time-series CSVs: {', '.join(csv_links)}"])
+
+    snap_title = (
+        f"Time-Series & Sampled Instant Snapshots (S1-S{len(samples)})"
+        if samples
+        else "Time-Series Telemetry"
     )
+    fig_sections = [
+        (
+            "Hardware Simulator GUI (cacaosim-CTRL)",
+            [
+                (
+                    "cacaosim-CTRL 3-Pane Hardware Configurator & "
+                    "DM Parameter Inspector (F2:BUILDER)",
+                    "cacaosim_gui_builder.png",
+                ),
+                (
+                    "cacaosim-CTRL Active Mirrors, Wavefront/Science Sensors & "
+                    "Beamsplitters Summary (F4:TABLES)",
+                    "cacaosim_gui_tables.png",
+                ),
+                (
+                    "cacaosim-CTRL Live Shared-Memory Streams & "
+                    "Active MILK FPS Units (F5:STATUS)",
+                    "cacaosim_gui_status.png",
+                ),
+            ],
+        ),
+        (
+            "Long-Exposure PSF & Wavefront Summary",
+            [
+                ("Long-Exposure PSF Comparison (2x3)", "psf_comparison_2x3.png"),
+                ("PSF Radial Profiles & Encircled Energy", "psf_radial_profiles.png"),
+                ("Wavefront Mean & Temporal Std Dev Maps (2x3)", "wf_stats_2x3.png"),
+            ],
+        ),
+        (
+            snap_title,
+            [
+                (
+                    "RMS Wavefront Error & Strehl Ratio Time Series "
+                    "with Sampled Instants (4x1)",
+                    "wf_strehl_timeseries_4x1.png",
+                ),
+                (
+                    "Instantaneous Visible 0.75 um PSFs at Sampled Instants (5x3)",
+                    "psf_inst_vis_5x3.png",
+                ),
+                (
+                    "Instantaneous Near-IR H-Band 1.65 um PSFs at Sampled Instants (5x3)",
+                    "psf_inst_nir_5x3.png",
+                ),
+                (
+                    "Instantaneous Pupil Wavefront OPD Samples at Sampled Instants (5x3)",
+                    "wf_samples_5x3.png",
+                ),
+                (
+                    "Instantaneous DM Actuator Commands & Pupil OPD Shapes "
+                    "at Sampled Instants (5x4)",
+                    "dm_samples_5x4.png",
+                ),
+                (
+                    "Instantaneous Pyramid WFS Frames & Ref-Subtracted Signals "
+                    "at Sampled Instants (5x4)",
+                    "wfs_samples_5x4.png",
+                ),
+            ],
+        ),
+        (
+            "Loop Calibration, Latency & Modal Control",
+            [
+                ("Applied Per-Mode Integrator Gains (1x2)", "modal_gains_1x2.png"),
+                ("Hardware Latency Measurement (mlat, 1x2)", "mlat_latency_1x2.png"),
+                (
+                    "Modal Self-Response Matrix Summary (selfRM, 2x4)",
+                    "selfrm_summary_2x4.png",
+                ),
+            ],
+        ),
+    ]
+    fig_lines = []
+    for sec_title, items in fig_sections:
+        present = [
+            f"- ![{alt}]({fname})"
+            for alt, fname in items
+            if os.path.isfile(os.path.join(out_dir, fname))
+        ]
+        if present:
+            fig_lines.extend(["", f"### {sec_title}", "", *present])
+    if fig_lines:
+        lines.extend(["", "## Figures", *fig_lines])
     with open(os.path.join(out_dir, "REPORT.md"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
+
+
+def load_and_summarize_timeseries(out_dir, wf_metrics, tmp_npys):
+    ts_summary = {}
+
+    wf_arr = None
+    has_full_wf = False
+    wf_csv_p = os.path.join(out_dir, "wf_timeseries.csv")
+    if os.path.isfile(wf_csv_p):
+        try:
+            loaded = np.loadtxt(wf_csv_p, delimiter=",", skiprows=1, ndmin=2)
+            if loaded.ndim == 2 and loaded.shape[0] > 0 and loaded.shape[1] >= 5:
+                wf_arr = loaded[:, :5].astype(np.float64)
+                has_full_wf = True
+        except Exception:
+            wf_arr = None
+
+    if wf_arr is None and wf_metrics and wf_metrics.get("samples"):
+        rows = []
+        for sm in wf_metrics["samples"]:
+            rows.append(
+                [
+                    float(sm.get("frame", 0)),
+                    float(sm.get("t_phys_s", 0.0)),
+                    float(sm.get("raw", {}).get("rms_nm", float("nan"))),
+                    float(sm.get("stg1", {}).get("rms_nm", float("nan"))),
+                    float(sm.get("final", {}).get("rms_nm", float("nan"))),
+                ]
+            )
+        if rows:
+            wf_arr = np.asarray(rows, dtype=np.float64)
+
+    if wf_arr is not None and wf_arr.shape[0] > 0:
+        wf_npy = os.path.join(out_dir, "ts_wf_plot.npy")
+        np.save(wf_npy, wf_arr.astype(np.float32))
+        tmp_npys.append(wf_npy)
+        wf_rms_summary = {}
+        for col_i, k in ((2, "raw"), (3, "stg1"), (4, "final")):
+            vals = wf_arr[:, col_i]
+            vals = vals[np.isfinite(vals)]
+            if vals.size > 0:
+                wf_rms_summary[k] = {
+                    "n_frames": int(vals.size),
+                    "mean_nm": float(np.mean(vals)),
+                    "std_nm": float(np.std(vals)),
+                    "min_nm": float(np.min(vals)),
+                    "p05_nm": float(np.percentile(vals, 5.0)),
+                    "median_nm": float(np.median(vals)),
+                    "p95_nm": float(np.percentile(vals, 95.0)),
+                    "max_nm": float(np.max(vals)),
+                    "has_full_csv": has_full_wf,
+                }
+        if wf_rms_summary:
+            ts_summary["wf_rms_nm"] = wf_rms_summary
+
+    sr_cols = [
+        ("vis", "raw"),
+        ("vis", "stg1"),
+        ("vis", "final"),
+        ("nir", "raw"),
+        ("nir", "stg1"),
+        ("nir", "final"),
+    ]
+    sr_arr = None
+    has_full_sr = False
+    sr_csv_p = os.path.join(out_dir, "strehl_timeseries.csv")
+    if os.path.isfile(sr_csv_p):
+        try:
+            tbl = np.genfromtxt(sr_csv_p, delimiter=",", names=True, dtype=np.float64)
+            tbl = np.atleast_1d(tbl)
+            names = set(tbl.dtype.names or ())
+            if tbl.size > 0 and "t_phys_s" in names and "vis_raw_inst" in names:
+                cols_data = [np.asarray(tbl["t_phys_s"], dtype=np.float64)]
+                for bkey, skey in sr_cols:
+                    ik = f"{bkey}_{skey}_inst"
+                    lk = f"{bkey}_{skey}_long"
+                    cols_data.append(
+                        np.asarray(tbl[ik], dtype=np.float64)
+                        if ik in names
+                        else np.full(tbl.size, np.nan)
+                    )
+                    cols_data.append(
+                        np.asarray(tbl[lk], dtype=np.float64)
+                        if lk in names
+                        else np.full(tbl.size, np.nan)
+                    )
+                sr_arr = np.column_stack(cols_data)
+                has_full_sr = True
+        except Exception:
+            sr_arr = None
+
+    if sr_arr is None and wf_metrics and wf_metrics.get("samples"):
+        samps = wf_metrics["samples"]
+        if any(sm.get("inst_psf", {}).get("vis") for sm in samps):
+            t_vec = np.asarray([float(sm.get("t_phys_s", 0.0)) for sm in samps], dtype=np.float64)
+            cols_data = [t_vec]
+            for bkey, skey in sr_cols:
+                vals = np.asarray(
+                    [
+                        float(
+                            sm.get("inst_psf", {})
+                            .get(bkey, {})
+                            .get(skey, {})
+                            .get("strehl_peak", float("nan"))
+                        )
+                        for sm in samps
+                    ],
+                    dtype=np.float64,
+                )
+                lvals = np.full(vals.shape, np.nan, dtype=np.float64)
+                fin = np.isfinite(vals)
+                if np.any(fin):
+                    cnt = np.cumsum(fin.astype(np.float64))
+                    csum = np.cumsum(np.where(fin, vals, 0.0))
+                    lvals[fin] = csum[fin] / cnt[fin]
+                cols_data.extend([vals, lvals])
+            sr_arr = np.column_stack(cols_data)
+
+    if sr_arr is not None and sr_arr.shape[0] > 0:
+        sr_npy = os.path.join(out_dir, "ts_strehl_plot.npy")
+        np.save(sr_npy, sr_arr.astype(np.float32))
+        tmp_npys.append(sr_npy)
+        sr_summary = {"vis": {}, "nir": {}}
+        for idx, (bkey, skey) in enumerate(sr_cols):
+            iv = sr_arr[:, 1 + 2 * idx]
+            lv = sr_arr[:, 2 + 2 * idx]
+            iv_f = iv[np.isfinite(iv)]
+            lv_f = lv[np.isfinite(lv)]
+            if iv_f.size > 0:
+                sr_summary[bkey][skey] = {
+                    "n_exposures": int(iv_f.size),
+                    "inst_mean": float(np.mean(iv_f)),
+                    "inst_std": float(np.std(iv_f)),
+                    "inst_min": float(np.min(iv_f)),
+                    "inst_p05": float(np.percentile(iv_f, 5.0)),
+                    "inst_median": float(np.median(iv_f)),
+                    "inst_p95": float(np.percentile(iv_f, 95.0)),
+                    "inst_max": float(np.max(iv_f)),
+                    "long_final": float(lv_f[-1]) if lv_f.size > 0 else float("nan"),
+                    "has_full_csv": has_full_sr,
+                }
+        if sr_summary["vis"] or sr_summary["nir"]:
+            ts_summary["strehl"] = sr_summary
+
+    return ts_summary if ts_summary else None
 
 
 def main():
@@ -1761,7 +2521,7 @@ def main():
         print(
             "Analyze FITS PSFs, wavefront stats, mlat hardware latency, and selfRM cubes\n"
             "from two-stage AO3k + SCExAO simulation runs to generate REPORT.md,\n"
-            "ao3k_scexao_metrics.json, and 11 publication figures."
+            "ao3k_scexao_metrics.json, and 12 publication figures."
         )
         return
     if len(sys.argv) < 11 or any(a in ("-h", "--help", "-hm", "--help-mono") for a in sys.argv[1:]):
@@ -1892,6 +2652,7 @@ def main():
 
     stage1_info = load_loop_calib(work_dir, "ao3k", 1, out_dir, tmp_npys)
     stage2_info = load_loop_calib(work_dir, "scexao", 2, out_dir, tmp_npys)
+    ts_metrics = load_and_summarize_timeseries(out_dir, wf_metrics, tmp_npys)
 
     summary = {
         "configuration": "Subaru 8.2m AO3k + SCExAO (Two-Stage Pyramid WFS)",
@@ -1949,14 +2710,17 @@ def main():
     }
     if wf_metrics is not None:
         summary["wavefront_metrics"] = wf_metrics
+    if ts_metrics is not None:
+        summary["timeseries_metrics"] = ts_metrics
 
     summary_path = os.path.join(out_dir, "ao3k_scexao_metrics.json")
     with open(summary_path, "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
         fh.write("\n")
 
+    bench_filename = ensure_gui_screenshots(work_dir, out_dir)
     render_plots_via_sys_python(out_dir, summary_path)
-    write_ao_report_md(out_dir, summary)
+    write_ao_report_md(out_dir, summary, bench_filename=bench_filename)
     for npy_p in tmp_npys:
         if os.path.exists(npy_p):
             os.remove(npy_p)
