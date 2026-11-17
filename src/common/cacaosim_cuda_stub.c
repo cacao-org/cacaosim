@@ -29,6 +29,7 @@
 #include <stddef.h>
 
 #include "common/cacaosim_cuda.h"
+#include "common/cacaosim_wfstat_core.h"
 #include "coro/cacaosim_coro.h"
 #include "dm/cacaosim_dm.h"
 #include "fpcam/cacaosim_fpcam.h"
@@ -1074,6 +1075,52 @@ void cacaosim_cuda_beam_apply_wfe(
     (void) d_out_opd;
     (void) d_out_amp;
     (void) cuda_stream;
+}
+
+/* Wavefront statistics engine (cacaosim_wfstat_core): GPU path unavailable without CUDA */
+void *cacaosim_wfstat_gpu_create(
+    const double *h_weights,
+    uint64_t      npix,
+    uint32_t      nloc,
+    void         *cuda_stream)
+{
+    (void) h_weights;
+    (void) npix;
+    (void) nloc;
+    (void) cuda_stream;
+    return NULL;
+}
+
+void cacaosim_wfstat_gpu_free(void *gpu)
+{
+    (void) gpu;
+}
+
+void cacaosim_wfstat_gpu_accum(void *gpu, const float *const d_opd[])
+{
+    (void) gpu;
+    (void) d_opd;
+}
+
+int cacaosim_wfstat_gpu_fetch_sample(void *gpu, float *const h_maps[], double *h_frame)
+{
+    (void) gpu;
+    (void) h_maps;
+    (void) h_frame;
+    return -1;
+}
+
+int cacaosim_wfstat_gpu_fetch_sums(
+    void         *gpu,
+    double *const h_sum[],
+    double *const h_sum2[],
+    double       *h_acc)
+{
+    (void) gpu;
+    (void) h_sum;
+    (void) h_sum2;
+    (void) h_acc;
+    return -1;
 }
 
 #endif /* !HAVE_CUDA */

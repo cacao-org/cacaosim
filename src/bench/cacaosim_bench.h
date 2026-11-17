@@ -1267,6 +1267,15 @@ int cacaosim_bench_bind_export_beams(
     char                 *err_buf,
     size_t                err_cap);
 
+/**
+ * cacaosim_bench_find_beam() - Resolve a named optical beam to its slot index in ctx->beams[]
+ * @ctx:  Analyzed or initialized bench context (may be NULL).
+ * @name: Beam identifier (e.g. "b_pup", "b_post_stg2").
+ *
+ * Return: Beam slot index in `[0, ctx->n_beams - 1]`, or `-1` if not found / NULL args.
+ */
+int cacaosim_bench_find_beam(const cacaosim_bench_ctx_t *ctx, const char *name);
+
 #ifdef __cplusplus
 }
 #endif

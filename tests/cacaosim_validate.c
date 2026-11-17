@@ -3276,6 +3276,120 @@ static void test_coro_lowfs_wfe_and_scales(void)
  *
  * @return `0` if every assertion passed (`g_fail == 0`); `1` if one or more assertions failed.
  */
+/**
+ * @brief Section 14: CPU vs CUDA parity of the shared wavefront statistics engine.
+ *
+ * Feeds identical deterministic pseudo-random OPD frames (with per-frame piston offsets) to the
+ * CPU path (`cacaosim.wfstat`) and the CUDA in-DAG path (`csim_htsim.wfstat_enable`) of
+ * `cacaosim_wfstat_core`, then compares FP64 per-pixel sums, per-frame RMS accumulators, and
+ * the 5 captured sample maps. Both paths must agree to round-off since htsim replaces csim_wfstat
+ * in fused mode.
+ */
+static void test_wfstat_cpu_gpu_parity(void)
+{
+    printf("\n[14] Wavefront statistics engine: CPU vs CUDA parity\n");
+    if (!cacaosim_cuda_available())
+    {
+        printf("  [SKIP] No CUDA GPU available\n");
+        return;
+    }
+    const uint32_t nwf = 128, nframes = 200;
+    const uint64_t npix = (uint64_t) nwf * nwf;
+    float         *pup  = (float *) calloc(npix, sizeof(float));
+    float         *h_fr = (float *) calloc(3 * npix, sizeof(float));
+    cacaosim_pupil_cfg_t pcfg = { .nwf = nwf, .pup_diam = 0.9375f, .cobs = 0.30f,
+                                  .nspider = 4, .spider_w = 0.01f, .spider_deg = 45.0f };
+    cacaosim_make_pupil(&pcfg, pup);
+
+    void  *stream = cacaosim_cuda_stream_create();
+    float *d_fr[3];
+    for (int k = 0; k < 3; k++)
+    {
+        d_fr[k] = cacaosim_cuda_alloc_f32(npix);
+    }
+    cacaosim_wfstat_t wc, wg;
+    int rc_c = cacaosim_wfstat_init(&wc, nwf, pup, nframes, 0, 0, NULL);
+    int rc_g = cacaosim_wfstat_init(&wg, nwf, pup, nframes, 0, 1, stream);
+    check_cond(rc_c == 0 && rc_g == 0 && d_fr[2] != NULL, "wfstat CPU + CUDA engines initialize",
+               rc_g == 0 ? "ok" : "gpu init failed");
+    if (rc_c != 0 || rc_g != 0)
+    {
+        free(pup);
+        free(h_fr);
+        return;
+    }
+
+    uint64_t seed = 0x9E3779B97F4A7C15ULL;
+    for (uint32_t f = 0; f < nframes; f++)
+    {
+        for (int k = 0; k < 3; k++)
+        {
+            float piston = 0.05f * (float) (k + 1) * sinf(0.1f * (float) f);
+            for (uint64_t i = 0; i < npix; i++)
+            {
+                seed            = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+                float u         = (float) ((seed >> 40) & 0xFFFFFF) / 16777216.0f - 0.5f;
+                h_fr[k * npix + i] = piston + (0.6f / (float) (k + 1)) * u;
+            }
+            cacaosim_cuda_h2d_f32(d_fr[k], h_fr + k * npix, npix, stream);
+        }
+        const float *hc[3] = { h_fr, h_fr + npix, h_fr + 2 * npix };
+        const float *dg[3] = { d_fr[0], d_fr[1], d_fr[2] };
+        cacaosim_wfstat_frame(&wc, hc);
+        cacaosim_wfstat_frame(&wg, dg);
+        cacaosim_cuda_stream_sync(stream);
+    }
+
+    double acc[6];
+    int    rc_f = cacaosim_wfstat_gpu_fetch_sums(wg.gpu, wg.sum_wf, wg.sum2_wf, acc);
+    double max_rel_sum = 0.0, max_rel_acc = 0.0, max_abs_samp = 0.0, max_rel_ptv = 0.0;
+    for (int k = 0; k < 3; k++)
+    {
+        for (uint64_t i = 0; i < npix; i++)
+        {
+            double ref = fabs(wc.sum2_wf[k][i]) + 1e-12;
+            double d1  = fabs(wg.sum_wf[k][i] - wc.sum_wf[k][i]) / sqrt(ref * nframes);
+            double d2  = fabs(wg.sum2_wf[k][i] - wc.sum2_wf[k][i]) / ref;
+            max_rel_sum = fmax(max_rel_sum, fmax(d1, d2));
+        }
+        max_rel_acc = fmax(max_rel_acc, fabs(acc[2 * k] - wc.sum_srms[k]) / wc.sum_srms[k]);
+        max_rel_acc = fmax(max_rel_acc, fabs(acc[2 * k + 1] - wc.sum_svar[k]) / wc.sum_svar[k]);
+        for (int s = 0; s < wc.nsamp; s++)
+        {
+            max_rel_ptv = fmax(max_rel_ptv, fabs(wg.samp_sptv[s][k] - wc.samp_sptv[s][k]) /
+                                                wc.samp_sptv[s][k]);
+            for (uint64_t i = 0; i < npix; i++)
+            {
+                double d = fabs((double) wg.samp_wf[k][s * npix + i] -
+                                (double) wc.samp_wf[k][s * npix + i]);
+                max_abs_samp = fmax(max_abs_samp, d);
+            }
+        }
+    }
+    char det[160];
+    snprintf(det, sizeof(det), "frames %lu/%lu, samples %d/%d", (unsigned long) wg.n_frames,
+             (unsigned long) wc.n_frames, wg.nsamp, wc.nsamp);
+    check_cond(rc_f == 0 && wg.n_frames == nframes && wg.nsamp == 5 && wc.nsamp == 5,
+               "wfstat GPU/CPU frame + sample bookkeeping", det);
+    snprintf(det, sizeof(det), "max rel = %.2e", max_rel_sum);
+    check_cond(max_rel_sum < 1e-9, "wfstat per-pixel FP64 sum/sum2 parity", det);
+    snprintf(det, sizeof(det), "max rel = %.2e", max_rel_acc);
+    check_cond(max_rel_acc < 1e-9, "wfstat per-frame RMS/variance accumulators", det);
+    snprintf(det, sizeof(det), "max |dmap| = %.2e nm, max rel dPTV = %.2e", max_abs_samp,
+             max_rel_ptv);
+    check_cond(max_abs_samp < 1e-3 && max_rel_ptv < 1e-9, "wfstat sample maps + PTV parity", det);
+
+    cacaosim_wfstat_free(&wc);
+    cacaosim_wfstat_free(&wg);
+    for (int k = 0; k < 3; k++)
+    {
+        cacaosim_cuda_free_f32(d_fr[k]);
+    }
+    cacaosim_cuda_stream_destroy(stream);
+    free(pup);
+    free(h_fr);
+}
+
 int main(void)
 {
     printf("======================================================================\n");
@@ -3296,6 +3410,7 @@ int main(void)
     test_bench_configurator_and_tui();
     test_custom_coro_masks_and_poly_cube();
     test_coro_lowfs_wfe_and_scales();
+    test_wfstat_cpu_gpu_parity();
 
     printf("\n======================================================================\n");
     printf("  Summary: %d passed, %d failed\n", g_pass, g_fail);

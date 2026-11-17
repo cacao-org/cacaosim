@@ -495,16 +495,29 @@ def drain(timeout_s):
             except OSError:
                 break
 
-drain(0.20)
-# Load ExAO preset ('P' -> '4' ExAO -> 'y' confirm), add DM ('a' -> '1') & WFE ('a' -> '9'),
-# cycle F3/F4/F5/F6/F2 tabs, save ('s'), and quit ('q')
-for seq in [b"P", b"4", b"y", b"a", b"1", b"a", b"9", b"\x1b[13~", b"\x1b[14~",
-            b"\x1b[15~", b"\x1b[17~", b"\x1b[12~", b"s", b"q"]:
-    os.write(master_fd, seq)
-    drain(0.06)
+try:
+    t_init = time.monotonic() + 5.0
+    while b"\x1b[?2026l" not in captured and time.monotonic() < t_init:
+        drain(0.05)
+    # Load ExAO preset ('P' -> '4' ExAO -> 'y' confirm), add DM ('a' -> '1') & WFE ('a' -> '9'),
+    # cycle F3/F4/F5/F6/F2 tabs, save ('s'), and quit ('q')
+    for seq in [b"P", b"4", b"y", b"a", b"1", b"a", b"9", b"\x1b[13~", b"\x1b[14~",
+                b"\x1b[15~", b"\x1b[17~", b"\x1b[12~", b"s", b"q"]:
+        os.write(master_fd, seq)
+        drain(0.06)
 
-rc = proc.wait(timeout=5.0)
-os.close(master_fd)
+    t_end = time.monotonic() + 5.0
+    while proc.poll() is None and time.monotonic() < t_end:
+        drain(0.05)
+    rc = proc.wait(timeout=1.0)
+finally:
+    try:
+        os.close(master_fd)
+    except OSError:
+        pass
+    if proc.poll() is None:
+        proc.kill()
+        proc.wait()
 assert rc == 0, f"cacaosim-CTRL exited with {rc}"
 assert b"\x1b[?2026h" in captured, "Missing synchronized output sequence"
 assert b"\x1b[?1049l" in captured, "Missing alternate screen restore"

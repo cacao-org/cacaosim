@@ -51,6 +51,7 @@
 #include "bench/cacaosim_bench.h"
 #include "bench/cacaosim_bench_view.h"
 #include "common/cacaosim_time.h"
+#include "common/cacaosim_wfstat_core.h"
 #include "dm/cacaosim_dm.h"
 #include "fpcam/cacaosim_fpcam.h"
 #include "fused/cacaosim_htsim_FPS.h"
@@ -65,6 +66,12 @@
 static char     param_bench_file[FUNCTION_PARAMETER_STRMAXLEN]   = "";
 static char     param_export_beams[FUNCTION_PARAMETER_STRMAXLEN] = "";
 static int64_t  param_export_enable                              = 1;
+static int64_t  param_wfstat_enable                              = 0;
+static char     param_wfstat_beams[FUNCTION_PARAMETER_STRMAXLEN] = "b_pup,b_post_stg1,b_post_stg2";
+static char     param_wfstat_outdir[FUNCTION_PARAMETER_STRMAXLEN] = ".";
+static uint64_t param_wfstat_ticks                                = 20000;
+static int64_t  param_wfstat_extra                                = 1;
+static uint64_t param_wfstat_frames                               = 0;
 static char     param_in_dmcmd[FUNCTION_PARAMETER_STRMAXLEN]     = "aol0_dmC";
 static char     param_out_wfscam[FUNCTION_PARAMETER_STRMAXLEN] = "aol0_wfsim";
 static char     param_out_dmopd[FUNCTION_PARAMETER_STRMAXLEN]  = "";
@@ -137,6 +144,22 @@ static float    param_strehl_ave                               = 0.0f;
     X(".export_enable", &param_export_enable, FPTYPE_ONOFF, 0,                          \
       FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
       "Live gate for SHM export of .export_beams (ON/OFF)")                             \
+    X(".wfstat_enable", &param_wfstat_enable, FPTYPE_ONOFF, 0,                          \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "In-DAG wavefront stats: ON starts, OFF (or .wfstat_ticks) writes outputs")       \
+    X(".wfstat_beams", param_wfstat_beams, FPTYPE_STRING, 0, FPFLAG_DEFAULT_INPUT,      \
+      "CSV raw,stg1,final beam names for in-DAG wavefront stats")                       \
+    X(".wfstat_outdir", param_wfstat_outdir, FPTYPE_STRING, 0,                          \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Output directory for wf_stats.json and FITS products (<64 chars)")               \
+    X(".wfstat_ticks", &param_wfstat_ticks, FPTYPE_UINT64, 0,                           \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Frames to accumulate before auto-writing (0 = until disabled)")                  \
+    X(".wfstat_extra", &param_wfstat_extra, FPTYPE_ONOFF, 0,                            \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Snapshot WFS/DM/PSF diagnostic streams at the 5 sample instants")                \
+    X(".wfstat_frames", &param_wfstat_frames, FPTYPE_UINT64, 0, FPFLAG_DEFAULT_OUTPUT,  \
+      "Frames accumulated by the current/last in-DAG wavefront stats run")              \
     X(".in_dmcmd", param_in_dmcmd, FPTYPE_STREAMNAME, 1,                                \
       FPFLAG_DEFAULT_INPUT | FPFLAG_TRIGGER_STREAM,                                     \
       "Input 2D DM actuator command stream (auto-created if missing)")                  \
@@ -233,7 +256,7 @@ static float    param_strehl_ave                               = 0.0f;
       "Live turbulence multiplier (0 = off for calibration, 1 = nominal)")              \
     X(".frame_rate", &param_frame_rate, FPTYPE_FLOAT32, 0,                              \
       FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
-      "Hardware master clock [Hz] via TIMER_ABSTIME (0 = use procinfo trigger)")        \
+      "Wall-clock pacing [Hz] (0 = procinfo trigger; .bench master_hz sets physics)")    \
     X(".rng_seed", &param_rng_seed, FPTYPE_UINT64, 0, FPFLAG_DEFAULT_INPUT,             \
       "Detector PRNG seed")                                                             \
     X(".backend", &param_backend, FPTYPE_INT32, 0, FPFLAG_DEFAULT_INPUT,                \
@@ -269,7 +292,8 @@ static MILK_COLD errno_t htsim_confcheck(void)
         const char *live_keys[] = {
             ".export_enable", ".delay_frames", ".tau_us",      ".max_stroke", ".mod_rad",
             ".wfs_flux",      ".wfs_ron",      ".wfs_shutter", ".fp_navg",    ".fp_flux",
-            ".fp_ron",        ".reset_long",   ".photon_noise", ".turb_gain", ".frame_rate"
+            ".fp_ron",        ".reset_long",   ".photon_noise", ".turb_gain", ".frame_rate",
+            ".wfstat_enable", ".wfstat_outdir", ".wfstat_ticks", ".wfstat_extra"
         };
         for (size_t i = 0; i < sizeof(live_keys) / sizeof(live_keys[0]); i++)
         {
@@ -343,6 +367,55 @@ static void resolve_bench_path(const char *spec, char *out, size_t cap)
 }
 
 /**
+ * htsim_wfstat_start() - Resolve .wfstat_beams and start in-DAG wavefront statistics
+ * @ws:   Destination statistics state.
+ * @bctx: Initialized bench context (beams accumulated on its CUDA stream or host buffers).
+ * @bidx: Output beam slot indices `[CACAOSIM_WFSTAT_NB_LOC]` (raw, stg1, final).
+ *
+ * Return: 0 on success, -1 on unknown beam name or allocation failure.
+ */
+static int htsim_wfstat_start(cacaosim_wfstat_t *ws, const cacaosim_bench_ctx_t *bctx,
+                              int *bidx)
+{
+    char  copy[FUNCTION_PARAMETER_STRMAXLEN];
+    char *save = NULL;
+    snprintf(copy, sizeof(copy), "%s", param_wfstat_beams);
+    char *tok = strtok_r(copy, ", ", &save);
+    for (int k = 0; k < CACAOSIM_WFSTAT_NB_LOC; k++)
+    {
+        bidx[k] = (tok != NULL) ? cacaosim_bench_find_beam(bctx, tok) : -1;
+        if (bidx[k] < 0)
+        {
+            fprintf(stderr, "[cacaosim.htsim] .wfstat_beams: beam %d ('%s') not found\n", k,
+                    tok ? tok : "");
+            return -1;
+        }
+        tok = strtok_r(NULL, ", ", &save);
+    }
+    if (cacaosim_wfstat_init(ws, bctx->nwf, bctx->pup_ptr, param_wfstat_ticks,
+                             (int) param_wfstat_extra, bctx->use_cuda,
+                             bctx->cuda_stream) != 0)
+    {
+        fprintf(stderr, "[cacaosim.htsim] in-DAG wavefront stats init failed\n");
+        return -1;
+    }
+    return 0;
+}
+
+/* Accumulate plane 0 of the three selected beams (device or host buffers) */
+static void htsim_wfstat_frame(cacaosim_wfstat_t *ws, const cacaosim_bench_ctx_t *bctx,
+                               const int *bidx)
+{
+    const float *opd[CACAOSIM_WFSTAT_NB_LOC];
+    for (int k = 0; k < CACAOSIM_WFSTAT_NB_LOC; k++)
+    {
+        const cacaosim_beam_slot_t *b = &bctx->beams[bidx[k]];
+        opd[k]                        = bctx->use_cuda ? b->d_opd : b->opd;
+    }
+    cacaosim_wfstat_frame(ws, opd);
+}
+
+/**
  * htsim_run_bench() - Execute `cacaosim.htsim` in declarative multi-stage `.bench` DAG mode
  * @self: Pointer to the owning `MILK_RUNNABLE` descriptor for `PROCESSINFO` lifecycle macros
  *
@@ -375,10 +448,11 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
     }
 
     /*
-     * Reconcile FPS parameters with `[bench]` file defaults: in FPS daemon mode
-     * (`dcfpsptr != NULL`), `cacaosim.deploy` already seeded `.frame_rate` and `.turb_gain` from `.bench`, so live FPS
-     * edits (including `0.0 <-> 1.0` toggles across stops) always win while keeping positive
-     * `bcfg.master_hz` when triggered externally (`frame_rate == 0.0`).
+     * Reconcile FPS parameters with `[bench]` file defaults. In FPS daemon mode
+     * (`dcfpsptr != NULL`) the physical master clock always comes from the staged `.bench`
+     * (`cacaosim.deploy --rate` already writes overrides there): `.frame_rate` only paces
+     * wall-clock time, so free-running at e.g. 160 or 640 Hz never alters simulated exposure
+     * times, WFS cadences, or DM dynamics. `.turb_gain` live FPS edits always win.
      */
     if (param_backend != 0)
     {
@@ -386,10 +460,6 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
     }
     if (dcfpsptr != NULL)
     {
-        if (param_frame_rate > 0.1f)
-        {
-            bcfg.master_hz = param_frame_rate;
-        }
         bcfg.turb_gain = param_turb_gain;
     }
     else
@@ -446,6 +516,11 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
     struct timespec deadline;
     clock_gettime(CLOCK_MONOTONIC, &deadline);
 
+    cacaosim_wfstat_t wfs;
+    int               wfs_active                         = 0;
+    int               wfs_bidx[CACAOSIM_WFSTAT_NB_LOC] = { 0 };
+    memset(&wfs, 0, sizeof(wfs));
+
     MILK_PROCINFO_INIT(self)
     MILK_PROCINFO_LOOPSTART(self)
     {
@@ -476,9 +551,46 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
         cacaosim_bench_step(&bctx, NULL, NULL, param_turb_gain, processinfo);
         param_strehl_inst = bctx.last_strehl_inst;
         param_strehl_ave  = bctx.last_strehl_ave;
+
+        /* In-DAG wavefront statistics on device beams (replaces SHM export + csim_wfstat) */
+        if (param_wfstat_enable && !wfs_active)
+        {
+            param_wfstat_frames = 0;
+            if (htsim_wfstat_start(&wfs, &bctx, wfs_bidx) == 0)
+            {
+                wfs_active = 1;
+            }
+            else
+            {
+                param_wfstat_enable = 0;
+            }
+        }
+        if (wfs_active)
+        {
+            if (param_wfstat_enable)
+            {
+                htsim_wfstat_frame(&wfs, &bctx, wfs_bidx);
+                param_wfstat_frames = wfs.n_frames;
+                if (param_wfstat_ticks > 0 && wfs.n_frames >= param_wfstat_ticks)
+                {
+                    param_wfstat_enable = 0;
+                }
+            }
+            if (!param_wfstat_enable)
+            {
+                cacaosim_wfstat_write(&wfs, param_wfstat_outdir, (double) bctx.dt_master_s);
+                cacaosim_wfstat_free(&wfs);
+                wfs_active = 0;
+            }
+        }
     }
     MILK_PROCINFO_END(self)
 
+    if (wfs_active)
+    {
+        cacaosim_wfstat_write(&wfs, param_wfstat_outdir, (double) bctx.dt_master_s);
+        cacaosim_wfstat_free(&wfs);
+    }
     cacaosim_bench_free(&bctx);
     return RETURN_SUCCESS;
 }

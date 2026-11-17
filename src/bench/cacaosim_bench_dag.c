@@ -2178,6 +2178,15 @@ const uint16_t *cacaosim_bench_sensor_u16(const cacaosim_bench_ctx_t *ctx, int s
     return nd->cam_u16;
 }
 
+int cacaosim_bench_find_beam(const cacaosim_bench_ctx_t *ctx, const char *name)
+{
+    if (ctx == NULL)
+    {
+        return -1;
+    }
+    return find_beam_name(ctx, name);
+}
+
 static int bind_single_export_beam(
     cacaosim_bench_ctx_t *ctx,
     uint32_t              bidx,

@@ -41,6 +41,7 @@ set(SOURCEFILES
     src/common/cacaosim_detector.c
     src/common/cacaosim_beam.c
     src/common/cacaosim_mask.c
+    src/common/cacaosim_wfstat_core.c
     src/common/cacaosim_cuda_stub.c
     src/pupil/cacaosim_pupil.c
     src/pupil/cacaosim_mkpupil_FPS.c
@@ -82,6 +83,7 @@ set(INCLUDEFILES
     src/common/cacaosim_detector.h
     src/common/cacaosim_beam.h
     src/common/cacaosim_mask.h
+    src/common/cacaosim_wfstat_core.h
     src/common/cacaosim_cuda.h
     src/pupil/cacaosim_pupil.h
     src/pupil/cacaosim_mkpupil_FPS.h
@@ -131,6 +133,7 @@ if(CACAOSIM_ENABLE_CUDA)
             add_compile_definitions(HAVE_CUDA)
             list(APPEND SOURCEFILES
                 src/common/cacaosim_cuda.cu
+                src/common/cacaosim_wfstat_cuda.cu
                 src/dm/cacaosim_dm_cuda.cu
                 src/coro/cacaosim_coro_cuda.cu
                 src/pyrwfs/cacaosim_pyrwfs_cuda.cu

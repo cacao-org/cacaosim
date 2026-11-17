@@ -52,6 +52,7 @@
 #include "common/cacaosim_mask.h"
 #include "common/cacaosim_rng.h"
 #include "common/cacaosim_time.h"
+#include "common/cacaosim_wfstat_core.h"
 
 /* Coronagraphic focal/pupil mask & LOWFS engine and FPS runnable */
 #include "coro/cacaosim_coro.h"
