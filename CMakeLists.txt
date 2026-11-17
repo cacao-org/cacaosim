@@ -47,6 +47,7 @@ set(SOURCEFILES
     src/beam/cacaosim_mkbeam_FPS.c
     src/beam/cacaosim_beamsplit_FPS.c
     src/beam/cacaosim_wfe_FPS.c
+    src/beam/cacaosim_wfstat_FPS.c
     src/dm/cacaosim_dm_engine.c
     src/dm/cacaosim_dmsim_FPS.c
     src/coro/cacaosim_coro_engine.c
@@ -87,6 +88,7 @@ set(INCLUDEFILES
     src/beam/cacaosim_mkbeam_FPS.h
     src/beam/cacaosim_beamsplit_FPS.h
     src/beam/cacaosim_wfe_FPS.h
+    src/beam/cacaosim_wfstat_FPS.h
     src/dm/cacaosim_dm.h
     src/dm/cacaosim_dmsim_FPS.h
     src/coro/cacaosim_coro.h
@@ -107,6 +109,7 @@ set(INCLUDEFILES
 
 set(SCRIPTS
     scripts/cacaosim-bench
+    scripts/cacaosim-ao-report
 )
 
 set(USE_CUDA_ACCEL OFF)

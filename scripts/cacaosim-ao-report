@@ -1,0 +1,2023 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Olivier Guyon et al
+# SPDX-License-Identifier: LGPL-3.0-or-later
+"""Compute quantitative PSF/loop metrics and render AO3k+SCExAO comparison plots."""
+
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+
+
+def _ensure_sci_python():
+    try:
+        import astropy  # noqa: F401
+        import matplotlib  # noqa: F401
+        import numpy  # noqa: F401
+        return
+    except ImportError:
+        pass
+    cands = [
+        os.environ.get("PYTHON_BIN", ""),
+        os.path.expanduser("~/miniforge3/bin/python3"),
+        os.path.expanduser("~/.local/envs/cacao/bin/python3"),
+    ]
+    for p in cands:
+        if p and os.path.isfile(p) and os.path.realpath(p) != os.path.realpath(sys.executable):
+            os.execv(p, [p] + sys.argv)
+
+
+_ensure_sci_python()
+import numpy as np  # noqa: E402
+from astropy.io import fits  # noqa: E402
+
+RAD2MAS = 206264.806247 * 1000.0
+TEL_DIAM_M = 8.2
+
+BANDS = {
+    "vis": {
+        "label": "Visible (0.75 um)",
+        "lam_um": 0.75,
+        "pixscale_ld": 2.20,
+        "stg1_ctrl_ld": 30.0,
+        "stg2_ctrl_ld": 23.0,
+    },
+    "nir": {
+        "label": "Near-IR H (1.65 um)",
+        "lam_um": 1.65,
+        "pixscale_ld": 2.50,
+        "stg1_ctrl_ld": 30.0,
+        "stg2_ctrl_ld": 23.0,
+    },
+}
+
+STAGES = [
+    ("dl", "Diffraction-Limited"),
+    ("raw", "Uncorrected (Open-Loop)"),
+    ("stg1", "Stage 1 Only (AO3k)"),
+    ("final", "Stage 1 + 2 (AO3k + SCExAO)"),
+]
+
+
+def radial_profile(img, cx, cy, dr=0.5):
+    ny, nx = img.shape
+    yy, xx = np.indices((ny, nx), dtype=np.float64)
+    rr = np.hypot(xx - cx, yy - cy)
+    rmax = min(cx, cy, nx - 2.0 - cx, ny - 2.0 - cy)
+    nbins = max(int(rmax / dr), 2)
+    centers = np.linspace(0.0, nbins * dr, nbins + 1)
+    thetas = np.linspace(0.0, 2.0 * math.pi, 144, endpoint=False)
+    xs = cx + centers[:, None] * np.cos(thetas)[None, :]
+    ys = cy + centers[:, None] * np.sin(thetas)[None, :]
+    x0 = np.floor(xs).astype(int)
+    y0 = np.floor(ys).astype(int)
+    wx = xs - x0
+    wy = ys - y0
+    vals = (
+        (1.0 - wx) * (1.0 - wy) * img[y0, x0]
+        + wx * (1.0 - wy) * img[y0, x0 + 1]
+        + (1.0 - wx) * wy * img[y0 + 1, x0]
+        + wx * wy * img[y0 + 1, x0 + 1]
+    )
+    prof = np.mean(vals, axis=1)
+    return centers, prof, rr
+
+
+def estimate_fwhm_pix(img, peak_xy=None):
+    ny, nx = img.shape
+    if peak_xy is None:
+        idx = int(np.argmax(img))
+        py, px = divmod(idx, nx)
+    else:
+        px, py = peak_xy
+    cx, cy = float(px), float(py)
+    peak_val = float(img[py, px])
+    if peak_val <= 0.0:
+        return 0.0
+    rmax = min(cx, cy, nx - 2.0 - cx, ny - 2.0 - cy)
+    if rmax <= 0.5:
+        return 1.0
+    r_grid = np.linspace(0.0, rmax, int(rmax * 20) + 1)
+    thetas = np.linspace(0.0, 2.0 * math.pi, 72, endpoint=False)
+    xx = cx + r_grid[:, None] * np.cos(thetas)[None, :]
+    yy = cy + r_grid[:, None] * np.sin(thetas)[None, :]
+    x0 = np.floor(xx).astype(int)
+    y0 = np.floor(yy).astype(int)
+    wx = xx - x0
+    wy = yy - y0
+    vals = (
+        (1.0 - wx) * (1.0 - wy) * img[y0, x0]
+        + wx * (1.0 - wy) * img[y0, x0 + 1]
+        + (1.0 - wx) * wy * img[y0 + 1, x0]
+        + wx * wy * img[y0 + 1, x0 + 1]
+    )
+    prof = np.mean(vals, axis=1)
+    half = 0.5 * prof[0]
+    above = np.where(prof >= half)[0]
+    k = int(above[-1]) if len(above) else 0
+    if k < len(prof) - 1 and prof[k] > prof[k + 1]:
+        frac = (half - prof[k]) / (prof[k + 1] - prof[k])
+        r_half = r_grid[k] + frac * (r_grid[k + 1] - r_grid[k])
+    else:
+        r_half = r_grid[k]
+    return float(2.0 * r_half)
+
+
+def analyze_band_stage(img, dl_sum, cfg):
+    ny, nx = img.shape
+    c0 = nx // 2
+    ld_mas = (cfg["lam_um"] * 1e-6 / TEL_DIAM_M) * RAD2MAS
+    pix_mas = ld_mas / cfg["pixscale_ld"]
+
+    peak_idx = int(np.argmax(img))
+    py, px = divmod(peak_idx, nx)
+    strehl_peak = float(img[py, px])
+    strehl_axis = float(img[c0, c0])
+
+    fwhm_pix = estimate_fwhm_pix(img, (px, py))
+    fwhm_mas = fwhm_pix * pix_mas
+    fwhm_ld = fwhm_mas / ld_mas
+
+    centers_pix, prof, rr_pix = radial_profile(img, float(c0), float(c0), dr=0.5)
+    rr_ld = rr_pix / cfg["pixscale_ld"]
+    rr_mas = rr_pix * pix_mas
+
+    norm_denom = dl_sum if dl_sum > 0.0 else float(np.sum(img))
+    ee_core = float(np.sum(img[rr_ld <= 1.22]) / norm_denom)
+    ee_50mas = float(np.sum(img[rr_mas <= 50.0]) / norm_denom)
+    ee_100mas = float(np.sum(img[rr_mas <= 100.0]) / norm_denom)
+
+    radii_mas_grid = np.linspace(0.5 * pix_mas, 1500.0, 400)
+    ee_curve = np.array(
+        [float(np.sum(img[rr_mas <= r]) / norm_denom) for r in radii_mas_grid]
+    )
+    idx50 = int(np.searchsorted(ee_curve, 0.50))
+    ee50_rad_mas = (
+        float(radii_mas_grid[idx50]) if idx50 < len(radii_mas_grid) else float("nan")
+    )
+
+    zone1 = (rr_ld >= 2.0) & (rr_ld <= cfg["stg1_ctrl_ld"])
+    zone2 = (rr_ld >= 2.0) & (rr_ld <= cfg["stg2_ctrl_ld"])
+    contrast_2_30ld = float(np.mean(img[zone1])) if np.any(zone1) else 0.0
+    contrast_2_23ld = float(np.mean(img[zone2])) if np.any(zone2) else 0.0
+
+    return {
+        "strehl_peak": strehl_peak,
+        "strehl_axis": strehl_axis,
+        "fwhm_pix": fwhm_pix,
+        "fwhm_mas": fwhm_mas,
+        "fwhm_ld": fwhm_ld,
+        "ee_1p22ld": ee_core,
+        "ee_50mas": ee_50mas,
+        "ee_100mas": ee_100mas,
+        "ee50_radius_mas": ee50_rad_mas,
+        "contrast_2_23ld": contrast_2_23ld,
+        "contrast_2_30ld": contrast_2_30ld,
+        "pixscale_mas": pix_mas,
+        "ld_mas": ld_mas,
+        "rad_mas": (centers_pix * pix_mas).tolist(),
+        "rad_ld": (centers_pix / cfg["pixscale_ld"]).tolist(),
+        "rad_prof": prof.tolist(),
+        "ee_grid_mas": radii_mas_grid[::4].tolist(),
+        "ee_grid_val": ee_curve[::4].tolist(),
+    }
+
+
+def fit_mlat_curve(dt_fr, val):
+    x = np.asarray(dt_fr, dtype=np.float64)
+    y = np.asarray(val, dtype=np.float64)
+    ym = float(np.mean(y))
+
+    def search_grid(taus, sigs):
+        g = np.exp(
+            -0.5 * ((x[None, None, :] - taus[:, None, None]) / sigs[None, :, None]) ** 2
+        )
+        gm = np.mean(g, axis=2)
+        gd = g - gm[:, :, None]
+        gv = np.maximum(np.mean(gd**2, axis=2), 1e-18)
+        cov = np.mean(gd * (y - ym)[None, None, :], axis=2)
+        a_hat = np.maximum(0.0, cov / gv)
+        b_hat = ym - a_hat * gm
+        pred = b_hat[:, :, None] + a_hat[:, :, None] * g
+        sse = np.sum((y[None, None, :] - pred) ** 2, axis=2)
+        it, isg = np.unravel_index(int(np.argmin(sse)), sse.shape)
+        return float(taus[it]), float(sigs[isg]), float(a_hat[it, isg]), float(
+            b_hat[it, isg]
+        ), float(sse[it, isg])
+
+    t0, s0, _, _, _ = search_grid(
+        np.linspace(0.4, 3.6, 161), np.linspace(0.18, 1.30, 57)
+    )
+    tau_f, sig_f, a_f, b_f, sse_f = search_grid(
+        np.linspace(max(0.2, t0 - 0.03), t0 + 0.03, 61),
+        np.linspace(max(0.10, s0 - 0.03), s0 + 0.03, 61),
+    )
+    sst = max(float(np.sum((y - ym) ** 2)), 1e-30)
+    r2 = max(0.0, 1.0 - sse_f / sst)
+    dof = max(len(x) - 4, 1)
+    s2 = sse_f / dof
+    g_opt = np.exp(-0.5 * ((x - tau_f) / sig_f) ** 2)
+    dg_dtau = a_f * ((x - tau_f) / (sig_f**2)) * g_opt
+    tau_err = math.sqrt(s2 / max(float(np.sum(dg_dtau**2)), 1e-18))
+    return {
+        "tau_fit_fr": tau_f,
+        "tau_err_fr": tau_err,
+        "sigma_fit_fr": sig_f,
+        "fwhm_fit_fr": 2.35482 * sig_f,
+        "amp_fit": a_f,
+        "base_fit": b_f,
+        "r2": r2,
+    }
+
+
+def smooth_boxcar_1d(arr, win):
+    x = np.asarray(arr, dtype=np.float64)
+    if x.size <= 3 or win <= 1:
+        return x.copy()
+    w = min(int(win) | 1, x.size if x.size % 2 == 1 else max(1, x.size - 1))
+    if w <= 1:
+        return x.copy()
+    pad = w // 2
+    xp = np.pad(x, pad, mode="reflect")
+    kern = np.ones(w, dtype=np.float64) / float(w)
+    return np.convolve(xp, kern, mode="valid")
+
+
+def analyze_selfrm_pair(conf_dir, out_dir, loop_num, tmp_npys):
+    cal_cands = [
+        os.path.join(out_dir, f"selfRM_calib_stg{loop_num}.fits"),
+        os.path.join(conf_dir, "selfRM_calib.fits"),
+    ]
+    sky_p = os.path.join(out_dir, f"selfRM_onsky_stg{loop_num}.fits")
+    cal_p = next((p for p in cal_cands if os.path.isfile(p)), None)
+    if cal_p is None or not os.path.isfile(sky_p):
+        return None
+
+    scal = np.asarray(fits.getdata(cal_p), dtype=np.float64)
+    ssky = np.asarray(fits.getdata(sky_p), dtype=np.float64)
+    if scal.ndim != 3 or ssky.ndim != 3:
+        return None
+
+    nz = min(scal.shape[0], ssky.shape[0])
+    nm_tot = min(scal.shape[1], scal.shape[2], ssky.shape[1], ssky.shape[2])
+    scal = scal[:nz, :nm_tot, :nm_tot]
+    ssky = ssky[:nz, :nm_tot, :nm_tot]
+
+    row_pk = np.max(np.abs(scal), axis=(0, 2))
+    active_rows = np.where(row_pk > 1e-5)[0]
+    m_cnt = int(active_rows[-1] + 1) if active_rows.size > 0 else nm_tot
+    scal = scal[:, :m_cnt, :m_cnt]
+    ssky = ssky[:, :m_cnt, :m_cnt]
+
+    cal_net = scal
+    sky_net = ssky
+
+    idx_d = np.arange(m_cnt)
+    d_cal_z = cal_net[:, idx_d, idx_d]
+    d_sky_z = sky_net[:, idx_d, idx_d]
+
+    mean_cal_z = np.mean(d_cal_z, axis=1)
+    mean_sky_z = np.mean(d_sky_z, axis=1)
+
+    pk_cal_val = float(np.max(mean_cal_z))
+    settled = np.where(mean_cal_z >= 0.96 * pk_cal_val)[0]
+    z_cal = int(settled[0]) if settled.size > 0 else int(np.argmax(mean_cal_z))
+    z_sky = int(np.argmax(mean_sky_z))
+
+    m_cal = cal_net[z_cal]
+    m_sky = sky_net[z_sky]
+
+    cal_diag = np.diag(m_cal)
+    sky_diag = np.diag(m_sky)
+    og_ratio = sky_diag / np.maximum(cal_diag, 0.20)
+    win = max(3, min(17, (m_cnt // 9) | 1))
+    sky_smooth = smooth_boxcar_1d(sky_diag, win)
+    og_smooth = smooth_boxcar_1d(og_ratio, win)
+
+    off_mask = ~np.eye(m_cnt, dtype=bool)
+    cal_off_rms = float(np.sqrt(np.mean(m_cal[off_mask] ** 2))) if m_cnt > 1 else 0.0
+    sky_off_rms = float(np.sqrt(np.mean(m_sky[off_mask] ** 2))) if m_cnt > 1 else 0.0
+
+    n_lo = max(2, min(20, m_cnt // 5))
+    i_hi = max(0, (3 * m_cnt) // 4)
+
+    cal_npy = os.path.join(out_dir, f"srm_cal_stg{loop_num}.npy")
+    sky_npy = os.path.join(out_dir, f"srm_sky_stg{loop_num}.npy")
+    np.save(cal_npy, m_cal.astype(np.float32))
+    np.save(sky_npy, m_sky.astype(np.float32))
+    if tmp_npys is not None:
+        tmp_npys.extend([cal_npy, sky_npy])
+
+    return {
+        "n_modes_probed": m_cnt,
+        "zsize": nz,
+        "z_cal_slice": z_cal,
+        "z_sky_slice": z_sky,
+        "cal_diag_mean": float(np.mean(cal_diag)),
+        "cal_diag_std": float(np.std(cal_diag)),
+        "cal_offdiag_rms": cal_off_rms,
+        "sky_og_mean": float(np.mean(sky_diag)),
+        "sky_og_ratio_mean": float(np.mean(og_ratio)),
+        "sky_og_tt": float(np.mean(sky_diag[: min(2, m_cnt)])),
+        "sky_og_low": float(np.mean(sky_diag[:n_lo])),
+        "sky_og_high": float(np.mean(sky_diag[i_hi:])),
+        "sky_ratio_tt": float(np.mean(og_ratio[: min(2, m_cnt)])),
+        "sky_ratio_low": float(np.mean(og_ratio[:n_lo])),
+        "sky_ratio_high": float(np.mean(og_ratio[i_hi:])),
+        "sky_offdiag_rms": sky_off_rms,
+        "cal_diag": cal_diag.tolist(),
+        "sky_diag": sky_diag.tolist(),
+        "sky_diag_smooth": sky_smooth.tolist(),
+        "og_ratio_smooth": og_smooth.tolist(),
+        "trace_cal_mean": mean_cal_z.tolist(),
+        "trace_sky_low": np.mean(d_sky_z[:, :n_lo], axis=1).tolist(),
+        "trace_sky_high": np.mean(d_sky_z[:, i_hi:], axis=1).tolist(),
+    }
+
+
+def load_loop_calib(work_dir, loop_name, loop_num, out_dir, tmp_npys=None):
+    conf_dir = os.path.join(work_dir, loop_name, "conf")
+    info = {"loop_name": loop_name, "loop_number": loop_num}
+    zresp_p = os.path.join(conf_dir, "zrespC.fits")
+    syn_p = os.path.join(conf_dir, "RMsyn_modesDM.fits")
+    cmdm_p = os.path.join(conf_dir, "CMmodesDM.fits")
+    dmmask_p = os.path.join(conf_dir, "dmmask.fits")
+    wfsmask_p = os.path.join(conf_dir, "wfsmask.fits")
+    meta_p = os.path.join(conf_dir, "rm_meta.env")
+
+    if os.path.isfile(zresp_p):
+        info["n_rm_modes"] = int(fits.getheader(zresp_p).get("NAXIS3", 0))
+    if os.path.isfile(syn_p):
+        info["n_syn_modes"] = int(fits.getheader(syn_p).get("NAXIS3", 0))
+    dm_m = None
+    if os.path.isfile(dmmask_p):
+        dm_m = np.asarray(fits.getdata(dmmask_p)) > 0.5
+        info["active_dm_act"] = int(np.sum(dm_m))
+        info["total_dm_act"] = int(dm_m.size)
+    if os.path.isfile(cmdm_p):
+        cm_arr = np.asarray(fits.getdata(cmdm_p), dtype=np.float64)
+        info["n_cm_modes"] = int(cm_arr.shape[0])
+        if dm_m is not None and cm_arr.ndim == 3:
+            mx = dm_m[:, 1:] & dm_m[:, :-1]
+            my = dm_m[1:, :] & dm_m[:-1, :]
+            n_mx = max(int(np.sum(mx)), 1)
+            n_my = max(int(np.sum(my)), 1)
+            n_dm = max(int(np.sum(dm_m)), 1)
+            rgrads = []
+            for m in range(cm_arr.shape[0]):
+                v = cm_arr[m] - float(np.mean(cm_arr[m][dm_m]))
+                gx2 = float(np.sum((v[:, 1:][mx] - v[:, :-1][mx]) ** 2)) / n_mx
+                gy2 = float(np.sum((v[1:, :][my] - v[:-1, :][my]) ** 2)) / n_my
+                v2 = float(np.sum(v[dm_m] ** 2)) / n_dm
+                rgrads.append(math.sqrt((gx2 + gy2) / max(v2, 1e-12)))
+            info["mode_rel_grad"] = rgrads
+    if os.path.isfile(wfsmask_p):
+        wfs_m = np.asarray(fits.getdata(wfsmask_p))
+        info["active_wfs_pix"] = int(np.sum(wfs_m > 0.5))
+        info["total_wfs_pix"] = int(wfs_m.size)
+    if os.path.isfile(meta_p):
+        txt = open(meta_p, "r", encoding="utf-8").read()
+        mf = re.search(r'RM_WFSFRATE="([0-9eE.+\-]+)"', txt)
+        ml = re.search(r'RM_LATENCYHARDWFR="([0-9eE.+\-]+)"', txt)
+        ms = re.search(r'RM_SVDLIM="([0-9eE.+\-]+)"', txt)
+        if mf:
+            info["wall_cal_hz"] = float(mf.group(1))
+        if ml:
+            info["latency_fr"] = float(ml.group(1))
+        if ms:
+            info["svdlim"] = float(ms.group(1))
+
+    for tag, fname in [
+        ("wfs_rms", f"aol{loop_num}_imWFS2.fits"),
+        ("mval_rms", f"aol{loop_num}_modevalWFS.fits"),
+        ("dm_rms_um", f"aol{loop_num}_dmC.fits"),
+    ]:
+        fpath = os.path.join(out_dir, fname)
+        if os.path.isfile(fpath):
+            arr = np.asarray(fits.getdata(fpath), dtype=np.float64)
+            info[tag] = float(np.sqrt(np.mean(arr**2)))
+            if tag == "dm_rms_um":
+                info["dm_ptv_um"] = float(np.max(arr) - np.min(arr))
+
+    mg_p = os.path.join(out_dir, f"aol{loop_num}_mgain.fits")
+    mgf_p = os.path.join(out_dir, f"aol{loop_num}_mgainfact.fits")
+    if os.path.isfile(mg_p):
+        mg = np.asarray(fits.getdata(mg_p), dtype=np.float64).ravel()
+        info["mgain_curve"] = mg.tolist()
+        info["mgain_tt"] = float(mg[0]) if mg.size else 0.0
+        info["mgain_median"] = float(np.median(mg)) if mg.size else 0.0
+        info["mgain_min"] = float(np.min(mg)) if mg.size else 0.0
+        info["mgain_max"] = float(np.max(mg)) if mg.size else 0.0
+    if os.path.isfile(mgf_p):
+        mgf = np.asarray(fits.getdata(mgf_p), dtype=np.float64).ravel()
+        info["mgainfact_curve"] = mgf.tolist()
+
+    pts_cands = [
+        os.path.join(conf_dir, "mlat_hardwlatencypts.dat"),
+        os.path.join(out_dir, f"stg{loop_num}_mlat_hardwlatencypts.dat"),
+    ]
+    raw_cands = [
+        os.path.join(conf_dir, "mlat_hardwlatency.dat"),
+        os.path.join(out_dir, f"stg{loop_num}_mlat_hardwlatency.dat"),
+    ]
+    pts_p = next((p for p in pts_cands if os.path.isfile(p)), None)
+    raw_p = next((p for p in raw_cands if os.path.isfile(p)), None)
+    fps_cal = float(info.get("wall_cal_hz", 40.0 if loop_num == 1 else 80.0))
+    phys_hz = 1000.0 if loop_num == 1 else 2000.0
+
+    if pts_p is not None:
+        pts = np.loadtxt(pts_p)
+        if pts.ndim == 2 and pts.shape[0] >= 6:
+            dt_raw_fr = pts[:, 1] * fps_cal
+            val_raw = pts[:, 2]
+            dt_med_fr = pts[:, 7] * fps_cal
+            val_med = pts[:, 8]
+            ipeak = int(np.argmax(val_med))
+            lat_fr = float(info.get("latency_fr", dt_med_fr[ipeak]))
+            fit = fit_mlat_curve(dt_raw_fr, val_raw)
+            nb_excl = 2
+            dtfr = (lat_fr - 0.5) + 0.5 * nb_excl
+            rm_del_fr = int(math.ceil(dtfr)) if dtfr > 0.0 else 0
+            wait_fr = max(0.0, float(rm_del_fr) - dtfr)
+            iter_lats = []
+            if raw_p is not None:
+                for line in open(raw_p, "r", encoding="utf-8"):
+                    s = line.strip()
+                    if s.startswith("#"):
+                        toks = s[1:].split()
+                        if len(toks) >= 2:
+                            iter_lats.append(float(toks[1]) * fps_cal)
+            info["mlat"] = {
+                "n_points": int(pts.shape[0]),
+                "n_iter": len(iter_lats),
+                "wall_fps_hz": fps_cal,
+                "phys_fps_hz": phys_hz,
+                "phys_frame_ms": 1000.0 / phys_hz,
+                "latency_fr": lat_fr,
+                "latency_phys_ms": lat_fr * (1000.0 / phys_hz),
+                "peak_val": float(val_med[ipeak]),
+                "iter_lat_mean_fr": (
+                    float(np.mean(iter_lats)) if iter_lats else lat_fr
+                ),
+                "iter_lat_std_fr": (
+                    float(np.std(iter_lats)) if len(iter_lats) > 1 else 0.0
+                ),
+                "rm_nbave": 2,
+                "rm_nbexcl": nb_excl,
+                "rm_dtfr": dtfr,
+                "rm_delay_fr": rm_del_fr,
+                "rm_subframe_wait_fr": wait_fr,
+                "rm_subframe_wait_wall_ms": (wait_fr / fps_cal) * 1000.0,
+                "fit": {
+                    **fit,
+                    "tau_fit_phys_ms": fit["tau_fit_fr"] * (1000.0 / phys_hz),
+                },
+                "dt_raw_fr": dt_raw_fr.tolist(),
+                "val_raw": val_raw.tolist(),
+                "dt_med_fr": dt_med_fr.tolist(),
+                "val_med": val_med.tolist(),
+            }
+
+    srm_info = analyze_selfrm_pair(conf_dir, out_dir, loop_num, tmp_npys)
+    if srm_info is not None:
+        info["selfrm"] = srm_info
+    return info
+
+
+def render_plots_via_sys_python(out_dir, summary_path):
+    plotter = r"""
+import json, os, sys
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
+from matplotlib.patches import Circle
+
+out_dir, summary_path = sys.argv[1], sys.argv[2]
+with open(summary_path, "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+
+stages = [
+    ("raw", "Uncorrected (0.6\" Seeing)"),
+    ("stg1", "After Stage 1 (AO3k NIR PyWFS)"),
+    ("final", "Final Stage 1+2 (AO3k + SCExAO)"),
+]
+bands = [
+    ("vis", "Visible I-Band (0.75 µm)", 0.72),
+    ("nir", "Near-IR H-Band (1.65 µm)", 1.50),
+]
+
+fig, axes = plt.subplots(2, 3, figsize=(14.5, 9.2), constrained_layout=True)
+fig.suptitle(
+    "Subaru 8.2 m AO3k + SCExAO Two-Stage Correction — 10.0 s Integrated PSFs\n"
+    "(Seeing = 0.60\", Star mV = 6 / mH = 6, Stage 1 = 1 kHz NIR PyWFS, "
+    "Stage 2 = 2 kHz Vis PyWFS)",
+    fontsize=13,
+    fontweight="bold",
+)
+
+for r, (bkey, blabel, half_fov_arcsec) in enumerate(bands):
+    im_handle = None
+    for c, (skey, slabel) in enumerate(stages):
+        ax = axes[r, c]
+        arr = np.load(os.path.join(out_dir, f"psf_{bkey}_{skey}.npy"))
+        m = data["psf_metrics"][bkey][skey]
+        ny, nx = arr.shape
+        c0 = nx // 2
+        pix_arcsec = m["pixscale_mas"] / 1000.0
+        hw = min(c0, int(round(half_fov_arcsec / pix_arcsec)))
+        sub = np.clip(arr[c0 - hw : c0 + hw, c0 - hw : c0 + hw], 1e-5, 1.0)
+        ext = [-hw * pix_arcsec, hw * pix_arcsec, -hw * pix_arcsec, hw * pix_arcsec]
+
+        im_handle = ax.imshow(
+            sub,
+            origin="lower",
+            extent=ext,
+            cmap="inferno",
+            norm=LogNorm(vmin=1e-4, vmax=1.0),
+            interpolation="nearest",
+        )
+        ld_arcsec = m["ld_mas"] / 1000.0
+        c1 = Circle(
+            (0.0, 0.0),
+            30.0 * ld_arcsec,
+            fill=False,
+            ls="--",
+            lw=0.9,
+            ec="cyan",
+            alpha=0.75,
+            label="AO3k 30 λ/D",
+        )
+        c2 = Circle(
+            (0.0, 0.0),
+            23.0 * ld_arcsec,
+            fill=False,
+            ls=":",
+            lw=1.0,
+            ec="lime",
+            alpha=0.85,
+            label="SCExAO 23 λ/D",
+        )
+        ax.add_patch(c1)
+        ax.add_patch(c2)
+        if r == 0 and c == 2:
+            ax.legend(
+                loc="upper right",
+                fontsize=8,
+                facecolor="#10141c",
+                edgecolor="#556070",
+                labelcolor="white",
+                framealpha=0.85,
+            )
+
+        if r == 0:
+            ax.set_title(slabel, fontsize=11.5, fontweight="bold")
+        if c == 0:
+            ax.set_ylabel(f"{blabel}\nΔDec [arcsec]", fontsize=10.5)
+        else:
+            ax.set_ylabel("ΔDec [arcsec]", fontsize=9.5)
+        ax.set_xlabel("ΔRA [arcsec]", fontsize=9.5)
+
+        txt = (
+            f"Strehl = {m['strehl_peak']*100:.1f}%\n"
+            f"FWHM = {m['fwhm_mas']:.1f} mas ({m['fwhm_ld']:.2f} λ/D)\n"
+            f"EE(1.22 λ/D) = {m['ee_1p22ld']*100:.1f}%"
+        )
+        ax.text(
+            0.03,
+            0.04,
+            txt,
+            transform=ax.transAxes,
+            fontsize=8.8,
+            color="white",
+             family="monospace",
+            bbox=dict(boxstyle="round,pad=0.3", fc="black", ec="none", alpha=0.68),
+        )
+    cbar = fig.colorbar(im_handle, ax=axes[r, :], shrink=0.88, pad=0.015)
+    cbar.set_label("Strehl-Normalized Intensity", fontsize=10)
+
+fig.savefig(os.path.join(out_dir, "psf_comparison_2x3.png"), dpi=180)
+plt.close(fig)
+
+fig2, axes2 = plt.subplots(2, 2, figsize=(13.5, 8.8), constrained_layout=True)
+fig2.suptitle(
+    "AO3k + SCExAO Azimuthal Radial PSF Profiles & Encircled Energy (10.0 s Integration)",
+    fontsize=13,
+    fontweight="bold",
+)
+curve_specs = [
+    ("dl", "Diffraction-Limited (turb=0)", "black", "--", 1.5),
+    ("raw", "Uncorrected (0.6\" seeing)", "#d62728", "-", 1.8),
+    ("stg1", "After Stage 1 (AO3k, 1 kHz)", "#ff7f0e", "-", 2.0),
+    ("final", "Final Stage 1+2 (AO3k+SCExAO, 2 kHz)", "#1f77b4", "-", 2.2),
+]
+
+for col, (bkey, blabel, _) in enumerate(bands):
+    ax_p = axes2[0, col]
+    ax_e = axes2[1, col]
+    ld_mas = data["psf_metrics"][bkey]["dl"]["ld_mas"]
+    for skey, lab, color, ls, lw in curve_specs:
+        m = data["psf_metrics"][bkey][skey]
+        r_mas = np.asarray(m["rad_mas"])
+        prof = np.clip(np.asarray(m["rad_prof"]), 1e-6, 1.2)
+        ax_p.semilogy(
+            r_mas,
+            prof,
+            label=f"{lab} (SR={m['strehl_peak']*100:.1f}%)",
+            color=color,
+            ls=ls,
+            lw=lw,
+        )
+        if skey != "dl":
+            ax_e.plot(
+                m["ee_grid_mas"],
+                np.asarray(m["ee_grid_val"]) * 100.0,
+                label=f"{lab} (r50={m['ee50_radius_mas']:.0f} mas)",
+                color=color,
+                ls=ls,
+                lw=lw,
+            )
+        else:
+            ax_e.plot(
+                m["ee_grid_mas"],
+                np.asarray(m["ee_grid_val"]) * 100.0,
+                label=lab,
+                color=color,
+                ls=ls,
+                lw=lw,
+            )
+
+    ax_p.axvline(30.0 * ld_mas, color="teal", ls="--", lw=1.0, alpha=0.7, label="AO3k 30 λ/D")
+    ax_p.axvline(23.0 * ld_mas, color="green", ls=":", lw=1.2, alpha=0.8, label="SCExAO 23 λ/D")
+    ax_p.set_xlim(0.0, 750.0 if bkey == "vis" else 1500.0)
+    ax_p.set_ylim(2e-5, 1.3)
+    ax_p.grid(True, which="both", alpha=0.28)
+    ax_p.set_title(f"{blabel} — Radial Intensity Profile", fontsize=11, fontweight="bold")
+    ax_p.set_xlabel("Angular Separation [mas]")
+    ax_p.set_ylabel("Azimuthal Mean Intensity [Strehl units]")
+    ax_p.legend(fontsize=8.2, loc="upper right")
+
+    ax_e.axvline(30.0 * ld_mas, color="teal", ls="--", lw=1.0, alpha=0.7)
+    ax_e.axvline(23.0 * ld_mas, color="green", ls=":", lw=1.2, alpha=0.8)
+    ax_e.set_xlim(0.0, 750.0 if bkey == "vis" else 1500.0)
+    ax_e.set_ylim(0.0, 102.0)
+    ax_e.grid(True, alpha=0.28)
+    ax_e.set_title(f"{blabel} — Encircled Energy", fontsize=11, fontweight="bold")
+    ax_e.set_xlabel("Aperture Radius [mas]")
+    ax_e.set_ylabel("Encircled Energy [%]")
+    ax_e.legend(fontsize=8.2, loc="lower right")
+
+fig2.savefig(os.path.join(out_dir, "psf_radial_profiles.png"), dpi=180)
+plt.close(fig2)
+
+wf_info = data.get("wavefront_metrics")
+if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
+    pup = np.load(os.path.join(out_dir, "wf_pupil_mask.npy"))
+    pmask = pup > 0.5
+    nwf_grid = pup.shape[0]
+    pup_pix = 0.9375 * nwf_grid
+    half_m = 0.5 * nwf_grid * (8.2 / pup_pix)
+    ext_m = [-half_m, half_m, -half_m, half_m]
+    wf_locs = [
+        ("raw", "Before Stage 1\n(Entrance Pupil b_pup)"),
+        ("stg1", "Between Stages 1 & 2\n(Post-AO3k b_post_stg1)"),
+        ("final", "After Stage 2\n(Post-SCExAO b_post_stg2)"),
+    ]
+
+    cmap_div = matplotlib.colormaps["RdBu_r"].copy()
+    cmap_div.set_bad("#141820")
+    cmap_std = matplotlib.colormaps["inferno"].copy()
+    cmap_std.set_bad("#141820")
+
+    samples = wf_info.get("samples", [])
+    nsamp = len(samples)
+    if nsamp > 0:
+        cubes = {
+            k: np.load(os.path.join(out_dir, f"wf_samples_{k}.npy"))
+            for k, _ in wf_locs
+        }
+        vmax_cols = {}
+        for k, _ in wf_locs:
+            vals = np.abs(cubes[k][:, pmask])
+            lim = float(np.percentile(vals, 99.3)) if vals.size else 100.0
+            step = 100.0 if lim > 800.0 else (25.0 if lim > 250.0 else 10.0)
+            vmax_cols[k] = max(step, np.ceil(lim / step) * step)
+
+        fig3, axes3 = plt.subplots(
+            nsamp,
+            3,
+            figsize=(13.6, 3.15 * nsamp + 1.2),
+            constrained_layout=True,
+        )
+        if nsamp == 1:
+            axes3 = axes3[None, :]
+        fig3.suptitle(
+            "Subaru 8.2 m AO3k + SCExAO — Instantaneous Pupil Wavefront Samples\n"
+            f"(Piston-removed OPD [nm] across {pup_pix:.0f}-pix Subaru pupil, 0.60\" seeing)",
+            fontsize=13,
+            fontweight="bold",
+        )
+
+        col_handles = {}
+        for c, (k, clabel) in enumerate(wf_locs):
+            vlim = vmax_cols[k]
+            for r, sm in enumerate(samples):
+                ax = axes3[r, c]
+                wf_s = np.where(pmask, cubes[k][r], np.nan)
+                imh = ax.imshow(
+                    wf_s,
+                    origin="lower",
+                    extent=ext_m,
+                    cmap=cmap_div,
+                    vmin=-vlim,
+                    vmax=vlim,
+                    interpolation="nearest",
+                )
+                col_handles[c] = imh
+                if r == 0:
+                    ax.set_title(clabel, fontsize=11, fontweight="bold")
+                if c == 0:
+                    ax.set_ylabel(
+                        f"t = {sm['t_phys_s']:.2f} s\ny [m]",
+                        fontsize=10,
+                        fontweight="bold",
+                    )
+                else:
+                    ax.set_ylabel("y [m]", fontsize=9)
+                if r == nsamp - 1:
+                    ax.set_xlabel("x [m]", fontsize=9.5)
+                badge = (
+                    f"RMS = {sm[k]['rms_nm']:6.1f} nm\n"
+                    f"PTV = {sm[k]['ptv_nm']:6.0f} nm"
+                )
+                ax.text(
+                    0.03,
+                    0.04,
+                    badge,
+                    transform=ax.transAxes,
+                    fontsize=8.5,
+                    color="white",
+                    family="monospace",
+                    bbox=dict(
+                        boxstyle="round,pad=0.25",
+                        fc="black",
+                        ec="none",
+                        alpha=0.72,
+                    ),
+                )
+            cb = fig3.colorbar(
+                col_handles[c],
+                ax=axes3[:, c],
+                orientation="horizontal",
+                shrink=0.88,
+                pad=0.02,
+            )
+            cb.set_label(f"OPD [nm] (±{vlim:.0f} nm)", fontsize=9.5)
+
+        fig3.savefig(os.path.join(out_dir, "wf_samples_5x3.png"), dpi=175)
+        plt.close(fig3)
+
+    fig4, axes4 = plt.subplots(2, 3, figsize=(14.5, 9.2), constrained_layout=True)
+    nfr = wf_info.get("n_frames", 0)
+    t_rec = wf_info.get("phys_time_recorded_s", 0.0)
+    fig4.suptitle(
+        f"Subaru 8.2 m AO3k + SCExAO — Wavefront Mean & Std Dev Maps "
+        f"({t_rec:.1f} s, {nfr:,d} frames)\n"
+        "(Row 1: Time-Averaged WF ⟨OPD⟩_t [nm] | Row 2: Temporal Std Dev std_t(OPD) [nm])",
+        fontsize=12.8,
+        fontweight="bold",
+    )
+
+    for c, (k, clabel) in enumerate(wf_locs):
+        loc_m = wf_info["locations"][k]
+        mean_arr = np.load(os.path.join(out_dir, f"wf_mean_{k}.npy"))
+        std_arr = np.load(os.path.join(out_dir, f"wf_std_{k}.npy"))
+
+        m_vals = np.abs(mean_arr[pmask])
+        mlim = float(np.percentile(m_vals, 99.5)) if m_vals.size else 10.0
+        mstep = 20.0 if mlim > 120.0 else (5.0 if mlim > 25.0 else 2.0)
+        mvmax = max(mstep, np.ceil(mlim / mstep) * mstep)
+
+        ax_m = axes4[0, c]
+        im_m = ax_m.imshow(
+            np.where(pmask, mean_arr, np.nan),
+            origin="lower",
+            extent=ext_m,
+            cmap=cmap_div,
+            vmin=-mvmax,
+            vmax=mvmax,
+            interpolation="nearest",
+        )
+        ax_m.set_title(clabel, fontsize=11, fontweight="bold")
+        ax_m.set_xlabel("x [m]", fontsize=9.5)
+        ax_m.set_ylabel("Average WF ⟨OPD⟩_t\ny [m]" if c == 0 else "y [m]", fontsize=10)
+        cb_m = fig4.colorbar(im_m, ax=ax_m, shrink=0.86, pad=0.02)
+        cb_m.set_label("Mean OPD [nm]", fontsize=9)
+        ax_m.text(
+            0.03,
+            0.04,
+            f"RMS(mean) = {loc_m['mean_map_rms_nm']:.1f} nm\n"
+            f"PTV(mean) = {loc_m['mean_map_ptv_nm']:.0f} nm",
+            transform=ax_m.transAxes,
+            fontsize=8.6,
+            color="white",
+            family="monospace",
+            bbox=dict(boxstyle="round,pad=0.26", fc="black", ec="none", alpha=0.72),
+        )
+
+        s_vals = std_arr[pmask]
+        slim = float(np.percentile(s_vals, 99.5)) if s_vals.size else 50.0
+        sstep = 100.0 if slim > 600.0 else (20.0 if slim > 150.0 else 10.0)
+        svmax = max(sstep, np.ceil(slim / sstep) * sstep)
+
+        ax_s = axes4[1, c]
+        im_s = ax_s.imshow(
+            np.where(pmask, std_arr, np.nan),
+            origin="lower",
+            extent=ext_m,
+            cmap=cmap_std,
+            vmin=0.0,
+            vmax=svmax,
+            interpolation="nearest",
+        )
+        ax_s.set_xlabel("x [m]", fontsize=9.5)
+        ax_s.set_ylabel(
+            "Std Dev std_t(OPD)\ny [m]" if c == 0 else "y [m]", fontsize=10
+        )
+        cb_s = fig4.colorbar(im_s, ax=ax_s, shrink=0.86, pad=0.02)
+        cb_s.set_label("Std Dev OPD [nm]", fontsize=9)
+        ax_s.text(
+            0.03,
+            0.04,
+            f"RMS(std) = {loc_m['std_map_rms_nm']:.1f} nm\n"
+            f"Med={loc_m['std_map_median_nm']:.0f}, P95={loc_m['std_map_p95_nm']:.0f} nm",
+            transform=ax_s.transAxes,
+            fontsize=8.5,
+            color="white",
+            family="monospace",
+            bbox=dict(boxstyle="round,pad=0.26", fc="black", ec="none", alpha=0.72),
+        )
+
+    fig4.savefig(os.path.join(out_dir, "wf_stats_2x3.png"), dpi=180)
+    plt.close(fig4)
+
+    samples = wf_info.get("samples", []) if wf_info else []
+    nsamp = len(samples)
+    wfs_ready = nsamp > 0 and os.path.exists(
+        os.path.join(out_dir, "wfs_raw_stg1_samples.npy")
+    )
+    if wfs_ready:
+        wfs_cols = [
+            (
+                "wfs_raw_stg1",
+                "Stage 1 AO3k Raw PyWFS\n(csim_wfs_nir, 1.22 µm @ 1 kHz)",
+                "raw",
+            ),
+            (
+                "wfs_sig_stg1",
+                "Stage 1 AO3k Ref-Sub Signal\n(aol1_imWFS2, 160×160)",
+                "sig",
+            ),
+            (
+                "wfs_raw_stg2",
+                "Stage 2 SCExAO Raw PyWFS\n(csim_wfs_vis, 0.75 µm @ 2 kHz)",
+                "raw",
+            ),
+            (
+                "wfs_sig_stg2",
+                "Stage 2 SCExAO Ref-Sub Signal\n(aol2_imWFS2, 120×120)",
+                "sig",
+            ),
+        ]
+        wcubes = {
+            ek: np.load(os.path.join(out_dir, f"{ek}_samples.npy"))
+            for ek, _, _ in wfs_cols
+        }
+        fig5, axes5 = plt.subplots(
+            nsamp,
+            4,
+            figsize=(16.2, 3.05 * nsamp + 1.3),
+            constrained_layout=True,
+        )
+        if nsamp == 1:
+            axes5 = axes5[None, :]
+        fig5.suptitle(
+            "Subaru 8.2 m AO3k + SCExAO — Instantaneous Pyramid WFS Frames\n"
+            "(Raw Detector [ADU] & Reference-Subtracted Differential Signal "
+            "at 5 Sampled Instants)",
+            fontsize=13,
+            fontweight="bold",
+        )
+        for c, (ek, clab, kind) in enumerate(wfs_cols):
+            cube = wcubes[ek]
+            if kind == "raw":
+                vmin = 95.0
+                vmax = max(150.0, float(np.percentile(cube, 99.7)))
+                cmap_w = "magma"
+                cblab = "Detector [ADU]"
+            else:
+                lim = max(1e-4, float(np.percentile(np.abs(cube), 99.5)))
+                vmin, vmax = -lim, lim
+                cmap_w = "RdBu_r"
+                cblab = "Ref-Sub Signal [norm]"
+            imh = None
+            for r, sm in enumerate(samples):
+                ax = axes5[r, c]
+                imh = ax.imshow(
+                    cube[r],
+                    origin="lower",
+                    cmap=cmap_w,
+                    vmin=vmin,
+                    vmax=vmax,
+                    interpolation="nearest",
+                )
+                if r == 0:
+                    ax.set_title(clab, fontsize=10.5, fontweight="bold")
+                if c == 0:
+                    ax.set_ylabel(
+                        f"t = {sm['t_phys_s']:.2f} s\ny [pix]",
+                        fontsize=10,
+                        fontweight="bold",
+                    )
+                else:
+                    ax.set_ylabel("y [pix]", fontsize=8.8)
+                if r == nsamp - 1:
+                    ax.set_xlabel("x [pix]", fontsize=9)
+                ex = sm.get("extra", {}).get(ek, {})
+                if kind == "raw":
+                    btxt = (
+                        f"Max = {ex.get('max_adu', 0.0):6.0f} ADU\n"
+                        f"Sum = {ex.get('sum_adu', 0.0)/1e3:5.0f} kADU"
+                    )
+                else:
+                    btxt = (
+                        f"RMS = {ex.get('rms', 0.0)*1e4:5.2f}e-4\n"
+                        f"PTV = {ex.get('ptv', 0.0)*1e3:5.2f}e-3"
+                    )
+                ax.text(
+                    0.03,
+                    0.04,
+                    btxt,
+                    transform=ax.transAxes,
+                    fontsize=8.1,
+                    color="white" if kind == "raw" else "black",
+                    family="monospace",
+                    bbox=dict(
+                        boxstyle="round,pad=0.22",
+                        fc="black" if kind == "raw" else "white",
+                        ec="none",
+                        alpha=0.72 if kind == "raw" else 0.78,
+                    ),
+                )
+            cb = fig5.colorbar(
+                imh,
+                ax=axes5[:, c],
+                orientation="horizontal",
+                shrink=0.88,
+                pad=0.02,
+            )
+            cb.set_label(cblab, fontsize=9.2)
+        fig5.savefig(os.path.join(out_dir, "wfs_samples_5x4.png"), dpi=175)
+        plt.close(fig5)
+
+    dm_ready = (
+        nsamp > 0
+        and os.path.exists(os.path.join(out_dir, "dm_cmd_stg1_samples.npy"))
+        and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy"))
+    )
+    if dm_ready:
+        dm_cols = [
+            (
+                "dm_cmd_stg1",
+                "Stage 1 AO3k Actuator Cmd\n(dm01disp, 64×64, D=60 Stroke [µm])",
+                "cmd",
+            ),
+            (
+                "dm_opd_stg1",
+                "Stage 1 AO3k Pupil DM OPD\n(csim_dm01_opd, 256×256 [nm])",
+                "opd",
+            ),
+            (
+                "dm_cmd_stg2",
+                "Stage 2 SCExAO Actuator Cmd\n(dm02disp, 50×50, D=46 Stroke [µm])",
+                "cmd",
+            ),
+            (
+                "dm_opd_stg2",
+                "Stage 2 SCExAO Pupil DM OPD\n(csim_dm02_opd, 256×256 [nm])",
+                "opd",
+            ),
+        ]
+        dcubes = {
+            ek: np.load(os.path.join(out_dir, f"{ek}_samples.npy"))
+            for ek, _, _ in dm_cols
+        }
+        fig6, axes6 = plt.subplots(
+            nsamp,
+            4,
+            figsize=(16.2, 3.05 * nsamp + 1.3),
+            constrained_layout=True,
+        )
+        if nsamp == 1:
+            axes6 = axes6[None, :]
+        fig6.suptitle(
+            "Subaru 8.2 m AO3k + SCExAO — Instantaneous DM Actuator Commands & "
+            "Pupil OPD Shapes\n"
+            "(Mechanical Stroke [µm] & Piston-Removed Reflective OPD [nm] "
+            "at 5 Sampled Instants)",
+            fontsize=13,
+            fontweight="bold",
+        )
+        for c, (ek, clab, kind) in enumerate(dm_cols):
+            cube = dcubes[ek]
+            if kind == "cmd":
+                lim = max(0.05, float(np.percentile(np.abs(cube), 99.5)))
+                vlim = np.ceil(lim * 20.0) / 20.0
+                cblab = f"Stroke [µm] (±{vlim:.2f} µm)"
+            else:
+                vals = np.abs(cube[:, pmask])
+                lim = max(10.0, float(np.percentile(vals, 99.3)))
+                step = 100.0 if lim > 800.0 else (25.0 if lim > 200.0 else 10.0)
+                vlim = max(step, np.ceil(lim / step) * step)
+                cblab = f"DM OPD [nm] (±{vlim:.0f} nm)"
+            imh = None
+            for r, sm in enumerate(samples):
+                ax = axes6[r, c]
+                ex = sm.get("extra", {}).get(ek, {})
+                if kind == "cmd":
+                    imh = ax.imshow(
+                        cube[r],
+                        origin="lower",
+                        cmap="RdBu_r",
+                        vmin=-vlim,
+                        vmax=vlim,
+                        interpolation="nearest",
+                    )
+                    ylab = "act y"
+                    xlab = "act x"
+                    btxt = (
+                        f"RMS = {ex.get('rms_um', 0.0):.3f} µm\n"
+                        f"PTV = {ex.get('ptv_um', 0.0):.2f} µm"
+                    )
+                    tc, fc, al = "black", "white", 0.78
+                else:
+                    imh = ax.imshow(
+                        np.where(pmask, cube[r], np.nan),
+                        origin="lower",
+                        extent=ext_m,
+                        cmap=cmap_div,
+                        vmin=-vlim,
+                        vmax=vlim,
+                        interpolation="nearest",
+                    )
+                    ylab = "y [m]"
+                    xlab = "x [m]"
+                    btxt = (
+                        f"RMS = {ex.get('rms_nm', 0.0):6.1f} nm\n"
+                        f"PTV = {ex.get('ptv_nm', 0.0):6.0f} nm"
+                    )
+                    tc, fc, al = "white", "black", 0.72
+                if r == 0:
+                    ax.set_title(clab, fontsize=10.5, fontweight="bold")
+                if c == 0:
+                    ax.set_ylabel(
+                        f"t = {sm['t_phys_s']:.2f} s\n{ylab}",
+                        fontsize=10,
+                        fontweight="bold",
+                    )
+                else:
+                    ax.set_ylabel(ylab, fontsize=8.8)
+                if r == nsamp - 1:
+                    ax.set_xlabel(xlab, fontsize=9)
+                ax.text(
+                    0.03,
+                    0.04,
+                    btxt,
+                    transform=ax.transAxes,
+                    fontsize=8.1,
+                    color=tc,
+                    family="monospace",
+                    bbox=dict(
+                        boxstyle="round,pad=0.22", fc=fc, ec="none", alpha=al
+                    ),
+                )
+            cb = fig6.colorbar(
+                imh,
+                ax=axes6[:, c],
+                orientation="horizontal",
+                shrink=0.88,
+                pad=0.02,
+            )
+            cb.set_label(cblab, fontsize=9.2)
+        fig6.savefig(os.path.join(out_dir, "dm_samples_5x4.png"), dpi=175)
+        plt.close(fig6)
+
+    psf_inst_stages = [
+        ("raw", "Before Stage 1\n(Uncorrected Entrance Pupil)"),
+        ("stg1", "Between Stages 1 & 2\n(After AO3k 1 kHz NIR PyWFS)"),
+        ("final", "After Stage 2\n(Final AO3k + SCExAO 2 kHz)"),
+    ]
+    for bkey, blabel, half_fov_arcsec in bands:
+        sr_check = os.path.join(out_dir, f"psf_inst_{bkey}_final_sr.npy")
+        if nsamp == 0 or not os.path.exists(sr_check):
+            continue
+        pcubes = {
+            sk: np.load(os.path.join(out_dir, f"psf_inst_{bkey}_{sk}_sr.npy"))
+            for sk, _ in psf_inst_stages
+        }
+        m_ref = data["psf_metrics"][bkey]["final"]
+        pix_arcsec = m_ref["pixscale_mas"] / 1000.0
+        ld_arcsec = m_ref["ld_mas"] / 1000.0
+        c0 = pcubes["final"].shape[-1] // 2
+        hw = min(c0, int(round(half_fov_arcsec / pix_arcsec)))
+        ext_p = [
+            -hw * pix_arcsec,
+            hw * pix_arcsec,
+            -hw * pix_arcsec,
+            hw * pix_arcsec,
+        ]
+
+        figp, axesp = plt.subplots(
+            nsamp,
+            3,
+            figsize=(13.8, 3.15 * nsamp + 1.3),
+            constrained_layout=True,
+        )
+        if nsamp == 1:
+            axesp = axesp[None, :]
+        figp.suptitle(
+            f"Subaru 8.2 m AO3k + SCExAO — Instantaneous {blabel} PSFs (10 ms Exposures)\n"
+            "(Detector Speckle Snapshots Normalized to Strehl Intensity Units, "
+            "0.60\" Seeing)",
+            fontsize=12.8,
+            fontweight="bold",
+        )
+        imh_p = None
+        for c, (sk, slab) in enumerate(psf_inst_stages):
+            for r, sm in enumerate(samples):
+                ax = axesp[r, c]
+                sub = np.clip(
+                    pcubes[sk][r, c0 - hw : c0 + hw, c0 - hw : c0 + hw],
+                    1e-5,
+                    1.0,
+                )
+                imh_p = ax.imshow(
+                    sub,
+                    origin="lower",
+                    extent=ext_p,
+                    cmap="inferno",
+                    norm=LogNorm(vmin=1e-4, vmax=1.0),
+                    interpolation="nearest",
+                )
+                c1 = Circle(
+                    (0.0, 0.0),
+                    30.0 * ld_arcsec,
+                    fill=False,
+                    ls="--",
+                    lw=0.85,
+                    ec="cyan",
+                    alpha=0.72,
+                    label="AO3k 30 λ/D",
+                )
+                c2 = Circle(
+                    (0.0, 0.0),
+                    23.0 * ld_arcsec,
+                    fill=False,
+                    ls=":",
+                    lw=0.95,
+                    ec="lime",
+                    alpha=0.82,
+                    label="SCExAO 23 λ/D",
+                )
+                ax.add_patch(c1)
+                ax.add_patch(c2)
+                if r == 0 and c == 2:
+                    ax.legend(
+                        loc="upper right",
+                        fontsize=8,
+                        facecolor="#10141c",
+                        edgecolor="#556070",
+                        labelcolor="white",
+                        framealpha=0.85,
+                    )
+                if r == 0:
+                    ax.set_title(slab, fontsize=11, fontweight="bold")
+                if c == 0:
+                    ax.set_ylabel(
+                        f"t = {sm['t_phys_s']:.2f} s\nΔDec [\"]",
+                        fontsize=10,
+                        fontweight="bold",
+                    )
+                else:
+                    ax.set_ylabel("ΔDec [\"]", fontsize=9)
+                if r == nsamp - 1:
+                    ax.set_xlabel("ΔRA [\"]", fontsize=9.5)
+                pm = sm.get("inst_psf", {}).get(bkey, {}).get(sk, {})
+                ptxt = (
+                    f"Inst SR = {pm.get('strehl_peak', 0.0)*100:5.1f}%\n"
+                    f"r50 = {pm.get('ee50_radius_mas', 0.0):5.0f} mas"
+                )
+                ax.text(
+                    0.03,
+                    0.04,
+                    ptxt,
+                    transform=ax.transAxes,
+                    fontsize=8.4,
+                    color="white",
+                    family="monospace",
+                    bbox=dict(
+                        boxstyle="round,pad=0.25",
+                        fc="black",
+                        ec="none",
+                        alpha=0.70,
+                    ),
+                )
+            cb_p = figp.colorbar(
+                imh_p,
+                ax=axesp[:, c],
+                orientation="horizontal",
+                shrink=0.88,
+                pad=0.02,
+            )
+            cb_p.set_label("Strehl-Normalized Intensity", fontsize=9.2)
+        figp.savefig(
+            os.path.join(out_dir, f"psf_inst_{bkey}_5x3.png"), dpi=175
+        )
+        plt.close(figp)
+
+lp1 = data.get("loops", {}).get("stage1_ao3k", {})
+lp2 = data.get("loops", {}).get("stage2_scexao", {})
+if lp1.get("mgain_curve") and lp2.get("mgain_curve"):
+    figg, axesg = plt.subplots(1, 2, figsize=(13.5, 4.9), constrained_layout=True)
+    figg.suptitle(
+        "Subaru 8.2 m AO3k + SCExAO — Applied Per-Mode Integrator Gains "
+        "(mgain = loopgain × mgainfact)\n"
+        f"(Power-Law Rolloff α = {lp1.get('mgain_alpha', 0.8):.2f}, "
+        f"Floor = {lp1.get('mgain_floor', 0.10):.2f}, "
+        f"Tip/Tilt Factor = {lp1.get('mgain_tt_factor', 1.0):.2f}, "
+        f"Leak Mult = {lp1.get('mult', 0.98):.2f})",
+        fontsize=12.2,
+        fontweight="bold",
+    )
+    loop_specs = [
+        (
+            lp1,
+            "Stage 1 — AO3k (64×64 DM D=60, 160×160 NIR PyWFS @ 1 kHz)",
+            "#ff7f0e",
+        ),
+        (
+            lp2,
+            "Stage 2 — SCExAO (50×50 DM D=46, 120×120 Vis PyWFS @ 2 kHz)",
+            "#1f77b4",
+        ),
+    ]
+    for col, (lp, title, col_g) in enumerate(loop_specs):
+        ax = axesg[col]
+        mg = np.asarray(lp["mgain_curve"])
+        m_idx = np.arange(len(mg))
+        l1 = ax.plot(
+            m_idx,
+            mg,
+            color=col_g,
+            lw=2.3,
+            label=f"Modal Gain mgain[m] (N={len(mg)} modes)",
+        )
+        ax.scatter(
+            [0, 1],
+            mg[:2],
+            color="#d62728",
+            s=36,
+            zorder=5,
+            label=f"Tip/Tilt (m=0,1): g={mg[0]:.3f}",
+        )
+        ax.set_title(title, fontsize=11, fontweight="bold")
+        ax.set_xlabel("Controlled Mode Index m (Low → High Spatial Frequency)")
+        ax.set_ylabel("Effective Integrator Gain mgain[m]", color=col_g)
+        ax.set_ylim(0.0, max(0.48, float(np.max(mg)) * 1.35))
+        ax.set_xlim(-2, len(mg) + 1)
+        ax.grid(True, alpha=0.30)
+
+        lines = list(l1)
+        rgrad = lp.get("mode_rel_grad")
+        if rgrad and len(rgrad) == len(mg):
+            ax_r = ax.twinx()
+            l2 = ax_r.plot(
+                m_idx,
+                rgrad,
+                color="#4d5666",
+                ls="--",
+                lw=1.4,
+                alpha=0.80,
+                label="DM Spatial Gradient ‖∇φ_m‖/‖φ_m‖",
+            )
+            ax_r.set_ylabel("Relative DM Spatial Gradient", color="#4d5666")
+            ax_r.set_ylim(0.0, float(np.max(rgrad)) * 1.36)
+            lines.extend(l2)
+
+        g_med = float(np.median(mg))
+        g_min = float(np.min(mg))
+        txt_g = (
+            f"Modes 0..1 (TT) : {mg[0]:.3f}\n"
+            f"Median Gain     : {g_med:.3f}\n"
+            f"Highest Mode    : {g_min:.3f}"
+        )
+        ax.text(
+            0.04,
+            0.08,
+            txt_g,
+            transform=ax.transAxes,
+            fontsize=8.8,
+            family="monospace",
+            bbox=dict(
+                boxstyle="round,pad=0.3",
+                fc="white",
+                ec="#ccd2dc",
+                alpha=0.90,
+            ),
+        )
+        labs = [ln.get_label() for ln in lines]
+        ax.legend(lines, labs, loc="upper right", fontsize=8.4)
+
+    figg.savefig(os.path.join(out_dir, "modal_gains_1x2.png"), dpi=180)
+    plt.close(figg)
+
+if lp1.get("mlat") and lp2.get("mlat"):
+    figl, axesl = plt.subplots(1, 2, figsize=(13.8, 5.2), constrained_layout=True)
+    figl.suptitle(
+        "Subaru 8.2 m AO3k + SCExAO — Hardware Latency Calibration "
+        "(CACAO mlat → measlinresp Timing)\n"
+        "(Sub-Frame Randomized DM Step Pokes vs Frame-to-Frame WFS "
+        "Differential Response)",
+        fontsize=12.2,
+        fontweight="bold",
+    )
+    mlat_specs = [
+        (
+            lp1["mlat"],
+            "Stage 1 — AO3k (64×64 DM → 160×160 NIR PyWFS, 1.0 kHz)",
+            "#ff7f0e",
+        ),
+        (
+            lp2["mlat"],
+            "Stage 2 — SCExAO (50×50 DM → 120×120 Vis PyWFS, 2.0 kHz)",
+            "#1f77b4",
+        ),
+    ]
+    for col, (ml, title, col_m) in enumerate(mlat_specs):
+        ax = axesl[col]
+        xr = np.asarray(ml["dt_raw_fr"], dtype=float)
+        yr = np.asarray(ml["val_raw"], dtype=float) * 1.0e4
+        xm = np.asarray(ml["dt_med_fr"], dtype=float)
+        ym = np.asarray(ml["val_med"], dtype=float) * 1.0e4
+        fit = ml["fit"]
+        xg = np.linspace(-1.6, 6.4, 400)
+        yg = (
+            fit["base_fit"]
+            + fit["amp_fit"]
+            * np.exp(-0.5 * ((xg - fit["tau_fit_fr"]) / fit["sigma_fit_fr"]) ** 2)
+        ) * 1.0e4
+
+        ax.axvline(0.0, color="#6b7280", ls=":", lw=1.2, label="DM Poke Sent (Δt = 0)")
+        ax.scatter(
+            xr,
+            yr,
+            s=17,
+            color=col_m,
+            alpha=0.36,
+            edgecolors="none",
+            label=f"Raw Sub-Frame Diffs (N={ml['n_points']})",
+        )
+        ax.plot(
+            xm,
+            ym,
+            color=col_m,
+            lw=2.3,
+            label="CACAO mlat Sliding-Window Curve",
+        )
+        ax.plot(
+            xg,
+            yg,
+            color="#111827",
+            ls="--",
+            lw=1.9,
+            label=(
+                f"Gaussian Fit: τ={fit['tau_fit_fr']:.3f}±{fit['tau_err_fr']:.3f} fr "
+                f"(R²={fit['r2']:.2f})"
+            ),
+        )
+        lat_fr = ml["latency_fr"]
+        pk_y = ml["peak_val"] * 1.0e4
+        ax.axvline(
+            lat_fr,
+            color="#d62728",
+            ls="-.",
+            lw=1.7,
+            label=f"mlat Peak: {lat_fr:.3f} fr ({ml['latency_phys_ms']:.2f} ms)",
+        )
+        ax.scatter([lat_fr], [pk_y], color="#d62728", marker="*", s=115, zorder=6)
+
+        ymax = max(float(np.max(yr)), float(np.max(yg)), pk_y) * 1.38
+        ax.set_xlim(-1.5, 6.2)
+        ax.set_ylim(0.0, max(ymax, 0.1))
+        ax.set_title(title, fontsize=10.8, fontweight="bold")
+        ax.set_xlabel("Time Offset Δt from DM Poke [WFS Frames]")
+        ax.set_ylabel("WFS Frame-to-Frame Diff RMS [×10⁻⁴]")
+        ax.grid(True, alpha=0.30)
+
+        t_fr_ms = ml["phys_frame_ms"]
+        secax = ax.secondary_xaxis(
+            "top",
+            functions=(
+                lambda f, s=t_fr_ms: f * s,
+                lambda ms, s=t_fr_ms: ms / s,
+            ),
+        )
+        secax.set_xlabel(
+            f"Simulated Physical Delay [ms] (1 fr = {t_fr_ms:.2f} ms)",
+            fontsize=8.8,
+        )
+
+        txt_m = (
+            f"mlat WFSfrequ : {ml['wall_fps_hz']:6.2f} Hz (wall)\n"
+            f"mlat latency  : {lat_fr:6.3f} fr ({ml['latency_phys_ms']:.2f} ms)\n"
+            f"Gauss τ / FWHM: {fit['tau_fit_fr']:6.3f} / {fit['fwhm_fit_fr']:.2f} fr\n"
+            f"RM poke shift : RMdelayfr={ml['rm_delay_fr']} fr "
+            f"(+{ml['rm_subframe_wait_fr']:.2f} fr)"
+        )
+        ax.text(
+            0.47,
+            0.46,
+            txt_m,
+            transform=ax.transAxes,
+            fontsize=8.2,
+            family="monospace",
+            bbox=dict(
+                boxstyle="round,pad=0.32",
+                fc="white",
+                ec="#ccd2dc",
+                alpha=0.92,
+            ),
+        )
+        ax.legend(loc="upper right", fontsize=8.0, framealpha=0.92)
+
+    figl.savefig(os.path.join(out_dir, "mlat_latency_1x2.png"), dpi=180)
+    plt.close(figl)
+
+if lp1.get("selfrm") and lp2.get("selfrm"):
+    figs, axess = plt.subplots(2, 4, figsize=(17.6, 8.8), constrained_layout=True)
+    figs.suptitle(
+        "Subaru 8.2 m AO3k + SCExAO — Modal Self-Response Matrix (selfRM): "
+        "Zero-Turbulence Calibration vs On-Sky Closed Loop (0.60\" Seeing)\n"
+        "(2D Modal Interaction Matrices, Pyramid WFS Optical Gain g_opt(m), "
+        "and Closed-Loop Temporal Step Rejection)",
+        fontsize=12.4,
+        fontweight="bold",
+    )
+    srm_rows = [
+        (
+            1,
+            lp1["selfrm"],
+            "Stage 1 — AO3k (1 kHz NIR)",
+            "#ff7f0e",
+        ),
+        (
+            2,
+            lp2["selfrm"],
+            "Stage 2 — SCExAO (2 kHz Vis)",
+            "#1f77b4",
+        ),
+    ]
+    for r, (snum, sr, rlabel, col_s) in enumerate(srm_rows):
+        m_cal = np.load(os.path.join(out_dir, f"srm_cal_stg{snum}.npy"))
+        m_sky = np.load(os.path.join(out_dir, f"srm_sky_stg{snum}.npy"))
+        mcnt = sr["n_modes_probed"]
+
+        ax0 = axess[r, 0]
+        im0 = ax0.imshow(
+            m_cal.T,
+            origin="lower",
+            cmap="RdBu_r",
+            vmin=-1.05,
+            vmax=1.05,
+            aspect="equal",
+        )
+        if r == 0:
+            ax0.set_title("Calibration selfRM (turb = 0, OL)", fontsize=10.5, fontweight="bold")
+        ax0.set_ylabel(f"{rlabel}\nSensed WFS Mode Index", fontsize=9.0, fontweight="bold")
+        if r == 1:
+            ax0.set_xlabel("Poked DM Mode Index")
+        ax0.text(
+            0.04,
+            0.05,
+            f"z={sr['z_cal_slice']} (N={mcnt})\n"
+            f"Diag = {sr['cal_diag_mean']:.3f}±{sr['cal_diag_std']:.3f}\n"
+            f"OffRMS = {sr['cal_offdiag_rms']:.4f}",
+            transform=ax0.transAxes,
+            fontsize=8.0,
+            family="monospace",
+            bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#ccd2dc", alpha=0.90),
+        )
+
+        ax1 = axess[r, 1]
+        im1 = ax1.imshow(
+            m_sky.T,
+            origin="lower",
+            cmap="RdBu_r",
+            vmin=-1.05,
+            vmax=1.05,
+            aspect="equal",
+        )
+        if r == 0:
+            ax1.set_title("On-Sky selfRM (0.60\" Seeing, CL)", fontsize=10.5, fontweight="bold")
+        ax1.set_ylabel("Sensed WFS Mode Index", fontsize=8.8)
+        if r == 1:
+            ax1.set_xlabel("Poked DM Mode Index")
+        ax1.text(
+            0.04,
+            0.05,
+            f"z={sr['z_sky_slice']} (N={mcnt})\n"
+            f"Mean g_opt = {sr['sky_og_mean']:.3f}\n"
+            f"OffRMS     = {sr['sky_offdiag_rms']:.4f}",
+            transform=ax1.transAxes,
+            fontsize=8.0,
+            family="monospace",
+            bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#ccd2dc", alpha=0.90),
+        )
+        cb = figs.colorbar(im1, ax=[ax0, ax1], fraction=0.032, pad=0.02)
+        cb.set_label("Modal WFS / DM Poke", fontsize=8.5)
+
+        ax2 = axess[r, 2]
+        midx = np.arange(mcnt)
+        cdiag = np.asarray(sr["cal_diag"], dtype=float)
+        sdiag = np.asarray(sr["sky_diag"], dtype=float)
+        ssmo = np.asarray(sr["sky_diag_smooth"], dtype=float)
+        ax2.plot(
+            midx,
+            cdiag,
+            color="#374151",
+            ls="--",
+            lw=1.6,
+            label=f"Calib (turb=0): {sr['cal_diag_mean']:.3f}",
+        )
+        ax2.scatter(
+            midx,
+            sdiag,
+            s=11,
+            color=col_s,
+            alpha=0.28,
+            edgecolors="none",
+            label="On-Sky Per-Mode Diag",
+        )
+        ax2.plot(
+            midx,
+            ssmo,
+            color=col_s,
+            lw=2.3,
+            label=f"On-Sky Smooth Diag (mean={sr['sky_og_mean']:.2f})",
+        )
+        if sr.get("og_ratio_smooth"):
+            ax2.plot(
+                midx,
+                np.asarray(sr["og_ratio_smooth"], dtype=float),
+                color="#7c3aed",
+                ls="-.",
+                lw=1.7,
+                label=f"Optical Gain Ratio OnSky/Cal ({sr['sky_og_ratio_mean']:.2f})",
+            )
+        if r == 0:
+            ax2.set_title("Diagonal Sensitivity & Optical Gain", fontsize=10.5, fontweight="bold")
+        ax2.set_ylabel("selfRM[m, m]")
+        if r == 1:
+            ax2.set_xlabel("Controlled Mode Index m")
+        ax2.set_xlim(-2, mcnt + 1)
+        ax2.set_ylim(-0.08, 1.48)
+        ax2.grid(True, alpha=0.30)
+        ax2.text(
+            0.04,
+            0.05,
+            f"g_opt TT   : {sr['sky_ratio_tt']:.3f}\n"
+            f"g_opt Low  : {sr['sky_ratio_low']:.3f}\n"
+            f"g_opt High : {sr['sky_ratio_high']:.3f}",
+            transform=ax2.transAxes,
+            fontsize=8.0,
+            family="monospace",
+            bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#ccd2dc", alpha=0.90),
+        )
+        ax2.legend(loc="upper right", fontsize=7.6, framealpha=0.92)
+
+        ax3 = axess[r, 3]
+        zz = np.arange(sr["zsize"])
+        t_cal = np.asarray(sr["trace_cal_mean"], dtype=float)
+        t_slo = np.asarray(sr["trace_sky_low"], dtype=float)
+        t_shi = np.asarray(sr["trace_sky_high"], dtype=float)
+        ax3.axvline(
+            sr["z_sky_slice"],
+            color="#9ca3af",
+            ls=":",
+            lw=1.3,
+            label=f"Arrival Slice z={sr['z_sky_slice']}",
+        )
+        ax3.plot(
+            zz,
+            t_cal,
+            "o--",
+            color="#374151",
+            lw=1.7,
+            ms=4.5,
+            label="Calib Open-Loop Step",
+        )
+        ax3.plot(
+            zz,
+            t_slo,
+            "s-",
+            color=col_s,
+            lw=2.1,
+            ms=4.8,
+            label="On-Sky Low Modes (Fast CL)",
+        )
+        ax3.plot(
+            zz,
+            t_shi,
+            "^--",
+            color="#10b981",
+            lw=1.9,
+            ms=5.0,
+            label="On-Sky High Modes (Low Gain)",
+        )
+        if r == 0:
+            ax3.set_title("Temporal Step & CL Rejection vs z", fontsize=10.5, fontweight="bold")
+        ax3.set_ylabel("Mean Diagonal Response")
+        if r == 1:
+            ax3.set_xlabel("Loop Frame Step z After Poke")
+        ax3.set_ylim(-0.12, 1.38)
+        ax3.grid(True, alpha=0.30)
+        ax3.legend(loc="upper right", fontsize=7.6, framealpha=0.92)
+
+    figs.savefig(os.path.join(out_dir, "selfrm_summary_2x4.png"), dpi=180)
+    plt.close(figs)
+"""
+    py_exec = sys.executable
+    try:
+        subprocess.run(
+            [py_exec, "-c", "import matplotlib.pyplot"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        py_exec = "/usr/bin/python3"
+    if os.path.exists(py_exec):
+        subprocess.run([py_exec, "-c", plotter, out_dir, summary_path], check=True)
+
+
+def write_ao_report_md(out_dir, s):
+    sa = s.get("star_and_atmosphere", {})
+    lps = s.get("loops", {})
+    l1 = lps.get("stage1_ao3k", {})
+    l2 = lps.get("stage2_scexao", {})
+    pm = s.get("psf_metrics", {})
+    wm = s.get("wavefront_metrics")
+
+    lines = [
+        f"# AO Optical & Control Report: {s.get('configuration', 'AO3k + SCExAO')}",
+        "",
+        f"- **Seeing**: `{sa.get('seeing_arcsec_500nm', 0):.2f}\"` at 0.50 um | "
+        f"**Star**: mV={sa.get('star_mV', 6):.1f}, mH={sa.get('star_mH', 6):.1f}",
+        f"- **Integration**: `{sa.get('physical_time_s', 0):.2f} s` physical "
+        f"(`{sa.get('master_ticks_integrated', 0)}` ticks @ 2 kHz, "
+        f"`{sa.get('wall_elapsed_s', 0):.2f} s` wall-clock)",
+        f"- **Stage 1 (AO3k)**: `{l1.get('dm_grid', '64x64')}` DM (D="
+        f"{l1.get('dm_pupil_diam_act', 60)}), `{l1.get('wfs_detector', '160x160')}` NIR PyWFS, "
+        f"`{l1.get('n_cm_modes', 0)}` CM modes",
+        f"- **Stage 2 (SCExAO)**: `{l2.get('dm_grid', '50x50')}` DM (D="
+        f"{l2.get('dm_pupil_diam_act', 46)}), `{l2.get('wfs_detector', '120x120')}` Vis PyWFS, "
+        f"`{l2.get('n_cm_modes', 0)}` CM modes",
+        "",
+        "> Companion systems & optimization report: [COMPUTE_REPORT.md](COMPUTE_REPORT.md)",
+        "",
+        "## Long-Exposure PSF Summary",
+        "",
+        "| Band | Stage | Strehl Peak | FWHM [mas] | FWHM [l/D] | EE(1.22 l/D) | r50 [mas] |",
+        "| :--- | :--- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for bkey, bcfg in BANDS.items():
+        bm = pm.get(bkey, {})
+        for skey, slabel in STAGES:
+            m = bm.get(skey)
+            if not m:
+                continue
+            lines.append(
+                f"| {bcfg['label']} | {slabel} | {m['strehl_peak']*100:.2f}% | "
+                f"{m['fwhm_mas']:.2f} | {m['fwhm_ld']:.2f} | {m['ee_1p22ld']*100:.1f}% | "
+                f"{m['ee50_radius_mas']:.1f} |"
+            )
+
+    if wm and wm.get("locations"):
+        lines.extend(
+            [
+                "",
+                f"## Wavefront OPD Statistics ({wm.get('n_frames', 0)} frames, "
+                f"{wm.get('phys_time_recorded_s', 0):.2f} s)",
+                "",
+                "| Optical Plane | Total RMS [nm] | Mean Map RMS [nm] | Temporal Std RMS [nm] | "
+                "Marechal SR (750 nm / 1.65 um) |",
+                "| :--- | ---: | ---: | ---: | :---: |",
+            ]
+        )
+        for k in ("raw", "stg1", "final"):
+            loc = wm["locations"].get(k)
+            if loc:
+                lines.append(
+                    f"| {loc['label']} | {loc['quad_total_rms_nm']:.1f} | "
+                    f"{loc['mean_map_rms_nm']:.1f} | {loc['std_map_rms_nm']:.1f} | "
+                    f"{loc['marechal_sr_vis_750nm']*100:.1f}% / "
+                    f"{loc['marechal_sr_nir_1650nm']*100:.1f}% |"
+                )
+
+    lines.extend(
+        [
+            "",
+            "## Figures",
+            "",
+            "- ![PSF Comparison](psf_comparison_2x3.png)",
+            "- ![PSF Radial Profiles](psf_radial_profiles.png)",
+            "- ![Wavefront Stats](wf_stats_2x3.png)",
+            "- ![Hardware Latency](mlat_latency_1x2.png)",
+            "- ![selfRM Summary](selfrm_summary_2x4.png)",
+        ]
+    )
+    with open(os.path.join(out_dir, "REPORT.md"), "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def main():
+    if any(a in ("-h1", "--help-oneline") for a in sys.argv[1:]):
+        print("compile AO optical/control PSF, wavefront, mlat, and selfRM metrics + REPORT.md")
+        return
+    if any(a in ("-h2", "--help-description") for a in sys.argv[1:]):
+        print(
+            "Analyze FITS PSFs, wavefront stats, mlat hardware latency, and selfRM cubes\n"
+            "from two-stage AO3k + SCExAO simulation runs to generate REPORT.md,\n"
+            "ao3k_scexao_metrics.json, and 11 publication figures."
+        )
+        return
+    if len(sys.argv) < 11 or any(a in ("-h", "--help", "-hm", "--help-mono") for a in sys.argv[1:]):
+        print(
+            "Usage: cacaosim-ao-report <work_dir> <out_dir> <seeing> <phys_time> <master_ticks>\n"
+            "                          <wall_elapsed> <gain1> <gain2> <mult1> <mult2>\n"
+            "                          [mgain_alpha] [mgain_floor] [mgain_tt]"
+        )
+        return
+
+    (
+        work_dir,
+        out_dir,
+        seeing,
+        phys_time,
+        master_ticks,
+        wall_elapsed,
+        gain1,
+        gain2,
+        mult1,
+        mult2,
+    ) = sys.argv[1:11]
+    mgain_alpha = float(sys.argv[11]) if len(sys.argv) > 11 else 0.8
+    mgain_floor = float(sys.argv[12]) if len(sys.argv) > 12 else 0.10
+    mgain_tt = float(sys.argv[13]) if len(sys.argv) > 13 else 1.0
+
+    tmp_npys = []
+    psf_metrics = {}
+    dl_imgs = {}
+    for bkey, bcfg in BANDS.items():
+        psf_metrics[bkey] = {}
+        dl_img = np.asarray(
+            fits.getdata(os.path.join(out_dir, f"psf_{bkey}_dl.fits")), dtype=np.float64
+        )
+        dl_imgs[bkey] = dl_img
+        dl_sum = float(np.sum(dl_img))
+        for skey, _ in STAGES:
+            fpath = os.path.join(out_dir, f"psf_{bkey}_{skey}.fits")
+            img = np.asarray(fits.getdata(fpath), dtype=np.float64)
+            npy_p = os.path.join(out_dir, f"psf_{bkey}_{skey}.npy")
+            np.save(npy_p, img.astype(np.float32))
+            tmp_npys.append(npy_p)
+            psf_metrics[bkey][skey] = analyze_band_stage(img, dl_sum, bcfg)
+
+    wf_metrics = None
+    wf_json_p = os.path.join(out_dir, "wf_stats.json")
+    if os.path.isfile(wf_json_p):
+        with open(wf_json_p, "r", encoding="utf-8") as fh:
+            wf_metrics = json.load(fh)
+        wf_stems = [
+            "wf_pupil_mask",
+            "wfs_raw_stg1_samples",
+            "wfs_sig_stg1_samples",
+            "wfs_raw_stg2_samples",
+            "wfs_sig_stg2_samples",
+            "dm_cmd_stg1_samples",
+            "dm_opd_stg1_samples",
+            "dm_cmd_stg2_samples",
+            "dm_opd_stg2_samples",
+        ]
+        for k in ("raw", "stg1", "final"):
+            wf_stems.extend([f"wf_samples_{k}", f"wf_mean_{k}", f"wf_std_{k}"])
+        for stem in wf_stems:
+            fp = os.path.join(out_dir, f"{stem}.fits")
+            if os.path.isfile(fp):
+                npy_p = os.path.join(out_dir, f"{stem}.npy")
+                np.save(npy_p, np.asarray(fits.getdata(fp), dtype=np.float32))
+                tmp_npys.append(npy_p)
+
+        samples_list = wf_metrics.get("samples", [])
+        for sm in samples_list:
+            sm["inst_psf"] = {"vis": {}, "nir": {}}
+
+        for bkey, bcfg in BANDS.items():
+            dl_img = dl_imgs[bkey]
+            ny, nx = dl_img.shape
+            c0 = nx // 2
+            yy, xx = np.indices((ny, nx), dtype=np.float64)
+            core_m = np.hypot(xx - c0, yy - c0) <= 20.0
+            dl_core_sum = max(float(np.sum(dl_img[core_m])), 1e-6)
+            dl_tot_sum = max(float(np.sum(dl_img)), 1e-6)
+            ld_mas = (bcfg["lam_um"] * 1e-6 / TEL_DIAM_M) * RAD2MAS
+            pix_mas = ld_mas / bcfg["pixscale_ld"]
+            rr_mas = np.hypot(xx - c0, yy - c0) * pix_mas
+            rgrid_mas = np.linspace(0.5 * pix_mas, 1500.0, 200)
+
+            for skey in ("raw", "stg1", "final"):
+                sp = os.path.join(out_dir, f"psf_inst_{bkey}_{skey}_samples.fits")
+                dlp = os.path.join(out_dir, f"det_{bkey}_{skey}_dl.fits")
+                if not os.path.isfile(sp):
+                    continue
+                scube = np.asarray(fits.getdata(sp), dtype=np.float64)
+                if os.path.isfile(dlp):
+                    det_dl = np.asarray(fits.getdata(dlp), dtype=np.float64)
+                    det_sub = np.maximum(det_dl - 100.0, 0.0)
+                    adu_per_sr = max(float(np.sum(det_sub[core_m])) / dl_core_sum, 1.0)
+                else:
+                    adu_per_sr = max(float(np.max(scube - 100.0)), 1.0)
+
+                sr_cube = np.maximum(scube - 100.0, 0.0) / adu_per_sr
+                npy_sr = os.path.join(out_dir, f"psf_inst_{bkey}_{skey}_sr.npy")
+                np.save(npy_sr, sr_cube.astype(np.float32))
+                tmp_npys.append(npy_sr)
+
+                for idx in range(min(len(samples_list), sr_cube.shape[0])):
+                    frm = sr_cube[idx]
+                    pidx = int(np.argmax(frm))
+                    py, px = divmod(pidx, nx)
+                    sr_pk = float(frm[py, px])
+                    fw_px = estimate_fwhm_pix(frm, (px, py))
+                    ee_c = np.array(
+                        [float(np.sum(frm[rr_mas <= r]) / dl_tot_sum) for r in rgrid_mas]
+                    )
+                    i50 = int(np.searchsorted(ee_c, 0.50))
+                    r50 = (
+                        float(rgrid_mas[i50])
+                        if i50 < len(rgrid_mas)
+                        else float(rgrid_mas[-1])
+                    )
+                    samples_list[idx]["inst_psf"][bkey][skey] = {
+                        "strehl_peak": sr_pk,
+                        "fwhm_mas": fw_px * pix_mas,
+                        "fwhm_ld": (fw_px * pix_mas) / ld_mas,
+                        "ee50_radius_mas": r50,
+                        "peak_adu": float(np.max(scube[idx] - 100.0)),
+                        "adu_per_sr": adu_per_sr,
+                    }
+
+    stage1_info = load_loop_calib(work_dir, "ao3k", 1, out_dir, tmp_npys)
+    stage2_info = load_loop_calib(work_dir, "scexao", 2, out_dir, tmp_npys)
+
+    summary = {
+        "configuration": "Subaru 8.2m AO3k + SCExAO (Two-Stage Pyramid WFS)",
+        "telescope": {
+            "diameter_m": 8.2,
+            "cobs": 0.30,
+            "nspider": 4,
+            "nwf": 256,
+            "pup_diam_pix": 240.0,
+            "pupil_scale_m_pix": 8.2 / 240.0,
+        },
+        "star_and_atmosphere": {
+            "star_mV": 6.0,
+            "star_mH": 6.0,
+            "star_teff_K": 9600.0,
+            "seeing_arcsec_500nm": float(seeing),
+            "profile": "7-layer Maunakea (4.2..23.7 km, wind 6.5..22.0 m/s)",
+            "physical_time_s": float(phys_time),
+            "master_rate_phys_hz": 2000.0,
+            "stage1_rate_phys_hz": 1000.0,
+            "stage2_rate_phys_hz": 2000.0,
+            "master_ticks_integrated": int(master_ticks),
+            "wall_elapsed_s": float(wall_elapsed),
+            "calibration_turbulence_gain": 0.0,
+        },
+        "loops": {
+            "stage1_ao3k": {
+                **stage1_info,
+                "dm_grid": "64x64",
+                "dm_pupil_diam_act": 60,
+                "wfs_detector": "160x160",
+                "wfs_band": "J-band 1.22 um PyWFS (160x160, mod 3.0 l/D)",
+                "phys_rate_hz": 1000.0,
+                "gain": float(gain1),
+                "mult": float(mult1),
+                "mgain_alpha": mgain_alpha,
+                "mgain_floor": mgain_floor,
+                "mgain_tt_factor": mgain_tt,
+            },
+            "stage2_scexao": {
+                **stage2_info,
+                "dm_grid": "50x50",
+                "dm_pupil_diam_act": 46,
+                "wfs_detector": "120x120",
+                "wfs_band": "Visible 0.75 um PyWFS (120x120, mod 3.0 l/D)",
+                "phys_rate_hz": 2000.0,
+                "gain": float(gain2),
+                "mult": float(mult2),
+                "mgain_alpha": mgain_alpha,
+                "mgain_floor": mgain_floor,
+                "mgain_tt_factor": mgain_tt,
+            },
+        },
+        "psf_metrics": psf_metrics,
+    }
+    if wf_metrics is not None:
+        summary["wavefront_metrics"] = wf_metrics
+
+    summary_path = os.path.join(out_dir, "ao3k_scexao_metrics.json")
+    with open(summary_path, "w", encoding="utf-8") as fh:
+        json.dump(summary, fh, indent=2)
+        fh.write("\n")
+
+    render_plots_via_sys_python(out_dir, summary_path)
+    write_ao_report_md(out_dir, summary)
+    for npy_p in tmp_npys:
+        if os.path.exists(npy_p):
+            os.remove(npy_p)
+
+    print("\n=== Subaru AO3k + SCExAO 10.0s Performance Summary ===")
+    for bkey, bcfg in BANDS.items():
+        print(f"\n[{bcfg['label']}]")
+        for skey, slabel in STAGES:
+            m = psf_metrics[bkey][skey]
+            print(
+                f"  {slabel:<28s}: Strehl={m['strehl_peak']*100:6.2f}% "
+                f"(axis={m['strehl_axis']*100:6.2f}%), "
+                f"FWHM={m['fwhm_mas']:6.2f} mas ({m['fwhm_ld']:4.2f} l/D), "
+                f"EE(1.22 l/D)={m['ee_1p22ld']*100:5.1f}%, "
+                f"r50={m['ee50_radius_mas']:5.1f} mas"
+            )
+
+    if wf_metrics is not None:
+        print(
+            f"\n[Wavefront OPD Telemetry ({wf_metrics['n_frames']} frames, "
+            f"{wf_metrics['phys_time_recorded_s']:.2f} s)]"
+        )
+        for k in ("raw", "stg1", "final"):
+            lm = wf_metrics["locations"][k]
+            print(
+                f"  {lm['label']:<36s}: "
+                f"TotRMS={lm['quad_total_rms_nm']:6.1f} nm "
+                f"(MeanMapRMS={lm['mean_map_rms_nm']:5.1f} nm, "
+                f"StdMapRMS={lm['std_map_rms_nm']:6.1f} nm)"
+            )
+
+    if stage1_info.get("mlat") or stage2_info.get("mlat"):
+        print("\n[Hardware Latency (mlat) & RM Timing]")
+        for tag, sinf in [("Stage 1 (AO3k)", stage1_info), ("Stage 2 (SCExAO)", stage2_info)]:
+            ml = sinf.get("mlat")
+            if ml:
+                fit = ml["fit"]
+                print(
+                    f"  {tag:<18s}: mlat={ml['latency_fr']:.3f} fr "
+                    f"({ml['latency_phys_ms']:.2f} ms phys), "
+                    f"GaussFit={fit['tau_fit_fr']:.3f}+/-{fit['tau_err_fr']:.3f} fr "
+                    f"(FWHM={fit['fwhm_fit_fr']:.2f} fr, R2={fit['r2']:.2f}), "
+                    f"RMdelayfr={ml['rm_delay_fr']} (+{ml['rm_subframe_wait_fr']:.2f} fr)"
+                )
+
+    if stage1_info.get("selfrm") or stage2_info.get("selfrm"):
+        print("\n[Modal Self-Response Matrix (selfRM) — Calibration vs On-Sky]")
+        for tag, sinf in [("Stage 1 (AO3k)", stage1_info), ("Stage 2 (SCExAO)", stage2_info)]:
+            sr = sinf.get("selfrm")
+            if sr:
+                print(
+                    f"  {tag:<18s}: N={sr['n_modes_probed']:3d} | "
+                    f"Calib Diag={sr['cal_diag_mean']:.3f}+/-{sr['cal_diag_std']:.3f} "
+                    f"(OffRMS={sr['cal_offdiag_rms']:.4f}) | "
+                    f"OnSky Diag={sr['sky_og_mean']:.3f}, "
+                    f"g_opt(OnSky/Cal)={sr['sky_og_ratio_mean']:.3f} "
+                    f"[TT={sr['sky_ratio_tt']:.3f}, Low={sr['sky_ratio_low']:.3f}, "
+                    f"High={sr['sky_ratio_high']:.3f}] "
+                    f"(OffRMS={sr['sky_offdiag_rms']:.4f})"
+                )
+
+
+if __name__ == "__main__":
+    main()

@@ -70,6 +70,7 @@ static const MILK_RUNNABLE *const runnables[] = {
     &runnable_cacaosim_zwfs,
     &runnable_cacaosim_fpcam,
     &runnable_cacaosim_htsim,
+    &runnable_cacaosim_wfstat,
 };
 
 /* Emit standard `milk` dynamic module init/registration hooks for `libmilkcacaosim.so` */

@@ -38,6 +38,7 @@
 #include "beam/cacaosim_beamsplit_FPS.h"
 #include "beam/cacaosim_mkbeam_FPS.h"
 #include "beam/cacaosim_wfe_FPS.h"
+#include "beam/cacaosim_wfstat_FPS.h"
 
 /* Declarative .bench parser/serializer, schematic viewer, and interactive TUI configurator */
 #include "bench/cacaosim_bench.h"

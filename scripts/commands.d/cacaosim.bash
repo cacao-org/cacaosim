@@ -311,6 +311,38 @@ cacaosim.deploy() {
     return 0
 }
 
+# Update live .turb_gain across active cacaosim beam/fused FPS units
+cacaosim.set_turb() {
+    @args 'gain:float:turbulence OPD gain multiplier' -- "$@"
+
+    local shm_dir="${MILK_SHM_DIR:-/milk/shm}" fp u _v=""
+    shopt -s nullglob
+    for fp in "${shm_dir}"/csim_*.fps.shm; do
+        u="${fp##*/}"
+        u="${u%.fps.shm}"
+        if @get _v="f.${u}.turb_gain" 2>/dev/null; then
+            @set "f.${u}.turb_gain=${gain}"
+        fi
+    done
+    return 0
+}
+
+# Reset long-exposure PSF accumulators across active cacaosim camera/fused FPS units
+cacaosim.reset_long() {
+    @args -- "$@"
+
+    local shm_dir="${MILK_SHM_DIR:-/milk/shm}" fp u _v=""
+    shopt -s nullglob
+    for fp in "${shm_dir}"/csim_*.fps.shm; do
+        u="${fp##*/}"
+        u="${u%.fps.shm}"
+        if @get _v="f.${u}.reset_long" 2>/dev/null; then
+            @set "f.${u}.reset_long=ON"
+        fi
+    done
+    return 0
+}
+
 # Stop running cacaosim FPS compute units while preserving SHM streams
 cacaosim.stop() {
     @args 'workdir:str=:pipeline workspace directory' -- "$@"
@@ -321,7 +353,7 @@ cacaosim.stop() {
     local -a fallback_units=(
         csim_atmturb csim_htsim csim_mkpupil csim_mkbeam csim_fpcam
         csim_pyrwfs csim_shwfs csim_zwfs csim_coro
-        csim_beamsplit csim_wfe csim_dmsim
+        csim_beamsplit csim_wfe csim_dmsim csim_wfstat
     )
     local -a to_stop=()
     local u
@@ -381,7 +413,7 @@ cacaosim.teardown() {
     local -a fallback_units=(
         csim_atmturb csim_htsim csim_mkpupil csim_mkbeam csim_fpcam
         csim_pyrwfs csim_shwfs csim_zwfs csim_coro
-        csim_beamsplit csim_wfe csim_dmsim
+        csim_beamsplit csim_wfe csim_dmsim csim_wfstat
     )
     local u
     for u in "${fallback_units[@]}"; do
