@@ -62,8 +62,10 @@
 /* ---------------------------------------------------------------------------------------------- */
 
 /* Mode selector & SHM stream names (used in flat SCAO mode; `.bench_file` selects DAG mode) */
-static char     param_bench_file[FUNCTION_PARAMETER_STRMAXLEN] = "";
-static char     param_in_dmcmd[FUNCTION_PARAMETER_STRMAXLEN]   = "aol0_dmC";
+static char     param_bench_file[FUNCTION_PARAMETER_STRMAXLEN]   = "";
+static char     param_export_beams[FUNCTION_PARAMETER_STRMAXLEN] = "";
+static int64_t  param_export_enable                              = 1;
+static char     param_in_dmcmd[FUNCTION_PARAMETER_STRMAXLEN]     = "aol0_dmC";
 static char     param_out_wfscam[FUNCTION_PARAMETER_STRMAXLEN] = "aol0_wfsim";
 static char     param_out_dmopd[FUNCTION_PARAMETER_STRMAXLEN]  = "";
 static int64_t  param_enable_fpcam                             = 1;
@@ -130,6 +132,11 @@ static float    param_strehl_ave                               = 0.0f;
 #define CACAOSIM_HTSIM_PARAMS(X)                                                        \
     X(".bench_file", param_bench_file, FPTYPE_STRING, 0, FPFLAG_DEFAULT_INPUT,          \
       "Optional declarative multi-stage .bench DAG file (empty = flat single-stage)")   \
+    X(".export_beams", param_export_beams, FPTYPE_STRING, 0, FPFLAG_DEFAULT_INPUT,      \
+      "CSV optical beams to export to SHM (empty=none, *=all)")                         \
+    X(".export_enable", &param_export_enable, FPTYPE_ONOFF, 0,                          \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Live gate for SHM export of .export_beams (ON/OFF)")                             \
     X(".in_dmcmd", param_in_dmcmd, FPTYPE_STREAMNAME, 1,                                \
       FPFLAG_DEFAULT_INPUT | FPFLAG_TRIGGER_STREAM,                                     \
       "Input 2D DM actuator command stream (auto-created if missing)")                  \
@@ -260,9 +267,9 @@ static MILK_COLD errno_t htsim_confcheck(void)
     if (dcfpsptr != NULL)
     {
         const char *live_keys[] = {
-            ".delay_frames", ".tau_us",      ".max_stroke", ".mod_rad",   ".wfs_flux",
-            ".wfs_ron",      ".wfs_shutter", ".fp_navg",    ".fp_flux",   ".fp_ron",
-            ".reset_long",   ".photon_noise", ".turb_gain", ".frame_rate"
+            ".export_enable", ".delay_frames", ".tau_us",      ".max_stroke", ".mod_rad",
+            ".wfs_flux",      ".wfs_ron",      ".wfs_shutter", ".fp_navg",    ".fp_flux",
+            ".fp_ron",        ".reset_long",   ".photon_noise", ".turb_gain", ".frame_rate"
         };
         for (size_t i = 0; i < sizeof(live_keys) / sizeof(live_keys[0]); i++)
         {
@@ -368,29 +375,41 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
     }
 
     /*
-     * Reconcile FPS parameters with `[bench]` file defaults: non-default FPS values override the
-     * file, whereas untouched default FPS values inherit the `.bench` values so `milk-fpsCTRL`
-     * reflects the true running master clock and turbulence gain.
+     * Reconcile FPS parameters with `[bench]` file defaults: in FPS daemon mode
+     * (`dcfpsptr != NULL`), `cacaosim.deploy` already seeded `.frame_rate` and `.turb_gain` from `.bench`, so live FPS
+     * edits (including `0.0 <-> 1.0` toggles across stops) always win while keeping positive
+     * `bcfg.master_hz` when triggered externally (`frame_rate == 0.0`).
      */
     if (param_backend != 0)
     {
         bcfg.backend = param_backend;
     }
-    if (param_frame_rate != 2000.0f)
+    if (dcfpsptr != NULL)
     {
-        bcfg.master_hz = param_frame_rate;
-    }
-    else
-    {
-        param_frame_rate = bcfg.master_hz;
-    }
-    if (param_turb_gain != 1.0f)
-    {
+        if (param_frame_rate > 0.1f)
+        {
+            bcfg.master_hz = param_frame_rate;
+        }
         bcfg.turb_gain = param_turb_gain;
     }
     else
     {
-        param_turb_gain = bcfg.turb_gain;
+        if (param_frame_rate != 2000.0f)
+        {
+            bcfg.master_hz = param_frame_rate;
+        }
+        else
+        {
+            param_frame_rate = bcfg.master_hz;
+        }
+        if (param_turb_gain != 1.0f)
+        {
+            bcfg.turb_gain = param_turb_gain;
+        }
+        else
+        {
+            param_turb_gain = bcfg.turb_gain;
+        }
     }
 
     /* Compile topological DAG, allocate CPU/CUDA beam slots, and bind SHM (`connect_shm = 1`) */
@@ -398,6 +417,17 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
     {
         fprintf(stderr, "[cacaosim.htsim] .bench init error: %s\n", err_buf);
         return RETURN_FAILURE;
+    }
+
+    if (param_export_beams[0] != '\0')
+    {
+        if (cacaosim_bench_bind_export_beams(&bctx, param_export_beams, err_buf,
+                                             sizeof(err_buf)) != 0)
+        {
+            fprintf(stderr, "[cacaosim.htsim] .export_beams error: %s\n", err_buf);
+            cacaosim_bench_free(&bctx);
+            return RETURN_FAILURE;
+        }
     }
 
     /* Emit full ANSI box-drawing schematic on interactive TTYs; plain summary when piped to logs */
@@ -441,6 +471,8 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
         }
 
         /* Advance entire multi-rate bench by one master tick and publish Strehl telemetry */
+        bctx.export_beams_active =
+            (param_export_beams[0] != '\0' && param_export_enable != 0) ? 1 : 0;
         cacaosim_bench_step(&bctx, NULL, NULL, param_turb_gain, processinfo);
         param_strehl_inst = bctx.last_strehl_inst;
         param_strehl_ave  = bctx.last_strehl_ave;

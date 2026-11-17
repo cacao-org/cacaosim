@@ -214,6 +214,7 @@ static MILK_HOT errno_t wfstat_compute(const MILK_RUNNABLE *self)
         for (uint64_t i = 0; i < npix; i++)
         {
             mask[i]    = 1;
+            pup_amp[i] = 1.0f;
             weights[i] = 1.0 / (double) npix;
         }
     }

@@ -311,6 +311,9 @@ typedef struct
  * @d_opd:  CUDA device OPD cube [nlam * nwf * nwf] in microns [um] when use_cuda == 1, else NULL.
  * @d_amp:  CUDA device amplitude cube [nlam * nwf * nwf] when use_cuda == 1, else NULL.
  *
+ * @img_shm: Optional connected 3D float32 SHM export handle (`ID == -1` when disabled).
+ * @export_shm: 1 if this beam slot is exported to SHM when `export_beams_active` is 1.
+ *
  * Rationale:
  *   Representing beams in pupil space as [OPD_um, Amplitude] makes achromatic reflective DMs,
  *   static WFEs, and dichroic relays wavelength-independent single-plane operations (nlam == 1)
@@ -327,6 +330,8 @@ typedef struct
     float          *amp;
     float          *d_opd;
     float          *d_amp;
+    IMGID           img_shm;
+    int32_t         export_shm;
 } cacaosim_beam_slot_t;
 
 /**
@@ -541,6 +546,7 @@ typedef struct
     /* Live science Strehl telemetry (populated from primary fpcam node) */
     float                 last_strehl_inst;
     float                 last_strehl_ave;
+    int32_t               export_beams_active;
 } cacaosim_bench_ctx_t;
 
 /**
@@ -1245,6 +1251,21 @@ int cacaosim_bench_emit_plan(
     const cacaosim_plan_opts_t *opts,
     char                       *err_buf,
     size_t                      err_cap);
+
+/**
+ * cacaosim_bench_bind_export_beams() - Bind/create SHM streams for selective intermediate export
+ * @ctx:       Initialized bench context (`connect_shm` must be 1 for SHM creation).
+ * @csv_beams: Comma-separated beam names (or `"*"` / `"all"`) to export to SHM each tick.
+ * @err_buf:   Optional caller-owned diagnostic buffer populated on unknown beam / SHM error.
+ * @err_cap:   Capacity of `@err_buf` in bytes.
+ *
+ * Return: `0` on success, `-1` if `@ctx` is NULL, an unknown beam is named, or SHM creation fails.
+ */
+int cacaosim_bench_bind_export_beams(
+    cacaosim_bench_ctx_t *ctx,
+    const char           *csv_beams,
+    char                 *err_buf,
+    size_t                err_cap);
 
 #ifdef __cplusplus
 }

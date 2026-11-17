@@ -432,7 +432,7 @@ void MILK_HOT cacaosim_beam_init_cpu(
 {
     const uint64_t npix = (uint64_t) nwf * nwf;
 
-#pragma omp parallel for simd schedule(static) if (npix >= 8192)
+#pragma omp parallel for simd schedule(static) if (npix >= 262144)
     for (uint64_t p = 0; p < npix; p++)
     {
         float a = (pup_amp != NULL) ? pup_amp[p] : 1.0f;
@@ -477,7 +477,7 @@ void MILK_HOT cacaosim_beam_apply_dm_cpu(
 {
     const uint64_t npix = (uint64_t) nwf * nwf;
 
-#pragma omp parallel for simd schedule(static) if (npix >= 8192)
+#pragma omp parallel for simd schedule(static) if (npix >= 262144)
     for (uint64_t p = 0; p < npix; p++)
     {
         float o    = (in_opd != NULL) ? in_opd[p] : 0.0f;
@@ -528,7 +528,7 @@ void MILK_HOT cacaosim_beam_relay_cpu(
     /* Fast path: aligned pupil grids execute a single coalesced SIMD pass */
     if (cacaosim_reg_is_identity(reg))
     {
-#pragma omp parallel for simd schedule(static) if (npix >= 8192)
+#pragma omp parallel for simd schedule(static) if (npix >= 262144)
         for (uint64_t p = 0; p < npix; p++)
         {
             float o = (in_opd != NULL) ? in_opd[p] : 0.0f;
@@ -568,7 +568,7 @@ void MILK_HOT cacaosim_beam_relay_cpu(
     float *dst_o = (tmp_opd != NULL) ? tmp_opd : out_opd;
     float *dst_a = (tmp_amp != NULL) ? tmp_amp : out_amp;
 
-#pragma omp parallel for schedule(static) if (npix >= 4096)
+#pragma omp parallel for schedule(static) if (npix >= 65537)
     for (uint32_t iy = 0; iy < nwf; iy++)
     {
         float vy = (float) iy - ctr - dy;
@@ -675,7 +675,7 @@ void MILK_HOT cacaosim_beam_apply_wfe_cpu(
     /* Identity registration fast path: pure OpenMP SIMD elementwise accumulation */
     if (cacaosim_reg_is_identity(reg))
     {
-#pragma omp parallel for simd schedule(static) if (npix >= 8192)
+#pragma omp parallel for simd schedule(static) if (npix >= 262144)
         for (uint64_t p = 0; p < npix; p++)
         {
             float o    = (in_opd != NULL) ? in_opd[p] : 0.0f;
@@ -700,7 +700,7 @@ void MILK_HOT cacaosim_beam_apply_wfe_cpu(
     float dx   = reg->shift_x;
     float dy   = reg->shift_y;
 
-#pragma omp parallel for schedule(static) if (npix >= 4096)
+#pragma omp parallel for schedule(static) if (npix >= 65537)
     for (uint32_t iy = 0; iy < nwf; iy++)
     {
         float vy = (float) iy - ctr - dy;

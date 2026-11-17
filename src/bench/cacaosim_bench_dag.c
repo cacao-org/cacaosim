@@ -148,6 +148,8 @@ static int register_beam_name(
     }
     int idx = (int) ctx->n_beams++;
     snprintf(ctx->beams[idx].name, sizeof(ctx->beams[idx].name), "%s", name);
+    ctx->beams[idx].img_shm.ID = -1;
+    ctx->beams[idx].export_shm = 0;
     return idx;
 }
 
@@ -1315,6 +1317,15 @@ int cacaosim_bench_init(
                 {
                     nd->img_long =
                         stream_connect_create_2Df32(nd->cfg.out_long, nd->ncam, nd->ncam);
+                    if (nd->img_long.ID != -1 && nd->img_long.im->kw != NULL &&
+                        nd->img_long.md->NBkw >= 1)
+                    {
+                        snprintf(nd->img_long.im->kw[0].name, KEYWORD_MAX_STRING, "STREHL");
+                        nd->img_long.im->kw[0].type       = 'D';
+                        nd->img_long.im->kw[0].value.numf = 0.0;
+                        snprintf(nd->img_long.im->kw[0].comment, KEYWORD_MAX_COMMENT,
+                                 "Cumulative long-exposure Strehl ratio");
+                    }
                 }
             }
             else
@@ -1421,6 +1432,7 @@ void cacaosim_bench_free(cacaosim_bench_ctx_t *ctx)
         free(ctx->beams[b].amp);
         cacaosim_cuda_free_f32(ctx->beams[b].d_opd);
         cacaosim_cuda_free_f32(ctx->beams[b].d_amp);
+        free_imgid_if_valid(&ctx->beams[b].img_shm);
     }
 
     cacaosim_cuda_free_f32(ctx->d_pup_amp);
@@ -1928,6 +1940,20 @@ MILK_HOT void cacaosim_bench_step(
 
                     if (ctx->connect_shm && nd->img_long.ID != -1)
                     {
+                        if (nd->img_long.im->kw != NULL && nd->img_long.md->NBkw >= 1)
+                        {
+                            if (nd->img_long.im->kw[0].type != 'D' ||
+                                strcmp(nd->img_long.im->kw[0].name, "STREHL") != 0)
+                            {
+                                snprintf(nd->img_long.im->kw[0].name, KEYWORD_MAX_STRING,
+                                         "STREHL");
+                                nd->img_long.im->kw[0].type = 'D';
+                                snprintf(nd->img_long.im->kw[0].comment, KEYWORD_MAX_COMMENT,
+                                         "Cumulative long-exposure Strehl ratio");
+                            }
+                            nd->img_long.im->kw[0].value.numf =
+                                (double) nd->fpcam_ctx.long_strehl_peak;
+                        }
                         processinfo_update_output_stream(pinfo, nd->img_long.im, trig_im);
                     }
                 }
@@ -1937,6 +1963,61 @@ MILK_HOT void cacaosim_bench_step(
             {
                 processinfo_update_output_stream(pinfo, nd->img_cam.im, trig_im);
             }
+        }
+    }
+
+    /* Optional selective intermediate pupil-beam SHM export (queued async on CUDA stream) */
+    if (ctx->connect_shm && ctx->export_beams_active)
+    {
+        int any_d2h = 0;
+        for (uint32_t b = 0; b < ctx->n_beams; b++)
+        {
+            cacaosim_beam_slot_t *bs = &ctx->beams[b];
+            if (!bs->export_shm || bs->img_shm.ID == -1 || bs->img_shm.im == NULL)
+            {
+                continue;
+            }
+            bs->img_shm.md->write = 1;
+            uint32_t nl           = (bs->nlam >= 1u) ? bs->nlam : 1u;
+            uint32_t max_nl       = bs->img_shm.md->size[2] / 2u;
+            if (nl > max_nl)
+            {
+                nl = max_nl;
+            }
+            float *dst = bs->img_shm.im->array.F;
+            for (uint32_t c = 0; c < nl; c++)
+            {
+                size_t src_off = (size_t) c * ctx->npix_wf;
+                size_t dst_opd = (size_t) (2u * c) * ctx->npix_wf;
+                size_t dst_amp = (size_t) (2u * c + 1u) * ctx->npix_wf;
+                if (ctx->use_cuda)
+                {
+                    cacaosim_cuda_d2h_f32(dst + dst_opd, bs->d_opd + src_off, ctx->npix_wf,
+                                          ctx->cuda_stream);
+                    cacaosim_cuda_d2h_f32(dst + dst_amp, bs->d_amp + src_off, ctx->npix_wf,
+                                          ctx->cuda_stream);
+                    any_d2h = 1;
+                }
+                else
+                {
+                    memcpy(dst + dst_opd, bs->opd + src_off, ctx->npix_wf * sizeof(float));
+                    memcpy(dst + dst_amp, bs->amp + src_off, ctx->npix_wf * sizeof(float));
+                }
+            }
+        }
+        if (ctx->use_cuda && any_d2h)
+        {
+            cacaosim_cuda_stream_sync(ctx->cuda_stream);
+        }
+        for (uint32_t b = 0; b < ctx->n_beams; b++)
+        {
+            cacaosim_beam_slot_t *bs = &ctx->beams[b];
+            if (!bs->export_shm || bs->img_shm.ID == -1 || bs->img_shm.im == NULL)
+            {
+                continue;
+            }
+            cacaosim_beam_shm_write_spec(bs->img_shm.im, &bs->spec);
+            processinfo_update_output_stream(pinfo, bs->img_shm.im, trig_im);
         }
     }
 
@@ -2095,4 +2176,126 @@ const uint16_t *cacaosim_bench_sensor_u16(const cacaosim_bench_ctx_t *ctx, int s
         return nd->img_cam.im->array.UI16;
     }
     return nd->cam_u16;
+}
+
+static int bind_single_export_beam(
+    cacaosim_bench_ctx_t *ctx,
+    uint32_t              bidx,
+    char                 *err_buf,
+    size_t                err_cap)
+{
+    cacaosim_beam_slot_t *bs = &ctx->beams[bidx];
+    if (bs->export_shm && bs->img_shm.ID != -1)
+    {
+        return 0;
+    }
+    uint32_t nl = (bs->nlam >= 1u) ? bs->nlam : 1u;
+    bs->img_shm = stream_connect_create_3Df32(bs->name, ctx->nwf, ctx->nwf, 2u * nl);
+    if (bs->img_shm.ID == -1)
+    {
+        dag_err(err_buf, err_cap, "Failed creating export SHM stream for beam '%s'", bs->name);
+        return -1;
+    }
+    if (bs->img_shm.im != NULL && bs->img_shm.im->array.F != NULL)
+    {
+        float *dst = bs->img_shm.im->array.F;
+        for (uint32_t c = 0; c < nl; c++)
+        {
+            float *dst_opd = dst + (size_t) (2u * c) * ctx->npix_wf;
+            float *dst_amp = dst + (size_t) (2u * c + 1u) * ctx->npix_wf;
+            memset(dst_opd, 0, ctx->npix_wf * sizeof(float));
+            if (ctx->pup_ptr != NULL)
+            {
+                memcpy(dst_amp, ctx->pup_ptr, ctx->npix_wf * sizeof(float));
+            }
+        }
+    }
+    cacaosim_beam_shm_init_kw(bs->img_shm.im);
+    cacaosim_beam_shm_write_spec(bs->img_shm.im, &bs->spec);
+    if (nl > 1u)
+    {
+        cacaosim_beam_shm_write_poly_kw(bs->img_shm.im, nl, bs->lam_um[0], bs->lam_um[nl - 1u]);
+    }
+    bs->export_shm = 1;
+    return 0;
+}
+
+int cacaosim_bench_bind_export_beams(
+    cacaosim_bench_ctx_t *ctx,
+    const char           *csv_beams,
+    char                 *err_buf,
+    size_t                err_cap)
+{
+    if (ctx == NULL)
+    {
+        dag_err(err_buf, err_cap, "NULL bench context");
+        return -1;
+    }
+    if (!ctx->connect_shm || csv_beams == NULL || csv_beams[0] == '\0')
+    {
+        return 0;
+    }
+
+    char copy[512];
+    snprintf(copy, sizeof(copy), "%s", csv_beams);
+    char *p        = copy;
+    int   any_bind = 0;
+
+    while (*p != '\0')
+    {
+        while (*p == ' ' || *p == '\t' || *p == ',')
+        {
+            p++;
+        }
+        if (*p == '\0')
+        {
+            break;
+        }
+        char *tok = p;
+        while (*p != '\0' && *p != ',')
+        {
+            p++;
+        }
+        char *end = p;
+        if (*p == ',')
+        {
+            *p++ = '\0';
+        }
+        while (end > tok && (end[-1] == ' ' || end[-1] == '\t'))
+        {
+            *--end = '\0';
+        }
+        if (tok[0] == '\0')
+        {
+            continue;
+        }
+        if (strcmp(tok, "*") == 0 || strcmp(tok, "all") == 0)
+        {
+            for (uint32_t b = 0; b < ctx->n_beams; b++)
+            {
+                if (bind_single_export_beam(ctx, b, err_buf, err_cap) != 0)
+                {
+                    return -1;
+                }
+                any_bind = 1;
+            }
+        }
+        else
+        {
+            int bidx = find_beam_name(ctx, tok);
+            if (bidx < 0)
+            {
+                dag_err(err_buf, err_cap, "Unknown beam '%s' in .export_beams", tok);
+                return -1;
+            }
+            if (bind_single_export_beam(ctx, (uint32_t) bidx, err_buf, err_cap) != 0)
+            {
+                return -1;
+            }
+            any_bind = 1;
+        }
+    }
+
+    ctx->export_beams_active = any_bind ? 1 : 0;
+    return 0;
 }
