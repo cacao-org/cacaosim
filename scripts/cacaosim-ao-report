@@ -2601,8 +2601,11 @@ def ensure_telemetry_video(out_dir):
     )
     mp4_path = os.path.join(out_dir, "wfs_psf_short_evolution.mp4")
     meta_cache = os.path.join(out_dir, "wfs_psf_short_evolution_meta.json")
+    reuse_existing = os.environ.get("CACAOSIM_REUSE_VIDEO", "") in ("1", "true", "yes")
 
-    if tlm_dir is not None:
+    if tlm_dir is not None and not (
+        reuse_existing and os.path.isfile(mp4_path) and os.path.isfile(meta_cache)
+    ):
         script_dir = os.path.dirname(os.path.abspath(__file__))
         vid_cands = [
             shutil.which("cacaosim-telemetry-video") or "",
@@ -2655,6 +2658,193 @@ def ensure_telemetry_video(out_dir):
     return None
 
 
+REPO_SPECS = [
+    (
+        "cacao-work",
+        "CACAO_WORK_ROOT",
+        "https://github.com/cacao-org/cacao-work",
+        "main",
+        "Integration workspace, AO3k+SCExAO bench/runner, pytest suite & web report publisher",
+    ),
+    (
+        "cacaosim",
+        "CACAOSIM_SRC_DIR",
+        "https://github.com/cacao-org/cacaosim",
+        "main",
+        "GPU-fused & modular polychromatic AO hardware simulator, TUI & report engine",
+    ),
+    (
+        "cacao",
+        "CACAO_SRC_DIR",
+        "https://github.com/cacao-org/cacao",
+        "feat/bash-engine",
+        "Compute and Control for Adaptive Optics (acquireWFS, mlat, Hadamard RM, SVD CM, mfilt)",
+    ),
+    (
+        "milk",
+        "MILK_SRC_DIR",
+        "https://github.com/milk-org/milk",
+        "feat/bash-engine",
+        "Core FPS shared-memory engine, milk-script orchestrator, streamFITSlog & milk-perf-report",
+    ),
+    (
+        "ImageStreamIO",
+        "",
+        "https://github.com/milk-org/ImageStreamIO",
+        "dev",
+        "Low-latency POSIX/CUDA shared-memory image stream transport (milk submodule)",
+    ),
+    (
+        "milk-mltools",
+        "MILK_MLTOOLS_SRC_DIR",
+        "https://github.com/milk-org/milk-mltools",
+        "main",
+        "C telemetry indexing/sync, @calc JIT extensions, AO loop optimizer & polychromatic PSFR",
+    ),
+    (
+        "AtmosphericTurbulenceSimul",
+        "ATMTURB_SRC_DIR",
+        "https://github.com/oguyon/AtmosphericTurbulenceSimul",
+        "feat/bash-engine",
+        "Multi-layer Maunakea frozen-flow & boiling atmospheric phase screen generator (milkatmturb)",
+    ),
+    (
+        "OpticsMaterials",
+        "OPTICSMAT_SRC_DIR",
+        "https://github.com/milk-org/OpticsMaterials",
+        "feat/bash-engine",
+        "Optical material dispersion & air refractive-index library for milk",
+    ),
+    (
+        "WFpropagate",
+        "WFPROP_SRC_DIR",
+        "https://github.com/milk-org/WFpropagate",
+        "feat/bash-engine",
+        "Fresnel & angular-spectrum wavefront propagation library for milk",
+    ),
+]
+
+
+def _git_query(repo_dir, *args):
+    try:
+        res = subprocess.run(
+            ["git", "-C", repo_dir, *args],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if res.returncode == 0:
+            return res.stdout.strip()
+    except OSError:
+        pass
+    return ""
+
+
+def collect_reproducibility_info(out_dir, summary, bench_filename=None):
+    cacao_work_hint = os.environ.get("CACAO_WORK_ROOT", "")
+    if not cacao_work_hint:
+        cur = os.path.abspath(out_dir)
+        for _ in range(4):
+            if os.path.isfile(os.path.join(cur, "env.sh")):
+                cacao_work_hint = cur
+                break
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+    src_parent = (
+        os.path.dirname(os.path.abspath(cacao_work_hint))
+        if cacao_work_hint
+        else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+
+    repos_out = []
+    for name, env_key, def_url, def_branch, role in REPO_SPECS:
+        cands = []
+        if env_key and os.environ.get(env_key):
+            cands.append(os.environ[env_key])
+        if name == "ImageStreamIO":
+            milk_d = os.environ.get("MILK_SRC_DIR") or os.path.join(src_parent, "milk")
+            cands.append(os.path.join(milk_d, "src", "engine", "ImageStreamIO"))
+        cands.extend(
+            [
+                os.path.join(src_parent, name),
+                os.path.expanduser(f"~/src/{name}"),
+            ]
+        )
+        rdir = next(
+            (
+                d
+                for d in cands
+                if d and (os.path.isdir(os.path.join(d, ".git")) or os.path.isfile(os.path.join(d, ".git")))
+            ),
+            None,
+        )
+        url = def_url
+        branch = def_branch
+        sha = ""
+        if rdir:
+            raw_url = _git_query(rdir, "remote", "get-url", "origin")
+            if raw_url:
+                if raw_url.startswith("git@github.com:"):
+                    raw_url = "https://github.com/" + raw_url[len("git@github.com:") :]
+                if raw_url.endswith(".git"):
+                    raw_url = raw_url[:-4]
+                url = raw_url
+            br = _git_query(rdir, "rev-parse", "--abbrev-ref", "HEAD")
+            if br and br != "HEAD":
+                branch = br
+            sha = _git_query(rdir, "rev-parse", "HEAD")
+        repos_out.append(
+            {
+                "name": name,
+                "url": url,
+                "branch": branch,
+                "commit": sha,
+                "short_commit": sha[:7] if sha else "",
+                "role": role,
+            }
+        )
+
+    sa = summary.get("star_and_atmosphere", {})
+    lps = summary.get("loops", {})
+    l1 = lps.get("stage1_ao3k", {})
+    l2 = lps.get("stage2_scexao", {})
+    vid = summary.get("short_timescale_video")
+    ov_k = int(sa.get("oversample", 4))
+    tlm_mode = vid.get("telemetry_mode", "speckle") if isinstance(vid, dict) else "none"
+    tlm_flag = f" --save-telemetry {tlm_mode}" if tlm_mode != "none" else ""
+    svd1 = l1.get("svdlim", 0.004)
+    svd2 = l2.get("svdlim", 0.004)
+
+    run_cmd = (
+        f"./scripts/run-ao3k-scexao.sh"
+        f" --seeing {sa.get('seeing_arcsec_500nm', 0.6):.2f}"
+        f" --phys-time {sa.get('physical_time_s', 10.0):.1f}"
+        f" --oversample {ov_k}"
+        f" --bench-mode fused"
+        f" --gain1 {l1.get('gain', 0.35):.2f}"
+        f" --gain2 {l2.get('gain', 0.35):.2f}"
+        f" --mult1 {l1.get('mult', 0.98):.2f}"
+        f" --mult2 {l2.get('mult', 0.98):.2f}"
+        f" --mgain-alpha {l1.get('mgain_alpha', 0.8):.2f}"
+        f" --mgain-floor {l1.get('mgain_floor', 0.10):.2f}"
+        f" --mgain-tt {l1.get('mgain_tt_factor', 1.0):.2f}"
+        f" --svdlim1 {svd1}"
+        f" --svdlim2 {svd2}"
+        f" --save-rm _work/ao3k_scexao_rm{tlm_flag}"
+    )
+
+    return {
+        "bench_file": bench_filename or "ao3k_scexao.bench",
+        "metrics_file": "ao3k_scexao_metrics.json",
+        "run_command": run_cmd,
+        "telemetry_mode": tlm_mode,
+        "repositories": repos_out,
+    }
+
+
 def write_ao_report_md(out_dir, s, bench_filename=None):
     tel = s.get("telescope", {})
     sa = s.get("star_and_atmosphere", {})
@@ -2680,6 +2870,14 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
     lines = [
         f"# AO Optical & Control Report: {s.get('configuration', 'AO3k + SCExAO')}",
         "",
+        "End-to-end closed-loop adaptive optics hardware-in-the-loop simulation coupling "
+        "[cacao](https://github.com/cacao-org/cacao) real-time control, "
+        "[milk](https://github.com/milk-org/milk) shared-memory pipelines (`fpspipe` / `milk-script`), "
+        "[cacaosim](https://github.com/cacao-org/cacaosim) GPU polychromatic sub-stepping optics, "
+        "[milkatmturb](https://github.com/oguyon/AtmosphericTurbulenceSimul) Maunakea turbulence, and "
+        "[milk-mltools](https://github.com/milk-org/milk-mltools) telemetry & PSF reconstruction, "
+        "orchestrated by [cacao-work](https://github.com/cacao-org/cacao-work).",
+        "",
         f"- **Seeing**: `{sa.get('seeing_arcsec_500nm', 0):.2f}\"` at 0.50 um | "
         f"**Star**: mV={sa.get('star_mV', 6):.1f}, mH={sa.get('star_mH', 6):.1f}",
         f"- **Internal Optical-Bench Clock**: **`{int_khz:.1f} kHz` "
@@ -2701,7 +2899,9 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
         "(`0.75 um, 15% BW, N=3ch`) & Near-IR H-band (`1.65 um, 18% BW, N=3ch`) with "
         "focal `lambda/D` scaling",
         "",
-        "> Companion systems & optimization report: [COMPUTE_REPORT.md](COMPUTE_REPORT.md)",
+        "> Companion systems & optimization report: [COMPUTE_REPORT.md](COMPUTE_REPORT.md) "
+        "| GitHub repos & CLI/AI reproduction recipe: "
+        "[Reproducibility & GitHub Provenance](#reproducibility-github-provenance)",
     ]
 
     schem_png = os.path.join(out_dir, "cacaosim_gui_schematic.png")
@@ -3149,6 +3349,102 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
             fig_lines.extend(["", f"### {sec_title}", "", *present])
     if fig_lines:
         lines.extend(["", "## Figures", *fig_lines])
+
+    repro = s.get("reproducibility")
+    if isinstance(repro, dict) and repro.get("repositories"):
+        repos = repro["repositories"]
+        by_name = {r["name"]: r for r in repos}
+        lines.extend(
+            [
+                "",
+                "## Reproducibility & GitHub Provenance",
+                "",
+                "All source code, optical bench definitions, real-time control scripts, "
+                "and telemetry/report tools used to produce this report are open-source. "
+                "The repository commit table and shell commands below contain everything "
+                "needed for a developer or autonomous AI agent to reproduce these results "
+                "from a clean Linux workspace.",
+                "",
+                "### Open-Source GitHub Repositories & Exact Commits",
+                "",
+                "| Repository | Branch | Commit | Role in Simulation Stack |",
+                "| :--- | :---: | :---: | :--- |",
+            ]
+        )
+        for r in repos:
+            rname = r["name"]
+            rurl = r["url"]
+            rbr = r["branch"]
+            rsha = r.get("commit", "")
+            rshort = r.get("short_commit", "")
+            sha_cell = (
+                f"[`{rshort}`]({rurl}/commit/{rsha})" if rsha and rshort else "`HEAD`"
+            )
+            lines.append(
+                f"| [{rname}]({rurl}) | `{rbr}` | {sha_cell} | {r['role']} |"
+            )
+
+        def _checkout_line(rname, clone_dir=None):
+            r = by_name.get(rname, {})
+            d = clone_dir or rname
+            url = r.get("url", f"https://github.com/milk-org/{rname}") + ".git"
+            br = r.get("branch", "main")
+            sha = r.get("commit", "")
+            cmd = f"git clone -b {br} {url} {d}"
+            if sha:
+                cmd += f" && git -C {d} checkout -q {sha}"
+            return cmd
+
+        isio_sha = by_name.get("ImageStreamIO", {}).get("commit", "")
+        isio_step = "git -C milk submodule update --init src/engine/ImageStreamIO"
+        if isio_sha:
+            isio_step += f" && git -C milk/src/engine/ImageStreamIO checkout -q {isio_sha}"
+
+        bfile = repro.get("bench_file", "ao3k_scexao.bench")
+        mfile = repro.get("metrics_file", "ao3k_scexao_metrics.json")
+        rcmd = repro.get("run_command", "./scripts/run-ao3k-scexao.sh")
+
+        lines.extend(
+            [
+                "",
+                "### End-to-End Reproduction Recipe (CLI & AI Agent Ready)",
+                "",
+                "- **System Prerequisites**: Linux `x86_64` with `/dev/shm` (`tmpfs`), "
+                "GCC/G++ with OpenMP, CMake >= 3.20, `pkg-config`, CFITSIO, FFTW3 (`fftw3` & "
+                "`fftw3f`), OpenBLAS + LAPACKE, `ncurses`, NVIDIA CUDA Toolkit (`nvcc`, `cufft`, "
+                "`cublas`; CPU fallback also supported), and Python >= 3.10 with `numpy`, "
+                "`astropy`, `matplotlib`, `pillow`, `imageio-ffmpeg`, and `pytest`.",
+                f"- **Machine-Readable Config & Metrics**: [{bfile}]({bfile}) and "
+                f"[{mfile}]({mfile}) (includes this `reproducibility` manifest).",
+                "",
+                "```bash",
+                "# 1. Clone all stack repositories at the exact commits recorded above",
+                "mkdir -p ~/src && cd ~/src",
+                _checkout_line("milk"),
+                isio_step,
+                _checkout_line("cacao"),
+                _checkout_line("milk-mltools"),
+                _checkout_line("OpticsMaterials"),
+                _checkout_line("WFpropagate"),
+                _checkout_line("AtmosphericTurbulenceSimul"),
+                _checkout_line("cacaosim"),
+                _checkout_line("cacao-work"),
+                "",
+                "# 2. Configure, build, install into milk/_install, and run isolated sanity tests",
+                "cd ~/src/cacao-work",
+                "source env.sh",
+                "./scripts/build-all.sh",
+                "pytest -v tests/test_00_stack_sanity.py tests/test_05_ao_web_report.py",
+                "",
+                "# 3. Run the 10 s Subaru AO3k + SCExAO simulation, telemetry, video & reports",
+                rcmd,
+                "",
+                "# 4. Stage static HTML site locally under _work/_web_site/public/",
+                "./scripts/publish-ao-report.sh --build-only _work/ao3k_scexao",
+                "```",
+            ]
+        )
+
     with open(os.path.join(out_dir, "REPORT.md"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
 
@@ -3518,6 +3814,10 @@ def main():
     vid_meta = ensure_telemetry_video(out_dir)
     if vid_meta is not None:
         summary["short_timescale_video"] = vid_meta
+
+    summary["reproducibility"] = collect_reproducibility_info(
+        out_dir, summary, bench_filename=bench_filename
+    )
 
     summary_path = os.path.join(out_dir, "ao3k_scexao_metrics.json")
     with open(summary_path, "w", encoding="utf-8") as fh:
