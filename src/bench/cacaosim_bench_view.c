@@ -3021,7 +3021,8 @@ void cacaosim_bench_render(
                 float m_hz   = (ctx->eff_master_hz > 0.1f) ? ctx->eff_master_hz
                                                            : ctx->cfg.master_hz;
                 float hz     = (nd->eff_navg > 0) ? (m_hz / (float) nd->eff_navg) : 0.0f;
-                float bw     = (nd->cfg.bw_frac > 0.0f) ? nd->cfg.bw_frac : 0.15f;
+                float bw     = (nd->cfg.bw_frac > 0.0f) ? nd->cfg.bw_frac : 0.0f;
+                int   nch    = (nd->eff_nlam >= 1) ? nd->eff_nlam : 1;
                 float ph_pix = nd->eff_flux_ph /
                                (float) ((nd->ncam > 0) ? (nd->ncam * nd->ncam / 4u + 1u) : 256u);
                 const char *reg_lbl = (sqrtf(ph_pix) > 2.0f * ron) ? "Shot"
@@ -3044,7 +3045,7 @@ void cacaosim_bench_render(
                 {
                     snprintf(rt_s, sizeof(rt_s), "%.0fHz", hz);
                 }
-                snprintf(rn_s, sizeof(rn_s), "%.2fe %s", ron, reg_lbl);
+                snprintf(rn_s, sizeof(rn_s), "%.1fe %s %dch", ron, reg_lbl, nch);
 
                 sbuf_t rline;
                 sb_init(&rline);

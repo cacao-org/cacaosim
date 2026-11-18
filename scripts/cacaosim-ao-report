@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """Compute quantitative PSF/loop metrics and render AO3k+SCExAO comparison plots."""
 
+import glob
 import json
 import math
 import os
@@ -60,6 +61,352 @@ STAGES = [
     ("stg1", "Stage 1 Only (AO3k)"),
     ("final", "Stage 1 + 2 (AO3k + SCExAO)"),
 ]
+
+SPEC_NSPEC = 32
+SPEC_MIN_UM = 0.40
+SPEC_MAX_UM = 2.40
+SPEC_DL_UM = (SPEC_MAX_UM - SPEC_MIN_UM) / SPEC_NSPEC
+
+
+def _spec_bin_lambda(b):
+    return SPEC_MIN_UM + (b + 0.5) * SPEC_DL_UM
+
+
+def _smooth_step_lo(lam, cut, roll):
+    w = roll if roll > 1e-4 else 0.02
+    z = 4.0 * (lam - cut) / w
+    if z > 40.0:
+        return 0.0
+    if z < -40.0:
+        return 1.0
+    return 1.0 / (1.0 + math.exp(z))
+
+
+def _spec_integrate_interval(spec, l_lo, l_hi):
+    if l_hi <= l_lo:
+        return 0.0, 0.5 * (l_lo + l_hi)
+    if spec is None:
+        dl = l_hi - l_lo
+        return dl, 0.5 * dl * (l_lo + l_hi)
+    knots = [SPEC_MIN_UM + k * SPEC_DL_UM for k in range(SPEC_NSPEC + 1)]
+    inv_dl = 1.0 / SPEC_DL_UM
+    d = [p * inv_dl for p in spec]
+    f_knots = [0.0] * (SPEC_NSPEC + 1)
+    f_knots[0] = max(0.0, 1.5 * d[0] - 0.5 * d[1])
+    for k in range(1, SPEC_NSPEC):
+        f_knots[k] = 0.5 * (d[k - 1] + d[k])
+    f_knots[SPEC_NSPEC] = max(0.0, 1.5 * d[SPEC_NSPEC - 1] - 0.5 * d[SPEC_NSPEC - 2])
+    tot_ph = 0.0
+    tot_mom = 0.0
+    if l_lo < knots[0]:
+        b = min(l_hi, knots[0])
+        seg = b - l_lo
+        ph = f_knots[0] * seg
+        tot_ph += ph
+        tot_mom += ph * 0.5 * (l_lo + b)
+    for k in range(SPEC_NSPEC):
+        a = max(l_lo, knots[k])
+        b = min(l_hi, knots[k + 1])
+        if b <= a:
+            continue
+        inv_seg = 1.0 / (knots[k + 1] - knots[k])
+        fa = f_knots[k] + (f_knots[k + 1] - f_knots[k]) * ((a - knots[k]) * inv_seg)
+        fb = f_knots[k] + (f_knots[k + 1] - f_knots[k]) * ((b - knots[k]) * inv_seg)
+        seg = b - a
+        ph = 0.5 * (fa + fb) * seg
+        tot_ph += ph
+        tot_mom += seg * (a * (2.0 * fa + fb) + b * (fa + 2.0 * fb)) / 6.0
+    if l_hi > knots[SPEC_NSPEC]:
+        a = max(l_lo, knots[SPEC_NSPEC])
+        seg = l_hi - a
+        ph = f_knots[SPEC_NSPEC] * seg
+        tot_ph += ph
+        tot_mom += ph * 0.5 * (a + l_hi)
+    return tot_ph, tot_mom
+
+
+def _sample_band_exact(spec, lam0, bw_frac, nlam, dt_s, qe):
+    n = max(1, min(32, int(nlam)))
+    bw = max(0.0, min(1.5, float(bw_frac)))
+    scale = max(0.0, float(dt_s)) * max(0.0, min(1.0, float(qe)))
+    if bw <= 1e-7:
+        return 0.0, [lam0] * n, [1.0 / n] * n, lam0
+    dlam = lam0 * bw
+    l_min = max(0.05, lam0 - 0.5 * dlam)
+    l_max = lam0 + 0.5 * dlam
+    if l_max <= l_min + 1e-8:
+        return 0.0, [lam0] * n, [1.0 / n] * n, lam0
+    sub_dl = (l_max - l_min) / n
+    raw_ph = []
+    lam_c = []
+    tot_ph = 0.0
+    tot_mom = 0.0
+    for c in range(n):
+        a = l_min + c * sub_dl
+        b = l_max if c == n - 1 else (a + sub_dl)
+        ph_c, mom_c = _spec_integrate_interval(spec, a, b)
+        raw_ph.append(ph_c)
+        lam_c.append((mom_c / ph_c) if ph_c > 1e-30 else 0.5 * (a + b))
+        tot_ph += ph_c
+        tot_mom += mom_c
+    if tot_ph > 1e-30:
+        weights = [p / tot_ph for p in raw_ph]
+        eff_lam = tot_mom / tot_ph
+    else:
+        weights = [1.0 / n] * n
+        eff_lam = lam0
+    return tot_ph * scale, lam_c, weights, eff_lam
+
+
+def analyze_bench_chromaticity(bench_path):
+    if not bench_path or not os.path.isfile(bench_path):
+        return None
+    bench = {
+        "tel_diam_m": 8.2,
+        "cobs": 0.30,
+        "star_mag": 6.0,
+        "star_teff": 9600.0,
+        "tput_tel": 0.75,
+        "master_hz": 2000.0,
+        "out_beam": "b_pup",
+    }
+    nodes = []
+    cur = None
+    with open(bench_path, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                sec = line[1:-1].strip()
+                if sec.lower() == "bench":
+                    cur = ("bench", bench)
+                elif "." in sec:
+                    kind, nid = [t.strip() for t in sec.split(".", 1)]
+                    nd = {"kind": kind.lower(), "id": nid}
+                    nodes.append(nd)
+                    cur = ("node", nd)
+                else:
+                    cur = None
+                continue
+            if cur is None or "=" not in line:
+                continue
+            k, v = [t.strip() for t in line.split("=", 1)]
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+                v = v[1:-1]
+            cur[1][k] = v
+
+    diam = float(bench.get("tel_diam_m", 8.2))
+    obs = float(bench.get("cobs", bench.get("obs_frac", 0.30)))
+    mag = float(bench.get("star_mag", 6.0))
+    teff = max(500.0, float(bench.get("star_teff", 9600.0)))
+    tput = float(bench.get("tput_tel", bench.get("tel_tput", 0.75)))
+    master_hz = max(1.0, float(bench.get("master_hz", bench.get("frame_rate", 2000.0))))
+    oversample = max(1, int(float(bench.get("oversample", 1))))
+    eff_master_hz = master_hz * oversample
+    dt_outer_ms = 1000.0 / master_hz
+    dt_sub_ms = 1000.0 / eff_master_hz
+    dt_sub_us = 1.0e6 / eff_master_hz
+    atm_interp = str(bench.get("atm_interp", "1")).lower() not in ("0", "off", "false")
+    area = 0.25 * math.pi * diam * diam * (1.0 - obs * obs)
+    f0_v = 1.0e11 * (10.0 ** (-0.4 * mag))
+    base_flx = f0_v * area * tput * SPEC_DL_UM
+    hc_k = 14387.77
+    n_v = 1.0 / ((0.55**4) * math.expm1(hc_k / (0.55 * teff)))
+
+    root_spec = []
+    lam_bins = [_spec_bin_lambda(b) for b in range(SPEC_NSPEC)]
+    for lam in lam_bins:
+        x = hc_k / (lam * teff)
+        rel = 0.0 if x > 80.0 else (1.0 / ((lam**4) * math.expm1(x))) / n_v
+        root_spec.append(base_flx * rel)
+
+    beams = {bench.get("out_beam", "b_pup"): root_spec}
+    beam_nlam = {bench.get("out_beam", "b_pup"): 1}
+    sensors = []
+    dms = []
+
+    for nd in nodes:
+        kind = nd["kind"]
+        in_b = nd.get("in", nd.get("in_beam", ""))
+        sp_in = beams.get(in_b, root_spec)
+        in_nl = beam_nlam.get(in_b, 1)
+        if kind in ("dm", "ttm", "wfe", "static_wfe"):
+            tp = float(nd.get("tput", 0.98))
+            out_b = nd.get("out", nd.get("out_beam", ""))
+            if out_b:
+                beams[out_b] = [p * tp for p in sp_in]
+                beam_nlam[out_b] = in_nl
+            if kind in ("dm", "ttm"):
+                del_us = float(nd.get("delay_us", 0.0))
+                tau_us = float(nd.get("tau_us", 0.0))
+                dms.append(
+                    {
+                        "id": nd["id"],
+                        "kind": kind,
+                        "nact_x": int(nd.get("nact_x", 1)),
+                        "nact_y": int(nd.get("nact_y", 1)),
+                        "delay_us": del_us,
+                        "delay_subticks": del_us / dt_sub_us if dt_sub_us > 0 else 0.0,
+                        "tau_us": tau_us,
+                        "dyn_mode": int(nd.get("dyn_mode", 0)),
+                    }
+                )
+        elif kind == "splitter":
+            mode = nd.get("mode", "dichroic_lp").lower()
+            cut = float(nd.get("lambda_cut", 0.95))
+            bw_sp = float(nd.get("band_width", 0.25))
+            roll = float(nd.get("roll_um", 0.03))
+            er = float(nd.get("eff_refl", 0.95))
+            et = float(nd.get("eff_trans", 0.95))
+            rg = float(nd.get("r_gray", 0.50))
+            tg = float(nd.get("t_gray", 0.50))
+            sp_r, sp_t = [], []
+            for b, lam in enumerate(lam_bins):
+                if mode in ("gray", "0"):
+                    r, t = max(0.0, rg), max(0.0, tg)
+                elif mode in ("dichroic_lp", "lp", "1"):
+                    s = _smooth_step_lo(lam, cut, roll)
+                    r, t = er * s, et * (1.0 - s)
+                elif mode in ("dichroic_sp", "sp", "2"):
+                    s = _smooth_step_lo(lam, cut, roll)
+                    r, t = er * (1.0 - s), et * s
+                else:
+                    hw = 0.5 * max(0.01, bw_sp)
+                    bp = (1.0 - _smooth_step_lo(lam, cut - hw, roll)) * _smooth_step_lo(
+                        lam, cut + hw, roll
+                    )
+                    r, t = er * bp, et * (1.0 - bp)
+                if r + t > 1.0:
+                    r, t = r / (r + t), t / (r + t)
+                sp_r.append(r * sp_in[b])
+                sp_t.append(t * sp_in[b])
+            if nd.get("out_refl"):
+                beams[nd["out_refl"]] = sp_r
+                beam_nlam[nd["out_refl"]] = in_nl
+            if nd.get("out_trans"):
+                beams[nd["out_trans"]] = sp_t
+                beam_nlam[nd["out_trans"]] = in_nl
+        elif kind == "coro":
+            tp = float(nd.get("tput", 0.92))
+            bw_c = float(nd.get("bw_frac", 0.0))
+            nl_c = int(nd.get("nlambda", 0))
+            eff_c = nl_c if nl_c >= 1 else (in_nl if in_nl > 1 else (2 if bw_c > 1e-6 else 1))
+            out_b = nd.get("out", nd.get("out_beam", ""))
+            if out_b:
+                beams[out_b] = [p * tp for p in sp_in]
+                beam_nlam[out_b] = eff_c
+            lo_b = nd.get("out_lowfs", "")
+            if lo_b:
+                refl = float(nd.get("lowfs_refl", 0.95))
+                beams[lo_b] = [p * tp * refl * refl for p in sp_in]
+                beam_nlam[lo_b] = eff_c
+        elif kind in ("pyrwfs", "shwfs", "zwfs", "fpcam"):
+            def_lam = 1.65 if kind == "fpcam" else 0.75
+            def_bw = 0.18 if kind == "fpcam" else 0.20
+            def_qe = 0.85 if kind == "fpcam" else 0.80
+            lam0 = float(nd.get("lambda_um", def_lam))
+            if "dlambda_um" in nd:
+                bw_f = max(0.0, float(nd["dlambda_um"])) / max(0.05, lam0)
+            else:
+                bw_f = float(nd.get("bw_frac", def_bw))
+            cfg_nl = int(nd.get("nlambda", 0))
+            eff_nl = (
+                max(1, min(32, cfg_nl))
+                if cfg_nl >= 1
+                else (in_nl if in_nl > 1 else (2 if bw_f > 1e-6 else 1))
+            )
+            qe = float(nd.get("qe", def_qe))
+            rate_hz = float(nd.get("rate_hz", 0.0))
+            navg = max(1, int(nd.get("navg", 1)))
+            eff_hz = rate_hz if rate_hz > 0.1 else (master_hz / navg)
+            navg_sub = (
+                max(1, int(round(eff_master_hz / eff_hz)))
+                if rate_hz > 0.1
+                else (navg * oversample)
+            )
+            sim_hz_cfg = float(nd.get("sim_hz", 0.0))
+            sub_stride_cfg = int(nd.get("subframe_stride", 0))
+            if sim_hz_cfg > 0.1:
+                stride_sub = max(1, int(round(eff_master_hz / sim_hz_cfg)))
+            elif sub_stride_cfg >= 1:
+                stride_sub = sub_stride_cfg
+            elif kind == "fpcam" and oversample > 1:
+                stride_sub = oversample
+            else:
+                stride_sub = 1
+            stride_sub = min(stride_sub, navg_sub)
+            if sub_stride_cfg == 0 and sim_hz_cfg <= 0.1:
+                while stride_sub > 1 and (navg_sub % stride_sub) != 0:
+                    stride_sub -= 1
+            evals_per_fr = max(1, navg_sub // stride_sub)
+            dt_exp = 1.0 / eff_hz
+            use_bf = str(nd.get("use_beam_flux", "1")).lower() not in ("0", "off", "false")
+            flx, c_lam, c_w, eff_lam = _sample_band_exact(
+                sp_in if use_bf else None, lam0, bw_f, eff_nl, dt_exp, qe
+            )
+            if not use_bf:
+                flx = float(nd.get("flux_ph", 1.0e5))
+            dlam = lam0 * bw_f
+            ncam = (
+                int(nd.get("n_sub", 16)) * int(nd.get("pix_per_sub", 8))
+                if kind == "shwfs"
+                else int(nd.get("ncam", 128 if kind == "fpcam" else 64))
+            )
+            sensors.append(
+                {
+                    "id": nd["id"],
+                    "kind": kind,
+                    "in_beam": in_b,
+                    "out_cam": nd.get("out_cam", ""),
+                    "ncam": ncam,
+                    "lambda0_um": lam0,
+                    "bw_frac": bw_f,
+                    "dlambda_um": dlam,
+                    "lambda_min_um": max(0.05, lam0 - 0.5 * dlam),
+                    "lambda_max_um": lam0 + 0.5 * dlam,
+                    "eff_nlam": eff_nl,
+                    "eff_lambda_um": eff_lam,
+                    "chan_lam_um": c_lam,
+                    "chan_weight": c_w,
+                    "focal_scale_lam0_over_lam": [lam0 / lc for lc in c_lam],
+                    "rate_hz": eff_hz,
+                    "navg_subticks": navg_sub,
+                    "stride_subticks": stride_sub,
+                    "evals_per_frame": evals_per_fr,
+                    "qe": qe,
+                    "flux_ph_per_frame": flx,
+                }
+            )
+
+    beam_out = {}
+    for bname, sp in beams.items():
+        tot = float(sum(sp))
+        mean_l = (
+            float(sum(p * lam_bins[i] for i, p in enumerate(sp)) / tot) if tot > 0.0 else 0.0
+        )
+        beam_out[bname] = {
+            "total_ph_s": tot,
+            "mean_lambda_um": mean_l,
+            "ph_s_per_um": [p / SPEC_DL_UM for p in sp],
+        }
+
+    return {
+        "lambda_bins_um": lam_bins,
+        "spec_dl_um": SPEC_DL_UM,
+        "timing": {
+            "outer_master_hz": master_hz,
+            "outer_dt_ms": dt_outer_ms,
+            "oversample": oversample,
+            "internal_bench_hz": eff_master_hz,
+            "internal_dt_ms": dt_sub_ms,
+            "internal_dt_us": dt_sub_us,
+            "atm_interp": atm_interp,
+            "dms": dms,
+        },
+        "beams": beam_out,
+        "sensors": sensors,
+    }
 
 
 def radial_profile(img, cx, cy, dr=0.5):
@@ -500,7 +847,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 from matplotlib.lines import Line2D
-from matplotlib.patches import Circle
+from matplotlib.patches import Circle, Patch
 from matplotlib.ticker import MaxNLocator
 
 out_dir, summary_path = sys.argv[1], sys.argv[2]
@@ -513,16 +860,16 @@ stages = [
     ("final", "Final Stage 1+2 (AO3k + SCExAO)"),
 ]
 bands = [
-    ("vis", "Visible I-Band (0.75 µm)", 0.72),
-    ("nir", "Near-IR H-Band (1.65 µm)", 1.50),
+    ("vis", "Visible I-Band (0.75 µm, 15% BW, 3ch)", 0.72),
+    ("nir", "Near-IR H-Band (1.65 µm, 18% BW, 3ch)", 1.50),
 ]
 
 fig, axes = plt.subplots(2, 3, figsize=(14.5, 9.2), constrained_layout=True)
 fig.suptitle(
-    "Subaru 8.2 m AO3k + SCExAO Two-Stage Correction — 10.0 s Integrated PSFs\n"
-    "(Seeing = 0.60\", Star mV = 6 / mH = 6, Stage 1 = 1 kHz NIR PyWFS, "
-    "Stage 2 = 2 kHz Vis PyWFS)",
-    fontsize=13,
+    "Subaru 8.2 m AO3k + SCExAO Two-Stage Correction — 10.0 s Polychromatic PSFs\n"
+    "(Seeing = 0.60\", Star mV = 6 / mH = 6, Stage 1 = 1 kHz J-Band 20% 2ch PyWFS, "
+    "Stage 2 = 2 kHz Vis 20% 2ch PyWFS)",
+    fontsize=12.6,
     fontweight="bold",
 )
 
@@ -880,7 +1227,7 @@ if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
         wfs_cols = [
             (
                 "wfs_raw_stg1",
-                "Stage 1 AO3k Raw PyWFS\n(csim_wfs_nir, 1.22 µm @ 1 kHz)",
+                "Stage 1 AO3k Raw PyWFS\n(csim_wfs_nir, 1.22 µm 20% 2ch @ 1 kHz)",
                 "raw",
             ),
             (
@@ -890,7 +1237,7 @@ if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
             ),
             (
                 "wfs_raw_stg2",
-                "Stage 2 SCExAO Raw PyWFS\n(csim_wfs_vis, 0.75 µm @ 2 kHz)",
+                "Stage 2 SCExAO Raw PyWFS\n(csim_wfs_vis, 0.75 µm 20% 2ch @ 2 kHz)",
                 "raw",
             ),
             (
@@ -1716,7 +2063,22 @@ if has_wf_ts and has_sr_ts:
     samp_list = [
         sm for sm in (wf_info or {}).get("samples", []) if sm.get("t_phys_s") is not None
     ]
+    vid_info = data.get("short_timescale_video")
+    vid_span = None
+    if vid_info and vid_info.get("t_start_s") is not None and vid_info.get("t_end_s") is not None:
+        vid_span = (float(vid_info["t_start_s"]), float(vid_info["t_end_s"]))
+
     for ax in axest:
+        if vid_span is not None:
+            ax.axvspan(
+                vid_span[0],
+                vid_span[1],
+                color="#10b981",
+                alpha=0.22,
+                zorder=2,
+            )
+            ax.axvline(vid_span[0], color="#059669", lw=1.1, alpha=0.80, zorder=3)
+            ax.axvline(vid_span[1], color="#059669", lw=1.1, alpha=0.80, zorder=3)
         for sm in samp_list:
             ax.axvline(
                 float(sm["t_phys_s"]),
@@ -1802,6 +2164,19 @@ if has_wf_ts and has_sr_ts:
             )
         )
         l0.append(f"Sampled Snapshots S1-S{len(samp_list)} (PSF/WF/DM/WFS)")
+    if vid_span is not None:
+        h0.append(
+            Patch(
+                facecolor="#10b981",
+                edgecolor="#059669",
+                alpha=0.45,
+                lw=1.1,
+            )
+        )
+        l0.append(
+            f"Video Clip [{vid_span[0]:.2f}..{vid_span[1]:.2f} s] "
+            f"({(vid_span[1]-vid_span[0])*1e3:.0f} ms)"
+        )
     ax0.legend(h0, l0, loc="upper right", fontsize=8.0, framealpha=0.92)
 
     ax1 = axest[1]
@@ -1888,18 +2263,34 @@ if has_wf_ts and has_sr_ts:
     }
     for ax_s, bkey, blab, cols in sr_band_panels:
         max_sr = 10.0
+        has_highrate_sr = False
         for ci, cl, skey in cols:
             slab, col_c = sr_stage_meta[skey]
             yi = sr_arr[:, ci] * 100.0
             yl = sr_arr[:, cl] * 100.0
             ms = sr_stat.get(bkey, {}).get(skey, {})
-            if np.any(np.isfinite(yi)):
-                max_sr = max(max_sr, float(np.nanmax(yi)))
+            m_i = np.isfinite(yi)
+            if np.any(m_i):
+                t_i = t_sr[m_i]
+                y_i = yi[m_i]
+                max_sr = max(max_sr, float(np.max(y_i)))
                 lbl_i = (
                     f"{slab}: short mean={ms.get('inst_mean', 0)*100:.1f}% "
                     f"(long={ms.get('long_final', 0)*100:.1f}%)"
                 )
-                ax_s.plot(t_sr, yi, color=col_c, lw=1.15, alpha=0.68, label=lbl_i)
+                if y_i.size > 2000:
+                    has_highrate_sr = True
+                    ax_s.plot(t_i, y_i, color=col_c, lw=0.45, alpha=0.22)
+                    ax_s.plot(
+                        t_i,
+                        _boxcar_1d(y_i, 21),
+                        color=col_c,
+                        lw=1.55,
+                        alpha=0.88,
+                        label=lbl_i,
+                    )
+                else:
+                    ax_s.plot(t_i, y_i, color=col_c, lw=1.15, alpha=0.68, label=lbl_i)
                 if samp_list:
                     sx, sy = [], []
                     for sm in samp_list:
@@ -1912,14 +2303,14 @@ if has_wf_ts and has_sr_ts:
                         )
                         if sr_pk is not None and np.isfinite(sr_pk):
                             yv = float(sr_pk) * 100.0
-                        elif t_sr.size > 0:
-                            cand = np.where(t_sr <= ts_v + 1e-6)[0]
+                        elif t_i.size > 0:
+                            cand = np.where(t_i <= ts_v + 1e-6)[0]
                             idx_s = (
                                 int(cand[-1])
                                 if cand.size > 0
-                                else int(np.argmin(np.abs(t_sr - ts_v)))
+                                else int(np.argmin(np.abs(t_i - ts_v)))
                             )
-                            yv = float(yi[idx_s])
+                            yv = float(y_i[idx_s])
                         else:
                             yv = float("nan")
                         if np.isfinite(yv):
@@ -1935,11 +2326,17 @@ if has_wf_ts and has_sr_ts:
                             linewidths=1.15,
                             zorder=6,
                         )
-            if np.any(np.isfinite(yl)):
-                max_sr = max(max_sr, float(np.nanmax(yl)))
-                ax_s.plot(t_sr, yl, color=col_c, ls="--", lw=2.2, alpha=0.95)
+            m_l = np.isfinite(yl)
+            if np.any(m_l):
+                max_sr = max(max_sr, float(np.max(yl[m_l])))
+                ax_s.plot(t_sr[m_l], yl[m_l], color=col_c, ls="--", lw=2.2, alpha=0.95)
+        exp_desc = (
+            "Solid: 0.5 ms Speckle + 10 ms Smooth"
+            if has_highrate_sr
+            else "Solid: 10 ms Short-Exp"
+        )
         ax_s.set_title(
-            f"{blab} Strehl Ratios vs Time (Solid: 10 ms Short-Exp | Dashed: Cumulative Long-Exp)",
+            f"{blab} Strehl Ratios vs Time ({exp_desc} | Dashed: Cumulative Long-Exp)",
             fontsize=11,
             fontweight="bold",
         )
@@ -1959,6 +2356,137 @@ if has_wf_ts and has_sr_ts:
     axest[3].set_xlabel("Physical Simulation Time t [s]", fontsize=10.5)
     figt.savefig(os.path.join(out_dir, "wf_strehl_timeseries_4x1.png"), dpi=180)
     plt.close(figt)
+
+chrom = data.get("chromaticity")
+if chrom and chrom.get("beams") and chrom.get("sensors"):
+    lam_b = np.asarray(chrom["lambda_bins_um"], dtype=float)
+    bmap = chrom["beams"]
+    figc, axesc = plt.subplots(
+        2, 1, figsize=(13.8, 7.6), sharex=True, constrained_layout=True
+    )
+    figc.suptitle(
+        "Subaru 8.2 m AO3k + SCExAO — Polychromatic Photon Budget & "
+        "Sub-Band Optical Sampling\n"
+        "(32-Bin Dichroic Beam Spectra [0.40..2.40 µm] & Bolometric Sub-Band "
+        "Centroids λ_c with Focal λ₀/λ_c Scaling)",
+        fontsize=12.4,
+        fontweight="bold",
+    )
+
+    ax_sp = axesc[0]
+    beam_plot = [
+        ("b_pup", "Entrance Pupil (b_pup)", "#111827", "--", 2.0),
+        ("b_nir_wfs", "Stage-1 AO3k J-Band PyWFS Arm (b_nir_wfs)", "#d97706", "-", 2.3),
+        ("b_vis_wfs", "Stage-2 SCExAO Vis PyWFS Arm (b_vis_wfs)", "#2563eb", "-", 2.3),
+        ("b_vis_sci", "Stage-2 Vis Science Arm (b_vis_sci, 10%)", "#0891b2", "-.", 1.9),
+        ("b_nir_sci", "Stage-2 H-Band Science Arm (b_nir_sci)", "#dc2626", "-", 2.2),
+    ]
+    for bk, blab, col_b, ls_b, lw_b in beam_plot:
+        if bk not in bmap:
+            continue
+        yv = np.maximum(np.asarray(bmap[bk]["ph_s_per_um"], dtype=float), 2.0e5)
+        tot_s = bmap[bk]["total_ph_s"]
+        ax_sp.semilogy(
+            lam_b,
+            yv,
+            color=col_b,
+            ls=ls_b,
+            lw=lw_b,
+            label=f"{blab} ({tot_s:.2e} ph/s)",
+        )
+    ax_sp.set_ylim(1.0e5, 8.0e11)
+    ax_sp.set_ylabel("Spectral Photon Rate [ph / s / µm]")
+    ax_sp.set_title(
+        "Propagated 32-Bin Stellar & Dichroic Beam Spectra (mV = 6.0, Teff = 9600 K, D = 8.2 m)",
+        fontsize=11,
+        fontweight="bold",
+    )
+    ax_sp.grid(True, which="both", alpha=0.28)
+    ax_sp.legend(loc="upper right", fontsize=8.4, ncol=2, framealpha=0.92)
+
+    ax_sb = axesc[1]
+    pick_ids = ["wfs_vis", "vis_final", "wfs_nir", "nir_final"]
+    s_by_id = {sn["id"]: sn for sn in chrom["sensors"]}
+    disp_sens = [s_by_id[k] for k in pick_ids if k in s_by_id]
+    if not disp_sens:
+        disp_sens = chrom["sensors"][:6]
+    s_colors = {
+        "wfs_vis": "#2563eb",
+        "vis_final": "#0891b2",
+        "wfs_nir": "#d97706",
+        "nir_final": "#dc2626",
+    }
+    ylabels = []
+    for idx_y, sn in enumerate(disp_sens):
+        col_s = s_colors.get(sn["id"], "#3b82f6")
+        lmin = float(sn["lambda_min_um"])
+        lmax = float(sn["lambda_max_um"])
+        nlam = int(sn["eff_nlam"])
+        sub_dl = (lmax - lmin) / max(nlam, 1)
+        ax_sb.barh(
+            idx_y,
+            lmax - lmin,
+            left=lmin,
+            height=0.46,
+            color=col_s,
+            alpha=0.22,
+            edgecolor=col_s,
+            lw=1.5,
+        )
+        for k_edge in range(1, nlam):
+            xe = lmin + k_edge * sub_dl
+            ax_sb.plot(
+                [xe, xe],
+                [idx_y - 0.23, idx_y + 0.23],
+                color=col_s,
+                ls=":",
+                lw=1.2,
+            )
+        clams = sn["chan_lam_um"]
+        cws = sn["chan_weight"]
+        fscs = sn["focal_scale_lam0_over_lam"]
+        ax_sb.scatter(
+            clams,
+            [idx_y] * len(clams),
+            s=[160.0 * max(w, 0.15) for w in cws],
+            color=col_s,
+            edgecolors="#111827",
+            linewidths=1.1,
+            zorder=5,
+        )
+        tag_pts = ", ".join(
+            f"{lc:.3f}µm ({w*100:.0f}%, {sc:.2f}×)"
+            for lc, w, sc in zip(clams, cws, fscs)
+        )
+        place_left = lmin > 1.35
+        ax_sb.text(
+            (lmin - 0.025) if place_left else (lmax + 0.025),
+            idx_y,
+            f"N={nlam}ch | {sn['flux_ph_per_frame']:.2e} ph/fr | {tag_pts}",
+            va="center",
+            ha="right" if place_left else "left",
+            fontsize=8.3,
+            family="monospace",
+            color="#111827",
+        )
+        ylabels.append(
+            f"{sn['id']} ({sn['kind'].upper()})\n"
+            f"λ₀={sn['lambda0_um']:.2f}µm, Δλ/λ₀={sn['bw_frac']*100:.0f}%"
+        )
+    ax_sb.set_yticks(range(len(disp_sens)))
+    ax_sb.set_yticklabels(ylabels, fontsize=9.0, fontweight="bold")
+    ax_sb.set_ylim(-0.6, max(len(disp_sens) - 0.4, 0.6))
+    ax_sb.set_xlim(0.38, 2.42)
+    ax_sb.set_xlabel("Wavelength λ [µm]", fontsize=10.5)
+    ax_sb.set_title(
+        "Sensor Passbands [λ_min..λ_max], Contiguous Sub-Bands & "
+        "Flux-Weighted Propagation Slices λ_c (w_c, λ₀/λ_c)",
+        fontsize=10.8,
+        fontweight="bold",
+    )
+    ax_sb.grid(True, axis="x", alpha=0.28)
+    figc.savefig(os.path.join(out_dir, "chromatic_passbands_2x1.png"), dpi=180)
+    plt.close(figc)
 """
     py_exec = sys.executable
     try:
@@ -2055,6 +2583,78 @@ def ensure_gui_screenshots(work_dir, out_dir):
     return os.path.basename(staged_bench)
 
 
+def ensure_telemetry_video(out_dir):
+    tlm_cands = [
+        os.environ.get("CACAOSIM_TELEMETRY_DIR", ""),
+        os.path.join(out_dir, "telemetry"),
+    ]
+    tlm_dir = next(
+        (
+            d
+            for d in tlm_cands
+            if d
+            and os.path.isdir(d)
+            and glob.glob(os.path.join(d, "csim_wfs_vis_*.fits*"))
+            and glob.glob(os.path.join(d, "psf_vis_final_*.fits*"))
+        ),
+        None,
+    )
+    mp4_path = os.path.join(out_dir, "wfs_psf_short_evolution.mp4")
+    meta_cache = os.path.join(out_dir, "wfs_psf_short_evolution_meta.json")
+
+    if tlm_dir is not None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        vid_cands = [
+            shutil.which("cacaosim-telemetry-video") or "",
+            os.path.join(script_dir, "cacaosim-telemetry-video"),
+            os.path.join(
+                os.environ.get("MILK_INSTALL_ROOT", ""), "bin", "cacaosim-telemetry-video"
+            ),
+            os.path.join(
+                os.environ.get("MILK_ROOT", ""), "bin", "cacaosim-telemetry-video"
+            ),
+        ]
+        vid_bin = next(
+            (p for p in vid_cands if p and os.path.isfile(p)),
+            None,
+        )
+        if vid_bin is not None:
+            try:
+                subprocess.run(
+                    [
+                        sys.executable,
+                        vid_bin,
+                        "--telemetry-dir",
+                        tlm_dir,
+                        "--report-dir",
+                        out_dir,
+                        "--out",
+                        mp4_path,
+                        "--meta-out",
+                        meta_cache,
+                    ],
+                    check=True,
+                )
+            except (OSError, subprocess.CalledProcessError) as exc:
+                print(
+                    f"[cacaosim-ao-report] Warning: telemetry video render failed: {exc}",
+                    file=sys.stderr,
+                )
+
+    if os.path.isfile(mp4_path) and os.path.isfile(meta_cache):
+        try:
+            with open(meta_cache, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            pass
+    if os.path.isfile(mp4_path):
+        return {
+            "video_file": "wfs_psf_short_evolution.mp4",
+            "size_bytes": int(os.path.getsize(mp4_path)),
+        }
+    return None
+
+
 def write_ao_report_md(out_dir, s, bench_filename=None):
     tel = s.get("telescope", {})
     sa = s.get("star_and_atmosphere", {})
@@ -2064,20 +2664,42 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
     pm = s.get("psf_metrics", {})
     wm = s.get("wavefront_metrics")
 
+    chrom = s.get("chromaticity", {})
+    tinfo = s.get("timing") or chrom.get("timing", {})
+    outer_hz = float(tinfo.get("outer_master_hz", sa.get("master_rate_phys_hz", 2000.0)))
+    outer_khz = outer_hz / 1000.0
+    outer_dt_ms = float(tinfo.get("outer_dt_ms", 1000.0 / max(outer_hz, 1.0)))
+    ov_k = max(1, int(tinfo.get("oversample", sa.get("oversample", 4))))
+    int_hz = float(tinfo.get("internal_bench_hz", outer_hz * ov_k))
+    int_khz = int_hz / 1000.0
+    int_dt_ms = float(tinfo.get("internal_dt_ms", 1000.0 / max(int_hz, 1.0)))
+    int_dt_us = float(tinfo.get("internal_dt_us", 1.0e6 / max(int_hz, 1.0)))
+    n_outer_ticks = int(sa.get("master_ticks_integrated", 0))
+    n_sub_ticks = n_outer_ticks * ov_k
+
     lines = [
         f"# AO Optical & Control Report: {s.get('configuration', 'AO3k + SCExAO')}",
         "",
         f"- **Seeing**: `{sa.get('seeing_arcsec_500nm', 0):.2f}\"` at 0.50 um | "
         f"**Star**: mV={sa.get('star_mV', 6):.1f}, mH={sa.get('star_mH', 6):.1f}",
+        f"- **Internal Optical-Bench Clock**: **`{int_khz:.1f} kHz` "
+        f"(`dt = {int_dt_ms:.3f} ms = {int_dt_us:.0f} us`), i.e., "
+        f"`{ov_k}` sub-samples per `{outer_dt_ms:.2f} ms` (`{outer_khz:.1f} kHz`) outer tick**",
         f"- **Integration**: `{sa.get('physical_time_s', 0):.2f} s` physical "
-        f"(`{sa.get('master_ticks_integrated', 0)}` ticks @ 2 kHz, "
+        f"(`{n_outer_ticks}` outer ticks @ `{outer_khz:.1f} kHz` = "
+        f"`{n_sub_ticks}` internal sub-ticks @ `{int_khz:.1f} kHz`, "
         f"`{sa.get('wall_elapsed_s', 0):.2f} s` wall-clock)",
         f"- **Stage 1 (AO3k)**: `{l1.get('dm_grid', '64x64')}` DM (D="
-        f"{l1.get('dm_pupil_diam_act', 60)}), `{l1.get('wfs_detector', '160x160')}` NIR PyWFS, "
+        f"{l1.get('dm_pupil_diam_act', 60)}), `{l1.get('wfs_detector', '160x160')}` "
+        f"polychromatic J-band PyWFS (`1.22 um, 20% BW, N=2ch, /{2*ov_k} sub-ticks`), "
         f"`{l1.get('n_cm_modes', 0)}` CM modes",
         f"- **Stage 2 (SCExAO)**: `{l2.get('dm_grid', '50x50')}` DM (D="
-        f"{l2.get('dm_pupil_diam_act', 46)}), `{l2.get('wfs_detector', '120x120')}` Vis PyWFS, "
+        f"{l2.get('dm_pupil_diam_act', 46)}), `{l2.get('wfs_detector', '120x120')}` "
+        f"polychromatic Vis PyWFS (`0.75 um, 20% BW, N=2ch, /{ov_k} sub-ticks`), "
         f"`{l2.get('n_cm_modes', 0)}` CM modes",
+        "- **Science Cameras**: Polychromatic Soummer-MFT PSFs in Visible I-band "
+        "(`0.75 um, 15% BW, N=3ch`) & Near-IR H-band (`1.65 um, 18% BW, N=3ch`) with "
+        "focal `lambda/D` scaling",
         "",
         "> Companion systems & optimization report: [COMPUTE_REPORT.md](COMPUTE_REPORT.md)",
     ]
@@ -2098,11 +2720,12 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
             diam_v = tel.get("diameter_m", 8.2)
             cobs_pct = tel.get("cobs", 0.30) * 100.0
             pscale_v = tel.get("pupil_scale_m_pix", 8.2 / 240.0)
-            mhz_v = sa.get("master_rate_phys_hz", 2000.0) / 1000.0
             lines.append(
                 f"- **Declarative Bench**: [{bench_filename}]({bench_filename}) "
                 f"(`{nwf_v}x{nwf_v}` grid, `D = {diam_v:.2f} m`, "
-                f"`cobs = {cobs_pct:.0f}%`, `{pscale_v:.4f} m/pix`, `{mhz_v:.1f} kHz` master)"
+                f"`cobs = {cobs_pct:.0f}%`, `{pscale_v:.4f} m/pix`, "
+                f"`{outer_khz:.1f} kHz` outer `x{ov_k}` = "
+                f"`{int_khz:.1f} kHz` / `{int_dt_us:.0f} us` internal)"
             )
         lines.append(
             f"- **Optical Relay**: Entrance pupil (`b_pup`) -> Stage-1 AO3k "
@@ -2124,6 +2747,108 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
                     "",
                     "![cacaosim-CTRL 2D Optical Bench Schematic, Entrance Pupil & "
                     "32-Bin Polychromatic Spectra (F3:SCHEMATIC)](cacaosim_gui_schematic.png)",
+                ]
+            )
+
+    dms_t = tinfo.get("dms", [])
+    dm1_t = next((d for d in dms_t if d["id"] == "ao3k"), dms_t[0] if dms_t else None)
+    dm2_t = next((d for d in dms_t if d["id"] == "scexao"), dms_t[1] if len(dms_t) > 1 else None)
+    dm1_note = (
+        f"delay `{dm1_t['delay_us']:.0f} us` (`{dm1_t['delay_subticks']:.0f}` sub-ticks), "
+        f"RC `tau = {dm1_t['tau_us']:.0f} us`"
+        if dm1_t
+        else f"stepped every `{int_dt_us:.0f} us` sub-tick"
+    )
+    dm2_note = (
+        f"delay `{dm2_t['delay_us']:.0f} us` (`{dm2_t['delay_subticks']:.0f}` sub-ticks), "
+        f"RC `tau = {dm2_t['tau_us']:.0f} us`"
+        if dm2_t
+        else f"stepped every `{int_dt_us:.0f} us` sub-tick"
+    )
+    wf_nfr = (
+        int(wm["n_frames"])
+        if wm and "n_frames" in wm
+        else int(sa.get("physical_time_s", 10) * outer_hz)
+    )
+    lines.extend(
+        [
+            "",
+            f"### Internal Multi-Rate Timing & Sub-Stepping "
+            f"(`{int_khz:.1f} kHz` / `{int_dt_us:.0f} us`)",
+            "",
+            f"> **Internal Timing Architecture**: The fused GPU optical bench (`csim_htsim`) "
+            f"ran at **`{int_khz:.1f} kHz` (`dt = {int_dt_ms:.3f} ms = {int_dt_us:.0f} us`)**, "
+            f"i.e., **`{ov_k}` sub-samples per `{outer_dt_ms:.2f} ms` "
+            f"(`{outer_khz:.1f} kHz`) outer tick** (`master_hz = {outer_hz:.0f}`, "
+            f"`oversample = {ov_k}`).",
+            "",
+            "| Component | Physical Rate | Sub-Tick Cadence | Sub-Step Integration & Physics |",
+            "| :--- | :--- | :---: | :--- |",
+            f"| **Internal Bench Clock (`htsim`)** | `{int_khz:.1f} kHz` (`{int_dt_ms:.3f} ms`) | "
+            f"`1` (`{int_dt_us:.0f} us`) | `{ov_k}` sub-samples per `{outer_dt_ms:.2f} ms` "
+            f"(`{outer_khz:.1f} kHz`) outer tick |",
+            f"| **Turbulence (`atmturb` + `htsim`)** | "
+            f"`{outer_khz:.1f} kHz` (`{outer_dt_ms:.2f} ms`) | `{1}:{ov_k}` lockstep | "
+            f"New screen every `{outer_dt_ms:.2f} ms`, GPU-interpolated across "
+            f"`{ov_k}` sub-ticks |",
+            f"| **Stage-1 DM (`dm.ao3k`)** | `{int_khz:.1f} kHz` (`{int_dt_us:.0f} us`) | "
+            f"every sub-tick | Servo & FIFO stepped at `{int_khz:.1f} kHz`: {dm1_note} |",
+            f"| **Stage-2 DM (`dm.scexao`)** | `{int_khz:.1f} kHz` (`{int_dt_us:.0f} us`) | "
+            f"every sub-tick | Servo & FIFO stepped at `{int_khz:.1f} kHz`: {dm2_note} |",
+            f"| **Stage-2 Vis PyWFS (`wfs_vis`)** | `2.0 kHz` (`0.50 ms`) | "
+            f"`2000 (/{ov_k})` | Propagated every sub-tick (`stride = 1`): `{ov_k}` sub-samples "
+            "`x 2ch x 16` pts |",
+            f"| **Stage-1 NIR PyWFS (`wfs_nir`)** | `1.0 kHz` (`1.00 ms`) | "
+            f"`1000 (/{2*ov_k})` | Propagated every sub-tick (`stride = 1`): "
+            f"`{2*ov_k}` sub-samples `x 2ch x 16` pts |",
+            f"| **Science Cameras (`fpcam.*`, 6x)** | `100 Hz` (`10.0 ms`) | "
+            f"`100 (/{20*ov_k})` | `stride = {ov_k}` (staggered `0..{ov_k-1}`): `20` evals "
+            f"(`{outer_khz:.1f} kHz`) `x 3ch` / frame |",
+            f"| **Wavefront OPD Stats (`wfstat`)** | "
+            f"`{outer_khz:.1f} kHz` (`{outer_dt_ms:.2f} ms`) | every `{ov_k}` sub-ticks | "
+            f"Sampled once per `{outer_dt_ms:.2f} ms` outer tick "
+            f"(`{wf_nfr}` frames in `{sa.get('physical_time_s', 10):.1f} s`) |",
+        ]
+    )
+
+    if chrom and chrom.get("sensors"):
+        lines.extend(
+            [
+                "",
+                "## Polychromatic Passbands, Sub-Band Sampling & Flux Scaling",
+                "",
+                "| Sensor (`out_cam`) | Beam | Bandpass [um] (`dL/L0`) | Slices `N` | "
+                "Sub-Band `lambda_c` [um] (`w_c`) | Focal `L0/Lc` Scale | "
+                "Rate [Hz] (/Sub) | Flux [ph/fr] |",
+                "| :--- | :--- | :---: | ---: | :--- | :---: | :---: | ---: |",
+            ]
+        )
+        for sn in chrom["sensors"]:
+            ch_desc = ", ".join(
+                f"{lc:.3f} ({w * 100:.0f}%)"
+                for lc, w in zip(sn["chan_lam_um"], sn["chan_weight"])
+            )
+            fsc = sn["focal_scale_lam0_over_lam"]
+            sc_desc = (
+                f"{fsc[0]:.3f}x"
+                if len(fsc) == 1
+                else f"{min(fsc):.3f}..{max(fsc):.3f}x"
+            )
+            nsub_s = int(sn.get("navg_subticks", max(1, round(int_hz / max(sn["rate_hz"], 0.1)))))
+            rate_desc = f"{sn['rate_hz']:.0f} (/{nsub_s})"
+            lines.append(
+                f"| `{sn['id']}` (`{sn['out_cam']}`) | `{sn['in_beam']}` | "
+                f"{sn['lambda_min_um']:.3f}-{sn['lambda_max_um']:.3f} "
+                f"(`{sn['bw_frac']*100:.0f}%`) | {sn['eff_nlam']} | {ch_desc} | "
+                f"{sc_desc} | {rate_desc} | {sn['flux_ph_per_frame']:.2e} |"
+            )
+        chrom_png = os.path.join(out_dir, "chromatic_passbands_2x1.png")
+        if os.path.isfile(chrom_png):
+            lines.extend(
+                [
+                    "",
+                    "![Optical Bench 32-Bin Spectra & Polychromatic Sensor Sub-Band "
+                    "Sampling (2x1)](chromatic_passbands_2x1.png)",
                 ]
             )
 
@@ -2274,6 +2999,66 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
                 csv_links.append(f"[{cname}]({cname})")
         if csv_links:
             lines.extend(["", f"- Time-series CSVs: {', '.join(csv_links)}"])
+
+    vid_meta = s.get("short_timescale_video")
+    vid_fname = (
+        vid_meta.get("video_file", "wfs_psf_short_evolution.mp4")
+        if isinstance(vid_meta, dict)
+        else "wfs_psf_short_evolution.mp4"
+    )
+    if os.path.isfile(os.path.join(out_dir, vid_fname)):
+        lines.extend(["", "### Short-Timescale WFS & PSF Evolution (Video)", ""])
+        if isinstance(vid_meta, dict) and "t_start_s" in vid_meta and "n_frames" in vid_meta:
+            vt0 = float(vid_meta["t_start_s"])
+            vt1 = float(vid_meta["t_end_s"])
+            vdur = float(vid_meta["duration_ms"])
+            vnfr = int(vid_meta["n_frames"])
+            vdt = float(vid_meta["dt_step_ms"])
+            vfps = int(vid_meta["fps"])
+            vslow = float(vid_meta["slowdown_factor"])
+            vp_s1 = float(vid_meta.get("psf_stg1_rate_hz", 2000.0))
+            vp_fn = float(vid_meta.get("psf_final_rate_hz", 2000.0))
+            vsub = vnfr * ov_k
+            psf_cad_str = (
+                f"`{vp_fn/1e3:.1f} kHz` (`{1e3/max(vp_fn, 1.0):.2f} ms` speckle)"
+                if vp_fn >= 500.0
+                else f"`{vp_fn:.0f} Hz` (`{1e3/max(vp_fn, 1.0):.1f} ms` short-exposure)"
+            )
+            stg1_note = (
+                ""
+                if abs(vp_s1 - vp_fn) < 1.0
+                else f" (Post-AO3k at `{vp_s1:.0f} Hz`)"
+            )
+            lines.extend(
+                [
+                    f"- **Physical Window**: `t = {vt0:.4f} .. {vt1:.4f} s` "
+                    f"(`{vdur:.1f} ms` span, `{vnfr}` frames @ `{vdt:.2f} ms` / "
+                    f"`{outer_khz:.1f} kHz` outer tick = `{vsub}` internal sub-ticks @ "
+                    f"`{int_khz:.1f} kHz` / `{int_dt_us:.0f} us`), "
+                    "shaded in green on the time-series figure below",
+                    f"- **Synchronized Streams**: Stage-1 AO3k J-band PyWFS "
+                    f"(`1.0 kHz`, raw + `imWFS2`) + Stage-2 SCExAO Vis PyWFS "
+                    f"(`2.0 kHz`, raw + `imWFS2`) + Post-AO3k & Final Vis (`0.75 um`) / "
+                    f"H-band (`1.65 um`) PSFs at {psf_cad_str}{stg1_note}",
+                    f"- **Playback**: `{vfps} fps` "
+                    f"(`{vid_meta.get('playback_duration_s', 0):.1f} s` loop, "
+                    f"**`{vslow:.1f}x` slow-motion**) | Mean clip Strehl: "
+                    f"Vis Final `{vid_meta.get('vis_final_sr_mean_pct', 0):.1f}%` "
+                    f"(`{vid_meta.get('vis_final_sr_min_pct', 0):.1f}%.."
+                    f"{vid_meta.get('vis_final_sr_max_pct', 0):.1f}%`), "
+                    f"H Final `{vid_meta.get('nir_final_sr_mean_pct', 0):.1f}%` "
+                    f"(`{vid_meta.get('nir_final_sr_min_pct', 0):.1f}%.."
+                    f"{vid_meta.get('nir_final_sr_max_pct', 0):.1f}%`)",
+                    "",
+                    f"![Short-Timescale PyWFS & Speckle PSF Evolution "
+                    f"(t = {vt0:.2f}..{vt1:.2f} s, {vdur:.0f} ms @ {outer_khz:.1f} kHz / "
+                    f"{int_khz:.1f} kHz Sub-Tick, {vslow:.1f}x Slow-Motion)]({vid_fname})",
+                ]
+            )
+        else:
+            lines.append(
+                f"![Short-Timescale PyWFS & Speckle PSF Evolution]({vid_fname})"
+            )
 
     snap_title = (
         f"Time-Series & Sampled Instant Snapshots (S1-S{len(samples)})"
@@ -2684,7 +3469,7 @@ def main():
                 "dm_grid": "64x64",
                 "dm_pupil_diam_act": 60,
                 "wfs_detector": "160x160",
-                "wfs_band": "J-band 1.22 um PyWFS (160x160, mod 3.0 l/D)",
+                "wfs_band": "J-band 1.22 um PyWFS (20% BW, N=2ch, 160x160, mod 3.0 l0/D)",
                 "phys_rate_hz": 1000.0,
                 "gain": float(gain1),
                 "mult": float(mult1),
@@ -2697,7 +3482,7 @@ def main():
                 "dm_grid": "50x50",
                 "dm_pupil_diam_act": 46,
                 "wfs_detector": "120x120",
-                "wfs_band": "Visible 0.75 um PyWFS (120x120, mod 3.0 l/D)",
+                "wfs_band": "Visible 0.75 um PyWFS (20% BW, N=2ch, 120x120, mod 3.0 l0/D)",
                 "phys_rate_hz": 2000.0,
                 "gain": float(gain2),
                 "mult": float(mult2),
@@ -2713,12 +3498,32 @@ def main():
     if ts_metrics is not None:
         summary["timeseries_metrics"] = ts_metrics
 
+    bench_filename = ensure_gui_screenshots(work_dir, out_dir)
+    if bench_filename:
+        chrom_info = analyze_bench_chromaticity(os.path.join(out_dir, bench_filename))
+        if chrom_info is not None:
+            summary["chromaticity"] = chrom_info
+            t_b = chrom_info.get("timing", {})
+            if t_b:
+                summary["timing"] = t_b
+                sa_blk = summary["star_and_atmosphere"]
+                sa_blk["oversample"] = int(t_b["oversample"])
+                sa_blk["internal_bench_hz"] = float(t_b["internal_bench_hz"])
+                sa_blk["internal_dt_ms"] = float(t_b["internal_dt_ms"])
+                sa_blk["internal_dt_us"] = float(t_b["internal_dt_us"])
+                sa_blk["internal_subticks_integrated"] = (
+                    int(master_ticks) * int(t_b["oversample"])
+                )
+
+    vid_meta = ensure_telemetry_video(out_dir)
+    if vid_meta is not None:
+        summary["short_timescale_video"] = vid_meta
+
     summary_path = os.path.join(out_dir, "ao3k_scexao_metrics.json")
     with open(summary_path, "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
         fh.write("\n")
 
-    bench_filename = ensure_gui_screenshots(work_dir, out_dir)
     render_plots_via_sys_python(out_dir, summary_path)
     write_ao_report_md(out_dir, summary, bench_filename=bench_filename)
     for npy_p in tmp_npys:
@@ -2726,6 +3531,14 @@ def main():
             os.remove(npy_p)
 
     print("\n=== Subaru AO3k + SCExAO 10.0s Performance Summary ===")
+    t_prt = summary.get("timing", {})
+    if t_prt:
+        print(
+            f"  Internal Clock : {t_prt['internal_bench_hz']/1000:.1f} kHz "
+            f"(dt = {t_prt['internal_dt_ms']:.3f} ms = {t_prt['internal_dt_us']:.0f} us), "
+            f"{t_prt['oversample']} sub-samples per {t_prt['outer_dt_ms']:.2f} ms "
+            f"({t_prt['outer_master_hz']/1000:.1f} kHz) outer tick"
+        )
     for bkey, bcfg in BANDS.items():
         print(f"\n[{bcfg['label']}]")
         for skey, slabel in STAGES:

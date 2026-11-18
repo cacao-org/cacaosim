@@ -1,0 +1,1181 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Olivier Guyon et al
+# SPDX-License-Identifier: LGPL-3.0-or-later
+"""Render a synchronized short-timescale WFS & PSF evolution MP4 video from AO telemetry cubes."""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+
+def _ensure_sci_python() -> None:
+    help_flags = (
+        "-h",
+        "--help",
+        "-h1",
+        "--help-oneline",
+        "-h2",
+        "--help-description",
+        "-hm",
+        "--help-mono",
+    )
+    if any(a in help_flags for a in sys.argv[1:]):
+        return
+    try:
+        import astropy  # noqa: F401
+        import matplotlib  # noqa: F401
+        import numpy  # noqa: F401
+        return
+    except ImportError:
+        pass
+    cands = [
+        os.environ.get("PYTHON_BIN", ""),
+        os.path.expanduser("~/miniforge3/bin/python3"),
+        os.path.expanduser("~/.local/envs/cacao/bin/python3"),
+    ]
+    for p in cands:
+        if p and os.path.isfile(p) and os.path.realpath(p) != os.path.realpath(sys.executable):
+            os.execv(p, [p] + sys.argv)
+
+
+_ensure_sci_python()
+
+RAD2MAS = 206264.806247 * 1000.0
+TEL_DIAM_M = 8.2
+
+BAND_META = {
+    "vis": {
+        "label": "Vis I-Band (0.75 µm)",
+        "lam_um": 0.75,
+        "pixscale_ld": 2.20,
+        "fov_arcsec": 0.65,
+    },
+    "nir": {
+        "label": "Near-IR H-Band (1.65 µm)",
+        "lam_um": 1.65,
+        "pixscale_ld": 2.50,
+        "fov_arcsec": 1.35,
+    },
+}
+
+
+def find_ffmpeg_bin() -> str | None:
+    """Locate a working ffmpeg executable via env, PATH, ~/.local/bin, or imageio_ffmpeg."""
+    cands = [
+        os.environ.get("FFMPEG_BIN", ""),
+        shutil.which("ffmpeg") or "",
+        os.path.expanduser("~/.local/bin/ffmpeg"),
+    ]
+    for c in cands:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    try:
+        import imageio_ffmpeg  # type: ignore[import-not-found]
+
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and os.path.isfile(exe):
+            return exe
+    except Exception:
+        pass
+    return None
+
+
+def parse_bench_timing(bench_path: str | None) -> dict[str, float]:
+    """Extract master_hz and oversample from an optical .bench configuration file."""
+    info = {"master_hz": 2000.0, "oversample": 4.0}
+    if not bench_path or not os.path.isfile(bench_path):
+        return info
+    sec = ""
+    with open(bench_path, "r", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                sec = line
+                continue
+            if sec == "[bench]" and "=" in line:
+                k, v = [x.strip() for x in line.split("=", 1)]
+                v = v.strip('"').strip("'")
+                if k == "master_hz":
+                    try:
+                        info["master_hz"] = float(v)
+                    except ValueError:
+                        pass
+                elif k == "oversample":
+                    try:
+                        info["oversample"] = max(1.0, float(v))
+                    except ValueError:
+                        pass
+    return info
+
+
+def discover_stream_cubes(telem_dir: str, stream_name: str) -> list[tuple[str, str | None]]:
+    """Return sorted [(fits_path, txt_path_or_None), ...] for stream_name in telem_dir."""
+    pats = [
+        os.path.join(telem_dir, f"{stream_name}_[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*.fits"),
+        os.path.join(telem_dir, f"{stream_name}_[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*.fits.fz"),
+    ]
+    fits_files: list[str] = []
+    for pat in pats:
+        fits_files.extend(glob.glob(pat))
+    fits_files = sorted(set(fits_files))
+    pairs: list[tuple[str, str | None]] = []
+    for fp in fits_files:
+        if fp.endswith(".fits.fz"):
+            stem = fp[: -len(".fits.fz")]
+        else:
+            stem = fp[: -len(".fits")]
+        # Check exact prefix match so e.g. psf_vis_final does not match psf_vis_final_long
+        base = os.path.basename(stem)
+        m = re.match(r"^(.+)_\d{2}:\d{2}:\d{2}(?:\.\d+)?$", base)
+        if not m or m.group(1) != stream_name:
+            continue
+        tp = stem + ".txt"
+        pairs.append((fp, tp if os.path.isfile(tp) else None))
+
+    def _pair_sort_key(item: tuple[str, str | None]) -> tuple[int, float, str]:
+        fp, tp = item
+        if tp is not None:
+            c0, _ = read_tlm_txt(tp)
+            if c0.size > 0:
+                return (0, float(c0[0]), fp)
+        return (1, os.path.getmtime(fp), fp)
+
+    pairs.sort(key=_pair_sort_key)
+    return pairs
+
+
+def read_tlm_txt(txt_path: str):
+    """Parse logshmim 7-column or 4-column timing .txt -> (cnt0_arr, tacq_arr)."""
+    import numpy as np
+
+    cnt0_list: list[int] = []
+    tacq_list: list[float] = []
+    with open(txt_path, "r", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            s = raw.strip()
+            if not s or s.startswith("#"):
+                continue
+            toks = s.split()
+            if len(toks) >= 7:
+                try:
+                    tacq_list.append(float(toks[4]))
+                    cnt0_list.append(int(toks[5]))
+                except ValueError:
+                    continue
+            elif len(toks) == 4:
+                try:
+                    cnt0_list.append(int(toks[1]))
+                    tacq_list.append(0.0)
+                except ValueError:
+                    continue
+    return np.asarray(cnt0_list, dtype=np.int64), np.asarray(tacq_list, dtype=np.float64)
+
+
+class TelemetryStreamIndex:
+    """Lightweight memory-mapped index over one or more streamFITSlog cubes."""
+
+    def __init__(
+        self,
+        stream_name: str,
+        pairs: list[tuple[str, str | None]],
+        phys_time_s: float,
+        nominal_rate_hz: float | None = None,
+    ) -> None:
+        import numpy as np
+        from astropy.io import fits
+
+        self.stream_name = stream_name
+        self.segments: list[tuple[str, int, int, tuple[int, ...]]] = []
+        cnt0_parts = []
+        total_frames = 0
+        frame_shape: tuple[int, ...] = ()
+
+        for fp, tp in pairs:
+            with fits.open(fp, memmap=True) as hdul:
+                hdu = hdul[0] if hdul[0].data is not None else hdul[1]
+                shp = hdu.data.shape
+                if len(shp) == 3:
+                    nz = int(shp[0])
+                    fshp = (int(shp[1]), int(shp[2]))
+                elif len(shp) == 2:
+                    nz = 1
+                    fshp = (int(shp[0]), int(shp[1]))
+                else:
+                    continue
+            if tp is not None:
+                c0, _ = read_tlm_txt(tp)
+                n_use = min(nz, int(c0.size)) if c0.size > 0 else nz
+                if c0.size >= n_use and n_use > 0:
+                    cnt0_parts.append(c0[:n_use])
+                else:
+                    cnt0_parts.append(np.arange(total_frames, total_frames + n_use, dtype=np.int64))
+            else:
+                n_use = nz
+                cnt0_parts.append(np.arange(total_frames, total_frames + n_use, dtype=np.int64))
+            if n_use <= 0:
+                continue
+            frame_shape = fshp
+            self.segments.append((fp, total_frames, n_use, fshp))
+            total_frames += n_use
+
+        self.n_frames = total_frames
+        self.frame_shape = frame_shape
+        if total_frames == 0:
+            self.cnt0 = np.zeros(0, dtype=np.int64)
+            self.rate_hz = float(nominal_rate_hz or 2000.0)
+            self.t_phys_s = np.zeros(0, dtype=np.float64)
+            return
+
+        self.cnt0 = np.concatenate(cnt0_parts)
+        span_cnt = int(self.cnt0[-1] - self.cnt0[0] + 1)
+        if span_cnt <= 0 or span_cnt > total_frames * 50:
+            rel_idx = np.arange(total_frames, dtype=np.float64)
+            span_cnt = total_frames
+        else:
+            rel_idx = (self.cnt0 - self.cnt0[0]).astype(np.float64)
+
+        est_rate = float(span_cnt) / max(phys_time_s, 1e-6)
+        if nominal_rate_hz and abs(est_rate - nominal_rate_hz) / nominal_rate_hz < 0.08:
+            self.rate_hz = float(nominal_rate_hz)
+        else:
+            # Snap to standard harmonic bench rates when within 6%
+            std_rates = (8000.0, 4000.0, 2000.0, 1000.0, 500.0, 400.0, 250.0, 200.0, 100.0, 50.0)
+            snapped = next(
+                (sr for sr in std_rates if abs(est_rate - sr) / sr < 0.06),
+                round(est_rate, 3),
+            )
+            self.rate_hz = max(float(snapped), 1.0)
+
+        self.t_phys_s = (rel_idx + 1.0) / self.rate_hz
+
+    def load_slice(self, idx_start: int, idx_stop: int):
+        """Memory-map and extract frames [idx_start:idx_stop] into a float32 array."""
+        import numpy as np
+        from astropy.io import fits
+
+        idx_start = max(0, int(idx_start))
+        idx_stop = min(self.n_frames, int(idx_stop))
+        n_out = max(0, idx_stop - idx_start)
+        out = np.zeros((n_out, *self.frame_shape), dtype=np.float32)
+        if n_out == 0:
+            return out
+
+        for fp, seg0, seg_len, _ in self.segments:
+            seg1 = seg0 + seg_len
+            ov0 = max(idx_start, seg0)
+            ov1 = min(idx_stop, seg1)
+            if ov0 >= ov1:
+                continue
+            with fits.open(fp, memmap=True) as hdul:
+                hdu = hdul[0] if hdul[0].data is not None else hdul[1]
+                if hdu.data.ndim == 3:
+                    chunk = np.asarray(hdu.data[ov0 - seg0 : ov1 - seg0], dtype=np.float32)
+                else:
+                    chunk = np.asarray(hdu.data, dtype=np.float32)[None, :, :]
+            out[ov0 - idx_start : ov1 - idx_start] = chunk
+        return out
+
+
+def compute_wfs_refsub(raw_cube, calib_dir: str, norm_floor: float = 1.0):
+    """Compute exact CACAO acquireWFSim reference-subtracted signal imWFS2 from raw WFS frames."""
+    import numpy as np
+    from astropy.io import fits
+
+    wref_p = os.path.join(calib_dir, "wfsref.fits")
+    wmsk_p = os.path.join(calib_dir, "wfsmask.fits")
+    nfr, ny, nx = raw_cube.shape
+    npix = float(nx * ny)
+    raw64 = raw_cube.astype(np.float64)
+
+    if os.path.isfile(wmsk_p):
+        wmsk = np.asarray(fits.getdata(wmsk_p), dtype=np.float64)
+        if wmsk.shape != (ny, nx):
+            wmsk = np.ones((ny, nx), dtype=np.float64)
+    else:
+        wmsk = np.ones((ny, nx), dtype=np.float64)
+
+    flux = np.sum(raw64 * wmsk[None, :, :], axis=(1, 2), keepdims=True)
+    inv = 1.0 / np.maximum(flux + norm_floor * npix, 1.0e-12)
+    im1 = raw64 * inv * wmsk[None, :, :]
+
+    if os.path.isfile(wref_p):
+        wref = np.asarray(fits.getdata(wref_p), dtype=np.float64)
+        if wref.shape == (ny, nx):
+            return (im1 - wref[None, :, :]).astype(np.float32)
+
+    mean_ref = np.mean(im1, axis=0, keepdims=True)
+    return (im1 - mean_ref).astype(np.float32)
+
+
+def normalize_psf_to_strehl(
+    raw_cube,
+    report_dir: str,
+    bkey: str,
+    skey: str,
+    bias_adu: float = 100.0,
+):
+    """Convert raw fpcam ADU frames into Strehl-normalized intensity units."""
+    import numpy as np
+    from astropy.io import fits
+
+    dl_p = os.path.join(report_dir, f"psf_{bkey}_dl.fits")
+    det_dl_p = os.path.join(report_dir, f"det_{bkey}_{skey}_dl.fits")
+    sub = np.maximum(raw_cube.astype(np.float64) - bias_adu, 0.0)
+    _, ny, nx = sub.shape
+    c0 = nx // 2
+    yy, xx = np.indices((ny, nx), dtype=np.float64)
+    core_m = np.hypot(xx - c0, yy - c0) <= 20.0
+    fov_m = np.hypot(xx - c0, yy - c0) <= (0.45 * nx)
+
+    adu_per_sr = None
+    if os.path.isfile(dl_p) and os.path.isfile(det_dl_p):
+        dl_img = np.asarray(fits.getdata(dl_p), dtype=np.float64)
+        det_dl = np.asarray(fits.getdata(det_dl_p), dtype=np.float64)
+        if dl_img.shape == (ny, nx) and det_dl.shape == (ny, nx):
+            dl_core = max(float(np.sum(dl_img[core_m])), 1.0e-9)
+            det_sub = np.maximum(det_dl - bias_adu, 0.0)
+            base_adu_sr = max(float(np.sum(det_sub[core_m])) / dl_core, 1.0e-6)
+            # Guard against exposure-rate change between Step-2 det_dl and telemetry cube
+            det_tot = float(np.sum(det_sub[fov_m]))
+            cube_tot = float(np.median(np.sum(sub[:, fov_m], axis=1)))
+            if det_tot > 1.0 and cube_tot > 1.0:
+                ratio = cube_tot / det_tot
+                if ratio < 0.45 or ratio > 2.2:
+                    base_adu_sr *= ratio
+            adu_per_sr = base_adu_sr
+
+    if adu_per_sr is None and os.path.isfile(dl_p):
+        dl_img = np.asarray(fits.getdata(dl_p), dtype=np.float64)
+        if dl_img.shape == (ny, nx):
+            dl_tot = max(float(np.sum(dl_img[fov_m])), 1.0e-9)
+            cube_tot = max(float(np.median(np.sum(sub[:, fov_m], axis=1))), 1.0)
+            adu_per_sr = cube_tot / dl_tot
+
+    if adu_per_sr is None or adu_per_sr <= 0.0:
+        adu_per_sr = max(float(np.percentile(sub, 99.99)), 1.0)
+
+    return (sub / adu_per_sr).astype(np.float32)
+
+
+def render_telemetry_video(
+    telem_dir: str,
+    report_dir: str,
+    out_mp4: str,
+    poster_png: str | None = None,
+    meta_json: str | None = None,
+    t_start_req: float = 5.0,
+    duration_ms: float = 200.0,
+    fps: int = 30,
+) -> dict[str, object]:
+    """Slice telemetry cubes around [t_start, t_start + duration] and encode H.264 MP4 + poster."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+    from matplotlib.gridspec import GridSpec
+    from matplotlib.patches import Circle
+    from matplotlib.ticker import MaxNLocator
+    import numpy as np
+
+    t_wall0 = time.monotonic()
+    ffmpeg_bin = find_ffmpeg_bin()
+    if not ffmpeg_bin:
+        raise RuntimeError("ffmpeg binary not found (install imageio-ffmpeg or set FFMPEG_BIN)")
+
+    manifest: dict[str, object] = {}
+    man_json_p = os.path.join(telem_dir, "telemetry_manifest.json")
+    if os.path.isfile(man_json_p):
+        with open(man_json_p, "r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+
+    phys_time_s = float(manifest.get("phys_time_s", 10.0))
+    seeing_arcsec = float(manifest.get("seeing_arcsec", 0.60))
+    fs_stg1 = float(manifest.get("fs_stg1_hz", 1000.0))
+    fs_stg2 = float(manifest.get("fs_stg2_hz", 2000.0))
+    psf_navg = max(1, int(manifest.get("psf_navg", 20)))
+    nom_psf_hz = fs_stg2 / float(psf_navg)
+
+    bench_cands = [
+        os.path.join(report_dir, "ao3k_scexao.bench"),
+        os.path.join(os.path.dirname(report_dir), "ao3k_scexao.bench"),
+    ]
+    bench_p = next((p for p in bench_cands if os.path.isfile(p)), None)
+    btiming = parse_bench_timing(bench_p)
+    outer_hz = float(btiming.get("master_hz", fs_stg2))
+    oversample = int(round(btiming.get("oversample", 4.0)))
+    internal_hz = outer_hz * oversample
+    internal_dt_us = 1.0e6 / max(internal_hz, 1.0)
+
+    req_streams = {
+        "wfs1": ("csim_wfs_nir", fs_stg1),
+        "wfs2": ("csim_wfs_vis", fs_stg2),
+        "psf_vis_stg1": ("psf_vis_stg1", nom_psf_hz),
+        "psf_vis_final": ("psf_vis_final", nom_psf_hz),
+        "psf_nir_stg1": ("psf_nir_stg1", nom_psf_hz),
+        "psf_nir_final": ("psf_nir_final", nom_psf_hz),
+    }
+    indices: dict[str, TelemetryStreamIndex] = {}
+    for key, (sname, nom_hz) in req_streams.items():
+        pairs = discover_stream_cubes(telem_dir, sname)
+        if not pairs:
+            raise FileNotFoundError(f"Missing telemetry cube for stream '{sname}' in {telem_dir}")
+        idx = TelemetryStreamIndex(sname, pairs, phys_time_s, nominal_rate_hz=nom_hz)
+        if idx.n_frames == 0:
+            raise RuntimeError(f"Empty telemetry cube for stream '{sname}' in {telem_dir}")
+        indices[key] = idx
+
+    t_max_avail = min(float(idx.t_phys_s[-1]) for idx in indices.values())
+    t_min_avail = max(float(idx.t_phys_s[0]) for idx in indices.values())
+    dur_s = min(max(duration_ms * 1.0e-3, 0.010), max(t_max_avail - t_min_avail, 0.010))
+
+    t_start = float(t_start_req)
+    if t_start + dur_s > t_max_avail - 1.0e-6:
+        t_start = max(t_min_avail, 0.5 * (t_min_avail + t_max_avail - dur_s))
+    t_start = max(t_start, t_min_avail)
+    t_end = min(t_max_avail, t_start + dur_s)
+
+    # Step on Stage-2 WFS outer grid (0.50 ms @ 2.0 kHz)
+    wfs2_t = indices["wfs2"].t_phys_s
+    i2_0 = int(np.searchsorted(wfs2_t, t_start - 1.0e-7, side="left"))
+    i2_1 = int(np.searchsorted(wfs2_t, t_end + 1.0e-7, side="right"))
+    i2_1 = max(i2_0 + 2, min(i2_1, indices["wfs2"].n_frames))
+    t_grid = wfs2_t[i2_0:i2_1]
+    n_clip = int(t_grid.size)
+    t0_actual = float(t_grid[0])
+    t1_actual = float(t_grid[-1])
+    dt_step_ms = 1000.0 / max(indices["wfs2"].rate_hz, 1.0)
+    actual_dur_ms = max((t1_actual - t0_actual) * 1000.0, dt_step_ms)
+    slowdown = (1000.0 / dt_step_ms) / float(max(fps, 1))
+
+    # Slice only the [s0:s1] range needed from each stream via memmap
+    sliced_cubes: dict[str, np.ndarray] = {}
+    map_idx: dict[str, np.ndarray] = {}
+    abs_idx: dict[str, np.ndarray] = {}
+    for key, idx in indices.items():
+        pos = np.searchsorted(idx.t_phys_s, t_grid + 1.0e-7, side="right") - 1
+        pos = np.clip(pos, 0, idx.n_frames - 1)
+        s0 = int(np.min(pos))
+        s1 = int(np.max(pos)) + 1
+        sliced_cubes[key] = idx.load_slice(s0, s1)
+        map_idx[key] = pos - s0
+        abs_idx[key] = pos + 1  # 1-based exposure index
+
+    # Reference-subtracted WFS signals (exact acquireWFSim formula using calib_stg{1,2})
+    wfs1_raw = sliced_cubes["wfs1"]
+    wfs2_raw = sliced_cubes["wfs2"]
+    wfs1_sig = compute_wfs_refsub(wfs1_raw, os.path.join(telem_dir, "calib_stg1"))
+    wfs2_sig = compute_wfs_refsub(wfs2_raw, os.path.join(telem_dir, "calib_stg2"))
+
+    # Strehl-normalized PSF slices & ROI crops
+    psf_sr: dict[tuple[str, str], np.ndarray] = {}
+    psf_ext: dict[str, list[float]] = {}
+    psf_ld_arcsec: dict[str, float] = {}
+    psf_peak_sr: dict[tuple[str, str], np.ndarray] = {}
+
+    for bkey, bm in BAND_META.items():
+        ld_mas = (bm["lam_um"] * 1.0e-6 / TEL_DIAM_M) * RAD2MAS
+        pix_arcsec = (ld_mas / bm["pixscale_ld"]) / 1000.0
+        psf_ld_arcsec[bkey] = ld_mas / 1000.0
+        for skey in ("stg1", "final"):
+            raw_s = sliced_cubes[f"psf_{bkey}_{skey}"]
+            sr_full = normalize_psf_to_strehl(raw_s, report_dir, bkey, skey)
+            _, ny, nx = sr_full.shape
+            c0 = nx // 2
+            hw = min(c0, int(round(bm["fov_arcsec"] / pix_arcsec)))
+            psf_ext[bkey] = [
+                -hw * pix_arcsec,
+                hw * pix_arcsec,
+                -hw * pix_arcsec,
+                hw * pix_arcsec,
+            ]
+            crop = sr_full[:, c0 - hw : c0 + hw, c0 - hw : c0 + hw]
+            # Peak Strehl within central core (r <= 12 pix around center)
+            yy, xx = np.indices((ny, nx), dtype=np.float64)
+            cmask = np.hypot(xx - c0, yy - c0) <= 16.0
+            pk = np.max(sr_full[:, cmask], axis=1) * 100.0
+            psf_peak_sr[(bkey, skey)] = pk[map_idx[f"psf_{bkey}_{skey}"]]
+            # Pre-compute log10 intensity in [-4, 0] for fast linear Normalize rendering
+            psf_sr[(bkey, skey)] = np.log10(np.clip(crop, 1.0e-4, 1.0)).astype(np.float32)
+
+    # Load synchronized WFE time-series slice from wf_timeseries.csv (or modal fallback)
+    t_rel_ms = (t_grid - t0_actual) * 1000.0
+    wfe_stg1_nm = None
+    wfe_final_nm = None
+    wf_csv_p = os.path.join(report_dir, "wf_timeseries.csv")
+    if os.path.isfile(wf_csv_p):
+        try:
+            wf_tbl = np.loadtxt(wf_csv_p, delimiter=",", skiprows=1, ndmin=2)
+            if wf_tbl.ndim == 2 and wf_tbl.shape[1] >= 5 and wf_tbl.shape[0] > 2:
+                tw = wf_tbl[:, 1]
+                wfe_stg1_nm = np.interp(t_grid, tw, wf_tbl[:, 3])
+                wfe_final_nm = np.interp(t_grid, tw, wf_tbl[:, 4])
+        except Exception:
+            wfe_stg1_nm = None
+
+    wfe_label_mode = "pupil"
+    if wfe_stg1_nm is None or wfe_final_nm is None:
+        # Fallback to modal WFS residual RMS if wf_timeseries.csv is absent
+        wfe_label_mode = "modal"
+        modal_specs = [
+            ("stg1", "aol1_modevalWFS", fs_stg1),
+            ("final", "aol2_modevalWFS", fs_stg2),
+        ]
+        for tag, sname, fs_m in modal_specs:
+            mpairs = discover_stream_cubes(telem_dir, sname)
+            if mpairs:
+                midx = TelemetryStreamIndex(sname, mpairs, phys_time_s, nominal_rate_hz=fs_m)
+                mpos = np.clip(
+                    np.searchsorted(midx.t_phys_s, t_grid + 1.0e-7, side="right") - 1,
+                    0,
+                    midx.n_frames - 1,
+                )
+                ms0, ms1 = int(np.min(mpos)), int(np.max(mpos)) + 1
+                mcube = midx.load_slice(ms0, ms1).reshape(ms1 - ms0, -1)
+                mrms = np.sqrt(np.sum(mcube.astype(np.float64) ** 2, axis=1)) * 1000.0
+                if tag == "stg1":
+                    wfe_stg1_nm = mrms[mpos - ms0]
+                else:
+                    wfe_final_nm = mrms[mpos - ms0]
+        if wfe_stg1_nm is None:
+            wfe_stg1_nm = np.zeros_like(t_rel_ms)
+        if wfe_final_nm is None:
+            wfe_final_nm = np.zeros_like(t_rel_ms)
+
+    # Fixed color-scale limits across entire clip (prevents flicker)
+    w1_vmin, w1_vmax = 95.0, max(150.0, float(np.percentile(wfs1_raw, 99.7)))
+    w2_vmin, w2_vmax = 95.0, max(150.0, float(np.percentile(wfs2_raw, 99.7)))
+    s1_disp = wfs1_sig * 1.0e4
+    s2_disp = wfs2_sig * 1.0e4
+    s1_lim = max(0.5, float(np.percentile(np.abs(s1_disp), 99.5)))
+    s2_lim = max(0.5, float(np.percentile(np.abs(s2_disp), 99.5)))
+
+    w1_sum_kadu = np.sum(wfs1_raw.astype(np.float64), axis=(1, 2)) * 1.0e-3
+    w1_max_adu = np.max(wfs1_raw, axis=(1, 2))
+    w2_sum_kadu = np.sum(wfs2_raw.astype(np.float64), axis=(1, 2)) * 1.0e-3
+    w2_max_adu = np.max(wfs2_raw, axis=(1, 2))
+    s1_rms_e4 = np.sqrt(np.mean(wfs1_sig.astype(np.float64) ** 2, axis=(1, 2))) * 1.0e4
+    s2_rms_e4 = np.sqrt(np.mean(wfs2_sig.astype(np.float64) ** 2, axis=(1, 2))) * 1.0e4
+
+    # Build Matplotlib figure once (1480 x 1000 px @ 100 dpi, even dimensions for H.264 yuv420p)
+    fig = plt.figure(figsize=(14.8, 10.0), dpi=100, facecolor="#ffffff")
+    gs = GridSpec(
+        3,
+        4,
+        figure=fig,
+        height_ratios=[1.02, 1.06, 0.72],
+        left=0.052,
+        right=0.946,
+        bottom=0.058,
+        top=0.858,
+        hspace=0.37,
+        wspace=0.28,
+    )
+
+    fig.text(
+        0.5,
+        0.978,
+        f"Subaru 8.2 m AO3k + SCExAO — Short-Timescale WFS & PSF Evolution "
+        f"(Seeing = {seeing_arcsec:.2f}\", mV = mH = 6.0)",
+        ha="center",
+        va="top",
+        fontsize=13.2,
+        fontweight="bold",
+        color="#0f172a",
+    )
+    # Dedicated thin top axis for clean HUD blitting without touching subplot titles
+    ax_hud = fig.add_axes([0.04, 0.902, 0.92, 0.044])
+    ax_hud.set_axis_off()
+    hud_text = ax_hud.text(
+        0.5,
+        0.5,
+        "",
+        transform=ax_hud.transAxes,
+        ha="center",
+        va="center",
+        fontsize=9.4,
+        family="monospace",
+        fontweight="bold",
+        color="#1e293b",
+        bbox=dict(boxstyle="round,pad=0.30", fc="#f1f5f9", ec="#cbd5e1", lw=1.0),
+    )
+
+    # Row 0: 4 Pyramid WFS panels
+    wfs_specs = [
+        (
+            0,
+            f"Stg 1 AO3k Raw PyWFS\n(1.22 µm, {indices['wfs1'].rate_hz/1e3:.1f} kHz, 160×160)",
+            wfs1_raw,
+            map_idx["wfs1"],
+            "magma",
+            w1_vmin,
+            w1_vmax,
+            "Detector [ADU]",
+            "raw",
+        ),
+        (
+            1,
+            "Stg 1 AO3k Ref-Sub Signal\n(aol1_imWFS2, 160×160)",
+            s1_disp,
+            map_idx["wfs1"],
+            "RdBu_r",
+            -s1_lim,
+            s1_lim,
+            "Signal [×10⁻⁴ norm]",
+            "sig",
+        ),
+        (
+            2,
+            f"Stg 2 SCExAO Raw PyWFS\n(0.75 µm, {indices['wfs2'].rate_hz/1e3:.1f} kHz, 120×120)",
+            wfs2_raw,
+            map_idx["wfs2"],
+            "magma",
+            w2_vmin,
+            w2_vmax,
+            "Detector [ADU]",
+            "raw",
+        ),
+        (
+            3,
+            "Stg 2 SCExAO Ref-Sub Signal\n(aol2_imWFS2, 120×120)",
+            s2_disp,
+            map_idx["wfs2"],
+            "RdBu_r",
+            -s2_lim,
+            s2_lim,
+            "Signal [×10⁻⁴ norm]",
+            "sig",
+        ),
+    ]
+    wfs_ims = []
+    wfs_badges = []
+    for col, title, cube, midx_arr, cmap_n, vmin, vmax, cblab, kind in wfs_specs:
+        ax = fig.add_subplot(gs[0, col])
+        im = ax.imshow(
+            cube[midx_arr[0]],
+            origin="lower",
+            cmap=cmap_n,
+            vmin=vmin,
+            vmax=vmax,
+            interpolation="nearest",
+        )
+        ax.set_title(title, fontsize=9.8, fontweight="bold", pad=5)
+        ax.set_xlabel("x [pix]", fontsize=8.3, labelpad=2)
+        ax.set_ylabel("y [pix]" if col == 0 else "", fontsize=8.5, labelpad=2)
+        ax.tick_params(labelsize=7.8)
+        cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+        cb.ax.tick_params(labelsize=7.5)
+        cb.ax.yaxis.set_major_locator(MaxNLocator(4))
+        cb.set_label(cblab, fontsize=7.8)
+        bd = ax.text(
+            0.03,
+            0.04,
+            "",
+            transform=ax.transAxes,
+            fontsize=7.9,
+            family="monospace",
+            color="white" if kind == "raw" else "#0f172a",
+            bbox=dict(
+                boxstyle="round,pad=0.22",
+                fc="black" if kind == "raw" else "white",
+                ec="none",
+                alpha=0.72 if kind == "raw" else 0.82,
+            ),
+        )
+        wfs_ims.append((ax, im, cube, midx_arr))
+        wfs_badges.append((ax, bd))
+
+    # Row 1: 4 Short-Exposure Science PSF panels
+    psf_rate_lbl = {}
+    for pk in ("psf_vis_stg1", "psf_vis_final", "psf_nir_stg1", "psf_nir_final"):
+        rhz = indices[pk].rate_hz
+        psf_rate_lbl[pk] = f"{rhz/1e3:.1f} kHz" if rhz >= 500.0 else f"{rhz:.0f} Hz"
+
+    psf_specs = [
+        (
+            0,
+            "vis",
+            "stg1",
+            f"Vis 0.75 µm — Post-AO3k (Stg 1)\n({psf_rate_lbl['psf_vis_stg1']} Short-Exp Speckle)",
+        ),
+        (
+            1,
+            "vis",
+            "final",
+            f"Vis 0.75 µm — Final AO3k + SCExAO\n"
+            f"({psf_rate_lbl['psf_vis_final']} Short-Exp Speckle)",
+        ),
+        (
+            2,
+            "nir",
+            "stg1",
+            f"H-Band 1.65 µm — Post-AO3k (Stg 1)\n"
+            f"({psf_rate_lbl['psf_nir_stg1']} Short-Exp Speckle)",
+        ),
+        (
+            3,
+            "nir",
+            "final",
+            f"H-Band 1.65 µm — Final AO3k + SCExAO\n"
+            f"({psf_rate_lbl['psf_nir_final']} Short-Exp Speckle)",
+        ),
+    ]
+    psf_ims = []
+    psf_badges = []
+    log_norm = Normalize(vmin=-4.0, vmax=0.0)
+    for col, bkey, skey, title in psf_specs:
+        ax = fig.add_subplot(gs[1, col])
+        pk = f"psf_{bkey}_{skey}"
+        cube_log = psf_sr[(bkey, skey)]
+        midx_arr = map_idx[pk]
+        im = ax.imshow(
+            cube_log[midx_arr[0]],
+            origin="lower",
+            extent=psf_ext[bkey],
+            cmap="inferno",
+            norm=log_norm,
+            interpolation="nearest",
+        )
+        ld_a = psf_ld_arcsec[bkey]
+        c30 = Circle(
+            (0.0, 0.0),
+            30.0 * ld_a,
+            fill=False,
+            ls="--",
+            lw=0.85,
+            ec="cyan",
+            alpha=0.75,
+            label="30 λ/D",
+        )
+        c23 = Circle(
+            (0.0, 0.0),
+            23.0 * ld_a,
+            fill=False,
+            ls=":",
+            lw=0.95,
+            ec="lime",
+            alpha=0.85,
+            label="23 λ/D",
+        )
+        ax.add_patch(c30)
+        ax.add_patch(c23)
+        leg_p = None
+        if col in (1, 3):
+            leg_p = ax.legend(
+                loc="upper right",
+                fontsize=7.2,
+                facecolor="#10141c",
+                edgecolor="#556070",
+                labelcolor="white",
+                framealpha=0.82,
+            )
+        ax.set_title(title, fontsize=9.8, fontweight="bold", pad=5)
+        ax.set_xlabel('ΔRA ["]', fontsize=8.3, labelpad=2)
+        ax.set_ylabel('ΔDec ["]' if col == 0 else "", fontsize=8.5, labelpad=2)
+        ax.tick_params(labelsize=7.8)
+        cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03, ticks=[-4, -3, -2, -1, 0])
+        cb.ax.set_yticklabels(["10⁻⁴", "10⁻³", "10⁻²", "10⁻¹", "1"], fontsize=7.4)
+        cb.set_label("Strehl Intensity", fontsize=7.8)
+        bd = ax.text(
+            0.03,
+            0.04,
+            "",
+            transform=ax.transAxes,
+            fontsize=8.0,
+            family="monospace",
+            color="white",
+            bbox=dict(boxstyle="round,pad=0.22", fc="black", ec="none", alpha=0.72),
+        )
+        psf_ims.append((ax, im, c30, c23, leg_p, cube_log, midx_arr, bkey, skey, pk))
+        psf_badges.append((ax, bd))
+
+    # Row 2 Left: Residual WFE strip chart
+    ax_wfe = fig.add_subplot(gs[2, 0:2])
+    ax_wfe.plot(t_rel_ms, wfe_stg1_nm, color="#ff7f0e", lw=1.6, label="Post-AO3k (Stg 1)")
+    ax_wfe.plot(
+        t_rel_ms, wfe_final_nm, color="#1f77b4", lw=1.8, label="Post-SCExAO (Final Stg 1+2)"
+    )
+    if wfe_label_mode == "pupil":
+        ax_wfe.axhline(
+            119.37,
+            color="#64748b",
+            ls="--",
+            lw=0.95,
+            alpha=0.75,
+            label="1 rad @ 0.75 µm (119 nm)",
+        )
+        ax_wfe.set_ylabel("Residual WFE [nm]", fontsize=9.0)
+        ax_wfe.set_title(
+            f"Closed-Loop Residual Pupil RMS WFE ({t0_actual:.3f} .. {t1_actual:.3f} s)",
+            fontsize=10.0,
+            fontweight="bold",
+        )
+    else:
+        ax_wfe.set_ylabel("Modal Residual [nm]", fontsize=9.0)
+        ax_wfe.set_title(
+            f"Sensed Modal Residual Norm ({t0_actual:.3f} .. {t1_actual:.3f} s)",
+            fontsize=10.0,
+            fontweight="bold",
+        )
+    wfe_top = max(145.0, float(np.max(np.concatenate([wfe_stg1_nm, wfe_final_nm]))) * 1.25)
+    ax_wfe.set_xlim(0.0, max(float(t_rel_ms[-1]), 1.0))
+    ax_wfe.set_ylim(0.0, wfe_top)
+    ax_wfe.set_xlabel(f"Window Time Offset Δt [ms]  (t₀ = {t0_actual:.3f} s)", fontsize=8.8)
+    ax_wfe.tick_params(labelsize=8.2)
+    ax_wfe.grid(True, alpha=0.28)
+    leg_wfe = ax_wfe.legend(loc="upper right", fontsize=7.8, ncol=3, framealpha=0.90)
+    cur_wfe = ax_wfe.axvline(0.0, color="#7c3aed", lw=1.9, zorder=5, animated=True)
+    (dot_w1,) = ax_wfe.plot(
+        [0.0],
+        [wfe_stg1_nm[0]],
+        "o",
+        color="#ff7f0e",
+        mec="#0f172a",
+        ms=6.0,
+        zorder=6,
+        animated=True,
+    )
+    (dot_w2,) = ax_wfe.plot(
+        [0.0],
+        [wfe_final_nm[0]],
+        "o",
+        color="#1f77b4",
+        mec="#0f172a",
+        ms=6.0,
+        zorder=6,
+        animated=True,
+    )
+
+    # Row 2 Right: Short-Exposure Strehl strip chart
+    ax_sr = fig.add_subplot(gs[2, 2:4])
+    sr_v1 = psf_peak_sr[("vis", "stg1")]
+    sr_vf = psf_peak_sr[("vis", "final")]
+    sr_n1 = psf_peak_sr[("nir", "stg1")]
+    sr_nf = psf_peak_sr[("nir", "final")]
+    ax_sr.plot(t_rel_ms, sr_v1, color="#0284c7", ls="--", lw=1.35, alpha=0.85, label="Vis Stg 1")
+    ax_sr.plot(t_rel_ms, sr_vf, color="#1d4ed8", lw=1.8, label="Vis Final")
+    ax_sr.plot(t_rel_ms, sr_n1, color="#f59e0b", ls="--", lw=1.35, alpha=0.85, label="H Stg 1")
+    ax_sr.plot(t_rel_ms, sr_nf, color="#dc2626", lw=1.8, label="H Final")
+    sr_max = max(50.0, float(np.max(np.concatenate([sr_v1, sr_vf, sr_n1, sr_nf]))) * 1.18)
+    ax_sr.set_xlim(0.0, max(float(t_rel_ms[-1]), 1.0))
+    ax_sr.set_ylim(0.0, min(112.0, sr_max))
+    if sr_max > 95.0:
+        ax_sr.set_yticks([0, 20, 40, 60, 80, 100])
+    ax_sr.set_ylabel("Short-Exp Strehl [%]", fontsize=9.0)
+    ax_sr.set_xlabel(f"Window Time Offset Δt [ms]  (t₀ = {t0_actual:.3f} s)", fontsize=8.8)
+    ax_sr.set_title(
+        "Instantaneous Peak Strehl Ratio (Vis 0.75 µm & H-Band 1.65 µm)",
+        fontsize=10.0,
+        fontweight="bold",
+    )
+    ax_sr.tick_params(labelsize=8.2)
+    ax_sr.grid(True, alpha=0.28)
+    sr_all = np.concatenate([sr_v1, sr_vf, sr_n1, sr_nf])
+    sr_leg_loc = "lower right" if float(np.min(sr_all)) > 35.0 else "upper right"
+    leg_sr = ax_sr.legend(loc=sr_leg_loc, fontsize=7.8, ncol=4, framealpha=0.90)
+    cur_sr = ax_sr.axvline(0.0, color="#7c3aed", lw=1.9, zorder=5, animated=True)
+    (dot_sv,) = ax_sr.plot(
+        [0.0], [sr_vf[0]], "o", color="#1d4ed8", mec="#0f172a", ms=6.0, zorder=6, animated=True
+    )
+    (dot_sn,) = ax_sr.plot(
+        [0.0], [sr_nf[0]], "o", color="#dc2626", mec="#0f172a", ms=6.0, zorder=6, animated=True
+    )
+
+    hud_text.set_animated(True)
+    for _, im, _, _ in wfs_ims:
+        im.set_animated(True)
+    for _, bd in wfs_badges:
+        bd.set_animated(True)
+    for _, im, c30, c23, leg_p, _, _, _, _, _ in psf_ims:
+        im.set_animated(True)
+        c30.set_animated(True)
+        c23.set_animated(True)
+        if leg_p is not None:
+            leg_p.set_animated(True)
+    for _, bd in psf_badges:
+        bd.set_animated(True)
+    leg_wfe.set_animated(True)
+    leg_sr.set_animated(True)
+
+    fig.canvas.draw()
+    bg_cache = fig.canvas.copy_from_bbox(fig.bbox)
+    width_px, height_px = fig.canvas.get_width_height()
+    os.makedirs(os.path.dirname(os.path.abspath(out_mp4)), exist_ok=True)
+    if poster_png is None:
+        stem, _ = os.path.splitext(out_mp4)
+        poster_png = f"{stem}_poster.png"
+    tmp_mp4 = f"{out_mp4}.tmp.mp4"
+
+    ff_cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-pix_fmt",
+        "rgba",
+        "-s",
+        f"{width_px}x{height_px}",
+        "-r",
+        str(int(fps)),
+        "-i",
+        "-",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "24",
+        "-pix_fmt",
+        "yuv420p",
+        "-profile:v",
+        "high",
+        "-movflags",
+        "+faststart",
+        tmp_mp4,
+    ]
+    proc = subprocess.Popen(ff_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc.stdin is not None
+
+    poster_k = n_clip // 2
+    try:
+        from PIL import Image
+
+        for k in range(n_clip):
+            fig.canvas.restore_region(bg_cache)
+            t_cur = float(t_grid[k])
+            dt_ms = float(t_rel_ms[k])
+            outer_tick = int(round(t_cur * outer_hz))
+            sub_tick = outer_tick * oversample
+            hud_text.set_text(
+                f"t = {t_cur:7.4f} s (+{dt_ms:5.1f} / {actual_dur_ms:5.1f} ms)  |  "
+                f"Outer {outer_hz/1e3:.1f} kHz Tick: {outer_tick:6,d}  |  "
+                f"Internal {internal_hz/1e3:.1f} kHz Sub-Tick "
+                f"({internal_dt_us:.0f} µs): {sub_tick:7,d}  |  "
+                f"{slowdown:.1f}× Slow-Motion ({fps} fps)"
+            )
+            ax_hud.draw_artist(hud_text)
+
+            i1 = int(map_idx["wfs1"][k])
+            i2 = int(map_idx["wfs2"][k])
+            wfs_badges[0][1].set_text(
+                f"Max = {w1_max_adu[i1]:5.0f} ADU\n"
+                f"Sum = {w1_sum_kadu[i1]:4.0f} kADU (#{int(abs_idx['wfs1'][k])})"
+            )
+            wfs_badges[1][1].set_text(f"RMS = {s1_rms_e4[i1]:5.2f}e-4")
+            wfs_badges[2][1].set_text(
+                f"Max = {w2_max_adu[i2]:5.0f} ADU\n"
+                f"Sum = {w2_sum_kadu[i2]:4.0f} kADU (#{int(abs_idx['wfs2'][k])})"
+            )
+            wfs_badges[3][1].set_text(f"RMS = {s2_rms_e4[i2]:5.2f}e-4")
+
+            for w_i, (ax_w, im, cube, midx_arr) in enumerate(wfs_ims):
+                im.set_data(cube[midx_arr[k]])
+                ax_w.draw_artist(im)
+                for sp in ax_w.spines.values():
+                    ax_w.draw_artist(sp)
+                ax_w.draw_artist(wfs_badges[w_i][1])
+
+            for p_i, p_item in enumerate(psf_ims):
+                ax_p, im, c30, c23, leg_p, cube_log, midx_arr, bkey, skey, pk = p_item
+                im.set_data(cube_log[midx_arr[k]])
+                sr_v = float(psf_peak_sr[(bkey, skey)][k])
+                psf_badges[p_i][1].set_text(
+                    f"Inst SR = {sr_v:5.1f}%\nExp #{int(abs_idx[pk][k])}"
+                )
+                ax_p.draw_artist(im)
+                ax_p.draw_artist(c30)
+                ax_p.draw_artist(c23)
+                for sp in ax_p.spines.values():
+                    ax_p.draw_artist(sp)
+                if leg_p is not None:
+                    ax_p.draw_artist(leg_p)
+                ax_p.draw_artist(psf_badges[p_i][1])
+
+            cur_wfe.set_xdata([dt_ms, dt_ms])
+            dot_w1.set_data([dt_ms], [float(wfe_stg1_nm[k])])
+            dot_w2.set_data([dt_ms], [float(wfe_final_nm[k])])
+            ax_wfe.draw_artist(cur_wfe)
+            ax_wfe.draw_artist(dot_w1)
+            ax_wfe.draw_artist(dot_w2)
+            ax_wfe.draw_artist(leg_wfe)
+
+            cur_sr.set_xdata([dt_ms, dt_ms])
+            dot_sv.set_data([dt_ms], [float(sr_vf[k])])
+            dot_sn.set_data([dt_ms], [float(sr_nf[k])])
+            ax_sr.draw_artist(cur_sr)
+            ax_sr.draw_artist(dot_sv)
+            ax_sr.draw_artist(dot_sn)
+            ax_sr.draw_artist(leg_sr)
+
+            buf = fig.canvas.buffer_rgba()
+            if k == poster_k and poster_png:
+                img_rgba = Image.frombuffer(
+                    "RGBA", (width_px, height_px), bytes(buf), "raw", "RGBA", 0, 1
+                )
+                img_rgba.convert("RGB").save(poster_png)
+            proc.stdin.write(memoryview(buf))
+        proc.stdin.close()
+        proc.stdin = None
+        _, err_bytes = proc.communicate()
+    finally:
+        plt.close(fig)
+        if proc.stdin is not None:
+            proc.stdin.close()
+
+    if proc.returncode != 0:
+        if os.path.exists(tmp_mp4):
+            os.remove(tmp_mp4)
+        err_msg = err_bytes.decode(errors="replace")
+        raise RuntimeError(f"ffmpeg exited with code {proc.returncode}: {err_msg}")
+
+    os.replace(tmp_mp4, out_mp4)
+    wall_render_s = time.monotonic() - t_wall0
+    poster_base = (
+        os.path.basename(poster_png) if poster_png and os.path.isfile(poster_png) else None
+    )
+    meta = {
+        "video_file": os.path.basename(out_mp4),
+        "poster_file": poster_base,
+        "telemetry_mode": str(manifest.get("mode", "custom")),
+        "t_start_s": round(t0_actual, 6),
+        "t_end_s": round(t1_actual, 6),
+        "duration_ms": round(actual_dur_ms, 3),
+        "n_frames": n_clip,
+        "dt_step_ms": round(dt_step_ms, 4),
+        "fps": int(fps),
+        "playback_duration_s": round(n_clip / float(max(fps, 1)), 2),
+        "slowdown_factor": round(slowdown, 2),
+        "width_px": int(width_px),
+        "height_px": int(height_px),
+        "size_bytes": int(os.path.getsize(out_mp4)),
+        "wfs_stg1_rate_hz": float(indices["wfs1"].rate_hz),
+        "wfs_stg2_rate_hz": float(indices["wfs2"].rate_hz),
+        "psf_stg1_rate_hz": float(indices["psf_vis_stg1"].rate_hz),
+        "psf_final_rate_hz": float(indices["psf_vis_final"].rate_hz),
+        "internal_bench_hz": float(internal_hz),
+        "internal_dt_us": float(internal_dt_us),
+        "oversample": int(oversample),
+        "vis_final_sr_mean_pct": round(float(np.mean(sr_vf)), 2),
+        "vis_final_sr_min_pct": round(float(np.min(sr_vf)), 2),
+        "vis_final_sr_max_pct": round(float(np.max(sr_vf)), 2),
+        "nir_final_sr_mean_pct": round(float(np.mean(sr_nf)), 2),
+        "nir_final_sr_min_pct": round(float(np.min(sr_nf)), 2),
+        "nir_final_sr_max_pct": round(float(np.max(sr_nf)), 2),
+        "wfe_final_mean_nm": round(float(np.mean(wfe_final_nm)), 2),
+        "render_wall_s": round(wall_render_s, 2),
+    }
+    if meta_json:
+        with open(meta_json, "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, indent=2)
+            fh.write("\n")
+    return meta
+
+
+def main(argv: list[str] | None = None) -> int:
+    args_raw = sys.argv[1:] if argv is None else argv
+    if any(a in ("-h1", "--help-oneline") for a in args_raw):
+        print("render short-timescale WFS & PSF evolution MP4 video from AO telemetry cubes")
+        return 0
+    if any(a in ("-h2", "--help-description") for a in args_raw):
+        print(
+            "Memory-map streamFITSlog AO telemetry cubes (csim_wfs_*, psf_*) and render a\n"
+            "synchronized slow-motion H.264 MP4 movie + poster frame for AO web reports."
+        )
+        return 0
+
+    parser = argparse.ArgumentParser(
+        description="Render short-timescale WFS & PSF evolution video from on-disk AO telemetry."
+    )
+    parser.add_argument(
+        "--telemetry-dir",
+        required=True,
+        help="Path to telemetry directory produced by --save-telemetry",
+    )
+    parser.add_argument(
+        "--report-dir",
+        default=None,
+        help=(
+            "AO report directory with DL PSF references & wf_timeseries.csv "
+            "(default: parent of telemetry-dir)"
+        ),
+    )
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="Output .mp4 path (default: <report-dir>/wfs_psf_short_evolution.mp4)",
+    )
+    parser.add_argument(
+        "--poster",
+        default=None,
+        help="Output poster .png path (default: <out_stem>_poster.png)",
+    )
+    parser.add_argument(
+        "--meta-out",
+        default=None,
+        help="Optional output JSON file recording video clip statistics",
+    )
+    parser.add_argument(
+        "--t-start",
+        type=float,
+        default=5.0,
+        help="Physical start time [s] of the short-timescale clip (default: 5.0)",
+    )
+    parser.add_argument(
+        "--duration-ms",
+        type=float,
+        default=200.0,
+        help="Physical duration [ms] of the clip (default: 200.0)",
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=30,
+        help="Video playback frame rate [fps] (default: 30)",
+    )
+    args = parser.parse_args(args_raw)
+
+    telem_dir = os.path.abspath(args.telemetry_dir)
+    report_dir = os.path.abspath(args.report_dir) if args.report_dir else os.path.dirname(telem_dir)
+    out_mp4 = (
+        os.path.abspath(args.out)
+        if args.out
+        else os.path.join(report_dir, "wfs_psf_short_evolution.mp4")
+    )
+    meta = render_telemetry_video(
+        telem_dir=telem_dir,
+        report_dir=report_dir,
+        out_mp4=out_mp4,
+        poster_png=args.poster,
+        meta_json=args.meta_out,
+        t_start_req=args.t_start,
+        duration_ms=args.duration_ms,
+        fps=args.fps,
+    )
+    sz_mb = float(meta["size_bytes"]) / (1024.0 * 1024.0)
+    print(
+        f"[telemetry-video] Rendered {meta['n_frames']} frames "
+        f"(t = {meta['t_start_s']:.3f}..{meta['t_end_s']:.3f} s, "
+        f"{meta['slowdown_factor']}x slow-motion @ {meta['fps']} fps) -> "
+        f"{out_mp4} ({sz_mb:.2f} MiB in {meta['render_wall_s']:.1f} s)"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

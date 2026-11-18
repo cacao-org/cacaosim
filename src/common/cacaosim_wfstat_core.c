@@ -576,6 +576,7 @@ static uint64_t write_strehl_timeseries_csv(
             fprintf(fp, ",%s_inst,%s_long", s_strehl_defs[c].key, s_strehl_defs[c].key);
         }
         fprintf(fp, "\n");
+        uint64_t cur[6] = { 0, 0, 0, 0, 0, 0 };
         for (uint64_t r = 0; r < ao3k_max_len; r++)
         {
             uint64_t exp_id = r + 1U;
@@ -584,9 +585,20 @@ static uint64_t write_strehl_timeseries_csv(
             for (int c = 0; c < 6; c++)
             {
                 const cacaosim_wfstat_strehl_t *st = &ws->strehl[c];
-                if (st->active && r < st->len)
+                if (!st->active)
                 {
-                    fprintf(fp, ",%.6f,%.6f", (double) st->sr_inst[r], (double) st->sr_long[r]);
+                    fprintf(fp, ",nan,nan");
+                    continue;
+                }
+                while (cur[c] + 1U < st->len && st->frame[cur[c]] < fr)
+                {
+                    cur[c]++;
+                }
+                if (cur[c] < st->len && st->frame[cur[c]] == fr)
+                {
+                    fprintf(fp, ",%.6f,%.6f", (double) st->sr_inst[cur[c]],
+                            (double) st->sr_long[cur[c]]);
+                    cur[c]++;
                 }
                 else
                 {

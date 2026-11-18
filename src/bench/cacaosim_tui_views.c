@@ -382,8 +382,8 @@ void cs_render_view_tables(cs_tui_app_t *app, int x, int y, int w, int h)
         cs_printf_at(&app->scr, x + 2, ry++, w - 4, pal->fg_stream, pal->bg_panel, CS_ATTR_BOLD, 1,
                      "WAVEFRONT & FOCAL-PLANE SENSORS");
         cs_printf_at(&app->scr, x + 2, ry++, w - 4, pal->fg_dim, pal->bg_panel, 0u, 1,
-                     "%-12s %-6s %-10s %-12s %-10s %-12s %-8s %-14s %s", "ID", "KIND", "DETECTOR",
-                     "BAND [um]", "RATE [Hz]", "FLUX [ph/fr]", "RON", "OUT SHM", "IN BEAM");
+                     "%-12s %-6s %-10s %-15s %-10s %-12s %-8s %-14s %s", "ID", "KIND", "DETECTOR",
+                     "BAND / SLICES", "RATE [Hz]", "FLUX [ph/fr]", "RON", "OUT SHM", "IN BEAM");
     }
 
     for (uint32_t i = 0; i < app->cfg.n_nodes && ry < bot; i++)
@@ -416,6 +416,12 @@ void cs_render_view_tables(cs_tui_app_t *app, int x, int y, int w, int h)
                                ? nd->shwfs.lambda_um
                                : (nd->kind == CACAOSIM_NODE_ZWFS ? nd->zwfs.lambda_um
                                                                  : nd->fpcam.lambda_um));
+        int32_t cfg_nl = (nd->kind == CACAOSIM_NODE_PYRWFS)
+                             ? nd->pyrwfs.nlambda
+                             : (nd->kind == CACAOSIM_NODE_SHWFS
+                                    ? nd->shwfs.nlambda
+                                    : (nd->kind == CACAOSIM_NODE_ZWFS ? nd->zwfs.nlambda
+                                                                      : nd->fpcam.nlambda));
         float ron = (nd->kind == CACAOSIM_NODE_PYRWFS)
                         ? nd->pyrwfs.det.ron_e
                         : (nd->kind == CACAOSIM_NODE_SHWFS
@@ -425,9 +431,10 @@ void cs_render_view_tables(cs_tui_app_t *app, int x, int y, int w, int h)
         float mhz = (app->cfg.master_hz > 0.0f) ? app->cfg.master_hz : 2000.0f;
         float hz  = (nd->rate_hz > 0.0f) ? nd->rate_hz : (mhz / (float) (nd->navg ? nd->navg : 1u));
 
-        /* Look up precomputed per-frame photon flux and eff_navg from spectral analyzer */
+        /* Look up precomputed per-frame photon flux, eff_navg, and eff_nlam from analyzer */
         float    flux     = 0.0f;
         uint32_t disp_nav = nd->navg ? nd->navg : 1u;
+        int32_t  eff_nlam = cacaosim_resolve_nlambda(cfg_nl, 1u, nd->bw_frac);
         if (app->dag_valid)
         {
             for (uint32_t si = 0; si < app->ctx.n_nodes; si++)
@@ -436,21 +443,28 @@ void cs_render_view_tables(cs_tui_app_t *app, int x, int y, int w, int h)
                 {
                     flux     = app->ctx.nodes[si].eff_flux_ph;
                     disp_nav = app->ctx.nodes[si].eff_navg;
+                    if (app->ctx.nodes[si].eff_nlam >= 1)
+                    {
+                        eff_nlam = app->ctx.nodes[si].eff_nlam;
+                    }
                     break;
                 }
             }
         }
 
-        char dets[16], band[16], rstr[16], fstr[16], rons[12];
+        char   dets[16], band[32], rstr[16], fstr[16], rons[16];
+        double lam_c = (lam >= 0.0f && lam <= 99.9f) ? (double) lam : 0.0;
+        double bw_p  = (nd->bw_frac >= 0.0f && nd->bw_frac <= 9.99f) ? nd->bw_frac * 100.0 : 0.0;
+        int    nl_c  = (eff_nlam >= 1 && eff_nlam <= 99) ? eff_nlam : 1;
         snprintf(dets, sizeof(dets), "%ux%u", ncam, ncam);
-        snprintf(band, sizeof(band), "%.2f (%.0f%%)", lam, nd->bw_frac * 100.0f);
+        snprintf(band, sizeof(band), "%.2f/%.0f%%/%dch", lam_c, bw_p, nl_c);
         snprintf(rstr, sizeof(rstr), "%.0f (/%u)", hz, disp_nav);
         fmt_flux_v(flux, fstr, sizeof(fstr));
         snprintf(rons, sizeof(rons), "%.1fe-", ron);
 
         cs_printf_at(&app->scr, x + 2, ry, w - 4, sel ? pal->fg_bright : pal->fg_text, bg,
                      sel ? CS_ATTR_BOLD : 0u, 1,
-                     "%-12.12s %-6s %-10s %-12s %-10s %-12s %-8s %-14.14s %s", nd->id, kstr, dets,
+                     "%-12.12s %-6s %-10s %-15s %-10s %-12s %-8s %-14.14s %s", nd->id, kstr, dets,
                      band, rstr, fstr, rons, nd->out_cam, nd->in_beam);
         cs_tui_add_hit(app, CS_HIT_ELEM_ROW, (int) i + 1, x + 1, ry, w - 2, 1,
                        "Click to select wavefront/science sensor");
