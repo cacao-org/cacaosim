@@ -346,6 +346,12 @@ void cacaosim_pyrwfs_readout(
     uint16_t                 *out_u16,
     float                    *out_f32);
 
+void cacaosim_pyrwfs_readout_async(
+    cacaosim_pyrwfs_ctx_t    *ctx,
+    const cacaosim_det_cfg_t *det_live,
+    uint16_t                 *out_u16,
+    float                    *out_f32);
+
 /**
  * cacaosim_pyrwfs_step() - Single-subframe Pyramid WFS propagation and camera readout
  * @ctx:       Initialized Pyramid WFS context (non-NULL)
@@ -433,6 +439,25 @@ void cacaosim_pyrwfs_cuda_accum_poly(cacaosim_pyrwfs_ctx_t *ctx,
                                      const float           *d_beam_opd,
                                      const float           *d_beam_amp);
 
+void cacaosim_pyrwfs_cuda_accum_full(cacaosim_pyrwfs_ctx_t *ctx,
+                                     const float           *dyn_pup_amp,
+                                     const float           *atm_amp,
+                                     const float           *wf_in,
+                                     const float           *dm_opd,
+                                     const float           *d_pup_amp_ext,
+                                     const float           *d_wf_opd_ext,
+                                     const float           *d_dm_opd_ext,
+                                     float                  wf_to_opd);
+
+void cacaosim_pyrwfs_cuda_accum_poly_full(cacaosim_pyrwfs_ctx_t *ctx,
+                                          const float           *beam_opd,
+                                          const float           *beam_amp,
+                                          const float           *beam_lam_um,
+                                          uint32_t               beam_nlam,
+                                          uint64_t               chan_stride,
+                                          const float           *d_beam_opd,
+                                          const float           *d_beam_amp);
+
 /**
  * cacaosim_pyrwfs_cuda_free() - Release all GPU plans, CUDA Graphs, device buffers, and streams
  * @ctx: Pyramid WFS context whose `cuda_priv` state will be destroyed
@@ -495,6 +520,12 @@ void cacaosim_pyrwfs_cuda_readout(cacaosim_pyrwfs_ctx_t    *ctx,
                                   const cacaosim_det_cfg_t *det_live,
                                   uint16_t                 *out_u16,
                                   float                    *out_f32);
+
+void cacaosim_pyrwfs_cuda_readout_ex(cacaosim_pyrwfs_ctx_t    *ctx,
+                                     const cacaosim_det_cfg_t *det_live,
+                                     uint16_t                 *out_u16,
+                                     float                    *out_f32,
+                                     int                       sync_stream);
 
 #ifdef __cplusplus
 }

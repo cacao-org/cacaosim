@@ -636,10 +636,13 @@ static uint64_t write_strehl_timeseries_csv(
     return 0;
 }
 
-int cacaosim_wfstat_write(cacaosim_wfstat_t *ws, const char *out_dir, double dt_phys)
+void cacaosim_wfstat_sync_gpu(cacaosim_wfstat_t *ws)
 {
-    uint64_t npix = ws->npix;
-    if (ws->use_cuda)
+    if (ws == NULL)
+    {
+        return;
+    }
+    if (ws->use_cuda && ws->gpu != NULL)
     {
         double   acc[2 * CACAOSIM_WFSTAT_NB_LOC];
         uint64_t gpu_ts_len = 0;
@@ -653,6 +656,35 @@ int cacaosim_wfstat_write(cacaosim_wfstat_t *ws, const char *out_dir, double dt_
             }
             ws->ts_len = gpu_ts_len;
         }
+        cacaosim_wfstat_gpu_free(ws->gpu);
+        ws->gpu      = NULL;
+        ws->use_cuda = 0;
+    }
+    /* Release process-global MILK SHM handles on caller thread so background disk write is pure */
+    for (int e = 0; e < CACAOSIM_WFSTAT_NB_EXTRA; e++)
+    {
+        if (ws->extras[e].img.ID != -1)
+        {
+            imgid_free(&ws->extras[e].img);
+            ws->extras[e].img.ID = -1;
+        }
+    }
+    for (int c = 0; c < CACAOSIM_WFSTAT_NB_STREHL; c++)
+    {
+        if (ws->strehl[c].img.ID != -1)
+        {
+            imgid_free(&ws->strehl[c].img);
+            ws->strehl[c].img.ID = -1;
+        }
+    }
+}
+
+int cacaosim_wfstat_write(cacaosim_wfstat_t *ws, const char *out_dir, double dt_phys)
+{
+    uint64_t npix = ws->npix;
+    if (ws->use_cuda)
+    {
+        cacaosim_wfstat_sync_gpu(ws);
     }
 
     mkdir_p(out_dir);

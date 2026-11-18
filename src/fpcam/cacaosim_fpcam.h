@@ -372,6 +372,15 @@ void cacaosim_fpcam_readout(
     float                    *out_f32,
     float                    *out_long);
 
+void cacaosim_fpcam_readout_async(
+    cacaosim_fpcam_ctx_t     *ctx,
+    const cacaosim_det_cfg_t *det_live,
+    uint16_t                 *out_u16,
+    float                    *out_f32,
+    float                    *out_long);
+
+void cacaosim_fpcam_readout_finish(cacaosim_fpcam_ctx_t *ctx);
+
 /**
  * cacaosim_fpcam_step() - Single-subframe optical propagation + detector readout convenience call
  * @ctx:       Active camera context.
@@ -455,6 +464,7 @@ void cacaosim_fpcam_cuda_upload_weights(cacaosim_fpcam_ctx_t *ctx);
  *   Uses `cudaMemsetAsync` on the camera stream to avoid host synchronization between exposures.
  */
 void cacaosim_fpcam_cuda_reset_accum(cacaosim_fpcam_ctx_t *ctx);
+void cacaosim_fpcam_cuda_reset_long(cacaosim_fpcam_ctx_t *ctx);
 
 /**
  * cacaosim_fpcam_cuda_accum() - Accumulate one monochromatic-input optical subframe on CUDA GPU
@@ -531,6 +541,15 @@ void cacaosim_fpcam_cuda_readout(cacaosim_fpcam_ctx_t     *ctx,
                                  float                    *host_exp_int,
                                  uint16_t                 *out_u16,
                                  float                    *out_f32);
+
+void cacaosim_fpcam_cuda_readout_full(cacaosim_fpcam_ctx_t     *ctx,
+                                      const cacaosim_det_cfg_t *det_live,
+                                      uint16_t                 *out_u16,
+                                      float                    *out_f32,
+                                      float                    *out_long,
+                                      int                       sync_stream);
+
+void cacaosim_fpcam_cuda_readout_finish(cacaosim_fpcam_ctx_t *ctx);
 
 #ifdef __cplusplus
 }

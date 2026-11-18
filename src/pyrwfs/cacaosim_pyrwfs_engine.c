@@ -988,6 +988,13 @@ void MILK_HOT cacaosim_pyrwfs_accum_subframe(
     float        wf_to_opd = cacaosim_wf_to_opd_scale(ctx->cfg.wf_unit, ctx->cfg.ref_lambda,
                                                       turb_gain);
     const float *wf_eff    = (turb_gain != 0.0f) ? wf_in : NULL;
+    if (ctx->use_cuda && ctx->force_full_mod && ctx->n_slices > 1)
+    {
+        cacaosim_pyrwfs_cuda_accum_full(ctx, NULL, atm_amp, wf_eff, dm_opd, NULL, NULL, d_dm_opd,
+                                        wf_to_opd);
+        return;
+    }
+
     int32_t      reps      = (ctx->force_full_mod && ctx->n_slices > 1) ? ctx->n_slices : 1;
     if (reps > 1)
     {
@@ -1041,6 +1048,13 @@ void MILK_HOT cacaosim_pyrwfs_accum_beam(
     if (fabsf(mod_rad - ctx->cached_mod_rad) > 1e-5f)
     {
         cacaosim_pyrwfs_update_masks(ctx, mod_rad);
+    }
+
+    if (ctx->use_cuda && ctx->force_full_mod && ctx->n_slices > 1)
+    {
+        cacaosim_pyrwfs_cuda_accum_full(ctx, beam_amp, NULL, beam_opd, NULL, d_beam_amp, d_beam_opd,
+                                        NULL, 1.0f);
+        return;
     }
 
     int32_t reps = (ctx->force_full_mod && ctx->n_slices > 1) ? ctx->n_slices : 1;
@@ -1124,6 +1138,13 @@ void MILK_HOT cacaosim_pyrwfs_accum_beam_poly(
         cacaosim_pyrwfs_update_masks(ctx, mod_rad);
     }
 
+    if (ctx->use_cuda && ctx->force_full_mod && ctx->n_slices > 1)
+    {
+        cacaosim_pyrwfs_cuda_accum_poly_full(ctx, beam_opd, beam_amp, beam_lam_um, beam_nlam,
+                                             chan_stride, d_beam_opd, d_beam_amp);
+        return;
+    }
+
     int32_t reps = (ctx->force_full_mod && ctx->n_slices > 1) ? ctx->n_slices : 1;
     if (reps > 1)
     {
@@ -1178,11 +1199,12 @@ void MILK_HOT cacaosim_pyrwfs_accum_beam_poly(
  *   regardless of `navg`, advances `frame_seq` for independent noise realizations, and resets
  *   `subframe_cnt` and `slice_cursor` to begin the next exposure cleanly.
  */
-void MILK_HOT cacaosim_pyrwfs_readout(
+static void MILK_HOT pyrwfs_readout_impl(
     cacaosim_pyrwfs_ctx_t    *ctx,
     const cacaosim_det_cfg_t *det_live,
     uint16_t                 *out_u16,
-    float                    *out_f32)
+    float                    *out_f32,
+    int                       sync_stream)
 {
     if (ctx->subframe_cnt == 0u)
     {
@@ -1194,7 +1216,7 @@ void MILK_HOT cacaosim_pyrwfs_readout(
 
     if (ctx->use_cuda)
     {
-        cacaosim_pyrwfs_cuda_readout(ctx, det, out_u16, out_f32);
+        cacaosim_pyrwfs_cuda_readout_ex(ctx, det, out_u16, out_f32, sync_stream);
         ctx->subframe_cnt = 0u;
         ctx->slice_cursor = 0;
         return;
@@ -1217,6 +1239,24 @@ void MILK_HOT cacaosim_pyrwfs_readout(
                                   ctx->flat_flux_norm, out_u16, out_f32);
     ctx->subframe_cnt = 0u;
     ctx->slice_cursor = 0;
+}
+
+void MILK_HOT cacaosim_pyrwfs_readout(
+    cacaosim_pyrwfs_ctx_t    *ctx,
+    const cacaosim_det_cfg_t *det_live,
+    uint16_t                 *out_u16,
+    float                    *out_f32)
+{
+    pyrwfs_readout_impl(ctx, det_live, out_u16, out_f32, 1);
+}
+
+void MILK_HOT cacaosim_pyrwfs_readout_async(
+    cacaosim_pyrwfs_ctx_t    *ctx,
+    const cacaosim_det_cfg_t *det_live,
+    uint16_t                 *out_u16,
+    float                    *out_f32)
+{
+    pyrwfs_readout_impl(ctx, det_live, out_u16, out_f32, 0);
 }
 
 /**

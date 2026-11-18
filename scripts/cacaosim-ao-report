@@ -717,14 +717,13 @@ def load_loop_calib(work_dir, loop_name, loop_num, out_dir, tmp_npys=None):
             n_mx = max(int(np.sum(mx)), 1)
             n_my = max(int(np.sum(my)), 1)
             n_dm = max(int(np.sum(dm_m)), 1)
-            rgrads = []
-            for m in range(cm_arr.shape[0]):
-                v = cm_arr[m] - float(np.mean(cm_arr[m][dm_m]))
-                gx2 = float(np.sum((v[:, 1:][mx] - v[:, :-1][mx]) ** 2)) / n_mx
-                gy2 = float(np.sum((v[1:, :][my] - v[:-1, :][my]) ** 2)) / n_my
-                v2 = float(np.sum(v[dm_m] ** 2)) / n_dm
-                rgrads.append(math.sqrt((gx2 + gy2) / max(v2, 1e-12)))
-            info["mode_rel_grad"] = rgrads
+            v_dm = cm_arr[:, dm_m]
+            v_dm_mean = np.mean(v_dm, axis=1)
+            v = cm_arr - v_dm_mean[:, None, None]
+            gx2 = np.sum((v[:, :, 1:][:, mx] - v[:, :, :-1][:, mx]) ** 2, axis=1) / n_mx
+            gy2 = np.sum((v[:, 1:, :][:, my] - v[:, :-1, :][:, my]) ** 2, axis=1) / n_my
+            v2 = np.sum((v_dm - v_dm_mean[:, None]) ** 2, axis=1) / n_dm
+            info["mode_rel_grad"] = np.sqrt((gx2 + gy2) / np.maximum(v2, 1e-12)).tolist()
     if os.path.isfile(wfsmask_p):
         wfs_m = np.asarray(fits.getdata(wfsmask_p))
         info["active_wfs_pix"] = int(np.sum(wfs_m > 0.5))
@@ -854,6 +853,28 @@ out_dir, summary_path = sys.argv[1], sys.argv[2]
 with open(summary_path, "r", encoding="utf-8") as fh:
     data = json.load(fh)
 
+_orig_savefig = matplotlib.figure.Figure.savefig
+def _fast_savefig(self, fname, *args, **kwargs):
+    if isinstance(fname, str) and fname.endswith(".png") and "pil_kwargs" not in kwargs:
+        kwargs["pil_kwargs"] = {"compress_level": 1}
+    return _orig_savefig(self, fname, *args, **kwargs)
+matplotlib.figure.Figure.savefig = _fast_savefig
+
+_n_shards = min(13, max(1, os.cpu_count() or 1)) if hasattr(os, "fork") else 1
+_child_pids = []
+_my_shard = 0
+if _n_shards > 1:
+    for _s in range(1, _n_shards):
+        _pid = os.fork()
+        if _pid == 0:
+            _my_shard = _s
+            _child_pids = []
+            break
+        _child_pids.append(_pid)
+
+def _want_plot(slot):
+    return (slot % _n_shards) == _my_shard
+
 stages = [
     ("raw", "Uncorrected (0.6\" Seeing)"),
     ("stg1", "After Stage 1 (AO3k NIR PyWFS)"),
@@ -864,168 +885,170 @@ bands = [
     ("nir", "Near-IR H-Band (1.65 µm, 18% BW, 3ch)", 1.50),
 ]
 
-fig, axes = plt.subplots(2, 3, figsize=(14.5, 9.2), constrained_layout=True)
-fig.suptitle(
-    "Subaru 8.2 m AO3k + SCExAO Two-Stage Correction — 10.0 s Polychromatic PSFs\n"
-    "(Seeing = 0.60\", Star mV = 6 / mH = 6, Stage 1 = 1 kHz J-Band 20% 2ch PyWFS, "
-    "Stage 2 = 2 kHz Vis 20% 2ch PyWFS)",
-    fontsize=12.6,
-    fontweight="bold",
-)
+if _want_plot(0):
+    fig, axes = plt.subplots(2, 3, figsize=(14.5, 9.2), constrained_layout=True)
+    fig.suptitle(
+        "Subaru 8.2 m AO3k + SCExAO Two-Stage Correction — 10.0 s Polychromatic PSFs\n"
+        "(Seeing = 0.60\", Star mV = 6 / mH = 6, Stage 1 = 1 kHz J-Band 20% 2ch PyWFS, "
+        "Stage 2 = 2 kHz Vis 20% 2ch PyWFS)",
+        fontsize=12.6,
+        fontweight="bold",
+    )
 
-for r, (bkey, blabel, half_fov_arcsec) in enumerate(bands):
-    im_handle = None
-    for c, (skey, slabel) in enumerate(stages):
-        ax = axes[r, c]
-        arr = np.load(os.path.join(out_dir, f"psf_{bkey}_{skey}.npy"))
-        m = data["psf_metrics"][bkey][skey]
-        ny, nx = arr.shape
-        c0 = nx // 2
-        pix_arcsec = m["pixscale_mas"] / 1000.0
-        hw = min(c0, int(round(half_fov_arcsec / pix_arcsec)))
-        sub = np.clip(arr[c0 - hw : c0 + hw, c0 - hw : c0 + hw], 1e-5, 1.0)
-        ext = [-hw * pix_arcsec, hw * pix_arcsec, -hw * pix_arcsec, hw * pix_arcsec]
+    for r, (bkey, blabel, half_fov_arcsec) in enumerate(bands):
+        im_handle = None
+        for c, (skey, slabel) in enumerate(stages):
+            ax = axes[r, c]
+            arr = np.load(os.path.join(out_dir, f"psf_{bkey}_{skey}.npy"))
+            m = data["psf_metrics"][bkey][skey]
+            ny, nx = arr.shape
+            c0 = nx // 2
+            pix_arcsec = m["pixscale_mas"] / 1000.0
+            hw = min(c0, int(round(half_fov_arcsec / pix_arcsec)))
+            sub = np.clip(arr[c0 - hw : c0 + hw, c0 - hw : c0 + hw], 1e-5, 1.0)
+            ext = [-hw * pix_arcsec, hw * pix_arcsec, -hw * pix_arcsec, hw * pix_arcsec]
 
-        im_handle = ax.imshow(
-            sub,
-            origin="lower",
-            extent=ext,
-            cmap="inferno",
-            norm=LogNorm(vmin=1e-4, vmax=1.0),
-            interpolation="nearest",
-        )
-        ld_arcsec = m["ld_mas"] / 1000.0
-        c1 = Circle(
-            (0.0, 0.0),
-            30.0 * ld_arcsec,
-            fill=False,
-            ls="--",
-            lw=0.9,
-            ec="cyan",
-            alpha=0.75,
-            label="AO3k 30 λ/D",
-        )
-        c2 = Circle(
-            (0.0, 0.0),
-            23.0 * ld_arcsec,
-            fill=False,
-            ls=":",
-            lw=1.0,
-            ec="lime",
-            alpha=0.85,
-            label="SCExAO 23 λ/D",
-        )
-        ax.add_patch(c1)
-        ax.add_patch(c2)
-        if r == 0 and c == 2:
-            ax.legend(
-                loc="upper right",
-                fontsize=8,
-                facecolor="#10141c",
-                edgecolor="#556070",
-                labelcolor="white",
-                framealpha=0.85,
+            im_handle = ax.imshow(
+                sub,
+                origin="lower",
+                extent=ext,
+                cmap="inferno",
+                norm=LogNorm(vmin=1e-4, vmax=1.0),
+                interpolation="nearest",
             )
+            ld_arcsec = m["ld_mas"] / 1000.0
+            c1 = Circle(
+                (0.0, 0.0),
+                30.0 * ld_arcsec,
+                fill=False,
+                ls="--",
+                lw=0.9,
+                ec="cyan",
+                alpha=0.75,
+                label="AO3k 30 λ/D",
+            )
+            c2 = Circle(
+                (0.0, 0.0),
+                23.0 * ld_arcsec,
+                fill=False,
+                ls=":",
+                lw=1.0,
+                ec="lime",
+                alpha=0.85,
+                label="SCExAO 23 λ/D",
+            )
+            ax.add_patch(c1)
+            ax.add_patch(c2)
+            if r == 0 and c == 2:
+                ax.legend(
+                    loc="upper right",
+                    fontsize=8,
+                    facecolor="#10141c",
+                    edgecolor="#556070",
+                    labelcolor="white",
+                    framealpha=0.85,
+                )
 
-        if r == 0:
-            ax.set_title(slabel, fontsize=11.5, fontweight="bold")
-        if c == 0:
-            ax.set_ylabel(f"{blabel}\nΔDec [arcsec]", fontsize=10.5)
-        else:
-            ax.set_ylabel("ΔDec [arcsec]", fontsize=9.5)
-        ax.set_xlabel("ΔRA [arcsec]", fontsize=9.5)
+            if r == 0:
+                ax.set_title(slabel, fontsize=11.5, fontweight="bold")
+            if c == 0:
+                ax.set_ylabel(f"{blabel}\nΔDec [arcsec]", fontsize=10.5)
+            else:
+                ax.set_ylabel("ΔDec [arcsec]", fontsize=9.5)
+            ax.set_xlabel("ΔRA [arcsec]", fontsize=9.5)
 
-        txt = (
-            f"Strehl = {m['strehl_peak']*100:.1f}%\n"
-            f"FWHM = {m['fwhm_mas']:.1f} mas ({m['fwhm_ld']:.2f} λ/D)\n"
-            f"EE(1.22 λ/D) = {m['ee_1p22ld']*100:.1f}%"
-        )
-        ax.text(
-            0.03,
-            0.04,
-            txt,
-            transform=ax.transAxes,
-            fontsize=8.8,
-            color="white",
-             family="monospace",
-            bbox=dict(boxstyle="round,pad=0.3", fc="black", ec="none", alpha=0.68),
-        )
-    cbar = fig.colorbar(im_handle, ax=axes[r, :], shrink=0.88, pad=0.015)
-    cbar.set_label("Strehl-Normalized Intensity", fontsize=10)
+            txt = (
+                f"Strehl = {m['strehl_peak']*100:.1f}%\n"
+                f"FWHM = {m['fwhm_mas']:.1f} mas ({m['fwhm_ld']:.2f} λ/D)\n"
+                f"EE(1.22 λ/D) = {m['ee_1p22ld']*100:.1f}%"
+            )
+            ax.text(
+                0.03,
+                0.04,
+                txt,
+                transform=ax.transAxes,
+                fontsize=8.8,
+                color="white",
+                family="monospace",
+                bbox=dict(boxstyle="round,pad=0.3", fc="black", ec="none", alpha=0.68),
+            )
+        cbar = fig.colorbar(im_handle, ax=axes[r, :], shrink=0.88, pad=0.015)
+        cbar.set_label("Strehl-Normalized Intensity", fontsize=10)
 
-fig.savefig(os.path.join(out_dir, "psf_comparison_2x3.png"), dpi=180)
-plt.close(fig)
+    fig.savefig(os.path.join(out_dir, "psf_comparison_2x3.png"), dpi=180)
+    plt.close(fig)
 
-fig2, axes2 = plt.subplots(2, 2, figsize=(13.5, 8.8), constrained_layout=True)
-fig2.suptitle(
-    "AO3k + SCExAO Azimuthal Radial PSF Profiles & Encircled Energy (10.0 s Integration)",
-    fontsize=13,
-    fontweight="bold",
-)
-curve_specs = [
-    ("dl", "Diffraction-Limited (turb=0)", "black", "--", 1.5),
-    ("raw", "Uncorrected (0.6\" seeing)", "#d62728", "-", 1.8),
-    ("stg1", "After Stage 1 (AO3k, 1 kHz)", "#ff7f0e", "-", 2.0),
-    ("final", "Final Stage 1+2 (AO3k+SCExAO, 2 kHz)", "#1f77b4", "-", 2.2),
-]
+if _want_plot(1):
+    fig2, axes2 = plt.subplots(2, 2, figsize=(13.5, 8.8), constrained_layout=True)
+    fig2.suptitle(
+        "AO3k + SCExAO Azimuthal Radial PSF Profiles & Encircled Energy (10.0 s Integration)",
+        fontsize=13,
+        fontweight="bold",
+    )
+    curve_specs = [
+        ("dl", "Diffraction-Limited (turb=0)", "black", "--", 1.5),
+        ("raw", "Uncorrected (0.6\" seeing)", "#d62728", "-", 1.8),
+        ("stg1", "After Stage 1 (AO3k, 1 kHz)", "#ff7f0e", "-", 2.0),
+        ("final", "Final Stage 1+2 (AO3k+SCExAO, 2 kHz)", "#1f77b4", "-", 2.2),
+    ]
 
-for col, (bkey, blabel, _) in enumerate(bands):
-    ax_p = axes2[0, col]
-    ax_e = axes2[1, col]
-    ld_mas = data["psf_metrics"][bkey]["dl"]["ld_mas"]
-    for skey, lab, color, ls, lw in curve_specs:
-        m = data["psf_metrics"][bkey][skey]
-        r_mas = np.asarray(m["rad_mas"])
-        prof = np.clip(np.asarray(m["rad_prof"]), 1e-6, 1.2)
-        ax_p.semilogy(
-            r_mas,
-            prof,
-            label=f"{lab} (SR={m['strehl_peak']*100:.1f}%)",
-            color=color,
-            ls=ls,
-            lw=lw,
-        )
-        if skey != "dl":
-            ax_e.plot(
-                m["ee_grid_mas"],
-                np.asarray(m["ee_grid_val"]) * 100.0,
-                label=f"{lab} (r50={m['ee50_radius_mas']:.0f} mas)",
+    for col, (bkey, blabel, _) in enumerate(bands):
+        ax_p = axes2[0, col]
+        ax_e = axes2[1, col]
+        ld_mas = data["psf_metrics"][bkey]["dl"]["ld_mas"]
+        for skey, lab, color, ls, lw in curve_specs:
+            m = data["psf_metrics"][bkey][skey]
+            r_mas = np.asarray(m["rad_mas"])
+            prof = np.clip(np.asarray(m["rad_prof"]), 1e-6, 1.2)
+            ax_p.semilogy(
+                r_mas,
+                prof,
+                label=f"{lab} (SR={m['strehl_peak']*100:.1f}%)",
                 color=color,
                 ls=ls,
                 lw=lw,
             )
-        else:
-            ax_e.plot(
-                m["ee_grid_mas"],
-                np.asarray(m["ee_grid_val"]) * 100.0,
-                label=lab,
-                color=color,
-                ls=ls,
-                lw=lw,
-            )
+            if skey != "dl":
+                ax_e.plot(
+                    m["ee_grid_mas"],
+                    np.asarray(m["ee_grid_val"]) * 100.0,
+                    label=f"{lab} (r50={m['ee50_radius_mas']:.0f} mas)",
+                    color=color,
+                    ls=ls,
+                    lw=lw,
+                )
+            else:
+                ax_e.plot(
+                    m["ee_grid_mas"],
+                    np.asarray(m["ee_grid_val"]) * 100.0,
+                    label=lab,
+                    color=color,
+                    ls=ls,
+                    lw=lw,
+                )
 
-    ax_p.axvline(30.0 * ld_mas, color="teal", ls="--", lw=1.0, alpha=0.7, label="AO3k 30 λ/D")
-    ax_p.axvline(23.0 * ld_mas, color="green", ls=":", lw=1.2, alpha=0.8, label="SCExAO 23 λ/D")
-    ax_p.set_xlim(0.0, 750.0 if bkey == "vis" else 1500.0)
-    ax_p.set_ylim(2e-5, 1.3)
-    ax_p.grid(True, which="both", alpha=0.28)
-    ax_p.set_title(f"{blabel} — Radial Intensity Profile", fontsize=11, fontweight="bold")
-    ax_p.set_xlabel("Angular Separation [mas]")
-    ax_p.set_ylabel("Azimuthal Mean Intensity [Strehl units]")
-    ax_p.legend(fontsize=8.2, loc="upper right")
+        ax_p.axvline(30.0 * ld_mas, color="teal", ls="--", lw=1.0, alpha=0.7, label="AO3k 30 λ/D")
+        ax_p.axvline(23.0 * ld_mas, color="green", ls=":", lw=1.2, alpha=0.8, label="SCExAO 23 λ/D")
+        ax_p.set_xlim(0.0, 750.0 if bkey == "vis" else 1500.0)
+        ax_p.set_ylim(2e-5, 1.3)
+        ax_p.grid(True, which="both", alpha=0.28)
+        ax_p.set_title(f"{blabel} — Radial Intensity Profile", fontsize=11, fontweight="bold")
+        ax_p.set_xlabel("Angular Separation [mas]")
+        ax_p.set_ylabel("Azimuthal Mean Intensity [Strehl units]")
+        ax_p.legend(fontsize=8.2, loc="upper right")
 
-    ax_e.axvline(30.0 * ld_mas, color="teal", ls="--", lw=1.0, alpha=0.7)
-    ax_e.axvline(23.0 * ld_mas, color="green", ls=":", lw=1.2, alpha=0.8)
-    ax_e.set_xlim(0.0, 750.0 if bkey == "vis" else 1500.0)
-    ax_e.set_ylim(0.0, 102.0)
-    ax_e.grid(True, alpha=0.28)
-    ax_e.set_title(f"{blabel} — Encircled Energy", fontsize=11, fontweight="bold")
-    ax_e.set_xlabel("Aperture Radius [mas]")
-    ax_e.set_ylabel("Encircled Energy [%]")
-    ax_e.legend(fontsize=8.2, loc="lower right")
+        ax_e.axvline(30.0 * ld_mas, color="teal", ls="--", lw=1.0, alpha=0.7)
+        ax_e.axvline(23.0 * ld_mas, color="green", ls=":", lw=1.2, alpha=0.8)
+        ax_e.set_xlim(0.0, 750.0 if bkey == "vis" else 1500.0)
+        ax_e.set_ylim(0.0, 102.0)
+        ax_e.grid(True, alpha=0.28)
+        ax_e.set_title(f"{blabel} — Encircled Energy", fontsize=11, fontweight="bold")
+        ax_e.set_xlabel("Aperture Radius [mas]")
+        ax_e.set_ylabel("Encircled Energy [%]")
+        ax_e.legend(fontsize=8.2, loc="lower right")
 
-fig2.savefig(os.path.join(out_dir, "psf_radial_profiles.png"), dpi=180)
-plt.close(fig2)
+    fig2.savefig(os.path.join(out_dir, "psf_radial_profiles.png"), dpi=180)
+    plt.close(fig2)
 
 wf_info = data.get("wavefront_metrics")
 if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
@@ -1048,7 +1071,7 @@ if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
 
     samples = wf_info.get("samples", [])
     nsamp = len(samples)
-    if nsamp > 0:
+    if _want_plot(2) and nsamp > 0:
         cubes = {
             k: np.load(os.path.join(out_dir, f"wf_samples_{k}.npy"))
             for k, _ in wf_locs
@@ -1134,96 +1157,97 @@ if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
         fig3.savefig(os.path.join(out_dir, "wf_samples_5x3.png"), dpi=175)
         plt.close(fig3)
 
-    fig4, axes4 = plt.subplots(2, 3, figsize=(14.5, 9.2), constrained_layout=True)
-    nfr = wf_info.get("n_frames", 0)
-    t_rec = wf_info.get("phys_time_recorded_s", 0.0)
-    fig4.suptitle(
-        f"Subaru 8.2 m AO3k + SCExAO — Wavefront Mean & Std Dev Maps "
-        f"({t_rec:.1f} s, {nfr:,d} frames)\n"
-        "(Row 1: Time-Averaged WF ⟨OPD⟩_t [nm] | Row 2: Temporal Std Dev std_t(OPD) [nm])",
-        fontsize=12.8,
-        fontweight="bold",
-    )
-
-    for c, (k, clabel) in enumerate(wf_locs):
-        loc_m = wf_info["locations"][k]
-        mean_arr = np.load(os.path.join(out_dir, f"wf_mean_{k}.npy"))
-        std_arr = np.load(os.path.join(out_dir, f"wf_std_{k}.npy"))
-
-        m_vals = np.abs(mean_arr[pmask])
-        mlim = float(np.percentile(m_vals, 99.5)) if m_vals.size else 10.0
-        mstep = 20.0 if mlim > 120.0 else (5.0 if mlim > 25.0 else 2.0)
-        mvmax = max(mstep, np.ceil(mlim / mstep) * mstep)
-
-        ax_m = axes4[0, c]
-        im_m = ax_m.imshow(
-            np.where(pmask, mean_arr, np.nan),
-            origin="lower",
-            extent=ext_m,
-            cmap=cmap_div,
-            vmin=-mvmax,
-            vmax=mvmax,
-            interpolation="nearest",
-        )
-        ax_m.set_title(clabel, fontsize=11, fontweight="bold")
-        ax_m.set_xlabel("x [m]", fontsize=9.5)
-        ax_m.set_ylabel("Average WF ⟨OPD⟩_t\ny [m]" if c == 0 else "y [m]", fontsize=10)
-        cb_m = fig4.colorbar(im_m, ax=ax_m, shrink=0.86, pad=0.02)
-        cb_m.set_label("Mean OPD [nm]", fontsize=9)
-        ax_m.text(
-            0.03,
-            0.04,
-            f"RMS(mean) = {loc_m['mean_map_rms_nm']:.1f} nm\n"
-            f"PTV(mean) = {loc_m['mean_map_ptv_nm']:.0f} nm",
-            transform=ax_m.transAxes,
-            fontsize=8.6,
-            color="white",
-            family="monospace",
-            bbox=dict(boxstyle="round,pad=0.26", fc="black", ec="none", alpha=0.72),
+    if _want_plot(3):
+        fig4, axes4 = plt.subplots(2, 3, figsize=(14.5, 9.2), constrained_layout=True)
+        nfr = wf_info.get("n_frames", 0)
+        t_rec = wf_info.get("phys_time_recorded_s", 0.0)
+        fig4.suptitle(
+            f"Subaru 8.2 m AO3k + SCExAO — Wavefront Mean & Std Dev Maps "
+            f"({t_rec:.1f} s, {nfr:,d} frames)\n"
+            "(Row 1: Time-Averaged WF ⟨OPD⟩_t [nm] | Row 2: Temporal Std Dev std_t(OPD) [nm])",
+            fontsize=12.8,
+            fontweight="bold",
         )
 
-        s_vals = std_arr[pmask]
-        slim = float(np.percentile(s_vals, 99.5)) if s_vals.size else 50.0
-        sstep = 100.0 if slim > 600.0 else (20.0 if slim > 150.0 else 10.0)
-        svmax = max(sstep, np.ceil(slim / sstep) * sstep)
+        for c, (k, clabel) in enumerate(wf_locs):
+            loc_m = wf_info["locations"][k]
+            mean_arr = np.load(os.path.join(out_dir, f"wf_mean_{k}.npy"))
+            std_arr = np.load(os.path.join(out_dir, f"wf_std_{k}.npy"))
 
-        ax_s = axes4[1, c]
-        im_s = ax_s.imshow(
-            np.where(pmask, std_arr, np.nan),
-            origin="lower",
-            extent=ext_m,
-            cmap=cmap_std,
-            vmin=0.0,
-            vmax=svmax,
-            interpolation="nearest",
-        )
-        ax_s.set_xlabel("x [m]", fontsize=9.5)
-        ax_s.set_ylabel(
-            "Std Dev std_t(OPD)\ny [m]" if c == 0 else "y [m]", fontsize=10
-        )
-        cb_s = fig4.colorbar(im_s, ax=ax_s, shrink=0.86, pad=0.02)
-        cb_s.set_label("Std Dev OPD [nm]", fontsize=9)
-        ax_s.text(
-            0.03,
-            0.04,
-            f"RMS(std) = {loc_m['std_map_rms_nm']:.1f} nm\n"
-            f"Med={loc_m['std_map_median_nm']:.0f}, P95={loc_m['std_map_p95_nm']:.0f} nm",
-            transform=ax_s.transAxes,
-            fontsize=8.5,
-            color="white",
-            family="monospace",
-            bbox=dict(boxstyle="round,pad=0.26", fc="black", ec="none", alpha=0.72),
-        )
+            m_vals = np.abs(mean_arr[pmask])
+            mlim = float(np.percentile(m_vals, 99.5)) if m_vals.size else 10.0
+            mstep = 20.0 if mlim > 120.0 else (5.0 if mlim > 25.0 else 2.0)
+            mvmax = max(mstep, np.ceil(mlim / mstep) * mstep)
 
-    fig4.savefig(os.path.join(out_dir, "wf_stats_2x3.png"), dpi=180)
-    plt.close(fig4)
+            ax_m = axes4[0, c]
+            im_m = ax_m.imshow(
+                np.where(pmask, mean_arr, np.nan),
+                origin="lower",
+                extent=ext_m,
+                cmap=cmap_div,
+                vmin=-mvmax,
+                vmax=mvmax,
+                interpolation="nearest",
+            )
+            ax_m.set_title(clabel, fontsize=11, fontweight="bold")
+            ax_m.set_xlabel("x [m]", fontsize=9.5)
+            ax_m.set_ylabel("Average WF ⟨OPD⟩_t\ny [m]" if c == 0 else "y [m]", fontsize=10)
+            cb_m = fig4.colorbar(im_m, ax=ax_m, shrink=0.86, pad=0.02)
+            cb_m.set_label("Mean OPD [nm]", fontsize=9)
+            ax_m.text(
+                0.03,
+                0.04,
+                f"RMS(mean) = {loc_m['mean_map_rms_nm']:.1f} nm\n"
+                f"PTV(mean) = {loc_m['mean_map_ptv_nm']:.0f} nm",
+                transform=ax_m.transAxes,
+                fontsize=8.6,
+                color="white",
+                family="monospace",
+                bbox=dict(boxstyle="round,pad=0.26", fc="black", ec="none", alpha=0.72),
+            )
+
+            s_vals = std_arr[pmask]
+            slim = float(np.percentile(s_vals, 99.5)) if s_vals.size else 50.0
+            sstep = 100.0 if slim > 600.0 else (20.0 if slim > 150.0 else 10.0)
+            svmax = max(sstep, np.ceil(slim / sstep) * sstep)
+
+            ax_s = axes4[1, c]
+            im_s = ax_s.imshow(
+                np.where(pmask, std_arr, np.nan),
+                origin="lower",
+                extent=ext_m,
+                cmap=cmap_std,
+                vmin=0.0,
+                vmax=svmax,
+                interpolation="nearest",
+            )
+            ax_s.set_xlabel("x [m]", fontsize=9.5)
+            ax_s.set_ylabel(
+                "Std Dev std_t(OPD)\ny [m]" if c == 0 else "y [m]", fontsize=10
+            )
+            cb_s = fig4.colorbar(im_s, ax=ax_s, shrink=0.86, pad=0.02)
+            cb_s.set_label("Std Dev OPD [nm]", fontsize=9)
+            ax_s.text(
+                0.03,
+                0.04,
+                f"RMS(std) = {loc_m['std_map_rms_nm']:.1f} nm\n"
+                f"Med={loc_m['std_map_median_nm']:.0f}, P95={loc_m['std_map_p95_nm']:.0f} nm",
+                transform=ax_s.transAxes,
+                fontsize=8.5,
+                color="white",
+                family="monospace",
+                bbox=dict(boxstyle="round,pad=0.26", fc="black", ec="none", alpha=0.72),
+            )
+
+        fig4.savefig(os.path.join(out_dir, "wf_stats_2x3.png"), dpi=180)
+        plt.close(fig4)
 
     samples = wf_info.get("samples", []) if wf_info else []
     nsamp = len(samples)
     wfs_ready = nsamp > 0 and os.path.exists(
         os.path.join(out_dir, "wfs_raw_stg1_samples.npy")
     )
-    if wfs_ready:
+    if _want_plot(4) and wfs_ready:
         wfs_cols = [
             (
                 "wfs_raw_stg1",
@@ -1349,7 +1373,7 @@ if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
         and os.path.exists(os.path.join(out_dir, "dm_cmd_stg1_samples.npy"))
         and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy"))
     )
-    if dm_ready:
+    if _want_plot(5) and dm_ready:
         dm_cols = [
             (
                 "dm_cmd_stg1",
@@ -1481,7 +1505,9 @@ if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
         ("stg1", "Between Stages 1 & 2\n(After AO3k 1 kHz NIR PyWFS)"),
         ("final", "After Stage 2\n(Final AO3k + SCExAO 2 kHz)"),
     ]
-    for bkey, blabel, half_fov_arcsec in bands:
+    for _bi, (bkey, blabel, half_fov_arcsec) in enumerate(bands):
+        if not _want_plot(6 + _bi):
+            continue
         sr_check = os.path.join(out_dir, f"psf_inst_{bkey}_final_sr.npy")
         if nsamp == 0 or not os.path.exists(sr_check):
             continue
@@ -1611,7 +1637,7 @@ if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
 
 lp1 = data.get("loops", {}).get("stage1_ao3k", {})
 lp2 = data.get("loops", {}).get("stage2_scexao", {})
-if lp1.get("mgain_curve") and lp2.get("mgain_curve"):
+if _want_plot(8) and lp1.get("mgain_curve") and lp2.get("mgain_curve"):
     figg, axesg = plt.subplots(1, 2, figsize=(13.5, 4.9), constrained_layout=True)
     figg.suptitle(
         "Subaru 8.2 m AO3k + SCExAO — Applied Per-Mode Integrator Gains "
@@ -1705,7 +1731,7 @@ if lp1.get("mgain_curve") and lp2.get("mgain_curve"):
     figg.savefig(os.path.join(out_dir, "modal_gains_1x2.png"), dpi=180)
     plt.close(figg)
 
-if lp1.get("mlat") and lp2.get("mlat"):
+if _want_plot(9) and lp1.get("mlat") and lp2.get("mlat"):
     figl, axesl = plt.subplots(1, 2, figsize=(13.8, 5.2), constrained_layout=True)
     figl.suptitle(
         "Subaru 8.2 m AO3k + SCExAO — Hardware Latency Calibration "
@@ -1827,7 +1853,7 @@ if lp1.get("mlat") and lp2.get("mlat"):
     figl.savefig(os.path.join(out_dir, "mlat_latency_1x2.png"), dpi=180)
     plt.close(figl)
 
-if lp1.get("selfrm") and lp2.get("selfrm"):
+if _want_plot(10) and lp1.get("selfrm") and lp2.get("selfrm"):
     figs, axess = plt.subplots(2, 4, figsize=(17.6, 8.8), constrained_layout=True)
     figs.suptitle(
         "Subaru 8.2 m AO3k + SCExAO — Modal Self-Response Matrix (selfRM): "
@@ -2024,7 +2050,7 @@ ts_wf_p = os.path.join(out_dir, "ts_wf_plot.npy")
 ts_sr_p = os.path.join(out_dir, "ts_strehl_plot.npy")
 has_wf_ts = os.path.exists(ts_wf_p)
 has_sr_ts = os.path.exists(ts_sr_p)
-if has_wf_ts and has_sr_ts:
+if _want_plot(11) and has_wf_ts and has_sr_ts:
     wf_arr = np.load(ts_wf_p)
     sr_arr = np.load(ts_sr_p)
     ts_m = data.get("timeseries_metrics", {})
@@ -2358,7 +2384,7 @@ if has_wf_ts and has_sr_ts:
     plt.close(figt)
 
 chrom = data.get("chromaticity")
-if chrom and chrom.get("beams") and chrom.get("sensors"):
+if _want_plot(12) and chrom and chrom.get("beams") and chrom.get("sensors"):
     lam_b = np.asarray(chrom["lambda_bins_um"], dtype=float)
     bmap = chrom["beams"]
     figc, axesc = plt.subplots(
@@ -2487,6 +2513,16 @@ if chrom and chrom.get("beams") and chrom.get("sensors"):
     ax_sb.grid(True, axis="x", alpha=0.28)
     figc.savefig(os.path.join(out_dir, "chromatic_passbands_2x1.png"), dpi=180)
     plt.close(figc)
+
+if _my_shard != 0:
+    os._exit(0)
+_fail = 0
+for _cpid in _child_pids:
+    _, _st = os.waitpid(_cpid, 0)
+    if _st != 0:
+        _fail = 1
+if _fail:
+    sys.exit(1)
 """
     py_exec = sys.executable
     try:
@@ -2549,6 +2585,15 @@ def ensure_gui_screenshots(work_dir, out_dir):
     if os.path.abspath(src_bench) != os.path.abspath(staged_bench):
         if not os.path.isfile(staged_bench):
             shutil.copy2(src_bench, staged_bench)
+
+    gui_pngs = (
+        "cacaosim_gui_schematic.png",
+        "cacaosim_gui_builder.png",
+        "cacaosim_gui_tables.png",
+        "cacaosim_gui_status.png",
+    )
+    if all(os.path.isfile(os.path.join(out_dir, gp)) for gp in gui_pngs):
+        return os.path.basename(staged_bench)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     shot_cands = [
@@ -3515,26 +3560,32 @@ def load_and_summarize_timeseries(out_dir, wf_metrics, tmp_npys):
     sr_csv_p = os.path.join(out_dir, "strehl_timeseries.csv")
     if os.path.isfile(sr_csv_p):
         try:
-            tbl = np.genfromtxt(sr_csv_p, delimiter=",", names=True, dtype=np.float64)
-            tbl = np.atleast_1d(tbl)
-            names = set(tbl.dtype.names or ())
-            if tbl.size > 0 and "t_phys_s" in names and "vis_raw_inst" in names:
-                cols_data = [np.asarray(tbl["t_phys_s"], dtype=np.float64)]
-                for bkey, skey in sr_cols:
-                    ik = f"{bkey}_{skey}_inst"
-                    lk = f"{bkey}_{skey}_long"
-                    cols_data.append(
-                        np.asarray(tbl[ik], dtype=np.float64)
-                        if ik in names
-                        else np.full(tbl.size, np.nan)
-                    )
-                    cols_data.append(
-                        np.asarray(tbl[lk], dtype=np.float64)
-                        if lk in names
-                        else np.full(tbl.size, np.nan)
-                    )
-                sr_arr = np.column_stack(cols_data)
-                has_full_sr = True
+            with open(sr_csv_p, "r", encoding="utf-8") as fh:
+                hdr_line = fh.readline().strip()
+            col_names = [c.strip() for c in hdr_line.split(",")]
+            col_map = {name: idx for idx, name in enumerate(col_names)}
+            if "t_phys_s" in col_map and "vis_raw_inst" in col_map:
+                raw_mat = np.loadtxt(
+                    sr_csv_p, delimiter=",", skiprows=1, ndmin=2, dtype=np.float64
+                )
+                if raw_mat.ndim == 2 and raw_mat.shape[0] > 0:
+                    nrows = raw_mat.shape[0]
+                    cols_data = [raw_mat[:, col_map["t_phys_s"]]]
+                    for bkey, skey in sr_cols:
+                        ik = f"{bkey}_{skey}_inst"
+                        lk = f"{bkey}_{skey}_long"
+                        cols_data.append(
+                            raw_mat[:, col_map[ik]]
+                            if ik in col_map and col_map[ik] < raw_mat.shape[1]
+                            else np.full(nrows, np.nan)
+                        )
+                        cols_data.append(
+                            raw_mat[:, col_map[lk]]
+                            if lk in col_map and col_map[lk] < raw_mat.shape[1]
+                            else np.full(nrows, np.nan)
+                        )
+                    sr_arr = np.column_stack(cols_data)
+                    has_full_sr = True
         except Exception:
             sr_arr = None
 

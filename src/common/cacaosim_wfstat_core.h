@@ -162,7 +162,8 @@ void cacaosim_wfstat_frame(cacaosim_wfstat_t *ws, const float *const opd_um[]);
  *
  * Return: 0 on success, -1 if wf_stats.json could not be written.
  */
-int cacaosim_wfstat_write(cacaosim_wfstat_t *ws, const char *out_dir, double dt_phys);
+int  cacaosim_wfstat_write(cacaosim_wfstat_t *ws, const char *out_dir, double dt_phys);
+void cacaosim_wfstat_sync_gpu(cacaosim_wfstat_t *ws);
 
 /** cacaosim_wfstat_free() - Release host, device, and SHM resources held by @ws. */
 void cacaosim_wfstat_free(cacaosim_wfstat_t *ws);

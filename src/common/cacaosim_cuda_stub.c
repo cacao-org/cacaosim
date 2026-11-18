@@ -547,6 +547,48 @@ void cacaosim_pyrwfs_cuda_accum_poly(
     (void) d_beam_amp;
 }
 
+void cacaosim_pyrwfs_cuda_accum_full(
+    cacaosim_pyrwfs_ctx_t *ctx,
+    const float           *dyn_pup_amp,
+    const float           *atm_amp,
+    const float           *wf_in,
+    const float           *dm_opd,
+    const float           *d_pup_amp_ext,
+    const float           *d_wf_opd_ext,
+    const float           *d_dm_opd_ext,
+    float                  wf_to_opd)
+{
+    (void) ctx;
+    (void) dyn_pup_amp;
+    (void) atm_amp;
+    (void) wf_in;
+    (void) dm_opd;
+    (void) d_pup_amp_ext;
+    (void) d_wf_opd_ext;
+    (void) d_dm_opd_ext;
+    (void) wf_to_opd;
+}
+
+void cacaosim_pyrwfs_cuda_accum_poly_full(
+    cacaosim_pyrwfs_ctx_t *ctx,
+    const float           *beam_opd,
+    const float           *beam_amp,
+    const float           *beam_lam_um,
+    uint32_t               beam_nlam,
+    uint64_t               chan_stride,
+    const float           *d_beam_opd,
+    const float           *d_beam_amp)
+{
+    (void) ctx;
+    (void) beam_opd;
+    (void) beam_amp;
+    (void) beam_lam_um;
+    (void) beam_nlam;
+    (void) chan_stride;
+    (void) d_beam_opd;
+    (void) d_beam_amp;
+}
+
 /**
  * cacaosim_pyrwfs_cuda_free() - No-op Pyramid WFS CUDA destructor stub for CPU-only builds
  * @ctx: Unused Pyramid WFS context
@@ -627,6 +669,20 @@ void cacaosim_pyrwfs_cuda_readout(
     (void) out_f32;
 }
 
+void cacaosim_pyrwfs_cuda_readout_ex(
+    cacaosim_pyrwfs_ctx_t    *ctx,
+    const cacaosim_det_cfg_t *det_live,
+    uint16_t                 *out_u16,
+    float                    *out_f32,
+    int                       sync_stream)
+{
+    (void) ctx;
+    (void) det_live;
+    (void) out_u16;
+    (void) out_f32;
+    (void) sync_stream;
+}
+
 /**
  * cacaosim_fpcam_cuda_init() - Fail-safe focal-plane camera CUDA init stub returning `-1`
  * @ctx:        Unused focal-plane camera context
@@ -686,6 +742,11 @@ void cacaosim_fpcam_cuda_upload_weights(cacaosim_fpcam_ctx_t *ctx)
  *   Unreached when `ctx->use_cuda == 0`.
  */
 void cacaosim_fpcam_cuda_reset_accum(cacaosim_fpcam_ctx_t *ctx)
+{
+    (void) ctx;
+}
+
+void cacaosim_fpcam_cuda_reset_long(cacaosim_fpcam_ctx_t *ctx)
 {
     (void) ctx;
 }
@@ -790,6 +851,27 @@ void cacaosim_fpcam_cuda_readout(
     (void) host_exp_int;
     (void) out_u16;
     (void) out_f32;
+}
+
+void cacaosim_fpcam_cuda_readout_full(
+    cacaosim_fpcam_ctx_t     *ctx,
+    const cacaosim_det_cfg_t *det_live,
+    uint16_t                 *out_u16,
+    float                    *out_f32,
+    float                    *out_long,
+    int                       sync_stream)
+{
+    (void) ctx;
+    (void) det_live;
+    (void) out_u16;
+    (void) out_f32;
+    (void) out_long;
+    (void) sync_stream;
+}
+
+void cacaosim_fpcam_cuda_readout_finish(cacaosim_fpcam_ctx_t *ctx)
+{
+    (void) ctx;
 }
 
 /**

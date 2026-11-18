@@ -737,6 +737,10 @@ void cacaosim_fpcam_reset_long(cacaosim_fpcam_ctx_t *ctx)
         return;
     }
     __builtin_memset(ctx->cpu_long_int, 0, ctx->npix_cam * sizeof(float));
+    if (ctx->use_cuda)
+    {
+        cacaosim_fpcam_cuda_reset_long(ctx);
+    }
     ctx->long_cnt         = 0;
     ctx->long_strehl_peak = 0.0f;
 }
@@ -940,50 +944,49 @@ void MILK_HOT cacaosim_fpcam_accum_beam(
  * `long_strehl_peak`) even when the detector output is heavily photon-starved, saturated, or
  * shuttered dark.
  */
-void MILK_HOT cacaosim_fpcam_readout(
+static void MILK_HOT fpcam_readout_impl(
     cacaosim_fpcam_ctx_t     *ctx,
     const cacaosim_det_cfg_t *det_live,
     uint16_t                 *out_u16,
     float                    *out_f32,
-    float                    *out_long)
+    float                    *out_long,
+    int                       sync_stream)
 {
     if (ctx->subframe_cnt == 0u)
     {
         return;
     }
 
-    const cacaosim_det_cfg_t *det      = (det_live != NULL) ? det_live : &ctx->cfg.det;
-    const uint64_t            npix     = ctx->npix_cam;
-    const uint32_t            c0       = ctx->cfg.ncam / 2u;
-    const uint64_t            axis_idx = (uint64_t) c0 * ctx->cfg.ncam + c0;
+    const cacaosim_det_cfg_t *det = (det_live != NULL) ? det_live : &ctx->cfg.det;
     ctx->frame_seq++;
+    ctx->long_cnt++;
 
     if (ctx->use_cuda)
     {
-        cacaosim_fpcam_cuda_readout(ctx, det, ctx->cpu_exp_int, out_u16, out_f32);
+        cacaosim_fpcam_cuda_readout_full(ctx, det, out_u16, out_f32, out_long, sync_stream);
+        ctx->subframe_cnt = 0u;
+        return;
     }
-    else
-    {
-        const float             inv_sub = 1.0f / (float) ctx->subframe_cnt;
-        const float *__restrict acc     = MILK_ASSUME_ALIGNED(ctx->cpu_accum_int);
-        float *__restrict       exp     = MILK_ASSUME_ALIGNED(ctx->cpu_exp_int);
+
+    const uint64_t          npix     = ctx->npix_cam;
+    const uint32_t          c0       = ctx->cfg.ncam / 2u;
+    const uint64_t          axis_idx = (uint64_t) c0 * ctx->cfg.ncam + c0;
+    const float             inv_sub  = 1.0f / (float) ctx->subframe_cnt;
+    const float *__restrict acc      = MILK_ASSUME_ALIGNED(ctx->cpu_accum_int);
+    float *__restrict       exp      = MILK_ASSUME_ALIGNED(ctx->cpu_exp_int);
 #pragma omp simd
-        for (uint64_t i = 0; i < npix; i++)
-        {
-            exp[i] = acc[i] * inv_sub;
-        }
-        cacaosim_detector_readout_cpu(&ctx->det_pool, det, exp, npix, ctx->inf_flux_norm, out_u16,
-                                      out_f32);
+    for (uint64_t i = 0; i < npix; i++)
+    {
+        exp[i] = acc[i] * inv_sub;
     }
+    cacaosim_detector_readout_cpu(&ctx->det_pool, det, exp, npix, ctx->inf_flux_norm, out_u16,
+                                  out_f32);
 
     /* Update Strehl telemetry and cumulative long-exposure PSF from noise-free optical `exp` */
-    const float *__restrict exp      = MILK_ASSUME_ALIGNED(ctx->cpu_exp_int);
-    float *__restrict       lbuf     = MILK_ASSUME_ALIGNED(ctx->cpu_long_int);
-    ctx->long_cnt++;
-    const float             inv_long = 1.0f / (float) ctx->long_cnt;
-
-    float max_exp  = 0.0f;
-    float max_long = 0.0f;
+    float *__restrict lbuf     = MILK_ASSUME_ALIGNED(ctx->cpu_long_int);
+    const float       inv_long = 1.0f / (float) ctx->long_cnt;
+    float             max_exp  = 0.0f;
+    float             max_long = 0.0f;
     for (uint64_t i = 0; i < npix; i++)
     {
         float v = exp[i];
@@ -1007,6 +1010,34 @@ void MILK_HOT cacaosim_fpcam_readout(
     ctx->last_strehl_peak = max_exp;
     ctx->long_strehl_peak = max_long;
     ctx->subframe_cnt     = 0u;
+}
+
+void MILK_HOT cacaosim_fpcam_readout(
+    cacaosim_fpcam_ctx_t     *ctx,
+    const cacaosim_det_cfg_t *det_live,
+    uint16_t                 *out_u16,
+    float                    *out_f32,
+    float                    *out_long)
+{
+    fpcam_readout_impl(ctx, det_live, out_u16, out_f32, out_long, 1);
+}
+
+void MILK_HOT cacaosim_fpcam_readout_async(
+    cacaosim_fpcam_ctx_t     *ctx,
+    const cacaosim_det_cfg_t *det_live,
+    uint16_t                 *out_u16,
+    float                    *out_f32,
+    float                    *out_long)
+{
+    fpcam_readout_impl(ctx, det_live, out_u16, out_f32, out_long, 0);
+}
+
+void MILK_HOT cacaosim_fpcam_readout_finish(cacaosim_fpcam_ctx_t *ctx)
+{
+    if (ctx != NULL && ctx->use_cuda)
+    {
+        cacaosim_fpcam_cuda_readout_finish(ctx);
+    }
 }
 
 /**

@@ -12,9 +12,12 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import time
+import traceback
 
 
 def _ensure_sci_python() -> None:
@@ -938,7 +941,9 @@ def render_telemetry_video(
         "-c:v",
         "libx264",
         "-preset",
-        "medium",
+        "veryfast",
+        "-threads",
+        "8",
         "-crf",
         "24",
         "-pix_fmt",
@@ -949,93 +954,179 @@ def render_telemetry_video(
         "+faststart",
         tmp_mp4,
     ]
-    proc = subprocess.Popen(ff_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    assert proc.stdin is not None
 
     poster_k = n_clip // 2
+    from PIL import Image
+
+    def _draw_frame(k: int):
+        fig.canvas.restore_region(bg_cache)
+        t_cur = float(t_grid[k])
+        dt_ms = float(t_rel_ms[k])
+        outer_tick = int(round(t_cur * outer_hz))
+        sub_tick = outer_tick * oversample
+        hud_text.set_text(
+            f"t = {t_cur:7.4f} s (+{dt_ms:5.1f} / {actual_dur_ms:5.1f} ms)  |  "
+            f"Outer {outer_hz/1e3:.1f} kHz Tick: {outer_tick:6,d}  |  "
+            f"Internal {internal_hz/1e3:.1f} kHz Sub-Tick "
+            f"({internal_dt_us:.0f} µs): {sub_tick:7,d}  |  "
+            f"{slowdown:.1f}× Slow-Motion ({fps} fps)"
+        )
+        ax_hud.draw_artist(hud_text)
+
+        i1 = int(map_idx["wfs1"][k])
+        i2 = int(map_idx["wfs2"][k])
+        wfs_badges[0][1].set_text(
+            f"Max = {w1_max_adu[i1]:5.0f} ADU\n"
+            f"Sum = {w1_sum_kadu[i1]:4.0f} kADU (#{int(abs_idx['wfs1'][k])})"
+        )
+        wfs_badges[1][1].set_text(f"RMS = {s1_rms_e4[i1]:5.2f}e-4")
+        wfs_badges[2][1].set_text(
+            f"Max = {w2_max_adu[i2]:5.0f} ADU\n"
+            f"Sum = {w2_sum_kadu[i2]:4.0f} kADU (#{int(abs_idx['wfs2'][k])})"
+        )
+        wfs_badges[3][1].set_text(f"RMS = {s2_rms_e4[i2]:5.2f}e-4")
+
+        for w_i, (ax_w, im, cube, midx_arr) in enumerate(wfs_ims):
+            im.set_data(cube[midx_arr[k]])
+            ax_w.draw_artist(im)
+            for sp in ax_w.spines.values():
+                ax_w.draw_artist(sp)
+            ax_w.draw_artist(wfs_badges[w_i][1])
+
+        for p_i, p_item in enumerate(psf_ims):
+            ax_p, im, c30, c23, leg_p, cube_log, midx_arr, bkey, skey, pk = p_item
+            im.set_data(cube_log[midx_arr[k]])
+            sr_v = float(psf_peak_sr[(bkey, skey)][k])
+            psf_badges[p_i][1].set_text(
+                f"Inst SR = {sr_v:5.1f}%\nExp #{int(abs_idx[pk][k])}"
+            )
+            ax_p.draw_artist(im)
+            ax_p.draw_artist(c30)
+            ax_p.draw_artist(c23)
+            for sp in ax_p.spines.values():
+                ax_p.draw_artist(sp)
+            if leg_p is not None:
+                ax_p.draw_artist(leg_p)
+            ax_p.draw_artist(psf_badges[p_i][1])
+
+        cur_wfe.set_xdata([dt_ms, dt_ms])
+        dot_w1.set_data([dt_ms], [float(wfe_stg1_nm[k])])
+        dot_w2.set_data([dt_ms], [float(wfe_final_nm[k])])
+        ax_wfe.draw_artist(cur_wfe)
+        ax_wfe.draw_artist(dot_w1)
+        ax_wfe.draw_artist(dot_w2)
+        ax_wfe.draw_artist(leg_wfe)
+
+        cur_sr.set_xdata([dt_ms, dt_ms])
+        dot_sv.set_data([dt_ms], [float(sr_vf[k])])
+        dot_sn.set_data([dt_ms], [float(sr_nf[k])])
+        ax_sr.draw_artist(cur_sr)
+        ax_sr.draw_artist(dot_sv)
+        ax_sr.draw_artist(dot_sn)
+        ax_sr.draw_artist(leg_sr)
+
+        buf = fig.canvas.buffer_rgba()
+        if k == poster_k and poster_png:
+            poster_tmp = f"{poster_png}.tmp.png"
+            img_rgba = Image.frombuffer(
+                "RGBA", (width_px, height_px), bytes(buf), "raw", "RGBA", 0, 1
+            )
+            img_rgba.convert("RGB").save(poster_tmp, compress_level=1)
+            os.replace(poster_tmp, poster_png)
+        return buf
+
+    n_workers = (
+        min(10, os.cpu_count() or 1, max(1, (n_clip + 24) // 25))
+        if hasattr(os, "fork") and n_clip >= 40
+        else 1
+    )
+    chunks: list[tuple[int, int]] = []
+    for w in range(n_workers):
+        k0 = (w * n_clip) // n_workers
+        k1 = ((w + 1) * n_clip) // n_workers
+        if k1 > k0:
+            chunks.append((k0, k1))
+    n_workers = len(chunks)
+
+    shm_tmp_dir = None
+    if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):
+        try:
+            need_b = int(n_clip) * int(width_px) * int(height_px) * 4 + (512 << 20)
+            if shutil.disk_usage("/dev/shm").free >= need_b:
+                shm_tmp_dir = "/dev/shm"
+        except OSError:
+            shm_tmp_dir = None
+
+    worker_tfs = []
+    child_pids: list[int] = []
+    proc = None
+    err_bytes = b""
     try:
-        from PIL import Image
+        for _ in range(1, n_workers):
+            worker_tfs.append(tempfile.TemporaryFile(dir=shm_tmp_dir))
 
-        for k in range(n_clip):
-            fig.canvas.restore_region(bg_cache)
-            t_cur = float(t_grid[k])
-            dt_ms = float(t_rel_ms[k])
-            outer_tick = int(round(t_cur * outer_hz))
-            sub_tick = outer_tick * oversample
-            hud_text.set_text(
-                f"t = {t_cur:7.4f} s (+{dt_ms:5.1f} / {actual_dur_ms:5.1f} ms)  |  "
-                f"Outer {outer_hz/1e3:.1f} kHz Tick: {outer_tick:6,d}  |  "
-                f"Internal {internal_hz/1e3:.1f} kHz Sub-Tick "
-                f"({internal_dt_us:.0f} µs): {sub_tick:7,d}  |  "
-                f"{slowdown:.1f}× Slow-Motion ({fps} fps)"
-            )
-            ax_hud.draw_artist(hud_text)
+        for idx_w in range(1, n_workers):
+            k0, k1 = chunks[idx_w]
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    my_tf = worker_tfs[idx_w - 1]
+                    for j, tf in enumerate(worker_tfs):
+                        if j != idx_w - 1:
+                            tf.close()
+                    for k in range(k0, k1):
+                        my_tf.write(memoryview(_draw_frame(k)))
+                    my_tf.flush()
+                    os._exit(0)
+                except BaseException:
+                    traceback.print_exc()
+                    os._exit(1)
+            child_pids.append(pid)
 
-            i1 = int(map_idx["wfs1"][k])
-            i2 = int(map_idx["wfs2"][k])
-            wfs_badges[0][1].set_text(
-                f"Max = {w1_max_adu[i1]:5.0f} ADU\n"
-                f"Sum = {w1_sum_kadu[i1]:4.0f} kADU (#{int(abs_idx['wfs1'][k])})"
-            )
-            wfs_badges[1][1].set_text(f"RMS = {s1_rms_e4[i1]:5.2f}e-4")
-            wfs_badges[2][1].set_text(
-                f"Max = {w2_max_adu[i2]:5.0f} ADU\n"
-                f"Sum = {w2_sum_kadu[i2]:4.0f} kADU (#{int(abs_idx['wfs2'][k])})"
-            )
-            wfs_badges[3][1].set_text(f"RMS = {s2_rms_e4[i2]:5.2f}e-4")
+        proc = subprocess.Popen(ff_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert proc.stdin is not None
 
-            for w_i, (ax_w, im, cube, midx_arr) in enumerate(wfs_ims):
-                im.set_data(cube[midx_arr[k]])
-                ax_w.draw_artist(im)
-                for sp in ax_w.spines.values():
-                    ax_w.draw_artist(sp)
-                ax_w.draw_artist(wfs_badges[w_i][1])
+        k0_0, k1_0 = chunks[0]
+        for k in range(k0_0, k1_0):
+            proc.stdin.write(memoryview(_draw_frame(k)))
 
-            for p_i, p_item in enumerate(psf_ims):
-                ax_p, im, c30, c23, leg_p, cube_log, midx_arr, bkey, skey, pk = p_item
-                im.set_data(cube_log[midx_arr[k]])
-                sr_v = float(psf_peak_sr[(bkey, skey)][k])
-                psf_badges[p_i][1].set_text(
-                    f"Inst SR = {sr_v:5.1f}%\nExp #{int(abs_idx[pk][k])}"
-                )
-                ax_p.draw_artist(im)
-                ax_p.draw_artist(c30)
-                ax_p.draw_artist(c23)
-                for sp in ax_p.spines.values():
-                    ax_p.draw_artist(sp)
-                if leg_p is not None:
-                    ax_p.draw_artist(leg_p)
-                ax_p.draw_artist(psf_badges[p_i][1])
+        for idx_w, pid in enumerate(child_pids):
+            _, st = os.waitpid(pid, 0)
+            child_pids[idx_w] = 0
+            if st != 0:
+                raise RuntimeError(f"telemetry-video worker {idx_w + 1} exited with status {st}")
+            tf = worker_tfs[idx_w]
+            tf.seek(0)
+            while True:
+                blk = tf.read(4 * 1024 * 1024)
+                if not blk:
+                    break
+                proc.stdin.write(blk)
+            tf.close()
+            worker_tfs[idx_w] = None
 
-            cur_wfe.set_xdata([dt_ms, dt_ms])
-            dot_w1.set_data([dt_ms], [float(wfe_stg1_nm[k])])
-            dot_w2.set_data([dt_ms], [float(wfe_final_nm[k])])
-            ax_wfe.draw_artist(cur_wfe)
-            ax_wfe.draw_artist(dot_w1)
-            ax_wfe.draw_artist(dot_w2)
-            ax_wfe.draw_artist(leg_wfe)
-
-            cur_sr.set_xdata([dt_ms, dt_ms])
-            dot_sv.set_data([dt_ms], [float(sr_vf[k])])
-            dot_sn.set_data([dt_ms], [float(sr_nf[k])])
-            ax_sr.draw_artist(cur_sr)
-            ax_sr.draw_artist(dot_sv)
-            ax_sr.draw_artist(dot_sn)
-            ax_sr.draw_artist(leg_sr)
-
-            buf = fig.canvas.buffer_rgba()
-            if k == poster_k and poster_png:
-                img_rgba = Image.frombuffer(
-                    "RGBA", (width_px, height_px), bytes(buf), "raw", "RGBA", 0, 1
-                )
-                img_rgba.convert("RGB").save(poster_png)
-            proc.stdin.write(memoryview(buf))
         proc.stdin.close()
         proc.stdin = None
         _, err_bytes = proc.communicate()
     finally:
         plt.close(fig)
-        if proc.stdin is not None:
+        for pid in child_pids:
+            if pid > 0:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+                try:
+                    os.waitpid(pid, 0)
+                except OSError:
+                    pass
+        for tf in worker_tfs:
+            if tf is not None:
+                try:
+                    tf.close()
+                except OSError:
+                    pass
+        if proc is not None and proc.stdin is not None:
             proc.stdin.close()
 
     if proc.returncode != 0:

@@ -1880,6 +1880,22 @@ static inline uint32_t bench_sensor_subf_cnt(const cacaosim_bench_node_t *nd)
     return 0u;
 }
 
+static inline int bench_shm_has_sem_readers(const IMAGE *im)
+{
+    if (im == NULL || im->md == NULL || im->semReadPID == NULL)
+    {
+        return 0;
+    }
+    for (uint16_t s = 0; s < im->md->sem; s++)
+    {
+        if (im->semReadPID[s] > 0)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 MILK_HOT void cacaosim_bench_step(
     cacaosim_bench_ctx_t *ctx,
     const float          *ext_wf,
@@ -1906,13 +1922,14 @@ MILK_HOT void cacaosim_bench_step(
      *    nodes backward so upstream optical stages whose output beams are unused on this sub-tick
      *    (e.g. a coronagraph branch between strided FPCAM/LOWFS samples) are pruned cleanly.
      */
-    uint8_t beam_needed[CACAOSIM_BENCH_MAX_BEAMS] = { 0 };
-    uint8_t node_live[CACAOSIM_BENCH_MAX_NODES]   = { 0 };
-    uint8_t sens_accum[CACAOSIM_BENCH_MAX_NODES]  = { 0 };
-    uint8_t sens_read[CACAOSIM_BENCH_MAX_NODES]   = { 0 };
-    uint8_t dm_pend_d2h[CACAOSIM_BENCH_MAX_NODES] = { 0 };
-    int     any_dm_d2h                            = 0;
-    int     any_readout_sync                      = 0;
+    uint8_t beam_needed[CACAOSIM_BENCH_MAX_BEAMS]    = { 0 };
+    uint8_t node_live[CACAOSIM_BENCH_MAX_NODES]      = { 0 };
+    uint8_t sens_accum[CACAOSIM_BENCH_MAX_NODES]     = { 0 };
+    uint8_t sens_read[CACAOSIM_BENCH_MAX_NODES]      = { 0 };
+    uint8_t dm_pend_d2h[CACAOSIM_BENCH_MAX_NODES]    = { 0 };
+    uint8_t fp_pend_finish[CACAOSIM_BENCH_MAX_NODES] = { 0 };
+    int     any_dm_d2h                               = 0;
+    int     any_async_readout                        = 0;
 
     if (do_export)
     {
@@ -1942,6 +1959,10 @@ MILK_HOT void cacaosim_bench_step(
         nd->ready_this_tick       = 0;
 
         if (nd->cfg.kind < CACAOSIM_NODE_PYRWFS || nd->cfg.kind > CACAOSIM_NODE_FPCAM)
+        {
+            continue;
+        }
+        if (ctx->skip_fpcam && nd->cfg.kind == CACAOSIM_NODE_FPCAM)
         {
             continue;
         }
@@ -2211,8 +2232,17 @@ MILK_HOT void cacaosim_bench_step(
             const float *flat_in =
                 (ctx->connect_shm && nd->img_flat.ID != -1) ? nd->img_flat.im->array.F : NULL;
 
-            int want_shm_opd = (!ctx->calib_fast && ctx->connect_shm && nd->img_opd.ID != -1 &&
-                                ((ctx->tick_cnt % tel_st) == 0ULL));
+            int want_shm_opd = 0;
+            if (!ctx->calib_fast && ctx->connect_shm && nd->img_opd.ID != -1 &&
+                ((ctx->tick_cnt % tel_st) == 0ULL))
+            {
+                if (!ctx->use_cuda || ctx->export_beams_active || ctx->wfstat_snap_active ||
+                    bench_shm_has_sem_readers(nd->img_opd.im) ||
+                    (((ctx->tick_cnt / tel_st) & 63ULL) == 0ULL))
+                {
+                    want_shm_opd = 1;
+                }
+            }
             float eff_delay  = (nd->cfg.dm.delay_sec > 0.0f)
                                    ? (nd->cfg.dm.delay_sec / ctx->dt_master_s)
                                    : (nd->cfg.dm.delay_frames * (float) eff_ov);
@@ -2478,9 +2508,9 @@ MILK_HOT void cacaosim_bench_step(
                         nd->img_cam.md->write = 1;
                     }
                     cacaosim_det_cfg_t det_cfg = bench_sensor_det(ctx, &nd->cfg.pyrwfs.det);
-                    cacaosim_pyrwfs_readout(&nd->pyrwfs_ctx, &det_cfg, dst_u16, dst_f32);
+                    cacaosim_pyrwfs_readout_async(&nd->pyrwfs_ctx, &det_cfg, dst_u16, dst_f32);
                     nd->ready_this_tick = 1;
-                    any_readout_sync    = 1;
+                    any_async_readout   = 1;
                 }
                 nd->prev_subframe_cnt = nd->pyrwfs_ctx.subframe_cnt;
             }
@@ -2501,7 +2531,6 @@ MILK_HOT void cacaosim_bench_step(
                     cacaosim_det_cfg_t det_cfg = bench_sensor_det(ctx, &nd->cfg.shwfs.det);
                     cacaosim_shwfs_readout(&nd->shwfs_ctx, &det_cfg, dst_u16, dst_f32);
                     nd->ready_this_tick = 1;
-                    any_readout_sync    = 1;
                 }
                 nd->prev_subframe_cnt = nd->shwfs_ctx.subframe_cnt;
             }
@@ -2522,7 +2551,6 @@ MILK_HOT void cacaosim_bench_step(
                     cacaosim_det_cfg_t det_cfg = bench_sensor_det(ctx, &nd->cfg.zwfs.det);
                     cacaosim_zwfs_readout(&nd->zwfs_ctx, &det_cfg, dst_u16, dst_f32);
                     nd->ready_this_tick = 1;
-                    any_readout_sync    = 1;
                 }
                 nd->prev_subframe_cnt = nd->zwfs_ctx.subframe_cnt;
             }
@@ -2535,128 +2563,143 @@ MILK_HOT void cacaosim_bench_step(
                 }
                 if (sens_read[i] && nd->fpcam_ctx.subframe_cnt >= 1u)
                 {
-                    float *dst_long = (ctx->connect_shm && nd->img_long.ID != -1)
-                                          ? nd->img_long.im->array.F
-                                          : nd->long_f32;
+                    uint64_t next_long = nd->fpcam_ctx.long_cnt + 1ULL;
+                    int      copy_long = (!ctx->use_cuda || nd->eff_navg >= 4u ||
+                                          next_long <= 32ULL || ((next_long & 3ULL) == 0ULL));
+                    float   *dst_long  = copy_long
+                                             ? ((ctx->connect_shm && nd->img_long.ID != -1)
+                                                    ? nd->img_long.im->array.F
+                                                    : nd->long_f32)
+                                             : NULL;
                     if (ctx->connect_shm && nd->img_cam.ID != -1)
                     {
                         nd->img_cam.md->write = 1;
                     }
-                    if (ctx->connect_shm && nd->img_long.ID != -1)
+                    if (copy_long && ctx->connect_shm && nd->img_long.ID != -1)
                     {
                         nd->img_long.md->write = 1;
                     }
-                    cacaosim_fpcam_readout(&nd->fpcam_ctx, &nd->cfg.fpcam.det, dst_u16, dst_f32,
-                                           dst_long);
-                    ctx->last_strehl_inst = nd->fpcam_ctx.last_strehl_peak;
-                    ctx->last_strehl_ave  = nd->fpcam_ctx.long_strehl_peak;
-                    nd->ready_this_tick   = 1;
-                    any_readout_sync      = 1;
-
-                    if (ctx->connect_shm && nd->img_long.ID != -1)
-                    {
-                        cacaosim_fpcam_shm_write_kw(
-                            nd->img_long.im, nd->fpcam_ctx.long_strehl_peak,
-                            nd->fpcam_ctx.last_strehl_peak, nd->fpcam_ctx.last_strehl_axis,
-                            nd->fpcam_ctx.long_cnt);
-                        processinfo_update_output_stream(pinfo, nd->img_long.im, trig_im);
-                    }
+                    cacaosim_fpcam_readout_async(&nd->fpcam_ctx, &nd->cfg.fpcam.det, dst_u16,
+                                                 dst_f32, dst_long);
+                    nd->ready_this_tick = 1;
+                    fp_pend_finish[i]   = 1u;
+                    any_async_readout   = 1;
                 }
                 nd->prev_subframe_cnt = nd->fpcam_ctx.subframe_cnt;
-            }
-
-            if (nd->ready_this_tick && ctx->connect_shm && nd->img_cam.ID != -1)
-            {
-                processinfo_update_output_stream(pinfo, nd->img_cam.im, trig_im);
             }
         }
     }
 
-    /* 3. Deferred decimated D2H for DM `out_opd` telemetry & optional `.export_beams` */
-    if (any_dm_d2h || do_export)
+    /* 3. Coalesced single-sync D2H completion & SHM semaphore publication across all nodes */
+    int any_d2h = 0;
+    if (any_dm_d2h)
     {
-        int any_d2h = 0;
-        if (any_dm_d2h)
+        for (uint32_t i = 0; i < ctx->n_nodes; i++)
         {
-            for (uint32_t i = 0; i < ctx->n_nodes; i++)
+            if (!dm_pend_d2h[i])
             {
-                if (!dm_pend_d2h[i])
+                continue;
+            }
+            cacaosim_bench_node_t *nd = &ctx->nodes[i];
+            nd->img_opd.md->write     = 1;
+            cacaosim_cuda_d2h_f32(nd->img_opd.im->array.F, nd->dm_ctx.d_opd_out, ctx->npix_wf,
+                                  ctx->cuda_stream);
+            any_d2h = 1;
+        }
+    }
+    if (do_export)
+    {
+        for (uint32_t b = 0; b < ctx->n_beams; b++)
+        {
+            cacaosim_beam_slot_t *bs = &ctx->beams[b];
+            if (!bs->export_shm || bs->img_shm.ID == -1 || bs->img_shm.im == NULL)
+            {
+                continue;
+            }
+            bs->img_shm.md->write = 1;
+            uint32_t nl           = (bs->nlam >= 1u) ? bs->nlam : 1u;
+            uint32_t max_nl       = bs->img_shm.md->size[2] / 2u;
+            if (nl > max_nl)
+            {
+                nl = max_nl;
+            }
+            float *dst = bs->img_shm.im->array.F;
+            for (uint32_t c = 0; c < nl; c++)
+            {
+                size_t src_off = (size_t) c * ctx->npix_wf;
+                size_t dst_opd = (size_t) (2u * c) * ctx->npix_wf;
+                size_t dst_amp = (size_t) (2u * c + 1u) * ctx->npix_wf;
+                if (ctx->use_cuda)
                 {
-                    continue;
+                    cacaosim_cuda_d2h_f32(dst + dst_opd, bs->d_opd + src_off, ctx->npix_wf,
+                                          ctx->cuda_stream);
+                    cacaosim_cuda_d2h_f32(dst + dst_amp, bs->d_amp + src_off, ctx->npix_wf,
+                                          ctx->cuda_stream);
+                    any_d2h = 1;
                 }
+                else
+                {
+                    memcpy(dst + dst_opd, bs->opd + src_off, ctx->npix_wf * sizeof(float));
+                    memcpy(dst + dst_amp, bs->amp + src_off, ctx->npix_wf * sizeof(float));
+                }
+            }
+        }
+    }
+
+    if (ctx->use_cuda && (any_async_readout || any_d2h))
+    {
+        cacaosim_cuda_stream_sync(ctx->cuda_stream);
+    }
+
+    for (uint32_t i = 0; i < ctx->n_nodes; i++)
+    {
+        cacaosim_bench_node_t *nd = &ctx->nodes[i];
+        if (!nd->ready_this_tick)
+        {
+            continue;
+        }
+        if (fp_pend_finish[i])
+        {
+            cacaosim_fpcam_readout_finish(&nd->fpcam_ctx);
+            ctx->last_strehl_inst = nd->fpcam_ctx.last_strehl_peak;
+            ctx->last_strehl_ave  = nd->fpcam_ctx.long_strehl_peak;
+            if (ctx->connect_shm && nd->img_long.ID != -1)
+            {
+                cacaosim_fpcam_shm_write_kw(
+                    nd->img_long.im, nd->fpcam_ctx.long_strehl_peak,
+                    nd->fpcam_ctx.last_strehl_peak, nd->fpcam_ctx.last_strehl_axis,
+                    nd->fpcam_ctx.long_cnt);
+                processinfo_update_output_stream(pinfo, nd->img_long.im, trig_im);
+            }
+        }
+        if (ctx->connect_shm && nd->img_cam.ID != -1)
+        {
+            processinfo_update_output_stream(pinfo, nd->img_cam.im, trig_im);
+        }
+    }
+
+    if (any_dm_d2h)
+    {
+        for (uint32_t i = 0; i < ctx->n_nodes; i++)
+        {
+            if (dm_pend_d2h[i])
+            {
                 cacaosim_bench_node_t *nd = &ctx->nodes[i];
-                nd->img_opd.md->write     = 1;
-                cacaosim_cuda_d2h_f32(nd->img_opd.im->array.F, nd->dm_ctx.d_opd_out, ctx->npix_wf,
-                                      ctx->cuda_stream);
-                any_d2h = 1;
+                processinfo_update_output_stream(pinfo, nd->img_opd.im, nd->img_cmd.im);
             }
         }
-        if (do_export)
+    }
+    if (do_export)
+    {
+        for (uint32_t b = 0; b < ctx->n_beams; b++)
         {
-            for (uint32_t b = 0; b < ctx->n_beams; b++)
+            cacaosim_beam_slot_t *bs = &ctx->beams[b];
+            if (!bs->export_shm || bs->img_shm.ID == -1 || bs->img_shm.im == NULL)
             {
-                cacaosim_beam_slot_t *bs = &ctx->beams[b];
-                if (!bs->export_shm || bs->img_shm.ID == -1 || bs->img_shm.im == NULL)
-                {
-                    continue;
-                }
-                bs->img_shm.md->write = 1;
-                uint32_t nl           = (bs->nlam >= 1u) ? bs->nlam : 1u;
-                uint32_t max_nl       = bs->img_shm.md->size[2] / 2u;
-                if (nl > max_nl)
-                {
-                    nl = max_nl;
-                }
-                float *dst = bs->img_shm.im->array.F;
-                for (uint32_t c = 0; c < nl; c++)
-                {
-                    size_t src_off = (size_t) c * ctx->npix_wf;
-                    size_t dst_opd = (size_t) (2u * c) * ctx->npix_wf;
-                    size_t dst_amp = (size_t) (2u * c + 1u) * ctx->npix_wf;
-                    if (ctx->use_cuda)
-                    {
-                        cacaosim_cuda_d2h_f32(dst + dst_opd, bs->d_opd + src_off, ctx->npix_wf,
-                                              ctx->cuda_stream);
-                        cacaosim_cuda_d2h_f32(dst + dst_amp, bs->d_amp + src_off, ctx->npix_wf,
-                                              ctx->cuda_stream);
-                        any_d2h = 1;
-                    }
-                    else
-                    {
-                        memcpy(dst + dst_opd, bs->opd + src_off, ctx->npix_wf * sizeof(float));
-                        memcpy(dst + dst_amp, bs->amp + src_off, ctx->npix_wf * sizeof(float));
-                    }
-                }
+                continue;
             }
-        }
-        (void) any_readout_sync;
-        if (ctx->use_cuda && any_d2h)
-        {
-            cacaosim_cuda_stream_sync(ctx->cuda_stream);
-        }
-        if (any_dm_d2h)
-        {
-            for (uint32_t i = 0; i < ctx->n_nodes; i++)
-            {
-                if (dm_pend_d2h[i])
-                {
-                    cacaosim_bench_node_t *nd = &ctx->nodes[i];
-                    processinfo_update_output_stream(pinfo, nd->img_opd.im, nd->img_cmd.im);
-                }
-            }
-        }
-        if (do_export)
-        {
-            for (uint32_t b = 0; b < ctx->n_beams; b++)
-            {
-                cacaosim_beam_slot_t *bs = &ctx->beams[b];
-                if (!bs->export_shm || bs->img_shm.ID == -1 || bs->img_shm.im == NULL)
-                {
-                    continue;
-                }
-                cacaosim_beam_shm_write_spec(bs->img_shm.im, &bs->spec);
-                processinfo_update_output_stream(pinfo, bs->img_shm.im, trig_im);
-            }
+            cacaosim_beam_shm_write_spec(bs->img_shm.im, &bs->spec);
+            processinfo_update_output_stream(pinfo, bs->img_shm.im, trig_im);
         }
     }
 
@@ -2885,6 +2928,24 @@ void cacaosim_bench_reset_wfs_accum(cacaosim_bench_ctx_t *ctx)
         }
         else if (nd->cfg.kind == CACAOSIM_NODE_FPCAM)
         {
+            nd->fpcam_ctx.subframe_cnt = 0u;
+        }
+    }
+}
+
+void cacaosim_bench_reset_fpcam_accum(cacaosim_bench_ctx_t *ctx)
+{
+    if (ctx == NULL)
+    {
+        return;
+    }
+    for (uint32_t i = 0; i < ctx->n_nodes; i++)
+    {
+        cacaosim_bench_node_t *nd = &ctx->nodes[i];
+        if (nd->cfg.kind == CACAOSIM_NODE_FPCAM)
+        {
+            nd->clock_phase            = nd->clock_phase_init;
+            nd->prev_subframe_cnt      = 0u;
             nd->fpcam_ctx.subframe_cnt = 0u;
         }
     }

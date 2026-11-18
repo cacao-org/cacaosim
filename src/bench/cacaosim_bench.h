@@ -585,7 +585,9 @@ typedef struct
     int32_t               calib_dm_node;
     const float          *calib_cmd_override;
     char                  calib_wfs_out[CACAOSIM_BENCH_NAME_LEN];
+    int32_t               skip_fpcam;
     int32_t               wfstat_step_active;
+    int32_t               wfstat_snap_active;
     int32_t               wfstat_beam_idx[3];
 } cacaosim_bench_ctx_t;
 
@@ -1331,6 +1333,12 @@ IMAGE *cacaosim_bench_find_dm_stream(const cacaosim_bench_ctx_t *ctx, const char
  * @ctx: Initialized bench context (no-op if NULL).
  */
 void cacaosim_bench_reset_wfs_accum(cacaosim_bench_ctx_t *ctx);
+
+/**
+ * cacaosim_bench_reset_fpcam_accum() - Reset subframe accumulators across all FPCAM nodes
+ * @ctx: Initialized bench context (no-op if NULL).
+ */
+void cacaosim_bench_reset_fpcam_accum(cacaosim_bench_ctx_t *ctx);
 
 #ifdef __cplusplus
 }

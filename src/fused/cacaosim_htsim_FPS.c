@@ -41,6 +41,7 @@
  */
 
 #include <math.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -77,6 +78,7 @@ static int64_t  param_wfstat_extra                                = 1;
 static uint64_t param_wfstat_frames                               = 0;
 static int64_t  param_calib_fast                                  = 0;
 static int64_t  param_calib_temporal                              = 0;
+static int64_t  param_calib_ring                                  = 0;
 static float    param_calib_poke_offset                           = 0.0f;
 static char     param_calib_trig[FUNCTION_PARAMETER_STRMAXLEN]    = "none";
 static char     param_calib_wfs[FUNCTION_PARAMETER_STRMAXLEN]     = "none";
@@ -177,6 +179,9 @@ static float    param_strehl_ave                               = 0.0f;
     X(".calib_temporal", &param_calib_temporal, FPTYPE_ONOFF, 0,                        \
       FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
       "Step real DM dynamics & oversampled WFS subframes during .calib_fast")           \
+    X(".calib_ring", &param_calib_ring, FPTYPE_ONOFF, 0,                                \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Auto-kick closed WFS->MVM->mfilt->DM ring on 5ms timeout in .calib_fast")        \
     X(".calib_poke_offset", &param_calib_poke_offset, FPTYPE_FLOAT32, 0,                \
       FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
       "DM poke arrival offset [us] relative to WFS frame start in .calib_temporal")     \
@@ -193,7 +198,8 @@ static float    param_strehl_ave                               = 0.0f;
       "Output 2D Pyramid WFS camera stream (e.g. aol0_wfsim)")                          \
     X(".out_dmopd", param_out_dmopd, FPTYPE_STRING, 0, FPFLAG_DEFAULT_INPUT,            \
       "Optional output 2D DM OPD stream (empty = zero-copy GPU internal)")              \
-    X(".enable_fpcam", &param_enable_fpcam, FPTYPE_ONOFF, 0, FPFLAG_DEFAULT_INPUT,      \
+    X(".enable_fpcam", &param_enable_fpcam, FPTYPE_ONOFF, 0,                            \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
       "Enable in-process focal plane science PSF camera")                               \
     X(".out_fpcam", param_out_fpcam, FPTYPE_STRING, 0, FPFLAG_DEFAULT_INPUT,            \
       "Output 2D focal plane science camera stream")                                    \
@@ -509,6 +515,25 @@ static uint32_t htsim_calib_wfs_navg(const cacaosim_bench_ctx_t *bctx, const cha
     return best;
 }
 
+typedef struct
+{
+    cacaosim_wfstat_t ws;
+    char              outdir[FUNCTION_PARAMETER_STRMAXLEN];
+    double            dt_phys;
+} htsim_wfstat_job_t;
+
+static void *htsim_wfstat_write_thread(void *arg)
+{
+    htsim_wfstat_job_t *job = (htsim_wfstat_job_t *) arg;
+    if (job != NULL)
+    {
+        cacaosim_wfstat_write(&job->ws, job->outdir, job->dt_phys);
+        cacaosim_wfstat_free(&job->ws);
+        free(job);
+    }
+    return NULL;
+}
+
 static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
 {
     cacaosim_bench_cfg_t bcfg;
@@ -601,7 +626,9 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
 
     cacaosim_wfstat_t wfs;
     int               wfs_active                         = 0;
-    int               wfs_bidx[CACAOSIM_WFSTAT_NB_LOC] = { 0 };
+    int               wfs_bidx[CACAOSIM_WFSTAT_NB_LOC]   = { 0 };
+    pthread_t         wfstat_bg_thr                      = 0;
+    int               wfstat_bg_running                  = 0;
     memset(&wfs, 0, sizeof(wfs));
 
     IMAGE   *cal_im                                 = NULL;
@@ -610,6 +637,8 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
     uint32_t cal_dm_nact                            = 0u;
     char     cal_bound[FUNCTION_PARAMETER_STRMAXLEN] = "";
     int      prev_cal_fast                          = 0;
+    int      prev_fpcam_en                          = param_enable_fpcam ? 1 : 0;
+    bctx.skip_fpcam                                 = prev_fpcam_en ? 0 : 1;
 
     MILK_PROCINFO_INIT(self)
     MILK_PROCINFO_LOOPSTART(self)
@@ -617,8 +646,16 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
         int      do_step          = 1;
         int      cal_fast         = param_calib_fast ? 1 : 0;
         int      cal_temp         = (cal_fast && param_calib_temporal != 0) ? 1 : 0;
+        int      fpcam_en         = param_enable_fpcam ? 1 : 0;
         int      trig_stream_mode = (processinfo != NULL && processinfo->triggermode == 3);
         uint32_t n_substeps       = 1u;
+
+        bctx.skip_fpcam = fpcam_en ? 0 : 1;
+        if (fpcam_en && !prev_fpcam_en)
+        {
+            cacaosim_bench_reset_fpcam_accum(&bctx);
+        }
+        prev_fpcam_en = fpcam_en;
 
         /* Manage lockstep calibration trigger binding transitions safely */
         if (!cal_fast && prev_cal_fast)
@@ -666,10 +703,15 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
             /* Wait synchronously on DM poke instead of wall-clock deadline sleep */
             struct timespec ts_wait;
             clock_gettime(CLOCK_REALTIME, &ts_wait);
-            cacaosim_timespec_add_ns(&ts_wait, 50000000ULL);
-            if (ImageStreamIO_semtimedwait(cal_im, cal_sem, &ts_wait) == 0)
+            cacaosim_timespec_add_ns(&ts_wait,
+                                     (param_calib_ring != 0) ? 5000000ULL : 50000000ULL);
+            int wrc = ImageStreamIO_semtimedwait(cal_im, cal_sem, &ts_wait);
+            if (wrc == 0 || param_calib_ring != 0)
             {
-                ImageStreamIO_semflush(cal_im, cal_sem);
+                if (wrc == 0)
+                {
+                    ImageStreamIO_semflush(cal_im, cal_sem);
+                }
                 if (processinfo != NULL)
                 {
                     processinfo_exec_start(processinfo);
@@ -778,6 +820,11 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
                 /* Start in-DAG wavefront/Strehl telemetry before stepping so tick #1 is captured */
                 if (param_wfstat_enable && !wfs_active)
                 {
+                    if (wfstat_bg_running)
+                    {
+                        pthread_join(wfstat_bg_thr, NULL);
+                        wfstat_bg_running = 0;
+                    }
                     param_wfstat_frames = 0;
                     if (htsim_wfstat_start(&wfs, &bctx, wfs_bidx) == 0)
                     {
@@ -791,7 +838,12 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
 
                 int sample_ws = (!cal_fast && wfs_active && param_wfstat_enable &&
                                  ((bctx.tick_cnt % eff_ws_st) == 0ULL));
+                int snap_ws   = (sample_ws && wfs.nsamp < CACAOSIM_WFSTAT_NB_SAMP &&
+                                 (wfs.n_frames + 1ULL) >= wfs.samp_ticks[wfs.nsamp])
+                                    ? 1
+                                    : 0;
                 bctx.wfstat_step_active = sample_ws;
+                bctx.wfstat_snap_active = snap_ws;
                 for (int k = 0; k < CACAOSIM_WFSTAT_NB_LOC; k++)
                 {
                     bctx.wfstat_beam_idx[k] = wfs_bidx[k];
@@ -804,6 +856,7 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
                 param_strehl_inst       = bctx.last_strehl_inst;
                 param_strehl_ave        = bctx.last_strehl_ave;
                 bctx.wfstat_step_active = 0;
+                bctx.wfstat_snap_active = 0;
 
                 /* In-DAG wavefront statistics on device beams (decimated by eff_ws_st) */
                 if (wfs_active)
@@ -819,10 +872,38 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
                     }
                     if (!param_wfstat_enable)
                     {
-                        cacaosim_wfstat_write(&wfs, param_wfstat_outdir,
-                                              (double) bctx.dt_master_s * (double) eff_ws_st);
-                        cacaosim_wfstat_free(&wfs);
-                        wfs_active = 0;
+                        double dt_phys = (double) bctx.dt_master_s * (double) eff_ws_st;
+                        if (wfstat_bg_running)
+                        {
+                            pthread_join(wfstat_bg_thr, NULL);
+                            wfstat_bg_running = 0;
+                        }
+                        cacaosim_wfstat_sync_gpu(&wfs);
+                        htsim_wfstat_job_t *job =
+                            (htsim_wfstat_job_t *) malloc(sizeof(htsim_wfstat_job_t));
+                        if (job != NULL)
+                        {
+                            job->ws = wfs;
+                            snprintf(job->outdir, sizeof(job->outdir), "%s", param_wfstat_outdir);
+                            job->dt_phys = dt_phys;
+                            memset(&wfs, 0, sizeof(wfs));
+                            wfs_active = 0;
+                            if (pthread_create(&wfstat_bg_thr, NULL, htsim_wfstat_write_thread,
+                                               job) == 0)
+                            {
+                                wfstat_bg_running = 1;
+                            }
+                            else
+                            {
+                                htsim_wfstat_write_thread(job);
+                            }
+                        }
+                        else
+                        {
+                            cacaosim_wfstat_write(&wfs, param_wfstat_outdir, dt_phys);
+                            cacaosim_wfstat_free(&wfs);
+                            wfs_active = 0;
+                        }
                     }
                 }
             }
@@ -843,6 +924,11 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
         cal_im->semReadPID[cal_sem] = 0;
     }
 
+    if (wfstat_bg_running)
+    {
+        pthread_join(wfstat_bg_thr, NULL);
+        wfstat_bg_running = 0;
+    }
     if (wfs_active)
     {
         uint32_t eff_ws_st = (param_wfstat_stride >= 1u) ? param_wfstat_stride

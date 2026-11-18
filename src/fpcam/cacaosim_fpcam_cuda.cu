@@ -117,10 +117,28 @@ typedef struct
     cufftComplex  *d_fft_in;
     cufftComplex  *d_fft_out;
 
-    float         *d_accum_int;
-    float         *d_exp_int;
-    uint16_t      *d_out_u16;
-    float         *d_out_f32;
+    float           *d_accum_int;
+    float           *d_exp_int;
+    float           *d_long_int;
+    float           *d_long_out;
+    uint32_t        *d_stats_u32;
+    uint32_t        *h_stats_u32;
+    int              pinned_stats;
+    uint16_t        *d_out_u16;
+    float           *d_out_f32;
+
+    cudaGraph_t      graph;
+    cudaGraphExec_t  graph_exec;
+    int              graph_valid;
+    int              graph_tried;
+    int              has_sig;
+    const float     *sig_pup;
+    const float     *sig_amp;
+    const float     *sig_wf;
+    const float     *sig_dm;
+    uint64_t         sig_stride;
+    float            sig_scale;
+    fpcam_poly_map_t sig_map;
 } fpcam_cuda_priv_t;
 
 __global__ static void k_fpcam_build_epup_batch(
@@ -355,6 +373,100 @@ __global__ static void k_fpcam_scale_exposure(
     }
 }
 
+__global__ static void k_fpcam_scale_long_stats(
+    const float *__restrict__ accum_int,
+    float *__restrict__       exp_int,
+    float *__restrict__       long_int,
+    float *__restrict__       long_out,
+    uint32_t *__restrict__    stats_u32,
+    uint64_t                  npix,
+    uint64_t                  axis_idx,
+    float                     inv_sub,
+    float                     inv_long)
+{
+    __shared__ float s_exp[256];
+    __shared__ float s_lng[256];
+
+    uint32_t tid = threadIdx.x;
+    uint64_t idx = (uint64_t) blockIdx.x * blockDim.x + tid;
+    float    ve  = 0.0f;
+    float    vl  = 0.0f;
+
+    if (idx < npix)
+    {
+        ve = accum_int[idx] * inv_sub;
+        if (ve < 0.0f)
+        {
+            ve = 0.0f;
+        }
+        exp_int[idx] = ve;
+
+        float lsum    = long_int[idx] + ve;
+        long_int[idx] = lsum;
+        vl            = lsum * inv_long;
+        if (vl < 0.0f)
+        {
+            vl = 0.0f;
+        }
+        if (long_out != NULL)
+        {
+            long_out[idx] = vl;
+        }
+        if (idx == axis_idx)
+        {
+            stats_u32[0] = __float_as_uint(ve);
+        }
+    }
+
+    s_exp[tid] = ve;
+    s_lng[tid] = vl;
+    __syncthreads();
+
+    for (uint32_t s = 128u; s > 0u; s >>= 1u)
+    {
+        if (tid < s)
+        {
+            if (s_exp[tid + s] > s_exp[tid])
+            {
+                s_exp[tid] = s_exp[tid + s];
+            }
+            if (s_lng[tid + s] > s_lng[tid])
+            {
+                s_lng[tid] = s_lng[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0u)
+    {
+        atomicMax(&stats_u32[1], __float_as_uint(s_exp[0]));
+        atomicMax(&stats_u32[2], __float_as_uint(s_lng[0]));
+    }
+}
+
+static void fpcam_cuda_invalidate_graph(fpcam_cuda_priv_t *p)
+{
+    if (p->graph_valid)
+    {
+        cudaGraphExecDestroy(p->graph_exec);
+        cudaGraphDestroy(p->graph);
+        p->graph_valid = 0;
+    }
+    p->graph_tried = 0;
+    p->has_sig     = 0;
+}
+
+static void fpcam_cuda_launch_prop_kernels(
+    cacaosim_fpcam_ctx_t *ctx,
+    const float          *d_pup,
+    const float          *d_amp,
+    const float          *d_wf,
+    fpcam_poly_map_t      map,
+    uint64_t              dev_stride,
+    const float          *d_dm,
+    float                 wf_to_opd);
+
 /**
  * cacaosim_fpcam_cuda_init() - Allocate device buffers, upload MFT/pupil data, and bind cuBLAS/FFT
  * @ctx:        Host-initialized focal-plane camera context
@@ -469,11 +581,31 @@ extern "C" int cacaosim_fpcam_cuda_init(
         cudaMalloc((void **) &p->d_scale_c, lam_bytes) != cudaSuccess ||
         cudaMalloc((void **) &p->d_accum_int, npix_cam * sizeof(float)) != cudaSuccess ||
         cudaMalloc((void **) &p->d_exp_int, npix_cam * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void **) &p->d_long_int, npix_cam * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void **) &p->d_long_out, npix_cam * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void **) &p->d_stats_u32, 3u * sizeof(uint32_t)) != cudaSuccess ||
         cudaMalloc((void **) &p->d_out_u16, npix_cam * sizeof(uint16_t)) != cudaSuccess ||
         cudaMalloc((void **) &p->d_out_f32, npix_cam * sizeof(float)) != cudaSuccess)
     {
         cacaosim_fpcam_cuda_free(ctx);
         return -1;
+    }
+
+    if (cudaHostAlloc((void **) &p->h_stats_u32, 3u * sizeof(uint32_t), cudaHostAllocDefault) ==
+        cudaSuccess)
+    {
+        p->pinned_stats = 1;
+        memset(p->h_stats_u32, 0, 3u * sizeof(uint32_t));
+    }
+    else
+    {
+        cudaGetLastError();
+        p->h_stats_u32 = (uint32_t *) calloc(3u, sizeof(uint32_t));
+        if (p->h_stats_u32 == NULL)
+        {
+            cacaosim_fpcam_cuda_free(ctx);
+            return -1;
+        }
     }
 
     cudaMemcpyAsync(p->d_pup_amp, pup_amp, npix_wf * sizeof(float), cudaMemcpyHostToDevice,
@@ -482,6 +614,8 @@ extern "C" int cacaosim_fpcam_cuda_init(
     cudaMemcpyAsync(p->d_strehl_w, ctx->strehl_w, lam_bytes, cudaMemcpyHostToDevice, p->stream);
     cudaMemcpyAsync(p->d_scale_c, ctx->scale_c, lam_bytes, cudaMemcpyHostToDevice, p->stream);
     cudaMemsetAsync(p->d_accum_int, 0, npix_cam * sizeof(float), p->stream);
+    cudaMemsetAsync(p->d_long_int, 0, npix_cam * sizeof(float), p->stream);
+    cudaMemsetAsync(p->d_stats_u32, 0, 3u * sizeof(uint32_t), p->stream);
 
     if (ncpa_opd != NULL)
     {
@@ -543,6 +677,14 @@ extern "C" int cacaosim_fpcam_cuda_init(
         p->has_fft = 1;
     }
 
+    /* Bind cuBLAS / cuFFT internal workspaces once outside CUDA Graph capture, then zero accum */
+    {
+        fpcam_poly_map_t zero_map = { { 0 }, { 0 }, { 0.0f } };
+        fpcam_cuda_launch_prop_kernels(ctx, p->d_pup_amp, NULL, NULL, zero_map, npix_wf, NULL,
+                                       1.0f);
+        cudaMemsetAsync(p->d_accum_int, 0, npix_cam * sizeof(float), p->stream);
+    }
+
     cudaStreamSynchronize(p->stream);
     return 0;
 }
@@ -554,6 +696,7 @@ extern "C" void cacaosim_fpcam_cuda_free(cacaosim_fpcam_ctx_t *ctx)
         return;
     }
     fpcam_cuda_priv_t *p = (fpcam_cuda_priv_t *) ctx->cuda_priv;
+    fpcam_cuda_invalidate_graph(p);
     if (p->cublas)
     {
         cublasDestroy(p->cublas);
@@ -580,6 +723,20 @@ extern "C" void cacaosim_fpcam_cuda_free(cacaosim_fpcam_ctx_t *ctx)
     cudaFree(p->d_fft_out);
     cudaFree(p->d_accum_int);
     cudaFree(p->d_exp_int);
+    cudaFree(p->d_long_int);
+    cudaFree(p->d_long_out);
+    cudaFree(p->d_stats_u32);
+    if (p->h_stats_u32 != NULL)
+    {
+        if (p->pinned_stats)
+        {
+            cudaFreeHost(p->h_stats_u32);
+        }
+        else
+        {
+            free(p->h_stats_u32);
+        }
+    }
     cudaFree(p->d_out_u16);
     cudaFree(p->d_out_f32);
     if (p->owns_stream && p->stream)
@@ -608,7 +765,21 @@ extern "C" void cacaosim_fpcam_cuda_reset_accum(cacaosim_fpcam_ctx_t *ctx)
     cudaMemsetAsync(p->d_accum_int, 0, ctx->npix_cam * sizeof(float), p->stream);
 }
 
-static void fpcam_cuda_run_prop(
+extern "C" void cacaosim_fpcam_cuda_reset_long(cacaosim_fpcam_ctx_t *ctx)
+{
+    fpcam_cuda_priv_t *p = (fpcam_cuda_priv_t *) ctx->cuda_priv;
+    if (p == NULL)
+    {
+        return;
+    }
+    cudaMemsetAsync(p->d_long_int, 0, ctx->npix_cam * sizeof(float), p->stream);
+    if (p->h_stats_u32 != NULL)
+    {
+        memset(p->h_stats_u32, 0, 3u * sizeof(uint32_t));
+    }
+}
+
+static void fpcam_cuda_launch_prop_kernels(
     cacaosim_fpcam_ctx_t *ctx,
     const float          *d_pup,
     const float          *d_amp,
@@ -670,6 +841,74 @@ static void fpcam_cuda_run_prop(
         k_fpcam_accum_fft_crop<<<g2d, b2d, 0, p->stream>>>(
             p->d_fft_out, p->d_scale_c, p->d_strehl_w, ctx->nfft, ncam, nlam, inv_s2,
             p->d_accum_int);
+    }
+}
+
+static void fpcam_cuda_run_prop(
+    cacaosim_fpcam_ctx_t *ctx,
+    const float          *d_pup,
+    const float          *d_amp,
+    const float          *d_wf,
+    fpcam_poly_map_t      map,
+    uint64_t              dev_stride,
+    const float          *d_dm,
+    float                 wf_to_opd)
+{
+    fpcam_cuda_priv_t *p = (fpcam_cuda_priv_t *) ctx->cuda_priv;
+
+    if (p->has_sig &&
+        (p->sig_pup != d_pup || p->sig_amp != d_amp || p->sig_wf != d_wf || p->sig_dm != d_dm ||
+         p->sig_stride != dev_stride || fabsf(p->sig_scale - wf_to_opd) > 1e-7f ||
+         memcmp(&p->sig_map, &map, sizeof(map)) != 0))
+    {
+        fpcam_cuda_invalidate_graph(p);
+    }
+
+    if (!p->graph_valid && !p->graph_tried)
+    {
+        p->graph_tried = 1;
+        if (cudaStreamBeginCapture(p->stream, cudaStreamCaptureModeRelaxed) == cudaSuccess)
+        {
+            fpcam_cuda_launch_prop_kernels(ctx, d_pup, d_amp, d_wf, map, dev_stride, d_dm,
+                                           wf_to_opd);
+            if (cudaStreamEndCapture(p->stream, &p->graph) == cudaSuccess)
+            {
+                if (cudaGraphInstantiate(&p->graph_exec, p->graph, NULL, NULL, 0) == cudaSuccess)
+                {
+                    p->graph_valid = 1;
+                    p->has_sig     = 1;
+                    p->sig_pup     = d_pup;
+                    p->sig_amp     = d_amp;
+                    p->sig_wf      = d_wf;
+                    p->sig_dm      = d_dm;
+                    p->sig_stride  = dev_stride;
+                    p->sig_scale   = wf_to_opd;
+                    p->sig_map     = map;
+                }
+                else
+                {
+                    cudaGraphDestroy(p->graph);
+                    cudaGetLastError();
+                }
+            }
+            else
+            {
+                cudaGetLastError();
+            }
+        }
+        else
+        {
+            cudaGetLastError();
+        }
+    }
+
+    if (p->graph_valid)
+    {
+        cudaGraphLaunch(p->graph_exec, p->stream);
+    }
+    else
+    {
+        fpcam_cuda_launch_prop_kernels(ctx, d_pup, d_amp, d_wf, map, dev_stride, d_dm, wf_to_opd);
     }
 }
 
@@ -870,6 +1109,74 @@ extern "C" void cacaosim_fpcam_cuda_accum_poly(
  * consumers and the exact noise-free Strehl PSF for host `out_long` / `.strehl_*` telemetry in one
  * stream barrier.
  */
+extern "C" void cacaosim_fpcam_cuda_readout_full(
+    cacaosim_fpcam_ctx_t     *ctx,
+    const cacaosim_det_cfg_t *det_live,
+    uint16_t                 *out_u16,
+    float                    *out_f32,
+    float                    *out_long,
+    int                       sync_stream)
+{
+    fpcam_cuda_priv_t *p        = (fpcam_cuda_priv_t *) ctx->cuda_priv;
+    const uint64_t     npix     = ctx->npix_cam;
+    const uint32_t     c0       = ctx->cfg.ncam / 2u;
+    const uint64_t     axis_idx = (uint64_t) c0 * ctx->cfg.ncam + c0;
+    const float        invs     = 1.0f / (float) ctx->subframe_cnt;
+    const float        invl     = 1.0f / (float) ctx->long_cnt;
+    float             *d_lout   = (out_long != NULL) ? p->d_long_out : NULL;
+
+    cudaMemsetAsync(p->d_stats_u32, 0, 3u * sizeof(uint32_t), p->stream);
+
+    uint32_t g1d = (uint32_t) ((npix + 255u) / 256u);
+    k_fpcam_scale_long_stats<<<g1d, 256, 0, p->stream>>>(
+        p->d_accum_int, p->d_exp_int, p->d_long_int, d_lout, p->d_stats_u32, npix, axis_idx, invs,
+        invl);
+
+    cacaosim_cuda_detector_readout(det_live, p->d_exp_int, npix, ctx->inf_flux_norm,
+                                   ctx->cfg.rng_seed, ctx->frame_seq, p->d_out_u16, p->d_out_f32,
+                                   p->stream);
+
+    cudaMemcpyAsync(p->h_stats_u32, p->d_stats_u32, 3u * sizeof(uint32_t), cudaMemcpyDeviceToHost,
+                    p->stream);
+
+    if (out_long != NULL)
+    {
+        cudaMemcpyAsync(out_long, p->d_long_out, npix * sizeof(float), cudaMemcpyDeviceToHost,
+                        p->stream);
+    }
+    if (det_live->out_dtype == 0 && out_u16 != NULL)
+    {
+        cudaMemcpyAsync(out_u16, p->d_out_u16, npix * sizeof(uint16_t), cudaMemcpyDeviceToHost,
+                        p->stream);
+    }
+    else if (det_live->out_dtype != 0 && out_f32 != NULL)
+    {
+        cudaMemcpyAsync(out_f32, p->d_out_f32, npix * sizeof(float), cudaMemcpyDeviceToHost,
+                        p->stream);
+    }
+    if (sync_stream)
+    {
+        cudaStreamSynchronize(p->stream);
+        cacaosim_fpcam_cuda_readout_finish(ctx);
+    }
+}
+
+extern "C" void cacaosim_fpcam_cuda_readout_finish(cacaosim_fpcam_ctx_t *ctx)
+{
+    if (ctx == NULL || ctx->cuda_priv == NULL)
+    {
+        return;
+    }
+    fpcam_cuda_priv_t *p = (fpcam_cuda_priv_t *) ctx->cuda_priv;
+    float              s_axis = 0.0f, s_peak = 0.0f, s_long = 0.0f;
+    memcpy(&s_axis, &p->h_stats_u32[0], sizeof(float));
+    memcpy(&s_peak, &p->h_stats_u32[1], sizeof(float));
+    memcpy(&s_long, &p->h_stats_u32[2], sizeof(float));
+    ctx->last_strehl_axis = s_axis;
+    ctx->last_strehl_peak = s_peak;
+    ctx->long_strehl_peak = s_long;
+}
+
 extern "C" void cacaosim_fpcam_cuda_readout(
     cacaosim_fpcam_ctx_t     *ctx,
     const cacaosim_det_cfg_t *det_live,
