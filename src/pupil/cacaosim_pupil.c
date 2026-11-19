@@ -78,15 +78,50 @@ double cacaosim_make_pupil(
     const int32_t  nsp    = (cfg->nspider > 0 && cfg->nspider <= 16) ? cfg->nspider : 0;
     const float    half_w = 0.5f * cfg->spider_w * (2.0f * r_out);
 
-    /* Precompute outward unit direction vectors (cos, sin) for each radial spider vane */
+    /* Precompute ray origins and outward unit vectors (cos, sin) for each spider vane */
+    float sp_ox[16];
+    float sp_oy[16];
     float sp_cos[16];
     float sp_sin[16];
-    for (int32_t k = 0; k < nsp; k++)
+    if (nsp == 4 && fabsf(cfg->spider_offset) > 1e-6f)
     {
-        float ang = cfg->spider_deg * (CACAOSIM_PI_F / 180.0f) +
-                    (CACAOSIM_TWO_PI_F * (float) k) / (float) nsp;
-        sp_cos[k] = cosf(ang);
-        sp_sin[k] = sinf(ang);
+        /* Off-center V-pair spider geometry (e.g. Subaru Nasmyth-IR +/-51.75 deg from +/-off_px) */
+        const float off_px = cfg->spider_offset * (2.0f * r_out);
+        const float ang    = cfg->spider_deg * (CACAOSIM_PI_F / 180.0f);
+        const float ca     = cosf(ang);
+        const float sa     = sinf(ang);
+
+        sp_ox[0]  = off_px;
+        sp_oy[0]  = 0.0f;
+        sp_cos[0] = ca;
+        sp_sin[0] = sa;
+
+        sp_ox[1]  = off_px;
+        sp_oy[1]  = 0.0f;
+        sp_cos[1] = ca;
+        sp_sin[1] = -sa;
+
+        sp_ox[2]  = -off_px;
+        sp_oy[2]  = 0.0f;
+        sp_cos[2] = -ca;
+        sp_sin[2] = sa;
+
+        sp_ox[3]  = -off_px;
+        sp_oy[3]  = 0.0f;
+        sp_cos[3] = -ca;
+        sp_sin[3] = -sa;
+    }
+    else
+    {
+        for (int32_t k = 0; k < nsp; k++)
+        {
+            float ang = cfg->spider_deg * (CACAOSIM_PI_F / 180.0f) +
+                        (CACAOSIM_TWO_PI_F * (float) k) / (float) nsp;
+            sp_ox[k]  = 0.0f;
+            sp_oy[k]  = 0.0f;
+            sp_cos[k] = cosf(ang);
+            sp_sin[k] = sinf(ang);
+        }
     }
 
     double sum_amp = 0.0;
@@ -117,12 +152,14 @@ double cacaosim_make_pupil(
                     {
                         for (int32_t k = 0; k < nsp; k++)
                         {
+                            float rx = dx - sp_ox[k];
+                            float ry = dy - sp_oy[k];
                             /* Radial projection along vane k (>= 0 selects outward half-line) */
-                            float along = dx * sp_cos[k] + dy * sp_sin[k];
+                            float along = rx * sp_cos[k] + ry * sp_sin[k];
                             if (along >= 0.0f)
                             {
                                 /* Perpendicular distance from sub-pixel to spider centerline */
-                                float perp = fabsf(-dx * sp_sin[k] + dy * sp_cos[k]);
+                                float perp = fabsf(-rx * sp_sin[k] + ry * sp_cos[k]);
                                 if (perp <= half_w)
                                 {
                                     blocked = 1;
@@ -482,5 +519,45 @@ void MILK_COLD cacaosim_make_wfe_m(
             in_pup      = (x * x + y * y <= 1.04f) ? 1 : 0;
         }
         wfe_out_m[i] = in_pup ? (((float) ((double) wfe_out_m[i] - mean)) * scale) : 0.0f;
+    }
+}
+
+/**
+ * cacaosim_add_defocus_m() - Accumulate smooth quadratic Zernike Z4 defocus OPD [meter]
+ * @nwf:           Square pupil grid dimension [pixels]
+ * @pup_diam:      Outer pupil diameter fraction of `nwf`
+ * @defocus_rms_m: Noll-normalized Z4 defocus RMS amplitude on unit disk [meter]
+ * @wfe_io_m:      In-place row-major `float` OPD buffer `[nwf * nwf]` in SI meters `[m]`
+ *
+ * Role:
+ *   Adds smooth quadratic Z4 defocus `defocus_rms_m * sqrt(3) * (2 * r^2 - 1)` across all
+ *   `[nwf x nwf]` pixels for defocused focal-plane WFS (`LLOWFS`) and phase-diversity arms.
+ */
+void MILK_COLD cacaosim_add_defocus_m(
+    uint32_t nwf,
+    float    pup_diam,
+    float    defocus_rms_m,
+    float   *wfe_io_m)
+{
+    if (wfe_io_m == NULL || nwf == 0 || pup_diam <= 0.0f || fabsf(defocus_rms_m) <= 0.0f)
+    {
+        return;
+    }
+
+    const float cx    = 0.5f * (float) (nwf - 1u);
+    const float cy    = 0.5f * (float) (nwf - 1u);
+    const float r_out = 0.5f * pup_diam * (float) nwf;
+    const float inv_r = 1.0f / r_out;
+    const float scale = defocus_rms_m * 1.7320508f;
+
+    for (uint32_t iy = 0; iy < nwf; iy++)
+    {
+        const float y = ((float) iy - cy) * inv_r;
+        for (uint32_t ix = 0; ix < nwf; ix++)
+        {
+            const float x  = ((float) ix - cx) * inv_r;
+            const float r2 = x * x + y * y;
+            wfe_io_m[(uint64_t) iy * nwf + ix] += scale * (2.0f * r2 - 1.0f);
+        }
     }
 }

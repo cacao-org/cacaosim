@@ -162,14 +162,22 @@ def analyze_bench_chromaticity(bench_path):
     if not bench_path or not os.path.isfile(bench_path):
         return None
     bench = {
+        "nwf": 256,
+        "pup_diam": 0.9375,
+        "pupil_geom": "",
         "tel_diam_m": 8.2,
         "cobs": 0.30,
+        "nspider": 4,
+        "spider_w": 0.012,
+        "spider_deg": 45.0,
+        "spider_offset": 0.0,
         "star_mag": 6.0,
         "star_teff": 9600.0,
         "tput_tel": 0.75,
         "master_hz": 2000.0,
         "out_beam": "b_pup",
     }
+    raw_bench_keys = set()
     nodes = []
     cur = None
     with open(bench_path, "r", encoding="utf-8") as fh:
@@ -195,9 +203,31 @@ def analyze_bench_chromaticity(bench_path):
             if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
                 v = v[1:-1]
             cur[1][k] = v
+            if cur[0] == "bench":
+                raw_bench_keys.add(k)
 
+    pgeom = str(bench.get("pupil_geom", "")).strip().lower()
+    if pgeom == "subaru":
+        subaru_defs = {
+            "tel_diam_m": 7.95,
+            "cobs": 0.307,
+            "nspider": 4,
+            "spider_w": 0.02314,
+            "spider_deg": 51.75,
+            "spider_offset": 0.08289,
+        }
+        for dk, dv in subaru_defs.items():
+            if dk not in raw_bench_keys:
+                bench[dk] = dv
+
+    nwf_b = max(16, int(float(bench.get("nwf", 256))))
+    pup_diam_b = float(bench.get("pup_diam", 0.9375))
     diam = float(bench.get("tel_diam_m", 8.2))
     obs = float(bench.get("cobs", bench.get("obs_frac", 0.30)))
+    nspider = int(float(bench.get("nspider", 4)))
+    spider_w = float(bench.get("spider_w", 0.012))
+    spider_deg = float(bench.get("spider_deg", 45.0))
+    spider_offset = float(bench.get("spider_offset", 0.0))
     mag = float(bench.get("star_mag", 6.0))
     teff = max(500.0, float(bench.get("star_teff", 9600.0)))
     tput = float(bench.get("tput_tel", bench.get("tel_tput", 0.75)))
@@ -225,6 +255,8 @@ def analyze_bench_chromaticity(bench_path):
     beam_nlam = {bench.get("out_beam", "b_pup"): 1}
     sensors = []
     dms = []
+    coros = []
+    wfes = []
 
     for nd in nodes:
         kind = nd["kind"]
@@ -250,6 +282,20 @@ def analyze_bench_chromaticity(bench_path):
                         "delay_subticks": del_us / dt_sub_us if dt_sub_us > 0 else 0.0,
                         "tau_us": tau_us,
                         "dyn_mode": int(nd.get("dyn_mode", 0)),
+                    }
+                )
+            else:
+                defoc_nm = float(
+                    nd.get("defocus_nm", float(nd.get("defocus_m", 0.0)) * 1.0e9)
+                )
+                wfes.append(
+                    {
+                        "id": nd["id"],
+                        "in_beam": in_b,
+                        "out_beam": out_b,
+                        "rms_nm": float(nd.get("rms_nm", 0.0)),
+                        "defocus_nm": defoc_nm,
+                        "tput": tp,
                     }
                 )
         elif kind == "splitter":
@@ -297,14 +343,47 @@ def analyze_bench_chromaticity(bench_path):
                 beams[out_b] = [p * tp for p in sp_in]
                 beam_nlam[out_b] = eff_c
             lo_b = nd.get("out_lowfs", "")
+            refl = float(nd.get("lowfs_refl", 0.95))
             if lo_b:
-                refl = float(nd.get("lowfs_refl", 0.95))
-                beams[lo_b] = [p * tp * refl * refl for p in sp_in]
+                beams[lo_b] = [p * tp for p in sp_in]
                 beam_nlam[lo_b] = eff_c
-        elif kind in ("pyrwfs", "shwfs", "zwfs", "fpcam"):
-            def_lam = 1.65 if kind == "fpcam" else 0.75
-            def_bw = 0.18 if kind == "fpcam" else 0.20
-            def_qe = 0.85 if kind == "fpcam" else 0.80
+            coros.append(
+                {
+                    "id": nd["id"],
+                    "type": nd.get("mode", nd.get("type", "lyot_spot")),
+                    "in_beam": in_b,
+                    "out_beam": out_b,
+                    "out_lowfs": lo_b,
+                    "out_pre_lyot": nd.get("out_pre_lyot", ""),
+                    "out_pre_lyot_long": nd.get("out_pre_lyot_long", ""),
+                    "lambda_um": float(nd.get("lambda_um", 1.65)),
+                    "bw_frac": bw_c,
+                    "nlambda": eff_c,
+                    "spot_radius_ld": float(
+                        nd.get("fpm_rad_ld", nd.get("spot_radius_ld", 3.0))
+                    ),
+                    "spot_trans": float(nd.get("fpm_amp", nd.get("spot_trans", 0.0))),
+                    "lyot_outer": float(nd.get("lyot_outer", 0.85)),
+                    "lyot_obs": float(nd.get("lyot_obs", 0.36)),
+                    "lyot_nspider": int(float(nd.get("lyot_nspider", nspider))),
+                    "lyot_spider_w": float(nd.get("lyot_spider_w", 0.025)),
+                    "lyot_spider_deg": float(nd.get("lyot_spider_deg", spider_deg)),
+                    "lyot_spider_offset": float(
+                        nd.get("lyot_spider_offset", spider_offset)
+                    ),
+                    "lowfs_mode": nd.get("lowfs_mode", "none"),
+                    "lowfs_refl": refl,
+                    "tput": tp,
+                }
+            )
+        elif kind in ("pyrwfs", "shwfs", "zwfs", "fpcam", "fpwfs"):
+            is_fpcam_like = kind in ("fpcam", "fpwfs")
+            is_wfs = (kind != "fpcam") or (
+                str(nd.get("is_wfs", "0")).lower() not in ("0", "off", "false")
+            )
+            def_lam = 1.65 if is_fpcam_like else 0.75
+            def_bw = 0.18 if is_fpcam_like else 0.20
+            def_qe = 0.85 if is_fpcam_like else 0.80
             lam0 = float(nd.get("lambda_um", def_lam))
             if "dlambda_um" in nd:
                 bw_f = max(0.0, float(nd["dlambda_um"])) / max(0.05, lam0)
@@ -314,7 +393,7 @@ def analyze_bench_chromaticity(bench_path):
             eff_nl = (
                 max(1, min(32, cfg_nl))
                 if cfg_nl >= 1
-                else (in_nl if in_nl > 1 else (2 if bw_f > 1e-6 else 1))
+                else (2 if bw_f > 1e-6 else 1)
             )
             qe = float(nd.get("qe", def_qe))
             rate_hz = float(nd.get("rate_hz", 0.0))
@@ -331,7 +410,7 @@ def analyze_bench_chromaticity(bench_path):
                 stride_sub = max(1, int(round(eff_master_hz / sim_hz_cfg)))
             elif sub_stride_cfg >= 1:
                 stride_sub = sub_stride_cfg
-            elif kind == "fpcam" and oversample > 1:
+            elif is_fpcam_like and (not is_wfs) and oversample > 1:
                 stride_sub = oversample
             else:
                 stride_sub = 1
@@ -351,15 +430,17 @@ def analyze_bench_chromaticity(bench_path):
             ncam = (
                 int(nd.get("n_sub", 16)) * int(nd.get("pix_per_sub", 8))
                 if kind == "shwfs"
-                else int(nd.get("ncam", 128 if kind == "fpcam" else 64))
+                else int(nd.get("ncam", 128 if is_fpcam_like else 64))
             )
             sensors.append(
                 {
                     "id": nd["id"],
-                    "kind": kind,
+                    "kind": "fpwfs" if (is_fpcam_like and is_wfs) else kind,
+                    "is_wfs": is_wfs,
                     "in_beam": in_b,
                     "out_cam": nd.get("out_cam", ""),
                     "ncam": ncam,
+                    "pixscale_ld": float(nd.get("pixscale_ld", 2.5)),
                     "lambda0_um": lam0,
                     "bw_frac": bw_f,
                     "dlambda_um": dlam,
@@ -391,7 +472,27 @@ def analyze_bench_chromaticity(bench_path):
             "ph_s_per_um": [p / SPEC_DL_UM for p in sp],
         }
 
+    pup_diam_pix = pup_diam_b * nwf_b
     return {
+        "bench": {
+            "name": str(bench.get("name", "")),
+            "pupil_geom": pgeom or "circular",
+            "nwf": nwf_b,
+            "pup_diam": pup_diam_b,
+            "pup_diam_pix": pup_diam_pix,
+            "tel_diam_m": diam,
+            "cobs": obs,
+            "nspider": nspider,
+            "spider_w": spider_w,
+            "spider_deg": spider_deg,
+            "spider_offset": spider_offset,
+            "tput_tel": tput,
+            "star_mag": mag,
+            "star_teff": teff,
+            "pupil_scale_m_pix": diam / max(pup_diam_pix, 1.0),
+        },
+        "coros": coros,
+        "wfes": wfes,
         "lambda_bins_um": lam_bins,
         "spec_dl_um": SPEC_DL_UM,
         "timing": {
@@ -409,7 +510,7 @@ def analyze_bench_chromaticity(bench_path):
     }
 
 
-def radial_profile(img, cx, cy, dr=0.5):
+def radial_profile(img, cx, cy, dr=0.5, return_std=False):
     ny, nx = img.shape
     yy, xx = np.indices((ny, nx), dtype=np.float64)
     rr = np.hypot(xx - cx, yy - cy)
@@ -430,7 +531,51 @@ def radial_profile(img, cx, cy, dr=0.5):
         + wx * wy * img[y0 + 1, x0 + 1]
     )
     prof = np.mean(vals, axis=1)
+    if return_std:
+        pstd = np.std(vals, axis=1, ddof=1)
+        return centers, prof, pstd, rr
     return centers, prof, rr
+
+
+def build_aperture_mask_2d(
+    nwf,
+    pup_diam,
+    outer_frac,
+    obs_frac,
+    nspider,
+    spider_w,
+    spider_deg,
+    spider_offset,
+):
+    dpix = float(pup_diam) * float(nwf)
+    p0 = 0.5 * float(nwf - 1)
+    sub = (np.arange(4, dtype=np.float64) + 0.5) / 4.0 - 0.5
+    coords = (np.arange(nwf, dtype=np.float64)[:, None] + sub[None, :]).ravel() - p0
+    xx = coords[None, :] / dpix
+    yy = coords[:, None] / dpix
+    rr = np.hypot(xx, yy)
+    inside = rr <= (0.5 * float(outer_frac))
+    if obs_frac > 0.0:
+        inside &= rr >= (0.5 * float(obs_frac))
+    hw = 0.5 * float(spider_w)
+    if nspider > 0 and hw > 0.0:
+        if nspider == 4 and abs(spider_offset) > 1.0e-6:
+            off = float(spider_offset)
+            ang = math.radians(float(spider_deg))
+            ca, sa = math.cos(ang), math.sin(ang)
+            for sx, ca_s in ((+off, +ca), (-off, -ca)):
+                dx = xx - sx
+                for sa_s in (+sa, -sa):
+                    t_par = dx * ca_s + yy * sa_s
+                    d_perp = np.abs(-dx * sa_s + yy * ca_s)
+                    inside &= ~((t_par >= -hw) & (d_perp <= hw))
+        else:
+            ang0 = math.radians(float(spider_deg))
+            for k in range(nspider):
+                ang = ang0 + k * math.pi / float(nspider)
+                d_perp = np.abs(-xx * math.sin(ang) + yy * math.cos(ang))
+                inside &= d_perp > hw
+    return inside.reshape(nwf, 4, nwf, 4).mean(axis=(1, 3))
 
 
 def estimate_fwhm_pix(img, peak_xy=None):
@@ -473,10 +618,10 @@ def estimate_fwhm_pix(img, peak_xy=None):
     return float(2.0 * r_half)
 
 
-def analyze_band_stage(img, dl_sum, cfg):
+def analyze_band_stage(img, dl_sum, cfg, tel_diam_m=TEL_DIAM_M):
     ny, nx = img.shape
     c0 = nx // 2
-    ld_mas = (cfg["lam_um"] * 1e-6 / TEL_DIAM_M) * RAD2MAS
+    ld_mas = (cfg["lam_um"] * 1e-6 / tel_diam_m) * RAD2MAS
     pix_mas = ld_mas / cfg["pixscale_ld"]
 
     peak_idx = int(np.argmax(img))
@@ -530,6 +675,432 @@ def analyze_band_stage(img, dl_sum, cfg):
         "rad_prof": prof.tolist(),
         "ee_grid_mas": radii_mas_grid[::4].tolist(),
         "ee_grid_val": ee_curve[::4].tolist(),
+    }
+
+
+def analyze_coronagraph_and_lowfs(
+    out_dir,
+    chrom_info,
+    psf_metrics,
+    stage2_info,
+    stage3_info,
+    tel_diam_m,
+    tmp_npys,
+):
+    coro_dl_p = os.path.join(out_dir, "psf_nir_coro_dl.fits")
+    coro_cl_p = os.path.join(out_dir, "psf_nir_coro.fits")
+    if not (os.path.isfile(coro_dl_p) and os.path.isfile(coro_cl_p)):
+        return None
+
+    bcfg = (chrom_info or {}).get("bench", {})
+    coros = (chrom_info or {}).get("coros", [])
+    wfes = (chrom_info or {}).get("wfes", [])
+    sensors = (chrom_info or {}).get("sensors", [])
+    cnode = coros[0] if coros else {}
+    s_coro = next((s for s in sensors if s["id"] == "nir_coro"), {})
+    s_lowfs = next((s for s in sensors if s["id"] == "wfs_lowfs"), {})
+    w_defoc = next((w for w in wfes if abs(w.get("defocus_nm", 0.0)) > 0.0), {})
+
+    nwf = int(bcfg.get("nwf", 256))
+    pup_diam = float(bcfg.get("pup_diam", 0.9375))
+    cobs = float(bcfg.get("cobs", 0.307))
+    nspider = int(bcfg.get("nspider", 4))
+    spider_w = float(bcfg.get("spider_w", 0.02314))
+    spider_deg = float(bcfg.get("spider_deg", 51.75))
+    spider_offset = float(bcfg.get("spider_offset", 0.08289))
+
+    pup_p = next(
+        (
+            p
+            for p in (
+                os.path.join(out_dir, "csim_pup.fits"),
+                os.path.join(out_dir, "wf_pupil_mask.fits"),
+            )
+            if os.path.isfile(p)
+        ),
+        None,
+    )
+    if pup_p is not None:
+        pup_amp = np.asarray(fits.getdata(pup_p), dtype=np.float64)
+        nwf = int(pup_amp.shape[0])
+    else:
+        pup_amp = build_aperture_mask_2d(
+            nwf, pup_diam, 1.0, cobs, nspider, spider_w, spider_deg, spider_offset
+        )
+
+    lyot_outer = float(cnode.get("lyot_outer", 0.85))
+    lyot_obs = float(cnode.get("lyot_obs", 0.38))
+    lyot_nsp = int(cnode.get("lyot_nspider", nspider))
+    lyot_sw = float(cnode.get("lyot_spider_w", 0.040))
+    lyot_sdeg = float(cnode.get("lyot_spider_deg", spider_deg))
+    lyot_soff = float(cnode.get("lyot_spider_offset", spider_offset))
+    lyot_amp = build_aperture_mask_2d(
+        nwf, pup_diam, lyot_outer, lyot_obs, lyot_nsp, lyot_sw, lyot_sdeg, lyot_soff
+    )
+
+    eff_lyot = pup_amp * lyot_amp
+    pup_power = max(float(np.sum(pup_amp**2)), 1.0e-12)
+    pup_sum_amp = max(float(np.sum(pup_amp)), 1.0e-12)
+    t_lyot_int = float(np.sum(eff_lyot**2)) / pup_power
+    eta_planet_peak = (float(np.sum(eff_lyot)) / pup_sum_amp) ** 2
+
+    # Save [2, nwf, nwf] pupil + Lyot mask array for plotting
+    pup_lyot_npy = os.path.join(out_dir, "coro_pup_lyot.npy")
+    np.save(pup_lyot_npy, np.stack([pup_amp, lyot_amp], axis=0).astype(np.float32))
+    tmp_npys.append(pup_lyot_npy)
+
+    lam_um = float(s_coro.get("lambda0_um", cnode.get("lambda_um", 1.65)))
+    bw_frac = float(s_coro.get("bw_frac", cnode.get("bw_frac", 0.18)))
+    pixscale_ld = float(s_coro.get("pixscale_ld", 2.50))
+    spot_ld = float(cnode.get("spot_radius_ld", 3.0))
+    ld_mas = (lam_um * 1.0e-6 / tel_diam_m) * RAD2MAS
+    pix_mas = ld_mas / pixscale_ld
+
+    img_dl = np.asarray(fits.getdata(coro_dl_p), dtype=np.float64)
+    img_cl = np.asarray(fits.getdata(coro_cl_p), dtype=np.float64)
+    unocc_dl_p = os.path.join(out_dir, "psf_nir_dl.fits")
+    unocc_cl_p = os.path.join(out_dir, "psf_nir_final.fits")
+    img_unocc_dl = (
+        np.asarray(fits.getdata(unocc_dl_p), dtype=np.float64)
+        if os.path.isfile(unocc_dl_p)
+        else None
+    )
+    img_unocc_cl = (
+        np.asarray(fits.getdata(unocc_cl_p), dtype=np.float64)
+        if os.path.isfile(unocc_cl_p)
+        else None
+    )
+
+    for stem, arr in (("psf_nir_coro_dl", img_dl), ("psf_nir_coro", img_cl)):
+        p_npy = os.path.join(out_dir, f"{stem}.npy")
+        np.save(p_npy, arr.astype(np.float32))
+        tmp_npys.append(p_npy)
+    if img_unocc_dl is not None:
+        p_udl = os.path.join(out_dir, "psf_nir_unocc_dl.npy")
+        np.save(p_udl, img_unocc_dl.astype(np.float32))
+        tmp_npys.append(p_udl)
+    if img_unocc_cl is not None:
+        p_ucl = os.path.join(out_dir, "psf_nir_unocc_cl.npy")
+        np.save(p_ucl, img_unocc_cl.astype(np.float32))
+        tmp_npys.append(p_ucl)
+
+    sr_nir_final = float(
+        psf_metrics.get("nir", {}).get("final", {}).get("strehl_peak", 1.0)
+    )
+    unocc_dl_sum = (
+        float(np.sum(img_unocc_dl)) if img_unocc_dl is not None else 1.0
+    )
+
+    c0 = img_cl.shape[1] // 2
+    r_pix_dl, prof_dl, std_dl, rr_pix = radial_profile(
+        img_dl, float(c0), float(c0), dr=0.5, return_std=True
+    )
+    _, prof_cl, std_cl, _ = radial_profile(
+        img_cl, float(c0), float(c0), dr=0.5, return_std=True
+    )
+    if img_unocc_dl is not None and img_unocc_dl.shape == img_dl.shape:
+        _, prof_unocc_dl, _ = radial_profile(img_unocc_dl, float(c0), float(c0), dr=0.5)
+    else:
+        prof_unocc_dl = np.zeros_like(prof_dl)
+    if img_unocc_cl is not None and img_unocc_cl.shape == img_cl.shape:
+        _, prof_unocc, _ = radial_profile(img_unocc_cl, float(c0), float(c0), dr=0.5)
+    else:
+        prof_unocc = np.zeros_like(prof_cl)
+
+    r_ld = r_pix_dl / pixscale_ld
+    r_mas = r_pix_dl * pix_mas
+    denom_dl = max(eta_planet_peak, 1.0e-6)
+    denom_cl = max(sr_nir_final * eta_planet_peak, 1.0e-6)
+
+    sep_knots_ld = [3.0, 5.0, 10.0, 15.0, 20.0]
+    sep_table = []
+    for s_ld in sep_knots_ld:
+        c_dl = float(np.interp(s_ld, r_ld, prof_dl))
+        s_dl_v = float(np.interp(s_ld, r_ld, std_dl))
+        c_cl = float(np.interp(s_ld, r_ld, prof_cl))
+        s_cl_v = float(np.interp(s_ld, r_ld, std_cl))
+        c_un = float(np.interp(s_ld, r_ld, prof_unocc))
+        sep_table.append(
+            {
+                "sep_ld": s_ld,
+                "sep_mas": s_ld * ld_mas,
+                "dl_raw_contrast": c_dl,
+                "dl_planet_contrast": c_dl / denom_dl,
+                "dl_5sigma_planet_contrast": (5.0 * s_dl_v) / denom_dl,
+                "cl_raw_contrast": c_cl,
+                "cl_planet_contrast": c_cl / denom_cl,
+                "cl_5sigma_planet_contrast": (5.0 * s_cl_v) / denom_cl,
+                "unocc_cl_intensity": c_un,
+                "coro_suppression_factor": c_un / max(c_cl, 1.0e-12) if c_un > 0 else 0.0,
+            }
+        )
+
+    rr_2d_ld = rr_pix / pixscale_ld
+    z_3_10 = (rr_2d_ld >= 3.0) & (rr_2d_ld <= 10.0)
+    z_5_20 = (rr_2d_ld >= 5.0) & (rr_2d_ld <= 20.0)
+
+    lowfs_dl_p = os.path.join(out_dir, "det_wfs_lowfs_dl.fits")
+    lowfs_cl_p = os.path.join(out_dir, "det_wfs_lowfs.fits")
+    imwfs3_p = os.path.join(out_dir, "aol3_imWFS2.fits")
+    lowfs_rate = float(s_lowfs.get("rate_hz", 500.0))
+    lowfs_qe = float(s_lowfs.get("qe", 0.85))
+    lowfs_bw = float(s_lowfs.get("bw_frac", 0.18))
+    lowfs_lam = float(s_lowfs.get("lambda0_um", 1.65))
+    lowfs_nlam = int(s_lowfs.get("eff_nlam", 3))
+    lowfs_refl = float(cnode.get("lowfs_refl", 0.95))
+    coro_tput = float(cnode.get("tput", 0.92))
+    defoc_tput = float(w_defoc.get("tput", 0.98))
+    tput_tel_val = float(bcfg.get("tput_tel", 0.20))
+
+    lowfs_info = {
+        "sensor_id": s_lowfs.get("id", "wfs_lowfs"),
+        "detector": f"{s_lowfs.get('ncam', 64)}x{s_lowfs.get('ncam', 64)}",
+        "rate_hz": lowfs_rate,
+        "lambda0_um": lowfs_lam,
+        "bw_frac": lowfs_bw,
+        "qe": lowfs_qe,
+        "defocus_nm": float(w_defoc.get("defocus_nm", 200.0)),
+        "clear_ref_phe_per_frame": float(s_lowfs.get("flux_ph_per_frame", 0.0)),
+        "flux_ph_per_frame": float(s_lowfs.get("flux_ph_per_frame", 0.0)),
+        "enabled_closed_loop": bool((stage3_info or {}).get("enabled", True)),
+        "n_zernike_modes": int((stage3_info or {}).get("n_cm_modes", 14)),
+        "dm3_stroke_rms_nm": float((stage3_info or {}).get("dm_rms_um", 0.0)) * 1000.0,
+        "wfs3_sig_rms": float((stage3_info or {}).get("wfs_rms", 0.0)),
+        "stg2_zpo_dm_rms_nm": float((stage2_info or {}).get("zpo_dm_rms_um", 0.0)) * 1000.0,
+        "stg2_zpo_wfs_rms": float((stage2_info or {}).get("zpo_wfs_rms", 0.0)),
+    }
+    if os.path.isfile(lowfs_cl_p):
+        det_lo = np.asarray(fits.getdata(lowfs_cl_p), dtype=np.float64)
+        lowfs_info["cl_max_adu"] = float(np.max(det_lo))
+        lowfs_info["cl_net_sum_adu"] = float(np.sum(np.maximum(det_lo - 100.0, 0.0)))
+        lo_npy = os.path.join(out_dir, "det_wfs_lowfs.npy")
+        np.save(lo_npy, det_lo.astype(np.float32))
+        tmp_npys.append(lo_npy)
+    if os.path.isfile(lowfs_dl_p):
+        det_lo_dl = np.asarray(fits.getdata(lowfs_dl_p), dtype=np.float64)
+        lowfs_info["dl_net_sum_adu"] = float(np.sum(np.maximum(det_lo_dl - 100.0, 0.0)))
+        lo_dl_npy = os.path.join(out_dir, "det_wfs_lowfs_dl.npy")
+        np.save(lo_dl_npy, det_lo_dl.astype(np.float32))
+        tmp_npys.append(lo_dl_npy)
+    if os.path.isfile(imwfs3_p):
+        im3 = np.asarray(fits.getdata(imwfs3_p), dtype=np.float64)
+        im3_npy = os.path.join(out_dir, "aol3_imWFS2.npy")
+        np.save(im3_npy, im3.astype(np.float32))
+        tmp_npys.append(im3_npy)
+
+    # Compute H-band (1.50..1.80 um) photon rates along the bench & LOWFS light-fraction budget
+    beams_dict = (chrom_info or {}).get("beams", {})
+    dl_bin = float((chrom_info or {}).get("spec_dl_um", SPEC_DL_UM))
+
+    def _beam_hband_ph_s(bname):
+        entry = beams_dict.get(bname)
+        if not entry or "ph_s_per_um" not in entry:
+            return 0.0
+        sp = [float(v) * dl_bin for v in entry["ph_s_per_um"]]
+        ph_s, _, _, _ = _sample_band_exact(sp, lowfs_lam, lowfs_bw, lowfs_nlam, 1.0, 1.0)
+        return float(ph_s)
+
+    root_bname = bcfg.get("out_beam", "b_pup") or "b_pup"
+    coro_in_bname = cnode.get("in_beam", "b_nir_sci") or "b_nir_sci"
+    ph_s_pup_h = _beam_hband_ph_s(root_bname)
+    ph_s_sky_h = ph_s_pup_h / max(tput_tel_val, 1.0e-9)
+    ph_s_coro_in_h = _beam_hband_ph_s(coro_in_bname)
+    if ph_s_coro_in_h <= 0.0:
+        ph_s_coro_in_h = ph_s_pup_h
+    ph_s_pup_broad = float(beams_dict.get(root_bname, {}).get("total_ph_s", 0.0))
+    upstream_h_tput = ph_s_coro_in_h / max(ph_s_pup_h, 1.0e-12) if ph_s_pup_h > 0 else 1.0
+    relay_lo_tput = coro_tput * defoc_tput
+
+    def _eval_pre_lyot_regime(fits_path, npy_stem, net_cam_adu):
+        if not os.path.isfile(fits_path):
+            return None
+        with fits.open(fits_path) as hdul:
+            arr_pre = np.asarray(hdul[0].data, dtype=np.float64)
+            hdr = hdul[0].header
+            kw_f_lo = hdr.get("F_LOWFS")
+            kw_f_pre = hdr.get("F_PRELYO")
+            kw_f_tr = hdr.get("F_LYOTTR")
+        np.save(os.path.join(out_dir, f"{npy_stem}.npy"), arr_pre.astype(np.float32))
+        tmp_npys.append(os.path.join(out_dir, f"{npy_stem}.npy"))
+
+        l2 = lyot_amp**2
+        e_in_pow = max(pup_power, 1.0e-12)
+        f_pre_map = float(np.sum(arr_pre)) / e_in_pow
+        f_tr_map = float(np.sum(l2 * arr_pre)) / e_in_pow
+        f_blk_map = float(np.sum(np.maximum(0.0, 1.0 - l2) * arr_pre)) / e_in_pow
+        f_lo_map = (lowfs_refl**2) * f_blk_map
+
+        f_pre = float(kw_f_pre) if (kw_f_pre is not None and kw_f_pre > 0) else f_pre_map
+        f_tr = float(kw_f_tr) if (kw_f_tr is not None and kw_f_tr > 0) else f_tr_map
+        f_blk = max(0.0, f_pre - f_tr)
+        f_lo = float(kw_f_lo) if (kw_f_lo is not None and kw_f_lo > 0) else f_lo_map
+        f_fpm_abs = max(0.0, 1.0 - f_pre)
+
+        # Fraction of coro-input H-band photons reaching LOWFS focal plane (full plane vs 64x64 FOV)
+        f_cam_inf_coro = f_lo * relay_lo_tput
+        ref_clear_phe = max(lowfs_info["clear_ref_phe_per_frame"], 1.0e-12)
+        if net_cam_adu is not None and net_cam_adu > 0.0 and ref_clear_phe > 1.0:
+            fov_ratio = min(1.0, float(net_cam_adu) / (ref_clear_phe * max(f_lo, 1.0e-9)))
+        else:
+            fov_ratio = 0.96
+        f_cam_fov_coro = f_cam_inf_coro * fov_ratio
+        f_cam_fov_pup_h = f_cam_fov_coro * upstream_h_tput
+        f_cam_fov_sky_h = f_cam_fov_pup_h * tput_tel_val
+        f_cam_inf_pup_h = f_cam_inf_coro * upstream_h_tput
+        f_cam_inf_sky_h = f_cam_inf_pup_h * tput_tel_val
+
+        ph_s_cam_fov = ph_s_coro_in_h * f_cam_fov_coro
+        phe_s_cam_fov = ph_s_cam_fov * lowfs_qe
+        ph_fr_cam_fov = ph_s_cam_fov / max(lowfs_rate, 1.0)
+        phe_fr_cam_fov = phe_s_cam_fov / max(lowfs_rate, 1.0)
+        f_cam_fov_broad = ph_s_cam_fov / max(ph_s_pup_broad, 1.0e-12) if ph_s_pup_broad > 0 else 0.0
+
+        return {
+            "frac_coro_in_fpm_absorbed": f_fpm_abs,
+            "frac_coro_in_incident_on_lyot": f_pre,
+            "frac_coro_in_lyot_transmitted_raw": f_tr,
+            "frac_coro_in_lyot_transmitted_sci": f_tr * coro_tput,
+            "frac_coro_in_lyot_blocked": f_blk,
+            "frac_coro_in_reflected_to_lowfs_beam": f_lo,
+            "frac_coro_in_incident_lowfs_focal_plane": f_cam_inf_coro,
+            "lowfs_64x64_fov_capture_fraction": fov_ratio,
+            "frac_coro_in_reaching_lowfs_cam_fov": f_cam_fov_coro,
+            "frac_entrance_pup_h_reaching_lowfs_focal": f_cam_inf_pup_h,
+            "frac_entrance_pup_h_reaching_lowfs_cam_fov": f_cam_fov_pup_h,
+            "frac_sky_h_reaching_lowfs_cam_fov": f_cam_fov_sky_h,
+            "frac_entrance_broadband_reaching_lowfs_cam_fov": f_cam_fov_broad,
+            "frac_entrance_pup_h_detected_phe": f_cam_fov_pup_h * lowfs_qe,
+            "lowfs_cam_incident_ph_s": ph_s_cam_fov,
+            "lowfs_cam_incident_ph_per_frame": ph_fr_cam_fov,
+            "lowfs_cam_detected_phe_s": phe_s_cam_fov,
+            "lowfs_cam_detected_phe_per_frame": phe_fr_cam_fov,
+            "pre_lyot_peak_intensity": float(np.max(arr_pre)),
+        }
+
+    pre_dl_p = os.path.join(out_dir, "coro_pre_lyot_dl.fits")
+    pre_cl_p = os.path.join(out_dir, "coro_pre_lyot.fits")
+    pre_inst_p = os.path.join(out_dir, "coro_pre_lyot_inst.fits")
+    if os.path.isfile(pre_inst_p):
+        arr_pi = np.asarray(fits.getdata(pre_inst_p), dtype=np.float32)
+        pi_npy = os.path.join(out_dir, "coro_pre_lyot_inst.npy")
+        np.save(pi_npy, arr_pi)
+        tmp_npys.append(pi_npy)
+
+    bud_dl = _eval_pre_lyot_regime(
+        pre_dl_p, "coro_pre_lyot_dl", lowfs_info.get("dl_net_sum_adu")
+    )
+    bud_cl = _eval_pre_lyot_regime(
+        pre_cl_p, "coro_pre_lyot", lowfs_info.get("cl_net_sum_adu")
+    )
+    if bud_cl:
+        # Expose true post-diffraction photon flux per frame on wfs_lowfs
+        lowfs_info["flux_ph_per_frame"] = bud_cl["lowfs_cam_detected_phe_per_frame"]
+        lowfs_info["incident_ph_per_frame"] = bud_cl["lowfs_cam_incident_ph_per_frame"]
+
+    lo_ts_csv = os.path.join(out_dir, "lowfs_light_timeseries.csv")
+    lo_ts_stats = None
+    if os.path.isfile(lo_ts_csv):
+        try:
+            ts_data = np.genfromtxt(lo_ts_csv, delimiter=",", skip_header=1)
+            if ts_data.ndim == 1 and ts_data.size >= 8:
+                ts_data = ts_data[None, :]
+            if ts_data.ndim == 2 and ts_data.shape[0] >= 1 and ts_data.shape[1] >= 8:
+                ts_npy = os.path.join(out_dir, "lowfs_light_ts.npy")
+                np.save(ts_npy, ts_data.astype(np.float32))
+                tmp_npys.append(ts_npy)
+                f_lo_i = ts_data[:, 3]
+                f_pre_i = ts_data[:, 5]
+                fov_r = bud_cl["lowfs_64x64_fov_capture_fraction"] if bud_cl else 0.96
+                scale_cam_coro = relay_lo_tput * fov_r
+                scale_cam_pup = scale_cam_coro * upstream_h_tput
+                lo_ts_stats = {
+                    "csv_file": "lowfs_light_timeseries.csv",
+                    "n_samples": int(ts_data.shape[0]),
+                    "frac_coro_in_lowfs_beam_mean": float(np.mean(f_lo_i)),
+                    "frac_coro_in_lowfs_beam_median": float(np.median(f_lo_i)),
+                    "frac_coro_in_lowfs_beam_std": float(np.std(f_lo_i)),
+                    "frac_coro_in_lowfs_beam_p05": float(np.percentile(f_lo_i, 5.0)),
+                    "frac_coro_in_lowfs_beam_p95": float(np.percentile(f_lo_i, 95.0)),
+                    "frac_coro_in_lowfs_beam_min": float(np.min(f_lo_i)),
+                    "frac_coro_in_lowfs_beam_max": float(np.max(f_lo_i)),
+                    "frac_pre_lyot_mean": float(np.mean(f_pre_i)),
+                    "frac_coro_in_cam_fov_mean": float(np.mean(f_lo_i) * scale_cam_coro),
+                    "frac_pup_h_cam_fov_mean": float(np.mean(f_lo_i) * scale_cam_pup),
+                }
+        except (OSError, ValueError):
+            pass
+
+    lowfs_budget = {
+        "tput_tel": tput_tel_val,
+        "upstream_ao_h_tput": upstream_h_tput,
+        "coro_relay_tput": coro_tput,
+        "lowfs_refl_amp": lowfs_refl,
+        "lowfs_refl_power": lowfs_refl**2,
+        "defocus_wfe_tput": defoc_tput,
+        "lowfs_qe": lowfs_qe,
+        "hband_sky_ph_s": ph_s_sky_h,
+        "hband_entrance_pupil_ph_s": ph_s_pup_h,
+        "hband_coro_input_ph_s": ph_s_coro_in_h,
+        "broadband_entrance_pupil_ph_s": ph_s_pup_broad,
+        "diffraction_limited": bud_dl,
+        "closed_loop": bud_cl,
+        "timeseries": lo_ts_stats,
+    }
+
+    return {
+        "coro_id": cnode.get("id", "coro_nir"),
+        "coro_type": cnode.get("type", "lyot_spot"),
+        "lambda_um": lam_um,
+        "bw_frac": bw_frac,
+        "nlambda": int(s_coro.get("eff_nlam", cnode.get("nlambda", 3))),
+        "pixscale_ld": pixscale_ld,
+        "pixscale_mas": pix_mas,
+        "ld_mas": ld_mas,
+        "spot_radius_ld": spot_ld,
+        "spot_iwa_mas": spot_ld * ld_mas,
+        "lowfs_mode": cnode.get("lowfs_mode", "lyot_refl"),
+        "lowfs_refl": float(cnode.get("lowfs_refl", 0.95)),
+        "lyot_stop": {
+            "outer": lyot_outer,
+            "obs": lyot_obs,
+            "nspider": lyot_nsp,
+            "spider_w": lyot_sw,
+            "spider_deg": lyot_sdeg,
+            "spider_offset": lyot_soff,
+            "intensity_throughput": t_lyot_int,
+            "planet_peak_throughput": eta_planet_peak,
+        },
+        "dl": {
+            "on_axis_raw_contrast": float(img_dl[c0, c0]),
+            "peak_raw_contrast": float(np.max(img_dl)),
+            "total_leakage_frac": float(np.sum(img_dl)) / max(unocc_dl_sum, 1.0e-12),
+            "mean_raw_contrast_3_10ld": float(np.mean(img_dl[z_3_10])),
+            "mean_raw_contrast_5_20ld": float(np.mean(img_dl[z_5_20])),
+        },
+        "closed_loop": {
+            "nir_unocculted_strehl": sr_nir_final,
+            "on_axis_raw_contrast": float(img_cl[c0, c0]),
+            "peak_raw_contrast": float(np.max(img_cl)),
+            "total_leakage_frac": float(np.sum(img_cl)) / max(unocc_dl_sum, 1.0e-12),
+            "mean_raw_contrast_3_10ld": float(np.mean(img_cl[z_3_10])),
+            "mean_raw_contrast_5_20ld": float(np.mean(img_cl[z_5_20])),
+            "mean_planet_contrast_3_10ld": float(np.mean(img_cl[z_3_10])) / denom_cl,
+            "mean_planet_contrast_5_20ld": float(np.mean(img_cl[z_5_20])) / denom_cl,
+        },
+        "contrast_table": sep_table,
+        "profiles": {
+            "rad_ld": r_ld.tolist(),
+            "rad_mas": r_mas.tolist(),
+            "unocc_dl": prof_unocc_dl.tolist(),
+            "dl_raw": prof_dl.tolist(),
+            "dl_planet": (prof_dl / denom_dl).tolist(),
+            "cl_raw": prof_cl.tolist(),
+            "cl_planet": (prof_cl / denom_cl).tolist(),
+            "cl_5sigma_planet": ((5.0 * std_cl) / denom_cl).tolist(),
+            "unocc_cl": prof_unocc.tolist(),
+        },
+        "llowfs": lowfs_info,
+        "lowfs_light_budget": lowfs_budget,
     }
 
 
@@ -685,7 +1256,9 @@ def analyze_selfrm_pair(conf_dir, out_dir, loop_num, tmp_npys):
     }
 
 
-def load_loop_calib(work_dir, loop_name, loop_num, out_dir, tmp_npys=None):
+def load_loop_calib(
+    work_dir, loop_name, loop_num, out_dir, tmp_npys=None, phys_hz_override=None
+):
     conf_dir = os.path.join(work_dir, loop_name, "conf")
     if not os.path.isdir(conf_dir):
         alt_conf = os.path.join(work_dir, f"stage{loop_num}")
@@ -744,6 +1317,8 @@ def load_loop_calib(work_dir, loop_name, loop_num, out_dir, tmp_npys=None):
         ("wfs_rms", f"aol{loop_num}_imWFS2.fits"),
         ("mval_rms", f"aol{loop_num}_modevalWFS.fits"),
         ("dm_rms_um", f"aol{loop_num}_dmC.fits"),
+        ("zpo_dm_rms_um", f"aol{loop_num}_dmzpo.fits"),
+        ("zpo_wfs_rms", f"aol{loop_num}_wfszpo.fits"),
     ]:
         fpath = os.path.join(out_dir, fname)
         if os.path.isfile(fpath):
@@ -775,8 +1350,10 @@ def load_loop_calib(work_dir, loop_name, loop_num, out_dir, tmp_npys=None):
     ]
     pts_p = next((p for p in pts_cands if os.path.isfile(p)), None)
     raw_p = next((p for p in raw_cands if os.path.isfile(p)), None)
-    fps_cal = float(info.get("wall_cal_hz", 40.0 if loop_num == 1 else 80.0))
-    phys_hz = 1000.0 if loop_num == 1 else 2000.0
+    def_wall_hz = {1: 40.0, 2: 80.0, 3: 20.0}.get(loop_num, 40.0)
+    def_phys_hz = {1: 1000.0, 2: 2000.0, 3: 500.0}.get(loop_num, 1000.0)
+    fps_cal = float(info.get("wall_cal_hz", def_wall_hz))
+    phys_hz = float(phys_hz_override or def_phys_hz)
 
     if pts_p is not None:
         pts = np.loadtxt(pts_p)
@@ -837,6 +1414,339 @@ def load_loop_calib(work_dir, loop_name, loop_num, out_dir, tmp_npys=None):
     return info
 
 
+def load_predictive_control_metrics(out_dir, tmp_npys):
+    pf_json_p = os.path.join(out_dir, "pf_stats.json")
+    env_pred = os.environ.get("CACAOSIM_PREDICTIVE", "0").lower() not in (
+        "0",
+        "off",
+        "false",
+        "",
+    )
+    has_pf_fits = os.path.isfile(os.path.join(out_dir, "aol1_arPFmat.fits")) or os.path.isfile(
+        os.path.join(out_dir, "aol1_eofPFmat.fits")
+    )
+    if not env_pred and not os.path.isfile(pf_json_p) and not has_pf_fits:
+        return None
+
+    raw = {}
+    if os.path.isfile(pf_json_p):
+        try:
+            with open(pf_json_p, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except Exception:
+            raw = {}
+
+    pf_mode = str(raw.get("pf_mode", "ar")).lower()
+    pf_blocksize = int(raw.get("pf_blocksize", 1 if pf_mode != "eof" else 128))
+    pf_order = int(raw.get("pf_order", os.environ.get("CACAOSIM_PF_ORDER", "8")))
+    pf_mix = float(raw.get("pf_mix", os.environ.get("CACAOSIM_PF_MIX", "0.90")))
+    pf_reg = float(raw.get("pf_reg", os.environ.get("CACAOSIM_PF_REG", "0.005")))
+    pf_mgain_exp = float(
+        raw.get("pf_mgain_exp", os.environ.get("CACAOSIM_PF_MGAIN_EXP", "0.50"))
+    )
+
+    algo_str = (
+        f"PSOL Block Cross-Mode EOF(B={pf_blocksize}, P={pf_order}) Predictor "
+        "(mkEOFPF + applyEOFPF)"
+        if pf_mode == "eof"
+        else "PSOL Regularized Wiener Auto-Regressive Predictor (mkARPF + applyARPF)"
+    )
+    out = {
+        "enabled": True,
+        "algorithm": algo_str,
+        "pf_mode": pf_mode,
+        "pf_blocksize": pf_blocksize,
+        "pf_order": pf_order,
+        "pf_mix": pf_mix,
+        "pf_reg": pf_reg,
+        "pf_mgain_exp": pf_mgain_exp,
+    }
+
+    for stg_idx, stg_key, rate_hz in ((1, "stage1", 1000.0), (2, "stage2", 2000.0)):
+        st_in = dict(raw.get(stg_key) or {})
+        st_out = {
+            "loop_rate_hz": rate_hz,
+            "pflatency_fr": float(st_in.get("pflatency_fr", 0.0)),
+            "pflatency_ms": float(st_in.get("pflatency_fr", 0.0)) * (1000.0 / rate_hz),
+            "wfsfact": float(st_in.get("wfsfact", 1.0)),
+            "n_updates": int(st_in.get("n_updates", 0)),
+            "n_eof_updates": int(st_in.get("n_eof_updates", 0)),
+            "eof_active": int(st_in.get("eof_active", 0)),
+            "n_samples": int(st_in.get("n_samples", 0)),
+            "rms_ol": float(st_in.get("rms_ol", 0.0)),
+            "rms_zoh": float(st_in.get("rms_zoh", 0.0)),
+            "rms_pred": float(st_in.get("rms_pred", 0.0)),
+            "var_red_pct": float(st_in.get("var_red_pct", 0.0)),
+            "offdiag_frac": float(st_in.get("offdiag_frac", 0.0)),
+            "active_frames": int(st_in.get("active_frames", 0)),
+            "timeout_cnt": int(st_in.get("timeout_cnt", 0)),
+        }
+        pf_mat_p = os.path.join(out_dir, f"aol{stg_idx}_arPFmat.fits")
+        eof_mat_p = os.path.join(out_dir, f"aol{stg_idx}_eofPFmat.fits")
+        if os.path.isfile(eof_mat_p):
+            fmat = np.asarray(fits.getdata(eof_mat_p), dtype=np.float64)
+            if fmat.ndim == 2:
+                # FITS stores (NBmode, PForder*B + diag_tail)
+                n_m, stride = fmat.shape
+                b_sz = max(1, pf_blocksize)
+                p_ord = pf_order if stride >= pf_order * b_sz else max(1, stride // b_sz)
+                pb_len = p_ord * b_sz
+                diag_tail = max(0, stride - pb_len)
+                wmat = np.zeros((p_ord, n_m), dtype=np.float64)
+                for m_i in range(n_m):
+                    loc_m = m_i % b_sz
+                    for k_i in range(p_ord):
+                        col_i = k_i * b_sz + loc_m
+                        if col_i < pb_len:
+                            wmat[k_i, m_i] = fmat[m_i, col_i]
+                npy_w = os.path.join(out_dir, f"pf_wmat_stg{stg_idx}.npy")
+                np.save(npy_w, wmat.astype(np.float32))
+                tmp_npys.append(npy_w)
+                dc_g = np.sum(wmat, axis=0)
+                if diag_tail > 0:
+                    dc_g = dc_g + np.sum(fmat[:, pb_len:], axis=1)
+                n2_g = np.sum(fmat**2, axis=1)
+                npy_n2 = os.path.join(out_dir, f"pf_n2_stg{stg_idx}.npy")
+                np.save(npy_n2, n2_g.astype(np.float32))
+                tmp_npys.append(npy_n2)
+                st_out.update(
+                    {
+                        "n_modes": int(n_m),
+                        "tap_order": int(p_ord),
+                        "blocksize": int(b_sz),
+                        "w0_median": float(np.median(wmat[0])),
+                        "w0_max": float(np.max(wmat[0])),
+                        "w1_median": float(np.median(wmat[1])) if p_ord > 1 else 0.0,
+                        "dc_gain_median": float(np.median(dc_g)),
+                        "dc_gain_max": float(np.max(dc_g)),
+                        "norm2_median": float(np.median(n2_g)),
+                        "norm2_max": float(np.max(n2_g)),
+                    }
+                )
+        elif os.path.isfile(pf_mat_p):
+            wmat = np.asarray(fits.getdata(pf_mat_p), dtype=np.float64)
+            if wmat.ndim == 2:
+                # FITS stores (PForder, NBmode) when xsize=NBmode, ysize=PForder
+                if wmat.shape[0] <= 64 and wmat.shape[1] > wmat.shape[0]:
+                    p_ord, n_m = wmat.shape
+                else:
+                    wmat = wmat.T
+                    p_ord, n_m = wmat.shape
+                npy_w = os.path.join(out_dir, f"pf_wmat_stg{stg_idx}.npy")
+                np.save(npy_w, wmat.astype(np.float32))
+                tmp_npys.append(npy_w)
+                dc_g = np.sum(wmat, axis=0)
+                n2_g = np.sum(wmat**2, axis=0)
+                st_out.update(
+                    {
+                        "n_modes": int(n_m),
+                        "tap_order": int(p_ord),
+                        "w0_median": float(np.median(wmat[0])),
+                        "w0_max": float(np.max(wmat[0])),
+                        "w1_median": float(np.median(wmat[1])) if p_ord > 1 else 0.0,
+                        "dc_gain_median": float(np.median(dc_g)),
+                        "dc_gain_max": float(np.max(dc_g)),
+                        "norm2_median": float(np.median(n2_g)),
+                        "norm2_max": float(np.max(n2_g)),
+                    }
+                )
+        vecs = {}
+        for sfx in ("mvalOLrms", "mvalPFresrms", "mvalWFSrms", "mvalDMrms", "mPFmix"):
+            fp = os.path.join(out_dir, f"aol{stg_idx}_{sfx}.fits")
+            if os.path.isfile(fp):
+                v = np.asarray(fits.getdata(fp), dtype=np.float64).ravel()
+                vecs[sfx] = v
+                npy_v = os.path.join(out_dir, f"pf_{sfx}_stg{stg_idx}.npy")
+                np.save(npy_v, v.astype(np.float32))
+                tmp_npys.append(npy_v)
+        if "mvalOLrms" in vecs:
+            st_out["quad_ol_rms"] = float(np.linalg.norm(vecs["mvalOLrms"]))
+        if "mvalPFresrms" in vecs:
+            st_out["quad_pfres_rms"] = float(np.linalg.norm(vecs["mvalPFresrms"]))
+        if "mvalWFSrms" in vecs:
+            st_out["quad_wfs_rms"] = float(np.linalg.norm(vecs["mvalWFSrms"]))
+        if "mvalDMrms" in vecs:
+            st_out["quad_dm_rms"] = float(np.linalg.norm(vecs["mvalDMrms"]))
+        out[stg_key] = st_out
+
+    return out
+
+
+def _bilinear_resample_2d(arr, new_h, new_w, scale_x=1.0, scale_y=1.0):
+    """Pure-NumPy bilinear resampling of 2D array centered on grid midpoint."""
+    old_h, old_w = arr.shape
+    cy_old = 0.5 * (old_h - 1.0)
+    cx_old = 0.5 * (old_w - 1.0)
+    cy_new = 0.5 * (new_h - 1.0)
+    cx_new = 0.5 * (new_w - 1.0)
+    yy = (np.arange(new_h, dtype=np.float64) - cy_new) * scale_y + cy_old
+    xx = (np.arange(new_w, dtype=np.float64) - cx_new) * scale_x + cx_old
+    valid_y = (yy >= 0.0) & (yy <= old_h - 1.0)
+    valid_x = (xx >= 0.0) & (xx <= old_w - 1.0)
+    y0 = np.clip(np.floor(yy).astype(np.int64), 0, old_h - 1)
+    x0 = np.clip(np.floor(xx).astype(np.int64), 0, old_w - 1)
+    y1 = np.clip(y0 + 1, 0, old_h - 1)
+    x1 = np.clip(x0 + 1, 0, old_w - 1)
+    wy = (yy - y0)[:, None]
+    wx = (xx - x0)[None, :]
+    out = (
+        (1.0 - wy) * (1.0 - wx) * arr[np.ix_(y0, x0)]
+        + (1.0 - wy) * wx * arr[np.ix_(y0, x1)]
+        + wy * (1.0 - wx) * arr[np.ix_(y1, x0)]
+        + wy * wx * arr[np.ix_(y1, x1)]
+    )
+    mask = valid_y[:, None] & valid_x[None, :]
+    out[~mask] = 0.0
+    return out
+
+
+def load_calib_2wfs1dm_metrics(out_dir, work_dir, tmp_npys):
+    """Load 2-WFS + inter-stage DM telemetry calibration outputs (mlt.calib2wfs1dm / mlt.sysid)."""
+    cands = [
+        os.path.join(out_dir, "calib_2wfs1dm"),
+        os.path.join(out_dir, "telemetry", "analysis", "calib_2wfs1dm"),
+    ]
+    cdir = next(
+        (d for d in cands if os.path.isfile(os.path.join(d, "sysid_summary.json"))),
+        None,
+    )
+    if cdir is None:
+        return None
+
+    try:
+        with open(os.path.join(cdir, "sysid_summary.json"), "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+
+    # Copy compact JSON summary into out_dir root so web bundler stages it as downloadable data.
+    root_json = os.path.join(out_dir, "calib_2wfs1dm_summary.json")
+    if os.path.abspath(os.path.join(cdir, "sysid_summary.json")) != os.path.abspath(root_json):
+        try:
+            with open(root_json, "w", encoding="utf-8") as fh:
+                json.dump(raw, fh, indent=2)
+                fh.write("\n")
+        except Exception:
+            pass
+
+    out = dict(raw)
+    out["enabled"] = True
+    out["algorithm"] = (
+        "Joint 2-WFS + 1-DM Telemetry Calibration "
+        "(B = Mab A + Mdb D + b0 & virtual A = Mba B - Mda_virt D + a0 via AR(p) W(z))"
+    )
+    out["source_dir"] = cdir
+
+    fits_map = {
+        "Mab": "Mab.fits",
+        "Mdb": "Mdb.fits",
+        "Mba": "Mba.fits",
+        "Mda_virt": "Mda_virt.fits",
+        "ar_taps": "ar_taps.fits",
+        "eta_d": "eta_d.fits",
+        "eta_d_raw": "eta_d_raw.fits",
+        "mdb_diag": "mdb_diag.fits",
+        "mdb_diag_raw": "mdb_diag_raw.fits",
+        "r2_b_w": "r2_b_w.fits",
+        "r2_ol_raw": "r2_ol_raw.fits",
+        "r2_a_raw": "r2_a_raw.fits",
+        "r2_a_w": "r2_a_w.fits",
+        "og_selfrm": "og_selfrm.fits",
+    }
+    loaded = {}
+    for key, fname in fits_map.items():
+        fp = os.path.join(cdir, fname)
+        if os.path.isfile(fp):
+            arr = np.asarray(fits.getdata(fp), dtype=np.float64)
+            loaded[key] = arr
+            npy_p = os.path.join(out_dir, f"calib2wfs_{key}.npy")
+            np.save(npy_p, arr.astype(np.float32))
+            tmp_npys.append(npy_p)
+
+    # Parse optional causal lag scan curve.
+    lscan_p = os.path.join(cdir, "lag_scan.txt")
+    if os.path.isfile(lscan_p):
+        rows = []
+        try:
+            with open(lscan_p, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    parts = s.split()
+                    if len(parts) >= 4:
+                        rows.append(
+                            {
+                                "lag_db_fr": float(parts[0]),
+                                "lag_ab_fr": float(parts[1]),
+                                "r2_b_w_med": float(parts[2]),
+                                "mdb_diag_med": float(parts[3]),
+                            }
+                        )
+        except Exception:
+            rows = []
+        if rows:
+            out["lag_scan"] = rows
+
+    # Independent geometric cross-DM verification: project Stage-2 CMmodesDM onto Stage-1 grid.
+    cm1_cands = [
+        os.path.join(work_dir, "ao3k", "conf", "CMmodesDM.fits"),
+        os.path.join(out_dir, "telemetry", "calib_stg1", "CMmodesDM.fits"),
+    ]
+    cm2_cands = [
+        os.path.join(work_dir, "scexao", "conf", "CMmodesDM.fits"),
+        os.path.join(out_dir, "telemetry", "calib_stg2", "CMmodesDM.fits"),
+    ]
+    cm1_p = next((p for p in cm1_cands if os.path.isfile(p)), None)
+    cm2_p = next((p for p in cm2_cands if os.path.isfile(p)), None)
+    if cm1_p and cm2_p and "Mda_virt" in loaded:
+        try:
+            mda = loaded["Mda_virt"]  # (dA, dD)
+            d_a, d_d = mda.shape
+            m1_raw = np.asarray(fits.getdata(cm1_p), dtype=np.float64)
+            m2_raw = np.asarray(fits.getdata(cm2_p), dtype=np.float64)
+            if m1_raw.ndim == 3 and m2_raw.ndim == 3:
+                # FITS (nmodes, ny, nx)
+                k1 = min(d_a, m1_raw.shape[0])
+                k2 = min(d_d, m2_raw.shape[0])
+                ny1, nx1 = m1_raw.shape[1], m1_raw.shape[2]
+                # Match pupil diameter ratio: DM1 D=60 act on 64x64, DM2 D=46 act on 50x50
+                scale = 46.0 / 60.0
+                u1 = m1_raw[:k1].reshape(k1, ny1 * nx1)  # (k1, P1)
+                u2_on_1 = np.empty((k2, ny1 * nx1), dtype=np.float64)
+                for j in range(k2):
+                    u2_on_1[j] = _bilinear_resample_2d(
+                        m2_raw[j], ny1, nx1, scale_x=scale, scale_y=scale
+                    ).ravel()
+                # Least-squares geometric DM2 -> DM1 modal projection: U1^T * M_geom = U2^T
+                g11 = u1 @ u1.T + 1e-6 * np.eye(k1)
+                m_geom = np.linalg.solve(g11, u1 @ u2_on_1.T)  # (k1, k2)
+                npy_g = os.path.join(out_dir, "calib2wfs_Mgeom.npy")
+                np.save(npy_g, m_geom.astype(np.float32))
+                tmp_npys.append(npy_g)
+                # Column-wise cosine similarity between Mda_virt and geometric M_geom
+                sub_est = mda[:k1, :k2]
+                cos_list = []
+                for j in range(k2):
+                    n1 = np.linalg.norm(sub_est[:, j])
+                    n2 = np.linalg.norm(m_geom[:, j])
+                    if n1 > 1e-12 and n2 > 1e-12:
+                        cos_list.append(abs(float(np.dot(sub_est[:, j], m_geom[:, j]) / (n1 * n2))))
+                if cos_list:
+                    out["geom_col_cos_med"] = float(np.median(cos_list))
+                    out["geom_col_cos_mean"] = float(np.mean(cos_list))
+                v1 = sub_est.ravel()
+                v2 = m_geom.ravel()
+                if np.std(v1) > 1e-12 and np.std(v2) > 1e-12:
+                    out["geom_matrix_corr"] = abs(float(np.corrcoef(v1, v2)[0, 1]))
+        except Exception:
+            pass
+
+    return out
+
+
 def render_plots_via_sys_python(out_dir, summary_path):
     plotter = r"""
 import json, os, sys
@@ -860,7 +1770,7 @@ def _fast_savefig(self, fname, *args, **kwargs):
     return _orig_savefig(self, fname, *args, **kwargs)
 matplotlib.figure.Figure.savefig = _fast_savefig
 
-_n_shards = min(13, max(1, os.cpu_count() or 1)) if hasattr(os, "fork") else 1
+_n_shards = min(16, max(1, os.cpu_count() or 1)) if hasattr(os, "fork") else 1
 _child_pids = []
 _my_shard = 0
 if _n_shards > 1:
@@ -875,10 +1785,17 @@ if _n_shards > 1:
 def _want_plot(slot):
     return (slot % _n_shards) == _my_shard
 
+tel_info = data.get("telescope", {})
+tel_d = float(tel_info.get("diameter_m", 8.2))
+tput_pct = float(tel_info.get("tput_tel", 0.20)) * 100.0
+sa_top = data.get("star_and_atmosphere", {})
+phys_t_top = float(sa_top.get("physical_time_s", 10.0))
+seeing_top = float(sa_top.get("seeing_arcsec_500nm", 0.60))
+
 stages = [
-    ("raw", "Uncorrected (0.6\" Seeing)"),
+    ("raw", f"Uncorrected ({seeing_top:.2f}\" Seeing)"),
     ("stg1", "After Stage 1 (AO3k NIR PyWFS)"),
-    ("final", "Final Stage 1+2 (AO3k + SCExAO)"),
+    ("final", "Final Stage 1+2+3 (AO3k + SCExAO)"),
 ]
 bands = [
     ("vis", "Visible I-Band (0.75 µm, 15% BW, 3ch)", 0.72),
@@ -888,10 +1805,11 @@ bands = [
 if _want_plot(0):
     fig, axes = plt.subplots(2, 3, figsize=(14.5, 9.2), constrained_layout=True)
     fig.suptitle(
-        "Subaru 8.2 m AO3k + SCExAO Two-Stage Correction — 10.0 s Polychromatic PSFs\n"
-        "(Seeing = 0.60\", Star mV = 6 / mH = 6, Stage 1 = 1 kHz J-Band 20% 2ch PyWFS, "
-        "Stage 2 = 2 kHz Vis 20% 2ch PyWFS)",
-        fontsize=12.6,
+        f"Subaru {tel_d:.2f} m AO3k + SCExAO Correction — "
+        f"{phys_t_top:.1f} s Polychromatic PSFs\n"
+        f"(Seeing = {seeing_top:.2f}\", Tput = {tput_pct:.0f}%, "
+        "Stg1 = 1 kHz J PyWFS, Stg2 = 2 kHz Vis PyWFS, Stg3 = 500 Hz LLOWFS)",
+        fontsize=12.4,
         fontweight="bold",
     )
 
@@ -981,15 +1899,16 @@ if _want_plot(0):
 if _want_plot(1):
     fig2, axes2 = plt.subplots(2, 2, figsize=(13.5, 8.8), constrained_layout=True)
     fig2.suptitle(
-        "AO3k + SCExAO Azimuthal Radial PSF Profiles & Encircled Energy (10.0 s Integration)",
-        fontsize=13,
+        f"Subaru {tel_d:.2f} m AO3k + SCExAO Azimuthal Radial PSF Profiles & "
+        f"Encircled Energy ({phys_t_top:.1f} s)",
+        fontsize=12.6,
         fontweight="bold",
     )
     curve_specs = [
         ("dl", "Diffraction-Limited (turb=0)", "black", "--", 1.5),
-        ("raw", "Uncorrected (0.6\" seeing)", "#d62728", "-", 1.8),
+        ("raw", f"Uncorrected ({seeing_top:.2f}\" seeing)", "#d62728", "-", 1.8),
         ("stg1", "After Stage 1 (AO3k, 1 kHz)", "#ff7f0e", "-", 2.0),
-        ("final", "Final Stage 1+2 (AO3k+SCExAO, 2 kHz)", "#1f77b4", "-", 2.2),
+        ("final", "Final Stage 1+2+3 (AO3k+SCExAO, 2 kHz)", "#1f77b4", "-", 2.2),
     ]
 
     for col, (bkey, blabel, _) in enumerate(bands):
@@ -1056,12 +1975,12 @@ if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
     pmask = pup > 0.5
     nwf_grid = pup.shape[0]
     pup_pix = 0.9375 * nwf_grid
-    half_m = 0.5 * nwf_grid * (8.2 / pup_pix)
+    half_m = 0.5 * nwf_grid * (tel_d / pup_pix)
     ext_m = [-half_m, half_m, -half_m, half_m]
     wf_locs = [
         ("raw", "Before Stage 1\n(Entrance Pupil b_pup)"),
         ("stg1", "Between Stages 1 & 2\n(Post-AO3k b_post_stg1)"),
-        ("final", "After Stage 2\n(Post-SCExAO b_post_stg2)"),
+        ("final", "After Stage 2+3\n(Post-SCExAO b_post_stg2)"),
     ]
 
     cmap_div = matplotlib.colormaps["RdBu_r"].copy()
@@ -1092,8 +2011,9 @@ if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
         if nsamp == 1:
             axes3 = axes3[None, :]
         fig3.suptitle(
-            "Subaru 8.2 m AO3k + SCExAO — Instantaneous Pupil Wavefront Samples\n"
-            f"(Piston-removed OPD [nm] across {pup_pix:.0f}-pix Subaru pupil, 0.60\" seeing)",
+            f"Subaru {tel_d:.2f} m AO3k + SCExAO — Instantaneous Pupil Wavefront Samples\n"
+            f"(Piston-removed OPD [nm] across {pup_pix:.0f}-pix Subaru pupil, "
+            f"{seeing_top:.2f}\" seeing)",
             fontsize=13,
             fontweight="bold",
         )
@@ -1162,7 +2082,7 @@ if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
         nfr = wf_info.get("n_frames", 0)
         t_rec = wf_info.get("phys_time_recorded_s", 0.0)
         fig4.suptitle(
-            f"Subaru 8.2 m AO3k + SCExAO — Wavefront Mean & Std Dev Maps "
+            f"Subaru {tel_d:.2f} m AO3k + SCExAO — Wavefront Mean & Std Dev Maps "
             f"({t_rec:.1f} s, {nfr:,d} frames)\n"
             "(Row 1: Time-Averaged WF ⟨OPD⟩_t [nm] | Row 2: Temporal Std Dev std_t(OPD) [nm])",
             fontsize=12.8,
@@ -1283,7 +2203,7 @@ if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
         if nsamp == 1:
             axes5 = axes5[None, :]
         fig5.suptitle(
-            "Subaru 8.2 m AO3k + SCExAO — Instantaneous Pyramid WFS Frames\n"
+            f"Subaru {tel_d:.2f} m AO3k + SCExAO — Instantaneous Pyramid WFS Frames\n"
             "(Raw Detector [ADU] & Reference-Subtracted Differential Signal "
             "at 5 Sampled Instants)",
             fontsize=13,
@@ -1409,7 +2329,7 @@ if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
         if nsamp == 1:
             axes6 = axes6[None, :]
         fig6.suptitle(
-            "Subaru 8.2 m AO3k + SCExAO — Instantaneous DM Actuator Commands & "
+            f"Subaru {tel_d:.2f} m AO3k + SCExAO — Instantaneous DM Actuator Commands & "
             "Pupil OPD Shapes\n"
             "(Mechanical Stroke [µm] & Piston-Removed Reflective OPD [nm] "
             "at 5 Sampled Instants)",
@@ -1536,9 +2456,9 @@ if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
         if nsamp == 1:
             axesp = axesp[None, :]
         figp.suptitle(
-            f"Subaru 8.2 m AO3k + SCExAO — Instantaneous {blabel} PSFs (10 ms Exposures)\n"
+            f"Subaru {tel_d:.2f} m AO3k + SCExAO — Instantaneous {blabel} PSFs (10 ms Exposures)\n"
             "(Detector Speckle Snapshots Normalized to Strehl Intensity Units, "
-            "0.60\" Seeing)",
+            f"{seeing_top:.2f}\" Seeing)",
             fontsize=12.8,
             fontweight="bold",
         )
@@ -1637,18 +2557,8 @@ if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
 
 lp1 = data.get("loops", {}).get("stage1_ao3k", {})
 lp2 = data.get("loops", {}).get("stage2_scexao", {})
+lp3 = data.get("loops", {}).get("stage3_llowfs", {})
 if _want_plot(8) and lp1.get("mgain_curve") and lp2.get("mgain_curve"):
-    figg, axesg = plt.subplots(1, 2, figsize=(13.5, 4.9), constrained_layout=True)
-    figg.suptitle(
-        "Subaru 8.2 m AO3k + SCExAO — Applied Per-Mode Integrator Gains "
-        "(mgain = loopgain × mgainfact)\n"
-        f"(Power-Law Rolloff α = {lp1.get('mgain_alpha', 0.8):.2f}, "
-        f"Floor = {lp1.get('mgain_floor', 0.10):.2f}, "
-        f"Tip/Tilt Factor = {lp1.get('mgain_tt_factor', 1.0):.2f}, "
-        f"Leak Mult = {lp1.get('mult', 0.98):.2f})",
-        fontsize=12.2,
-        fontweight="bold",
-    )
     loop_specs = [
         (
             lp1,
@@ -1661,6 +2571,28 @@ if _want_plot(8) and lp1.get("mgain_curve") and lp2.get("mgain_curve"):
             "#1f77b4",
         ),
     ]
+    if lp3.get("mgain_curve"):
+        loop_specs.append(
+            (
+                lp3,
+                "Stage 3 — LLOWFS (dm02 ZPO, 64×64 Lyot-Refl @ 500 Hz)",
+                "#059669",
+            )
+        )
+    nc_g = len(loop_specs)
+    figg, axesg = plt.subplots(
+        1, nc_g, figsize=(6.7 * nc_g + 0.3, 4.9), constrained_layout=True
+    )
+    figg.suptitle(
+        f"Subaru {tel_d:.2f} m AO3k + SCExAO — Applied Per-Mode Integrator Gains "
+        "(mgain = loopgain × mgainfact)\n"
+        f"(Power-Law Rolloff α = {lp1.get('mgain_alpha', 0.8):.2f}, "
+        f"Floor = {lp1.get('mgain_floor', 0.10):.2f}, "
+        f"Tip/Tilt Factor = {lp1.get('mgain_tt_factor', 1.0):.2f}, "
+        f"Leak Mult = {lp1.get('mult', 0.98):.2f})",
+        fontsize=12.2,
+        fontweight="bold",
+    )
     for col, (lp, title, col_g) in enumerate(loop_specs):
         ax = axesg[col]
         mg = np.asarray(lp["mgain_curve"])
@@ -1672,19 +2604,20 @@ if _want_plot(8) and lp1.get("mgain_curve") and lp2.get("mgain_curve"):
             lw=2.3,
             label=f"Modal Gain mgain[m] (N={len(mg)} modes)",
         )
-        ax.scatter(
-            [0, 1],
-            mg[:2],
-            color="#d62728",
-            s=36,
-            zorder=5,
-            label=f"Tip/Tilt (m=0,1): g={mg[0]:.3f}",
-        )
-        ax.set_title(title, fontsize=11, fontweight="bold")
+        if len(mg) >= 2:
+            ax.scatter(
+                [0, 1],
+                mg[:2],
+                color="#d62728",
+                s=36,
+                zorder=5,
+                label=f"Tip/Tilt (m=0,1): g={mg[0]:.3f}",
+            )
+        ax.set_title(title, fontsize=10.6, fontweight="bold")
         ax.set_xlabel("Controlled Mode Index m (Low → High Spatial Frequency)")
         ax.set_ylabel("Effective Integrator Gain mgain[m]", color=col_g)
         ax.set_ylim(0.0, max(0.48, float(np.max(mg)) * 1.35))
-        ax.set_xlim(-2, len(mg) + 1)
+        ax.set_xlim(-1, len(mg) + 1)
         ax.grid(True, alpha=0.30)
 
         lines = list(l1)
@@ -1716,7 +2649,7 @@ if _want_plot(8) and lp1.get("mgain_curve") and lp2.get("mgain_curve"):
             0.08,
             txt_g,
             transform=ax.transAxes,
-            fontsize=8.8,
+            fontsize=8.6,
             family="monospace",
             bbox=dict(
                 boxstyle="round,pad=0.3",
@@ -1726,21 +2659,12 @@ if _want_plot(8) and lp1.get("mgain_curve") and lp2.get("mgain_curve"):
             ),
         )
         labs = [ln.get_label() for ln in lines]
-        ax.legend(lines, labs, loc="upper right", fontsize=8.4)
+        ax.legend(lines, labs, loc="upper right", fontsize=8.2)
 
     figg.savefig(os.path.join(out_dir, "modal_gains_1x2.png"), dpi=180)
     plt.close(figg)
 
 if _want_plot(9) and lp1.get("mlat") and lp2.get("mlat"):
-    figl, axesl = plt.subplots(1, 2, figsize=(13.8, 5.2), constrained_layout=True)
-    figl.suptitle(
-        "Subaru 8.2 m AO3k + SCExAO — Hardware Latency Calibration "
-        "(CACAO mlat → measlinresp Timing)\n"
-        "(Sub-Frame Randomized DM Step Pokes vs Frame-to-Frame WFS "
-        "Differential Response)",
-        fontsize=12.2,
-        fontweight="bold",
-    )
     mlat_specs = [
         (
             lp1["mlat"],
@@ -1753,6 +2677,26 @@ if _want_plot(9) and lp1.get("mlat") and lp2.get("mlat"):
             "#1f77b4",
         ),
     ]
+    if lp3.get("mlat"):
+        mlat_specs.append(
+            (
+                lp3["mlat"],
+                "Stage 3 — LLOWFS (dm02 ZPO → 64×64 Lyot-Refl, 0.5 kHz)",
+                "#059669",
+            )
+        )
+    nc_l = len(mlat_specs)
+    figl, axesl = plt.subplots(
+        1, nc_l, figsize=(6.8 * nc_l + 0.3, 5.2), constrained_layout=True
+    )
+    figl.suptitle(
+        f"Subaru {tel_d:.2f} m AO3k + SCExAO — Hardware Latency Calibration "
+        "(CACAO mlat → measlinresp Timing)\n"
+        "(Sub-Frame Randomized DM Step Pokes vs Frame-to-Frame WFS "
+        "Differential Response)",
+        fontsize=12.2,
+        fontweight="bold",
+    )
     for col, (ml, title, col_m) in enumerate(mlat_specs):
         ax = axesl[col]
         xr = np.asarray(ml["dt_raw_fr"], dtype=float)
@@ -1809,7 +2753,7 @@ if _want_plot(9) and lp1.get("mlat") and lp2.get("mlat"):
         ymax = max(float(np.max(yr)), float(np.max(yg)), pk_y) * 1.38
         ax.set_xlim(-1.5, 6.2)
         ax.set_ylim(0.0, max(ymax, 0.1))
-        ax.set_title(title, fontsize=10.8, fontweight="bold")
+        ax.set_title(title, fontsize=10.5, fontweight="bold")
         ax.set_xlabel("Time Offset Δt from DM Poke [WFS Frames]")
         ax.set_ylabel("WFS Frame-to-Frame Diff RMS [×10⁻⁴]")
         ax.grid(True, alpha=0.30)
@@ -1839,7 +2783,7 @@ if _want_plot(9) and lp1.get("mlat") and lp2.get("mlat"):
             0.46,
             txt_m,
             transform=ax.transAxes,
-            fontsize=8.2,
+            fontsize=8.0,
             family="monospace",
             bbox=dict(
                 boxstyle="round,pad=0.32",
@@ -1848,21 +2792,12 @@ if _want_plot(9) and lp1.get("mlat") and lp2.get("mlat"):
                 alpha=0.92,
             ),
         )
-        ax.legend(loc="upper right", fontsize=8.0, framealpha=0.92)
+        ax.legend(loc="upper right", fontsize=7.8, framealpha=0.92)
 
     figl.savefig(os.path.join(out_dir, "mlat_latency_1x2.png"), dpi=180)
     plt.close(figl)
 
 if _want_plot(10) and lp1.get("selfrm") and lp2.get("selfrm"):
-    figs, axess = plt.subplots(2, 4, figsize=(17.6, 8.8), constrained_layout=True)
-    figs.suptitle(
-        "Subaru 8.2 m AO3k + SCExAO — Modal Self-Response Matrix (selfRM): "
-        "Zero-Turbulence Calibration vs On-Sky Closed Loop (0.60\" Seeing)\n"
-        "(2D Modal Interaction Matrices, Pyramid WFS Optical Gain g_opt(m), "
-        "and Closed-Loop Temporal Step Rejection)",
-        fontsize=12.4,
-        fontweight="bold",
-    )
     srm_rows = [
         (
             1,
@@ -1877,6 +2812,27 @@ if _want_plot(10) and lp1.get("selfrm") and lp2.get("selfrm"):
             "#1f77b4",
         ),
     ]
+    if lp3.get("selfrm"):
+        srm_rows.append(
+            (
+                3,
+                lp3["selfrm"],
+                "Stage 3 — LLOWFS (500 Hz Z2..Z15)",
+                "#059669",
+            )
+        )
+    nr_s = len(srm_rows)
+    figs, axess = plt.subplots(
+        nr_s, 4, figsize=(17.6, 4.2 * nr_s + 0.5), constrained_layout=True
+    )
+    figs.suptitle(
+        f"Subaru {tel_d:.2f} m AO3k + SCExAO — Modal Self-Response Matrix (selfRM): "
+        f"Zero-Turbulence Calibration vs On-Sky Closed Loop ({seeing_top:.2f}\" Seeing)\n"
+        "(2D Modal Interaction Matrices, WFS Optical Gain g_opt(m), "
+        "and Closed-Loop Temporal Step Rejection)",
+        fontsize=12.4,
+        fontweight="bold",
+    )
     for r, (snum, sr, rlabel, col_s) in enumerate(srm_rows):
         m_cal = np.load(os.path.join(out_dir, f"srm_cal_stg{snum}.npy"))
         m_sky = np.load(os.path.join(out_dir, f"srm_sky_stg{snum}.npy"))
@@ -1894,7 +2850,7 @@ if _want_plot(10) and lp1.get("selfrm") and lp2.get("selfrm"):
         if r == 0:
             ax0.set_title("Calibration selfRM (turb = 0, OL)", fontsize=10.5, fontweight="bold")
         ax0.set_ylabel(f"{rlabel}\nSensed WFS Mode Index", fontsize=9.0, fontweight="bold")
-        if r == 1:
+        if r == nr_s - 1:
             ax0.set_xlabel("Poked DM Mode Index")
         ax0.text(
             0.04,
@@ -1918,9 +2874,13 @@ if _want_plot(10) and lp1.get("selfrm") and lp2.get("selfrm"):
             aspect="equal",
         )
         if r == 0:
-            ax1.set_title("On-Sky selfRM (0.60\" Seeing, CL)", fontsize=10.5, fontweight="bold")
+            ax1.set_title(
+                f"On-Sky selfRM ({seeing_top:.2f}\" Seeing, CL)",
+                fontsize=10.5,
+                fontweight="bold",
+            )
         ax1.set_ylabel("Sensed WFS Mode Index", fontsize=8.8)
-        if r == 1:
+        if r == nr_s - 1:
             ax1.set_xlabel("Poked DM Mode Index")
         ax1.text(
             0.04,
@@ -1952,9 +2912,9 @@ if _want_plot(10) and lp1.get("selfrm") and lp2.get("selfrm"):
         ax2.scatter(
             midx,
             sdiag,
-            s=11,
+            s=14 if mcnt <= 30 else 11,
             color=col_s,
-            alpha=0.28,
+            alpha=0.35 if mcnt <= 30 else 0.28,
             edgecolors="none",
             label="On-Sky Per-Mode Diag",
         )
@@ -1977,9 +2937,9 @@ if _want_plot(10) and lp1.get("selfrm") and lp2.get("selfrm"):
         if r == 0:
             ax2.set_title("Diagonal Sensitivity & Optical Gain", fontsize=10.5, fontweight="bold")
         ax2.set_ylabel("selfRM[m, m]")
-        if r == 1:
+        if r == nr_s - 1:
             ax2.set_xlabel("Controlled Mode Index m")
-        ax2.set_xlim(-2, mcnt + 1)
+        ax2.set_xlim(-1, mcnt + 1)
         ax2.set_ylim(-0.08, 1.48)
         ax2.grid(True, alpha=0.30)
         ax2.text(
@@ -2037,7 +2997,7 @@ if _want_plot(10) and lp1.get("selfrm") and lp2.get("selfrm"):
         if r == 0:
             ax3.set_title("Temporal Step & CL Rejection vs z", fontsize=10.5, fontweight="bold")
         ax3.set_ylabel("Mean Diagonal Response")
-        if r == 1:
+        if r == nr_s - 1:
             ax3.set_xlabel("Loop Frame Step z After Poke")
         ax3.set_ylim(-0.12, 1.38)
         ax3.grid(True, alpha=0.30)
@@ -2077,7 +3037,8 @@ if _want_plot(11) and has_wf_ts and has_sr_ts:
         4, 1, figsize=(14.5, 12.2), sharex=True, constrained_layout=True
     )
     figt.suptitle(
-        "Subaru 8.2 m AO3k + SCExAO — Pupil RMS Wavefront Error & Strehl Ratio vs Time\n"
+        f"Subaru {tel_d:.2f} m AO3k + SCExAO — Pupil RMS Wavefront Error & "
+        "Strehl Ratio vs Time\n"
         f"(Seeing = {seeing_v:.2f}\", {phys_t:.1f} s physical, {nfr_wf:,d} WF frames, "
         f"{nexp_sr:,d} PSF exposures)",
         fontsize=12.8,
@@ -2388,10 +3349,10 @@ if _want_plot(12) and chrom and chrom.get("beams") and chrom.get("sensors"):
     lam_b = np.asarray(chrom["lambda_bins_um"], dtype=float)
     bmap = chrom["beams"]
     figc, axesc = plt.subplots(
-        2, 1, figsize=(13.8, 7.6), sharex=True, constrained_layout=True
+        2, 1, figsize=(13.8, 8.2), sharex=True, constrained_layout=True
     )
     figc.suptitle(
-        "Subaru 8.2 m AO3k + SCExAO — Polychromatic Photon Budget & "
+        f"Subaru {tel_d:.2f} m AO3k + SCExAO — Polychromatic Photon Budget & "
         "Sub-Band Optical Sampling\n"
         "(32-Bin Dichroic Beam Spectra [0.40..2.40 µm] & Bolometric Sub-Band "
         "Centroids λ_c with Focal λ₀/λ_c Scaling)",
@@ -2405,12 +3366,14 @@ if _want_plot(12) and chrom and chrom.get("beams") and chrom.get("sensors"):
         ("b_nir_wfs", "Stage-1 AO3k J-Band PyWFS Arm (b_nir_wfs)", "#d97706", "-", 2.3),
         ("b_vis_wfs", "Stage-2 SCExAO Vis PyWFS Arm (b_vis_wfs)", "#2563eb", "-", 2.3),
         ("b_vis_sci", "Stage-2 Vis Science Arm (b_vis_sci, 10%)", "#0891b2", "-.", 1.9),
-        ("b_nir_sci", "Stage-2 H-Band Science Arm (b_nir_sci)", "#dc2626", "-", 2.2),
+        ("b_nir_sci", "Unocculted H-Band Science (b_nir_sci)", "#dc2626", "-", 2.2),
+        ("b_coro_sci", "Post-Lyot Coronagraph Arm (b_coro_sci)", "#7c3aed", ":", 2.1),
+        ("b_lowfs_defoc", "Reflective-Lyot LLOWFS Arm (b_lowfs_defoc)", "#059669", "-.", 1.9),
     ]
     for bk, blab, col_b, ls_b, lw_b in beam_plot:
         if bk not in bmap:
             continue
-        yv = np.maximum(np.asarray(bmap[bk]["ph_s_per_um"], dtype=float), 2.0e5)
+        yv = np.maximum(np.asarray(bmap[bk]["ph_s_per_um"], dtype=float), 2.0e4)
         tot_s = bmap[bk]["total_ph_s"]
         ax_sp.semilogy(
             lam_b,
@@ -2420,18 +3383,19 @@ if _want_plot(12) and chrom and chrom.get("beams") and chrom.get("sensors"):
             lw=lw_b,
             label=f"{blab} ({tot_s:.2e} ph/s)",
         )
-    ax_sp.set_ylim(1.0e5, 8.0e11)
+    ax_sp.set_ylim(2.0e4, 8.0e11)
     ax_sp.set_ylabel("Spectral Photon Rate [ph / s / µm]")
     ax_sp.set_title(
-        "Propagated 32-Bin Stellar & Dichroic Beam Spectra (mV = 6.0, Teff = 9600 K, D = 8.2 m)",
+        f"Propagated 32-Bin Stellar & Dichroic Beam Spectra "
+        f"(mV = 6.0, Teff = 9600 K, D = {tel_d:.2f} m, Tput = {tput_pct:.0f}%)",
         fontsize=11,
         fontweight="bold",
     )
     ax_sp.grid(True, which="both", alpha=0.28)
-    ax_sp.legend(loc="upper right", fontsize=8.4, ncol=2, framealpha=0.92)
+    ax_sp.legend(loc="upper right", fontsize=8.0, ncol=2, framealpha=0.92)
 
     ax_sb = axesc[1]
-    pick_ids = ["wfs_vis", "vis_final", "wfs_nir", "nir_final"]
+    pick_ids = ["wfs_vis", "vis_final", "wfs_nir", "nir_final", "nir_coro", "wfs_lowfs"]
     s_by_id = {sn["id"]: sn for sn in chrom["sensors"]}
     disp_sens = [s_by_id[k] for k in pick_ids if k in s_by_id]
     if not disp_sens:
@@ -2441,6 +3405,8 @@ if _want_plot(12) and chrom and chrom.get("beams") and chrom.get("sensors"):
         "vis_final": "#0891b2",
         "wfs_nir": "#d97706",
         "nir_final": "#dc2626",
+        "nir_coro": "#7c3aed",
+        "wfs_lowfs": "#059669",
     }
     ylabels = []
     for idx_y, sn in enumerate(disp_sens):
@@ -2491,7 +3457,7 @@ if _want_plot(12) and chrom and chrom.get("beams") and chrom.get("sensors"):
             f"N={nlam}ch | {sn['flux_ph_per_frame']:.2e} ph/fr | {tag_pts}",
             va="center",
             ha="right" if place_left else "left",
-            fontsize=8.3,
+            fontsize=8.1,
             family="monospace",
             color="#111827",
         )
@@ -2500,7 +3466,7 @@ if _want_plot(12) and chrom and chrom.get("beams") and chrom.get("sensors"):
             f"λ₀={sn['lambda0_um']:.2f}µm, Δλ/λ₀={sn['bw_frac']*100:.0f}%"
         )
     ax_sb.set_yticks(range(len(disp_sens)))
-    ax_sb.set_yticklabels(ylabels, fontsize=9.0, fontweight="bold")
+    ax_sb.set_yticklabels(ylabels, fontsize=8.8, fontweight="bold")
     ax_sb.set_ylim(-0.6, max(len(disp_sens) - 0.4, 0.6))
     ax_sb.set_xlim(0.38, 2.42)
     ax_sb.set_xlabel("Wavelength λ [µm]", fontsize=10.5)
@@ -2513,6 +3479,1177 @@ if _want_plot(12) and chrom and chrom.get("beams") and chrom.get("sensors"):
     ax_sb.grid(True, axis="x", alpha=0.28)
     figc.savefig(os.path.join(out_dir, "chromatic_passbands_2x1.png"), dpi=180)
     plt.close(figc)
+
+coro_m = data.get("coronagraph_metrics")
+if (
+    _want_plot(13)
+    and coro_m
+    and os.path.exists(os.path.join(out_dir, "psf_nir_coro_dl.npy"))
+    and os.path.exists(os.path.join(out_dir, "psf_nir_coro.npy"))
+):
+    figk, axesk = plt.subplots(2, 3, figsize=(15.8, 9.6), constrained_layout=True)
+    ly = coro_m["lyot_stop"]
+    lo = coro_m["llowfs"]
+    spot_ld = float(coro_m["spot_radius_ld"])
+    ld_mas_c = float(coro_m["ld_mas"])
+    pix_mas_c = float(coro_m["pixscale_mas"])
+    figk.suptitle(
+        f"Subaru {tel_d:.2f} m AO3k + SCExAO — H-Band Lyot Coronagraph & "
+        f"Reflective-Lyot Defocused LLOWFS ({phys_t_top:.1f} s)\n"
+        f"(Spot R = {spot_ld:.1f} λ/D = {coro_m['spot_iwa_mas']:.0f} mas, "
+        f"Lyot Outer/Obs = {ly['outer']:.2f}/{ly['obs']:.2f}, "
+        f"LLOWFS Defocus = {lo['defocus_nm']:.0f} nm RMS Z4 @ {lo['rate_hz']:.0f} Hz)",
+        fontsize=12.4,
+        fontweight="bold",
+    )
+
+    # (0, 0): Subaru Nasmyth-IR Pupil + Reflective Lyot Stop Geometry
+    ax00 = axesk[0, 0]
+    pup_ly = np.load(os.path.join(out_dir, "coro_pup_lyot.npy"))
+    p_amp, l_amp = pup_ly[0], pup_ly[1]
+    nwf_c = p_amp.shape[0]
+    hm_c = 0.5 * nwf_c * (tel_d / (0.9375 * nwf_c))
+    ext_c = [-hm_c, hm_c, -hm_c, hm_c]
+    rgb = np.zeros((nwf_c, nwf_c, 3), dtype=np.float32)
+    rgb[:, :] = np.array([0.08, 0.10, 0.14], dtype=np.float32)
+    t_trans = p_amp * l_amp
+    t_refl = p_amp * np.maximum(0.0, 1.0 - l_amp)
+    for ch, c_tr, c_rf in zip(
+        range(3), (0.98, 0.84, 0.30), (0.14, 0.68, 0.90)
+    ):
+        rgb[:, :, ch] += t_trans * (c_tr - rgb[0, 0, ch]) + t_refl * (
+            c_rf - rgb[0, 0, ch]
+        )
+    ax00.imshow(np.clip(rgb, 0.0, 1.0), origin="lower", extent=ext_c)
+    ax00.set_title(
+        "Subaru Nasmyth-IR Pupil & Lyot Stop\n"
+        "(Gold = Coro Trans, Cyan = Reflected to LLOWFS)",
+        fontsize=10.4,
+        fontweight="bold",
+    )
+    ax00.set_xlabel("x [m]")
+    ax00.set_ylabel("y [m]")
+    ax00.text(
+        0.03,
+        0.04,
+        f"D = {tel_d:.2f} m, cobs = {tel_info.get('cobs', 0.307)*100:.1f}%\n"
+        f"V-spiders: ±{tel_info.get('spider_deg', 51.75):.2f}°, "
+        f"off={tel_info.get('spider_offset', 0.08289)*tel_d:.3f} m\n"
+        f"T_Lyot = {ly['intensity_throughput']*100:.1f}%, "
+        f"η_peak = {ly['planet_peak_throughput']*100:.1f}%",
+        transform=ax00.transAxes,
+        fontsize=8.1,
+        color="white",
+        family="monospace",
+        bbox=dict(boxstyle="round,pad=0.26", fc="black", ec="none", alpha=0.76),
+    )
+
+    # (0, 1): Defocused LLOWFS Detector Frame
+    ax01 = axesk[0, 1]
+    lo_npy_p = os.path.join(out_dir, "det_wfs_lowfs.npy")
+    if os.path.exists(lo_npy_p):
+        det_lo = np.maximum(np.load(lo_npy_p) - 100.0, 0.5)
+        vmax_lo = max(10.0, float(np.percentile(det_lo, 99.8)))
+        im01 = ax01.imshow(
+            det_lo,
+            origin="lower",
+            cmap="magma",
+            norm=LogNorm(vmin=1.0, vmax=vmax_lo),
+            interpolation="nearest",
+        )
+        cb01 = figk.colorbar(im01, ax=ax01, shrink=0.86, pad=0.02)
+        cb01.set_label("Net Detector [ADU]", fontsize=9)
+        bcl_k = (coro_m.get("lowfs_light_budget") or {}).get("closed_loop") or {}
+        if bcl_k:
+            f_ci_k = bcl_k.get("frac_coro_in_reaching_lowfs_cam_fov", 0.0) * 100.0
+            f_ph_k = bcl_k.get("frac_entrance_pup_h_reaching_lowfs_cam_fov", 0.0) * 100.0
+            lo_badge = (
+                f"LOWFS Light = {f_ci_k:.2f}% coro-in ({f_ph_k:.2f}% H-pup)\n"
+                f"Inc = {bcl_k.get('lowfs_cam_incident_ph_per_frame', 0.0):.2e} ph/fr | "
+                f"Det = {lo['flux_ph_per_frame']:.2e} e⁻/fr\n"
+                f"Defoc = +{lo['defocus_nm']:.0f} nm Z4"
+            )
+        else:
+            lo_badge = (
+                f"Flux = {lo['flux_ph_per_frame']:.2e} ph/fr\n"
+                f"NetSum = {lo.get('cl_net_sum_adu', 0.0)/1e3:.1f} kADU\n"
+                f"Defoc = +{lo['defocus_nm']:.0f} nm Z4"
+            )
+        ax01.text(
+            0.03,
+            0.04,
+            lo_badge,
+            transform=ax01.transAxes,
+            fontsize=8.0,
+            color="white",
+            family="monospace",
+            bbox=dict(boxstyle="round,pad=0.26", fc="black", ec="none", alpha=0.74),
+        )
+    ax01.set_title(
+        f"Reflective-Lyot Defocused LLOWFS\n"
+        f"(csim_wfs_lowfs, {lo['detector']} @ {lo['rate_hz']:.0f} Hz)",
+        fontsize=10.4,
+        fontweight="bold",
+    )
+    ax01.set_xlabel("x [pix]")
+    ax01.set_ylabel("y [pix]")
+
+    # (0, 2): Stage-3 LLOWFS Ref-Sub Signal & ZPO Coupling
+    ax02 = axesk[0, 2]
+    im3_p = os.path.join(out_dir, "aol3_imWFS2.npy")
+    if os.path.exists(im3_p):
+        im3 = np.load(im3_p) * 1.0e4
+        lim3 = max(0.5, float(np.percentile(np.abs(im3), 99.5)))
+        im02 = ax02.imshow(
+            im3,
+            origin="lower",
+            cmap="RdBu_r",
+            vmin=-lim3,
+            vmax=lim3,
+            interpolation="nearest",
+        )
+        cb02 = figk.colorbar(im02, ax=ax02, shrink=0.86, pad=0.02)
+        cb02.set_label("Ref-Sub Signal [×10⁻⁴]", fontsize=9)
+        st_lbl = "CLOSED" if lo["enabled_closed_loop"] else "OPEN"
+        ax02.text(
+            0.03,
+            0.04,
+            f"Loop 3 ({st_lbl}, N={lo['n_zernike_modes']} Z2..Z15)\n"
+            f"aol3_dmC RMS  = {lo['dm3_stroke_rms_nm']:.1f} nm stroke\n"
+            f"Stg2 ZPO WFS  = {lo['stg2_zpo_wfs_rms']*1e4:.2f}e-4",
+            transform=ax02.transAxes,
+            fontsize=8.1,
+            color="black",
+            family="monospace",
+            bbox=dict(boxstyle="round,pad=0.26", fc="white", ec="#cbd5e1", alpha=0.88),
+        )
+    ax02.set_title(
+        "Stage-3 LLOWFS Differential Signal\n"
+        "(aol3_imWFS2 → dm02 ZPO → aol2_wfszpo)",
+        fontsize=10.4,
+        fontweight="bold",
+    )
+    ax02.set_xlabel("x [pix]")
+    ax02.set_ylabel("y [pix]")
+
+    # (1, 0) & (1, 1): DL vs Closed-Loop Coronagraphic H-band PSFs
+    c_dl = np.load(os.path.join(out_dir, "psf_nir_coro_dl.npy"))
+    c_cl = np.load(os.path.join(out_dir, "psf_nir_coro.npy"))
+    c0_p = c_cl.shape[1] // 2
+    pix_arc = pix_mas_c / 1000.0
+    ld_arc = ld_mas_c / 1000.0
+    hw_p = min(c0_p, int(round(1.35 / pix_arc)))
+    ext_k = [-hw_p * pix_arc, hw_p * pix_arc, -hw_p * pix_arc, hw_p * pix_arc]
+    coro_panels = [
+        (
+            axesk[1, 0],
+            c_dl,
+            "Diffraction-Limited Lyot Coronagraph\n(psf_nir_coro_dl, turb = 0)",
+            coro_m["dl"],
+        ),
+        (
+            axesk[1, 1],
+            c_cl,
+            f"Closed-Loop Lyot Coronagraph\n(psf_nir_coro, {seeing_top:.2f}\" Seeing)",
+            coro_m["closed_loop"],
+        ),
+    ]
+    im_cp = None
+    for idx_cp, (axc, arr_c, ttl_c, m_blk) in enumerate(coro_panels):
+        sub_c = np.clip(arr_c[c0_p - hw_p : c0_p + hw_p, c0_p - hw_p : c0_p + hw_p], 1e-8, 1.0)
+        im_cp = axc.imshow(
+            sub_c,
+            origin="lower",
+            extent=ext_k,
+            cmap="inferno",
+            norm=LogNorm(vmin=1e-6, vmax=3e-2),
+            interpolation="nearest",
+        )
+        axc.add_patch(
+            Circle(
+                (0.0, 0.0),
+                spot_ld * ld_arc,
+                fill=False,
+                ls="-",
+                lw=1.2,
+                ec="white",
+                alpha=0.90,
+                label=f"Spot {spot_ld:.1f} λ/D",
+            )
+        )
+        axc.add_patch(
+            Circle(
+                (0.0, 0.0),
+                23.0 * ld_arc,
+                fill=False,
+                ls=":",
+                lw=1.0,
+                ec="lime",
+                alpha=0.85,
+                label="SCExAO 23 λ/D",
+            )
+        )
+        if idx_cp == 1:
+            axc.legend(
+                loc="upper right",
+                fontsize=7.8,
+                facecolor="#10141c",
+                edgecolor="#556070",
+                labelcolor="white",
+                framealpha=0.85,
+            )
+        axc.set_title(ttl_c, fontsize=10.4, fontweight="bold")
+        axc.set_xlabel("ΔRA [arcsec]")
+        axc.set_ylabel("ΔDec [arcsec]")
+        axc.text(
+            0.03,
+            0.04,
+            f"Peak Raw   = {m_blk['peak_raw_contrast']:.2e}\n"
+            f"⟨3..10λ/D⟩ = {m_blk['mean_raw_contrast_3_10ld']:.2e}\n"
+            f"⟨5..20λ/D⟩ = {m_blk['mean_raw_contrast_5_20ld']:.2e}",
+            transform=axc.transAxes,
+            fontsize=8.1,
+            color="white",
+            family="monospace",
+            bbox=dict(boxstyle="round,pad=0.26", fc="black", ec="none", alpha=0.74),
+        )
+        cb_c = figk.colorbar(im_cp, ax=axc, shrink=0.86, pad=0.02)
+        cb_c.set_label("Raw Contrast [I / I_DL(0)]", fontsize=8.8)
+
+    # (1, 2): Radial Raw & Planet-Throughput-Normalized Contrast Curves
+    ax12 = axesk[1, 2]
+    pr = coro_m["profiles"]
+    r_ld_v = np.asarray(pr["rad_ld"], dtype=float)
+    unocc_v = np.asarray(pr["unocc_cl"], dtype=float)
+    if np.any(unocc_v > 0):
+        sr_un_pct = coro_m["closed_loop"]["nir_unocculted_strehl"] * 100.0
+        ax12.semilogy(
+            r_ld_v,
+            np.clip(unocc_v, 1e-8, 2.0),
+            color="#64748b",
+            ls="--",
+            lw=1.5,
+            label=f"Unocculted CL PSF (SR={sr_un_pct:.1f}%)",
+        )
+    ax12.semilogy(
+        r_ld_v,
+        np.clip(np.asarray(pr["cl_planet"], dtype=float), 1e-8, 2.0),
+        color="#dc2626",
+        ls="-",
+        lw=2.2,
+        label="Coro CL Planet Contrast (Lyot+SR corr.)",
+    )
+    ax12.semilogy(
+        r_ld_v,
+        np.clip(np.asarray(pr["cl_5sigma_planet"], dtype=float), 1e-8, 2.0),
+        color="#f59e0b",
+        ls="-.",
+        lw=1.7,
+        label="Coro CL 5σ Speckle Contrast",
+    )
+    ax12.semilogy(
+        r_ld_v,
+        np.clip(np.asarray(pr["cl_raw"], dtype=float), 1e-8, 2.0),
+        color="#2563eb",
+        ls="-",
+        lw=1.8,
+        label="Coro CL Raw Intensity [I/I_DL(0)]",
+    )
+    ax12.semilogy(
+        r_ld_v,
+        np.clip(np.asarray(pr["dl_raw"], dtype=float), 1e-8, 2.0),
+        color="#111827",
+        ls=":",
+        lw=1.5,
+        label="Coro DL Raw Floor (turb=0)",
+    )
+    ax12.axvspan(0.0, spot_ld, color="#94a3b8", alpha=0.22, label=f"Spot IWA ({spot_ld:.1f} λ/D)")
+    ax12.axvline(23.0, color="green", ls=":", lw=1.2, alpha=0.80)
+    ax12.set_xlim(0.0, 32.0)
+    ax12.set_ylim(3e-7, 1.5)
+    ax12.grid(True, which="both", alpha=0.28)
+    ax12.set_title(
+        "H-Band Radial Contrast vs Separation", fontsize=10.4, fontweight="bold"
+    )
+    ax12.set_xlabel("Angular Separation [λ/D at 1.65 µm]")
+    ax12.set_ylabel("Azimuthal Contrast")
+    sec12 = ax12.secondary_xaxis(
+        "top",
+        functions=(
+            lambda x, s=ld_mas_c: x * s,
+            lambda m, s=ld_mas_c: m / s,
+        ),
+    )
+    sec12.set_xlabel("Separation [mas]", fontsize=8.8)
+    ax12.legend(loc="upper right", fontsize=7.6, framealpha=0.92)
+
+    figk.savefig(os.path.join(out_dir, "coro_lowfs_summary.png"), dpi=180)
+    plt.close(figk)
+
+if (
+    _want_plot(14)
+    and coro_m
+    and os.path.exists(os.path.join(out_dir, "psf_nir_unocc_dl.npy"))
+    and os.path.exists(os.path.join(out_dir, "psf_nir_unocc_cl.npy"))
+    and os.path.exists(os.path.join(out_dir, "psf_nir_coro_dl.npy"))
+    and os.path.exists(os.path.join(out_dir, "psf_nir_coro.npy"))
+):
+    figba, axesba = plt.subplots(2, 3, figsize=(16.0, 9.6), constrained_layout=True)
+    spot_ld = float(coro_m["spot_radius_ld"])
+    ld_mas_c = float(coro_m["ld_mas"])
+    pix_mas_c = float(coro_m["pixscale_mas"])
+    pix_arc = pix_mas_c / 1000.0
+    ld_arc = ld_mas_c / 1000.0
+    bud_ba = coro_m.get("lowfs_light_budget") or {}
+    bdl_ba = bud_ba.get("diffraction_limited") or {}
+    bcl_ba = bud_ba.get("closed_loop") or {}
+
+    figba.suptitle(
+        f"Subaru {tel_d:.2f} m AO3k + SCExAO — H-Band Focal-Plane PSF "
+        f"Before vs After Lyot Coronagraph ({phys_t_top:.1f} s)\n"
+        f"(λ₀ = {coro_m['lambda_um']:.2f} µm, {coro_m['bw_frac']*100:.0f}% BW, "
+        f"N = {coro_m['nlambda']}ch; Occulting Spot R = {spot_ld:.1f} λ/D = "
+        f"{coro_m['spot_iwa_mas']:.0f} mas; Shared I/I_DL(0) Scale)",
+        fontsize=12.2,
+        fontweight="bold",
+    )
+
+    u_dl = np.load(os.path.join(out_dir, "psf_nir_unocc_dl.npy"))
+    c_dl = np.load(os.path.join(out_dir, "psf_nir_coro_dl.npy"))
+    u_cl = np.load(os.path.join(out_dir, "psf_nir_unocc_cl.npy"))
+    c_cl = np.load(os.path.join(out_dir, "psf_nir_coro.npy"))
+    c0_ba = c_cl.shape[1] // 2
+    hw_ba = min(c0_ba, int(round(1.25 / pix_arc)))
+    ext_ba = [-hw_ba * pix_arc, hw_ba * pix_arc, -hw_ba * pix_arc, hw_ba * pix_arc]
+
+    dl_abs_pct = bdl_ba.get("frac_coro_in_fpm_absorbed", 0.882) * 100.0
+    cl_abs_pct = bcl_ba.get("frac_coro_in_fpm_absorbed", 0.840) * 100.0
+    sr_h_pct = coro_m["closed_loop"]["nir_unocculted_strehl"] * 100.0
+    dl_m = coro_m["dl"]
+    cl_m = coro_m["closed_loop"]
+
+    ba_panels = [
+        (
+            axesba[0, 0],
+            u_dl,
+            "BEFORE Coronagraph — Diffraction-Limited\n(psf_nir_dl, turb = 0)",
+            False,
+            f"Peak       = 1.000 I_DL(0)\n"
+            f"FPM <3λ/D  = {dl_abs_pct:.1f}% (absorbed)\n"
+            f"Halo >3λ/D = {100.0 - dl_abs_pct:.1f}% (→ Lyot)",
+        ),
+        (
+            axesba[0, 1],
+            c_dl,
+            "AFTER Lyot Coronagraph — Diffraction-Limited\n(psf_nir_coro_dl, turb = 0)",
+            True,
+            f"Peak Raw   = {dl_m['peak_raw_contrast']:.2e}\n"
+            f"Tot Leak   = {dl_m['total_leakage_frac']*100:.3f}%\n"
+            f"⟨3..10λ/D⟩ = {dl_m['mean_raw_contrast_3_10ld']:.2e}",
+        ),
+        (
+            axesba[1, 0],
+            u_cl,
+            f"BEFORE Coronagraph — Closed-Loop ({seeing_top:.2f}\" Seeing)\n"
+            f"(psf_nir_final, Strehl = {sr_h_pct:.1f}%)",
+            False,
+            f"Peak SR_H  = {sr_h_pct:.1f}%\n"
+            f"FPM <3λ/D  = {cl_abs_pct:.1f}% (absorbed)\n"
+            f"Halo >3λ/D = {100.0 - cl_abs_pct:.1f}% (→ Lyot)",
+        ),
+        (
+            axesba[1, 1],
+            c_cl,
+            f"AFTER Lyot Coronagraph — Closed-Loop ({seeing_top:.2f}\" Seeing)\n"
+            f"(psf_nir_coro, +Stage-3 LLOWFS)",
+            True,
+            f"Peak Raw   = {cl_m['peak_raw_contrast']:.2e}\n"
+            f"Tot Leak   = {cl_m['total_leakage_frac']*100:.2f}%\n"
+            f"⟨3..10λ/D⟩ = {cl_m['mean_raw_contrast_3_10ld']:.2e} "
+            f"(Pl {cl_m['mean_planet_contrast_3_10ld']:.1e})",
+        ),
+    ]
+
+    for idx_b, (axb, arr_b, ttl_b, is_after, btxt) in enumerate(ba_panels):
+        sub_b = np.clip(
+            arr_b[c0_ba - hw_ba : c0_ba + hw_ba, c0_ba - hw_ba : c0_ba + hw_ba],
+            3e-7,
+            1.0,
+        )
+        im_b = axb.imshow(
+            sub_b,
+            origin="lower",
+            extent=ext_ba,
+            cmap="inferno",
+            norm=LogNorm(vmin=3e-7, vmax=1.0),
+            interpolation="nearest",
+        )
+        axb.add_patch(
+            Circle(
+                (0.0, 0.0),
+                spot_ld * ld_arc,
+                fill=False,
+                ls="-" if is_after else "--",
+                lw=1.25,
+                ec="white" if is_after else "#22d3ee",
+                alpha=0.92,
+                label=f"Spot {spot_ld:.1f} λ/D",
+            )
+        )
+        axb.add_patch(
+            Circle(
+                (0.0, 0.0),
+                23.0 * ld_arc,
+                fill=False,
+                ls=":",
+                lw=1.0,
+                ec="lime",
+                alpha=0.85,
+                label="SCExAO 23 λ/D",
+            )
+        )
+        if idx_b in (0, 1):
+            axb.legend(
+                loc="upper right",
+                fontsize=7.6,
+                facecolor="#10141c",
+                edgecolor="#556070",
+                labelcolor="white",
+                framealpha=0.85,
+            )
+        axb.set_title(ttl_b, fontsize=10.2, fontweight="bold")
+        axb.set_xlabel("ΔRA [arcsec]")
+        axb.set_ylabel("ΔDec [arcsec]")
+        axb.text(
+            0.03,
+            0.04,
+            btxt,
+            transform=axb.transAxes,
+            fontsize=8.0,
+            color="white",
+            family="monospace",
+            bbox=dict(boxstyle="round,pad=0.26", fc="black", ec="none", alpha=0.76),
+        )
+        cb_b = figba.colorbar(im_b, ax=axb, shrink=0.86, pad=0.02)
+        cb_b.set_label("Intensity [I / I_DL(0)]", fontsize=8.8)
+
+    pr = coro_m["profiles"]
+    r_ld_v = np.asarray(pr["rad_ld"], dtype=float)
+
+    # (0, 2): Diffraction-Limited Before vs After Radial Profiles
+    ax_dl_r = axesba[0, 2]
+    ax_dl_r.semilogy(
+        r_ld_v,
+        np.clip(np.asarray(pr.get("unocc_dl", pr["unocc_cl"]), dtype=float), 1e-8, 2.0),
+        color="#334155",
+        ls="--",
+        lw=1.8,
+        label="Before Coro (Unocculted DL PSF)",
+    )
+    ax_dl_r.semilogy(
+        r_ld_v,
+        np.clip(np.asarray(pr["dl_planet"], dtype=float), 1e-8, 2.0),
+        color="#dc2626",
+        ls="-",
+        lw=2.0,
+        label="After Coro Planet Contrast (η_peak corr.)",
+    )
+    ax_dl_r.semilogy(
+        r_ld_v,
+        np.clip(np.asarray(pr["dl_raw"], dtype=float), 1e-8, 2.0),
+        color="#2563eb",
+        ls="-",
+        lw=1.7,
+        label="After Coro Raw Intensity [I/I_DL(0)]",
+    )
+    ax_dl_r.axvspan(0.0, spot_ld, color="#94a3b8", alpha=0.22, label=f"FPM ({spot_ld:.1f} λ/D)")
+    ax_dl_r.axvline(23.0, color="green", ls=":", lw=1.1, alpha=0.80)
+    ax_dl_r.set_xlim(0.0, 30.0)
+    ax_dl_r.set_ylim(1e-7, 1.5)
+    ax_dl_r.grid(True, which="both", alpha=0.28)
+    ax_dl_r.set_title(
+        "Diffraction-Limited Radial Profile (turb = 0)",
+        fontsize=10.2,
+        fontweight="bold",
+    )
+    ax_dl_r.set_xlabel("Angular Separation [λ/D at 1.65 µm]")
+    ax_dl_r.set_ylabel("Azimuthal Mean [I / I_DL(0)]")
+    sec_dl = ax_dl_r.secondary_xaxis(
+        "top",
+        functions=(lambda x, s=ld_mas_c: x * s, lambda m, s=ld_mas_c: m / s),
+    )
+    sec_dl.set_xlabel("Separation [mas]", fontsize=8.6)
+    ax_dl_r.legend(loc="upper right", fontsize=7.6, framealpha=0.92)
+
+    # (1, 2): Closed-Loop Before vs After Radial Profiles
+    ax_cl_r = axesba[1, 2]
+    ax_cl_r.semilogy(
+        r_ld_v,
+        np.clip(np.asarray(pr["unocc_cl"], dtype=float), 1e-8, 2.0),
+        color="#334155",
+        ls="--",
+        lw=1.8,
+        label=f"Before Coro CL PSF (SR={sr_h_pct:.1f}%)",
+    )
+    ax_cl_r.semilogy(
+        r_ld_v,
+        np.clip(np.asarray(pr["cl_planet"], dtype=float), 1e-8, 2.0),
+        color="#dc2626",
+        ls="-",
+        lw=2.1,
+        label="After Coro CL Planet Contrast",
+    )
+    ax_cl_r.semilogy(
+        r_ld_v,
+        np.clip(np.asarray(pr["cl_5sigma_planet"], dtype=float), 1e-8, 2.0),
+        color="#f59e0b",
+        ls="-.",
+        lw=1.6,
+        label="After Coro CL 5σ Speckle Contrast",
+    )
+    ax_cl_r.semilogy(
+        r_ld_v,
+        np.clip(np.asarray(pr["cl_raw"], dtype=float), 1e-8, 2.0),
+        color="#2563eb",
+        ls="-",
+        lw=1.8,
+        label="After Coro CL Raw Intensity [I/I_DL(0)]",
+    )
+    ax_cl_r.axvspan(0.0, spot_ld, color="#94a3b8", alpha=0.22, label=f"FPM ({spot_ld:.1f} λ/D)")
+    ax_cl_r.axvline(23.0, color="green", ls=":", lw=1.1, alpha=0.80)
+    ax_cl_r.set_xlim(0.0, 30.0)
+    ax_cl_r.set_ylim(3e-7, 1.5)
+    ax_cl_r.grid(True, which="both", alpha=0.28)
+    ax_cl_r.set_title(
+        f"Closed-Loop Radial Profile ({seeing_top:.2f}\" Seeing)",
+        fontsize=10.2,
+        fontweight="bold",
+    )
+    ax_cl_r.set_xlabel("Angular Separation [λ/D at 1.65 µm]")
+    ax_cl_r.set_ylabel("Azimuthal Mean / Contrast")
+    sec_cl = ax_cl_r.secondary_xaxis(
+        "top",
+        functions=(lambda x, s=ld_mas_c: x * s, lambda m, s=ld_mas_c: m / s),
+    )
+    sec_cl.set_xlabel("Separation [mas]", fontsize=8.6)
+    ax_cl_r.legend(loc="upper right", fontsize=7.5, framealpha=0.92)
+
+    figba.savefig(os.path.join(out_dir, "coro_before_after_psf.png"), dpi=180)
+    plt.close(figba)
+
+if (
+    _want_plot(15)
+    and coro_m
+    and os.path.exists(os.path.join(out_dir, "coro_pup_lyot.npy"))
+    and os.path.exists(os.path.join(out_dir, "coro_pre_lyot_dl.npy"))
+    and os.path.exists(os.path.join(out_dir, "coro_pre_lyot.npy"))
+):
+    bud_ly = coro_m.get("lowfs_light_budget") or {}
+    bdl_ly = bud_ly.get("diffraction_limited") or {}
+    bcl_ly = bud_ly.get("closed_loop") or {}
+    if bdl_ly and bcl_ly:
+        figly, axesly = plt.subplots(2, 3, figsize=(16.2, 9.8), constrained_layout=True)
+        ly = coro_m["lyot_stop"]
+        lo = coro_m["llowfs"]
+        spot_ld = float(coro_m["spot_radius_ld"])
+        refl_r = float(coro_m["lowfs_refl"])
+        up_h = float(bud_ly.get("upstream_ao_h_tput", 0.867))
+
+        figly.suptitle(
+            f"Subaru {tel_d:.2f} m AO3k + SCExAO — Light Incident on Lyot Stop & "
+            f"Reflective-Lyot LOWFS Power Budget\n"
+            f"(H-Band 1.65 µm, 18% BW; Spot R = {spot_ld:.1f} λ/D; "
+            f"Lyot Outer/Obs = {ly['outer']:.2f}/{ly['obs']:.2f}, r = {refl_r:.2f} → "
+            f"+{lo['defocus_nm']:.0f} nm Z4 Defocused 64×64 LOWFS @ {lo['rate_hz']:.0f} Hz)",
+            fontsize=12.0,
+            fontweight="bold",
+        )
+
+        pup_ly = np.load(os.path.join(out_dir, "coro_pup_lyot.npy"))
+        p_amp, l_amp = pup_ly[0], pup_ly[1]
+        p_int = p_amp**2
+        l_int = l_amp**2
+        pup_sum = max(float(np.sum(p_int)), 1.0)
+        nwf_c = p_amp.shape[0]
+        hm_c = 0.5 * nwf_c * (tel_d / (0.9375 * nwf_c))
+        ext_c = [-hm_c, hm_c, -hm_c, hm_c]
+
+        pre_dl_raw = np.load(os.path.join(out_dir, "coro_pre_lyot_dl.npy")).astype(np.float64)
+        pre_cl_raw = np.load(os.path.join(out_dir, "coro_pre_lyot.npy")).astype(np.float64)
+        f_pre_dl = float(bdl_ly["frac_coro_in_incident_on_lyot"])
+        f_pre_cl = float(bcl_ly["frac_coro_in_incident_on_lyot"])
+        pre_dl_n = pre_dl_raw * (f_pre_dl * pup_sum / max(float(np.sum(pre_dl_raw)), 1e-30))
+        pre_cl_n = pre_cl_raw * (f_pre_cl * pup_sum / max(float(np.sum(pre_cl_raw)), 1e-30))
+        refl_cl_n = (refl_r**2) * np.maximum(0.0, 1.0 - l_int) * pre_cl_n
+
+        pup_panels = [
+            (
+                axesly[0, 0],
+                p_int,
+                "Coronagraph Input Pupil |E_in|²\n(b_nir_sci, Before 3.0 λ/D Focal Spot)",
+                f"Coro-In H-Band = 100.00%\n"
+                f"= {up_h*100:.1f}% of b_pup H-Band\n"
+                f"= {up_h*float(bud_ly.get('tput_tel', 0.20))*100:.2f}% of Sky H-Band",
+            ),
+            (
+                axesly[0, 1],
+                pre_dl_n,
+                "Light Incident on Lyot Stop — DL (turb = 0)\n"
+                "(coro_pre_lyot_dl, Cyan = Lyot Stop Edge)",
+                f"Inc on Lyot = {f_pre_dl*100:.2f}% coro-in\n"
+                f"FPM Absorb  = {bdl_ly['frac_coro_in_fpm_absorbed']*100:.2f}%\n"
+                f"Lyot T / R  = {bdl_ly['frac_coro_in_lyot_transmitted_raw']*100:.2f}% / "
+                f"{bdl_ly['frac_coro_in_reflected_to_lowfs_beam']*100:.2f}%",
+            ),
+            (
+                axesly[0, 2],
+                pre_cl_n,
+                f"Light Incident on Lyot Stop — CL ({seeing_top:.2f}\" Seeing)\n"
+                "(coro_pre_lyot, Cyan = Lyot Stop Edge)",
+                f"Inc on Lyot = {f_pre_cl*100:.2f}% coro-in\n"
+                f"FPM Absorb  = {bcl_ly['frac_coro_in_fpm_absorbed']*100:.2f}%\n"
+                f"Lyot T / R  = {bcl_ly['frac_coro_in_lyot_transmitted_raw']*100:.2f}% / "
+                f"{bcl_ly['frac_coro_in_reflected_to_lowfs_beam']*100:.2f}%",
+            ),
+            (
+                axesly[1, 0],
+                refl_cl_n,
+                "Light Reflected by Lyot Stop → b_lowfs (CL)\n"
+                f"(r²(1 - |L|²)|E_pre_Lyot|², R = {refl_r**2*100:.2f}%)",
+                f"Refl b_lowfs = "
+                f"{bcl_ly['frac_coro_in_reflected_to_lowfs_beam']*100:.2f}% coro-in\n"
+                f"= {bcl_ly['frac_coro_in_reflected_to_lowfs_beam']*up_h*100:.2f}% "
+                f"of b_pup H-Band\n"
+                f"Blocked Mask = {bcl_ly['frac_coro_in_lyot_blocked']*100:.2f}% coro-in",
+            ),
+        ]
+
+        for idx_p, (axp, arr_p, ttl_p, ptxt) in enumerate(pup_panels):
+            im_p = axp.imshow(
+                np.clip(arr_p, 3e-4, 1.5),
+                origin="lower",
+                extent=ext_c,
+                cmap="inferno",
+                norm=LogNorm(vmin=3e-4, vmax=1.5),
+                interpolation="nearest",
+            )
+            axp.contour(
+                l_amp,
+                levels=[0.5],
+                extent=ext_c,
+                origin="lower",
+                colors=["#22d3ee"],
+                linewidths=0.95,
+                linestyles="--" if idx_p == 0 else "-",
+            )
+            axp.set_title(ttl_p, fontsize=10.1, fontweight="bold")
+            axp.set_xlabel("x [m]")
+            axp.set_ylabel("y [m]")
+            axp.text(
+                0.03,
+                0.04,
+                ptxt,
+                transform=axp.transAxes,
+                fontsize=7.9,
+                color="white",
+                family="monospace",
+                bbox=dict(boxstyle="round,pad=0.25", fc="black", ec="none", alpha=0.78),
+            )
+            cb_p = figly.colorbar(im_p, ax=axp, shrink=0.86, pad=0.02)
+            cb_p.set_label("Pupil Intensity [I / I_in,clear]", fontsize=8.6)
+
+        # (1, 1): Defocused 64x64 LOWFS Camera Image
+        ax_cam = axesly[1, 1]
+        lo_npy_p = os.path.join(out_dir, "det_wfs_lowfs.npy")
+        if os.path.exists(lo_npy_p):
+            det_lo = np.maximum(np.load(lo_npy_p) - 100.0, 0.5)
+            vmax_lo = max(10.0, float(np.percentile(det_lo, 99.8)))
+            im_cam = ax_cam.imshow(
+                det_lo,
+                origin="lower",
+                cmap="magma",
+                norm=LogNorm(vmin=1.0, vmax=vmax_lo),
+                interpolation="nearest",
+            )
+            cb_cam = figly.colorbar(im_cam, ax=ax_cam, shrink=0.86, pad=0.02)
+            cb_cam.set_label("Net Detector [ADU / frame]", fontsize=8.8)
+            f_ci_cam = bcl_ly["frac_coro_in_reaching_lowfs_cam_fov"] * 100.0
+            f_ph_cam = bcl_ly["frac_entrance_pup_h_reaching_lowfs_cam_fov"] * 100.0
+            f_sk_cam = bcl_ly["frac_sky_h_reaching_lowfs_cam_fov"] * 100.0
+            ax_cam.text(
+                0.03,
+                0.04,
+                f"LOWFS Cam FOV = {f_ci_cam:.2f}% coro-in\n"
+                f"= {f_ph_cam:.2f}% H-pup | {f_sk_cam:.2f}% Sky H\n"
+                f"Inc = {bcl_ly['lowfs_cam_incident_ph_per_frame']:.2e} ph/fr "
+                f"({bcl_ly['lowfs_cam_detected_phe_per_frame']:.2e} e⁻/fr)",
+                transform=ax_cam.transAxes,
+                fontsize=7.9,
+                color="white",
+                family="monospace",
+                bbox=dict(boxstyle="round,pad=0.25", fc="black", ec="none", alpha=0.78),
+            )
+        ax_cam.set_title(
+            f"Defocused LOWFS Camera ({lo['detector']} = 32×32 λ/D)\n"
+            f"(csim_wfs_lowfs @ {lo['rate_hz']:.0f} Hz, +{lo['defocus_nm']:.0f} nm Z4)",
+            fontsize=10.1,
+            fontweight="bold",
+        )
+        ax_cam.set_xlabel("x [pix]")
+        ax_cam.set_ylabel("y [pix]")
+
+        # (1, 2): 500 Hz LOWFS Light-Fraction Time Series
+        ax_ts = axesly[1, 2]
+        ts_npy_p = os.path.join(out_dir, "lowfs_light_ts.npy")
+        coro_tp = float(bud_ly.get("coro_relay_tput", 0.92))
+        def_tp = float(bud_ly.get("defocus_wfe_tput", 0.99))
+        fov_r = float(bcl_ly.get("lowfs_64x64_fov_capture_fraction", 0.96))
+        scale_cam = coro_tp * def_tp * fov_r
+
+        if os.path.exists(ts_npy_p):
+            ts_d = np.load(ts_npy_p)
+            t_v = ts_d[:, 2]
+            f_lo_inst = ts_d[:, 3] * 100.0
+            f_lo_long = ts_d[:, 4] * 100.0
+            f_pre_inst = ts_d[:, 5] * 100.0
+            f_cam_inst = f_lo_inst * scale_cam
+            f_cam_long = f_lo_long * scale_cam
+            dl_cam_pct = bdl_ly["frac_coro_in_reaching_lowfs_cam_fov"] * 100.0
+
+            ax_ts.plot(
+                t_v,
+                f_pre_inst,
+                color="#7c3aed",
+                lw=1.0,
+                alpha=0.65,
+                label=f"Incident on Lyot Stop (⟨{float(np.mean(f_pre_inst)):.2f}%⟩)",
+            )
+            ax_ts.plot(
+                t_v,
+                f_lo_inst,
+                color="#0284c7",
+                lw=1.05,
+                alpha=0.72,
+                label=f"Reflected into b_lowfs (⟨{float(np.mean(f_lo_inst)):.2f}%⟩)",
+            )
+            ax_ts.plot(
+                t_v,
+                f_cam_inst,
+                color="#10b981",
+                lw=1.15,
+                alpha=0.78,
+                label=f"Reaching LOWFS FOV inst (⟨{float(np.mean(f_cam_inst)):.2f}%⟩)",
+            )
+            ax_ts.plot(
+                t_v,
+                f_cam_long,
+                color="#064e3b",
+                lw=2.1,
+                label=f"Reaching LOWFS FOV cumul ({float(f_cam_long[-1]):.2f}%)",
+            )
+            ax_ts.axhline(
+                dl_cam_pct,
+                color="#dc2626",
+                ls="--",
+                lw=1.4,
+                label=f"DL Floor LOWFS FOV ({dl_cam_pct:.2f}%, turb=0)",
+            )
+            y_hi = max(22.0, float(np.percentile(f_pre_inst, 99.5)) * 1.25)
+            ax_ts.set_xlim(float(t_v[0]), max(float(t_v[-1]), 0.05))
+            ax_ts.set_ylim(0.0, y_hi)
+            sec_y = ax_ts.secondary_yaxis(
+                "right",
+                functions=(lambda y, u=up_h: y * u, lambda yp, u=up_h: yp / max(u, 1e-6)),
+            )
+            sec_y.set_ylabel("Entrance-Pupil H-Band Light [%]", fontsize=8.6)
+            ax_ts.set_xlabel("Physical Time [s]")
+            ax_ts.set_ylabel("Coronagraph-Input H-Band Light [%]")
+            ax_ts.legend(loc="upper right", fontsize=7.4, framealpha=0.92)
+        else:
+            lbls_b = ["Inc Lyot", "Refl b_lowfs", "LOWFS FOV", "H-Pup FOV"]
+            vals_dl = [
+                bdl_ly["frac_coro_in_incident_on_lyot"] * 100.0,
+                bdl_ly["frac_coro_in_reflected_to_lowfs_beam"] * 100.0,
+                bdl_ly["frac_coro_in_reaching_lowfs_cam_fov"] * 100.0,
+                bdl_ly["frac_entrance_pup_h_reaching_lowfs_cam_fov"] * 100.0,
+            ]
+            vals_cl = [
+                bcl_ly["frac_coro_in_incident_on_lyot"] * 100.0,
+                bcl_ly["frac_coro_in_reflected_to_lowfs_beam"] * 100.0,
+                bcl_ly["frac_coro_in_reaching_lowfs_cam_fov"] * 100.0,
+                bcl_ly["frac_entrance_pup_h_reaching_lowfs_cam_fov"] * 100.0,
+            ]
+            xb = np.arange(len(lbls_b))
+            ax_ts.bar(xb - 0.17, vals_dl, 0.34, label="DL (turb=0)", color="#64748b")
+            ax_ts.bar(xb + 0.17, vals_cl, 0.34, label="Closed-Loop", color="#059669")
+            ax_ts.set_xticks(xb)
+            ax_ts.set_xticklabels(lbls_b, fontsize=8.5)
+            ax_ts.set_ylabel("Light Fraction [%]")
+            ax_ts.legend(loc="upper right", fontsize=8.0)
+
+        ax_ts.grid(True, which="both", alpha=0.28)
+        ax_ts.set_title(
+            "500 Hz Tracked Light Fraction to LOWFS Camera",
+            fontsize=10.1,
+            fontweight="bold",
+        )
+
+        figly.savefig(os.path.join(out_dir, "coro_lyot_stop_illumination.png"), dpi=180)
+        plt.close(figly)
+
+pc_plot = data.get("predictive_control")
+if (
+    _want_plot(16)
+    and isinstance(pc_plot, dict)
+    and pc_plot.get("enabled")
+    and os.path.exists(os.path.join(out_dir, "pf_wmat_stg1.npy"))
+    and os.path.exists(os.path.join(out_dir, "pf_wmat_stg2.npy"))
+):
+    figpc, axespc = plt.subplots(2, 2, figsize=(14.4, 9.2), constrained_layout=True)
+    p_mode_top = str(pc_plot.get("pf_mode", "ar")).lower()
+    p_blk_top = int(pc_plot.get("pf_blocksize", 128))
+    p_ord_top = int(pc_plot.get("pf_order", 8))
+    p_mix_top = float(pc_plot.get("pf_mix", 0.90))
+    if p_mode_top == "eof":
+        pc_hdr = (
+            f"PSOL Block-EOF(B={p_blk_top}, P={p_ord_top}) Predictive Control "
+            f"Summary (mkEOFPF + applyEOFPF + mfilt)"
+        )
+    else:
+        pc_hdr = (
+            f"PSOL AR({p_ord_top}) Predictive Control "
+            f"Summary (mkARPF + applyARPF + mfilt)"
+        )
+    figpc.suptitle(
+        f"Subaru {tel_d:.2f} m AO3k + SCExAO — {pc_hdr}\n"
+        f"(Seeing = {seeing_top:.2f}\", Mix = {p_mix_top:.2f}, "
+        f"Stg1 = 1 kHz J PyWFS, Stg2 = 2 kHz Vis PyWFS)",
+        fontsize=12.0,
+        fontweight="bold",
+    )
+    for col_i, (stg_idx, stg_key, stg_lbl) in enumerate(
+        (
+            (1, "stage1", "Stage 1 (AO3k, 1.0 kHz)"),
+            (2, "stage2", "Stage 2 (SCExAO, 2.0 kHz)"),
+        )
+    ):
+        st_pc = pc_plot.get(stg_key, {})
+        wmat = np.load(os.path.join(out_dir, f"pf_wmat_stg{stg_idx}.npy"))
+        p_o, n_m = wmat.shape
+        modes = np.arange(n_m)
+
+        ax_top = axespc[0, col_i]
+        dc_g = np.sum(wmat, axis=0)
+        n2_p = os.path.join(out_dir, f"pf_n2_stg{stg_idx}.npy")
+        if os.path.exists(n2_p):
+            n2_g = np.sqrt(np.maximum(np.load(n2_p), 0.0))
+            n2_lbl = "Total Noise Gain ‖Fₘ‖₂"
+        else:
+            n2_g = np.sqrt(np.sum(wmat**2, axis=0))
+            n2_lbl = "Noise Gain ‖w‖₂"
+        ax_top.plot(modes, wmat[0], color="#2563eb", lw=1.0, alpha=0.82, label="Tap w₀ (t)")
+        if p_o > 1:
+            ax_top.plot(
+                modes, wmat[1], color="#ea580c", lw=0.95, alpha=0.78, label="Tap w₁ (t−1)"
+            )
+        if p_o > 2:
+            ax_top.plot(
+                modes, wmat[2], color="#059669", lw=0.9, alpha=0.72, label="Tap w₂ (t−2)"
+            )
+        ax_top.plot(
+            modes, dc_g, color="#0f172a", lw=1.5, ls="--", label="Self DC Gain Σwₖ"
+        )
+        ax_top.plot(
+            modes, n2_g, color="#9333ea", lw=1.3, ls=":", label=n2_lbl
+        )
+        ax_top.axhline(0.0, color="#64748b", lw=0.7, alpha=0.6)
+        ax_top.set_xlim(0, max(1, n_m - 1))
+        if p_mode_top == "eof":
+            sub_t = (
+                f"{stg_lbl} — Learned Block-EOF(B={p_blk_top}, P={p_o}) Weights\n"
+                f"(PFlat = {st_pc.get('pflatency_fr', 0):.2f} fr, "
+                f"Off-Diag = {st_pc.get('offdiag_frac', 0)*100.0:.1f}%, "
+                f"ΔVar vs Lag = {st_pc.get('var_red_pct', 0):.1f}%)"
+            )
+        else:
+            sub_t = (
+                f"{stg_lbl} — Learned AR({p_o}) Filter Weights\n"
+                f"(PFlatency = {st_pc.get('pflatency_fr', 0):.2f} fr, "
+                f"Updates = {st_pc.get('n_updates', 0)}, "
+                f"ΔVar vs Lag = {st_pc.get('var_red_pct', 0):.1f}%)"
+            )
+        ax_top.set_title(
+            sub_t,
+            fontsize=10.2,
+            fontweight="bold",
+        )
+        ax_top.set_xlabel("Modal Index")
+        ax_top.set_ylabel("Filter Weight / Gain")
+        ax_top.grid(True, alpha=0.28)
+        ax_top.legend(loc="best", fontsize=7.8, ncol=2, framealpha=0.9)
+
+        ax_bot = axespc[1, col_i]
+        ol_p = os.path.join(out_dir, f"pf_mvalOLrms_stg{stg_idx}.npy")
+        pr_p = os.path.join(out_dir, f"pf_mvalPFresrms_stg{stg_idx}.npy")
+        wf_p = os.path.join(out_dir, f"pf_mvalWFSrms_stg{stg_idx}.npy")
+        mx_p = os.path.join(out_dir, f"pf_mPFmix_stg{stg_idx}.npy")
+        if os.path.exists(ol_p):
+            v_ol = np.maximum(np.load(ol_p) * 1e3, 1e-3)
+            ax_bot.semilogy(
+                modes[: len(v_ol)],
+                v_ol,
+                color="#dc2626",
+                lw=1.0,
+                alpha=0.80,
+                label=f"PSOL Open-Loop ({st_pc.get('quad_ol_rms', 0)*1e3:.1f} nm)",
+            )
+        if os.path.exists(wf_p):
+            v_wf = np.maximum(np.load(wf_p) * 1e3, 1e-3)
+            ax_bot.semilogy(
+                modes[: len(v_wf)],
+                v_wf,
+                color="#2563eb",
+                lw=1.0,
+                alpha=0.85,
+                label=f"Closed-Loop WFS ({st_pc.get('quad_wfs_rms', 0)*1e3:.1f} nm)",
+            )
+        if os.path.exists(pr_p):
+            v_pr = np.maximum(np.load(pr_p) * 1e3, 1e-3)
+            pr_lbl = "EOF Pred Residual" if p_mode_top == "eof" else "AR Pred Residual"
+            ax_bot.semilogy(
+                modes[: len(v_pr)],
+                v_pr,
+                color="#059669",
+                lw=0.95,
+                alpha=0.78,
+                label=f"{pr_lbl} ({st_pc.get('quad_pfres_rms', 0)*1e3:.1f} nm)",
+            )
+        if os.path.exists(mx_p):
+            v_mx = np.load(mx_p)
+            ax_r = ax_bot.twinx()
+            ax_r.plot(
+                modes[: len(v_mx)],
+                v_mx,
+                color="#475569",
+                lw=1.4,
+                ls="--",
+                label="Applied PF Mix",
+            )
+            ax_r.set_ylim(0.0, 1.05)
+            ax_r.set_ylabel("PF Mixing Weight", fontsize=8.8, color="#475569")
+        ax_bot.set_xlim(0, max(1, n_m - 1))
+        ax_bot.set_title(
+            f"{stg_lbl} — PSOL vs Closed-Loop Modal RMS Spectrum",
+            fontsize=10.2,
+            fontweight="bold",
+        )
+        ax_bot.set_xlabel("Modal Index")
+        ax_bot.set_ylabel("Modal Amplitude RMS [nm]")
+        ax_bot.grid(True, which="both", alpha=0.28)
+        ax_bot.legend(loc="upper right", fontsize=7.8, framealpha=0.9)
+
+    figpc.savefig(os.path.join(out_dir, "predictive_control_summary_2x2.png"), dpi=180)
+    plt.close(figpc)
+
+c2d_plot = data.get("calib_2wfs1dm")
+if (
+    _want_plot(17)
+    and isinstance(c2d_plot, dict)
+    and c2d_plot.get("enabled")
+    and os.path.exists(os.path.join(out_dir, "calib2wfs_Mdb.npy"))
+    and os.path.exists(os.path.join(out_dir, "calib2wfs_Mab.npy"))
+):
+    fig2w, axes2w = plt.subplots(2, 2, figsize=(14.6, 9.5), constrained_layout=True)
+    w_ord_c = int(c2d_plot.get("whiten_order", 4))
+    nfr_c = int(c2d_plot.get("nframes", 0))
+    lag_db_c = float(c2d_plot.get("lag_db_fr", 2.5))
+    lag_ab_c = float(c2d_plot.get("lag_ab_fr", 0.0))
+    fig2w.suptitle(
+        f"Subaru {tel_d:.2f} m AO3k + SCExAO — Two-WFS + Inter-Stage DM Telemetry Calibration "
+        f"(B = Mab A + Mdb D)\n"
+        f"(N = {nfr_c} aligned frames, AR({w_ord_c}) whitening W(z), "
+        f"lag_DB = {lag_db_c:.2f} fr, lag_AB = {lag_ab_c:+.2f} fr)",
+        fontsize=11.8,
+        fontweight="bold",
+    )
+
+    # Panel (0,0): Conditional DM excitation eta_D (Unwhitened vs Whitened) + W(z) inset
+    ax00 = axes2w[0, 0]
+    eta_w = np.load(os.path.join(out_dir, "calib2wfs_eta_d.npy")).ravel()
+    eta_r = np.load(os.path.join(out_dir, "calib2wfs_eta_d_raw.npy")).ravel()
+    md_idx = np.arange(len(eta_w))
+    ax00.plot(
+        md_idx,
+        eta_r,
+        color="#dc2626",
+        lw=1.4,
+        ls="--",
+        alpha=0.85,
+        label=f"Unwhitened (med η_D = {float(c2d_plot.get('eta_d_raw_med', 0)):.3f})",
+    )
+    ax00.plot(
+        md_idx,
+        eta_w,
+        color="#2563eb",
+        lw=1.7,
+        label=f"AR({w_ord_c})-Whitened W(z) (med η_D = {float(c2d_plot.get('eta_d_white_med', 0)):.3f})",
+    )
+    ax00.fill_between(md_idx, eta_r, eta_w, color="#3b82f6", alpha=0.14)
+    ax00.set_ylim(0.0, 1.05)
+    ax00.set_xlim(0, max(1, len(eta_w) - 1))
+    ax00.set_xlabel("Stage-2 DM Mode Index")
+    ax00.set_ylabel("Conditional Excitation η_D = S_D / Σ_DD")
+    ax00.set_title("Breaking Closed-Loop Collinearity via W(z)", fontsize=10.3, fontweight="bold")
+    ax00.grid(True, alpha=0.28)
+    ax00.legend(loc="lower right", fontsize=8.2, framealpha=0.92)
+    taps_p = os.path.join(out_dir, "calib2wfs_ar_taps.npy")
+    if os.path.exists(taps_p):
+        taps = np.load(taps_p).ravel()
+        if len(taps) >= 2:
+            ax_in = ax00.inset_axes([0.55, 0.37, 0.42, 0.34])
+            w_f = np.linspace(0.0, np.pi, 128)
+            z_inv = np.exp(-1j * np.outer(w_f, np.arange(len(taps))))
+            H_w = np.abs(z_inv @ taps)
+            H_db = 20.0 * np.log10(np.maximum(H_w, 1e-4))
+            ax_in.plot(w_f / np.pi, H_db, color="#0f172a", lw=1.4)
+            ax_in.axhline(0.0, color="#64748b", lw=0.7, ls=":")
+            ax_in.set_title(r"$|W(e^{j\omega})|$ [dB]", fontsize=8.0, pad=2)
+            ax_in.set_xlabel(r"$f / f_{\mathrm{Nyq}}$", fontsize=7.4, labelpad=1.5)
+            ax_in.tick_params(labelsize=6.8)
+            ax_in.grid(True, alpha=0.3)
+
+    # Panel (0,1): Recovered Mdb diagonal (Unwhitened vs Whitened vs selfRM truth)
+    ax01 = axes2w[0, 1]
+    mdb_w = np.load(os.path.join(out_dir, "calib2wfs_mdb_diag.npy")).ravel()
+    mdb_r = np.load(os.path.join(out_dir, "calib2wfs_mdb_diag_raw.npy")).ravel()
+    mx = np.arange(len(mdb_w))
+    ax01.plot(
+        mx,
+        mdb_r,
+        color="#dc2626",
+        lw=1.3,
+        ls=":",
+        alpha=0.85,
+        label=f"Unwhitened diag(Mdb) (med = {float(c2d_plot.get('mdb_diag_raw_med', 0)):.3f})",
+    )
+    ax01.plot(
+        mx,
+        mdb_w,
+        color="#2563eb",
+        lw=1.7,
+        label=(
+            f"AR({w_ord_c}) diag(Mdb) (med = {float(c2d_plot.get('mdb_diag_med', 0)):.3f}, "
+            f"off = {float(c2d_plot.get('mdb_offdiag_rms', 0)):.3f})"
+        ),
+    )
+    og_p = os.path.join(out_dir, "calib2wfs_og_selfrm.npy")
+    if os.path.exists(og_p):
+        og_s = np.load(og_p).ravel()[: len(mdb_w)]
+        if np.any(og_s > 0):
+            ax01.plot(
+                mx,
+                og_s,
+                color="#0f172a",
+                lw=1.5,
+                ls="--",
+                label=(
+                    f"Active selfRM Opt. Gain "
+                    f"(med = {float(c2d_plot.get('selfrm_og_med', 0)):.3f}, "
+                    f"err = {float(c2d_plot.get('selfrm_rel_err', 0))*100:.1f}%)"
+                ),
+            )
+    ax01.set_xlim(0, max(1, len(mdb_w) - 1))
+    ax01.set_ylim(0.0, max(1.05, float(np.max(mdb_w)) * 1.15))
+    ax01.set_xlabel("Stage-2 Modal Index")
+    ax01.set_ylabel("DM2 → WFS B Modal Gain diag(Mdb)")
+    ax01.set_title("Probe-Free DM2 → WFS B Calibration vs Active selfRM", fontsize=10.3, fontweight="bold")
+    ax01.grid(True, alpha=0.28)
+    ax01.legend(loc="lower right", fontsize=8.0, framealpha=0.92)
+
+    # Panel (1,0): Calibrated Matrix Structure (|Mdb|, |Mab|, |Mda_virt| normalized tiles)
+    ax10 = axes2w[1, 0]
+    Mdb_m = np.load(os.path.join(out_dir, "calib2wfs_Mdb.npy"))
+    Mab_m = np.load(os.path.join(out_dir, "calib2wfs_Mab.npy"))
+    Mda_p = os.path.join(out_dir, "calib2wfs_Mda_virt.npy")
+    Mda_m = np.load(Mda_p) if os.path.exists(Mda_p) else None
+    kshow = min(30, Mdb_m.shape[0], Mdb_m.shape[1], Mab_m.shape[0], Mab_m.shape[1])
+    t_mdb = np.abs(Mdb_m[:kshow, :kshow])
+    t_mdb = t_mdb / max(float(np.percentile(t_mdb, 99.5)), 1e-9)
+    t_mab = np.abs(Mab_m[:kshow, :kshow])
+    t_mab = t_mab / max(float(np.percentile(t_mab, 99.5)), 1e-9)
+    gap = np.full((kshow, 2), np.nan)
+    if Mda_m is not None and Mda_m.shape[0] >= kshow and Mda_m.shape[1] >= kshow:
+        t_mda = np.abs(Mda_m[:kshow, :kshow])
+        t_mda = t_mda / max(float(np.percentile(t_mda, 99.5)), 1e-9)
+        mosaic = np.hstack([t_mdb, gap, t_mab, gap, t_mda])
+        x_ticks = [kshow * 0.5, kshow * 1.5 + 2, kshow * 2.5 + 4]
+        x_lbls = ["|Mdb| (DM2→B)", "|Mab| (A→B)", "|Mda_virt| (DM2→A)"]
+    else:
+        mosaic = np.hstack([t_mdb, gap, t_mab])
+        x_ticks = [kshow * 0.5, kshow * 1.5 + 2]
+        x_lbls = ["|Mdb| (DM2→B)", "|Mab| (A→B)"]
+    cmap_m = plt.get_cmap("magma").copy()
+    cmap_m.set_bad(color="#ffffff")
+    im10 = ax10.imshow(np.clip(mosaic, 0.0, 1.0), origin="upper", cmap=cmap_m, aspect="auto")
+    ax10.set_xticks(x_ticks)
+    ax10.set_xticklabels(x_lbls, fontsize=9.0, fontweight="bold")
+    ax10.set_ylabel(f"Output Mode Index (0..{kshow - 1})")
+    geom_note = ""
+    if "geom_col_cos_med" in c2d_plot:
+        geom_note = f" | DM2→DM1 Geom Cos = {float(c2d_plot['geom_col_cos_med']):.3f}"
+    ax10.set_title(
+        f"Calibrated Response Matrices (Normalized |M|, top {kshow} modes){geom_note}",
+        fontsize=9.8,
+        fontweight="bold",
+    )
+    fig2w.colorbar(im10, ax=ax10, fraction=0.032, pad=0.02, label="Relative |M|")
+
+    # Panel (1,1): Held-out contiguous temporal cross-validation R^2 per mode
+    ax11 = axes2w[1, 1]
+    r2_bw = np.load(os.path.join(out_dir, "calib2wfs_r2_b_w.npy")).ravel()
+    r2_ol = np.load(os.path.join(out_dir, "calib2wfs_r2_ol_raw.npy")).ravel()
+    r2_ar = np.load(os.path.join(out_dir, "calib2wfs_r2_a_raw.npy")).ravel()
+    n_ov = min(len(r2_bw), len(r2_ar))
+    xm = np.arange(n_ov)
+    ax11.plot(
+        xm,
+        np.clip(r2_ar[:n_ov], -0.2, 1.0),
+        color="#059669",
+        lw=1.7,
+        label=f"Virtual Upstream A = Mba B − Mda_virt D (med R² = {float(c2d_plot.get('r2_a_raw_med', 0)):.3f})",
+    )
+    ax11.plot(
+        xm,
+        np.clip(r2_ol[:n_ov], -0.2, 1.0),
+        color="#ea580c",
+        lw=1.4,
+        ls="--",
+        label=f"Pseudo-OL (B − Mdb D) vs Mab A (med R² = {float(c2d_plot.get('r2_ol_raw_med', 0)):.3f})",
+    )
+    ax11.plot(
+        xm,
+        np.clip(r2_bw[:n_ov], -0.2, 1.0),
+        color="#2563eb",
+        lw=1.4,
+        alpha=0.85,
+        label=f"Whitened Forward W(z)[B] (med R² = {float(c2d_plot.get('r2_b_w_med', 0)):.3f})",
+    )
+    ax11.axhline(0.0, color="#64748b", lw=0.8, ls=":")
+    ax11.set_xlim(0, max(1, n_ov - 1))
+    ax11.set_ylim(-0.15, 1.05)
+    ax11.set_xlabel("Modal Index")
+    ax11.set_ylabel("Held-Out Temporal CV R²")
+    ax11.set_title(
+        f"Out-of-Sample Contiguous Validation "
+        f"(Train = {int(c2d_plot.get('n_train', 0))}, Test = {int(c2d_plot.get('n_test', 0))})",
+        fontsize=10.2,
+        fontweight="bold",
+    )
+    ax11.grid(True, alpha=0.28)
+    ax11.legend(loc="lower right", fontsize=7.8, framealpha=0.92)
+
+    fig2w.savefig(os.path.join(out_dir, "calib_2wfs1dm_summary_2x2.png"), dpi=180)
+    plt.close(fig2w)
 
 if _my_shard != 0:
     os._exit(0)
@@ -2751,7 +4888,7 @@ REPO_SPECS = [
         "ATMTURB_SRC_DIR",
         "https://github.com/oguyon/AtmosphericTurbulenceSimul",
         "feat/bash-engine",
-        "Multi-layer Maunakea frozen-flow & boiling atmospheric phase screen generator (milkatmturb)",
+        "Multi-layer Maunakea frozen-flow & boiling atmospheric phase generator (milkatmturb)",
     ),
     (
         "OpticsMaterials",
@@ -2822,7 +4959,11 @@ def collect_reproducibility_info(out_dir, summary, bench_filename=None):
             (
                 d
                 for d in cands
-                if d and (os.path.isdir(os.path.join(d, ".git")) or os.path.isfile(os.path.join(d, ".git")))
+                if d
+                and (
+                    os.path.isdir(os.path.join(d, ".git"))
+                    or os.path.isfile(os.path.join(d, ".git"))
+                )
             ),
             None,
         )
@@ -2856,12 +4997,45 @@ def collect_reproducibility_info(out_dir, summary, bench_filename=None):
     lps = summary.get("loops", {})
     l1 = lps.get("stage1_ao3k", {})
     l2 = lps.get("stage2_scexao", {})
+    l3 = lps.get("stage3_llowfs", {})
     vid = summary.get("short_timescale_video")
     ov_k = int(sa.get("oversample", 4))
     tlm_mode = vid.get("telemetry_mode", "speckle") if isinstance(vid, dict) else "none"
     tlm_flag = f" --save-telemetry {tlm_mode}" if tlm_mode != "none" else ""
     svd1 = l1.get("svdlim", 0.004)
     svd2 = l2.get("svdlim", 0.004)
+    l3_flags = ""
+    if l3:
+        if not l3.get("enabled", True):
+            l3_flags = " --no-lowfs"
+        else:
+            svd3 = l3.get("svdlim", 0.02)
+            l3_flags = (
+                f" --gain3 {l3.get('gain', 0.20):.2f}"
+                f" --mult3 {l3.get('mult', 0.995):.3f}"
+                f" --svdlim3 {svd3}"
+            )
+
+    pc_rep = summary.get("predictive_control")
+    pf_flags = ""
+    if isinstance(pc_rep, dict) and pc_rep.get("enabled"):
+        pf_flags = " --predictive"
+        if abs(float(pc_rep.get("pf_mix", 0.90)) - 0.90) > 1e-4:
+            pf_flags += f" --pf-mix {float(pc_rep['pf_mix']):.2f}"
+        if int(pc_rep.get("pf_order", 8)) != 8:
+            pf_flags += f" --pf-order {int(pc_rep['pf_order'])}"
+
+    c2d_rep = summary.get("calib_2wfs1dm")
+    c2d_flags = ""
+    if isinstance(c2d_rep, dict) and c2d_rep.get("enabled"):
+        c2d_flags = " --calib-2wfs1dm"
+        if int(c2d_rep.get("dim_b", 40)) != 40:
+            c2d_flags += f" --sysid-modes {int(c2d_rep['dim_b'])}"
+        if int(c2d_rep.get("whiten_order", 4)) != 4:
+            c2d_flags += f" --sysid-whiten-order {int(c2d_rep['whiten_order'])}"
+
+    out_base = os.path.basename(os.path.abspath(out_dir))
+    out_flag = f" --outdir _work/{out_base}" if out_base != "ao3k_scexao" else ""
 
     run_cmd = (
         f"./scripts/run-ao3k-scexao.sh"
@@ -2877,8 +5051,8 @@ def collect_reproducibility_info(out_dir, summary, bench_filename=None):
         f" --mgain-floor {l1.get('mgain_floor', 0.10):.2f}"
         f" --mgain-tt {l1.get('mgain_tt_factor', 1.0):.2f}"
         f" --svdlim1 {svd1}"
-        f" --svdlim2 {svd2}"
-        f" --save-rm _work/ao3k_scexao_rm{tlm_flag}"
+        f" --svdlim2 {svd2}{l3_flags}{pf_flags}{c2d_flags}"
+        f" --save-rm _work/ao3k_scexao_rm{out_flag}{tlm_flag}"
     )
 
     return {
@@ -2896,8 +5070,10 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
     lps = s.get("loops", {})
     l1 = lps.get("stage1_ao3k", {})
     l2 = lps.get("stage2_scexao", {})
+    l3 = lps.get("stage3_llowfs", {})
     pm = s.get("psf_metrics", {})
     wm = s.get("wavefront_metrics")
+    coro_m = s.get("coronagraph_metrics")
 
     chrom = s.get("chromaticity", {})
     tinfo = s.get("timing") or chrom.get("timing", {})
@@ -2911,18 +5087,27 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
     int_dt_us = float(tinfo.get("internal_dt_us", 1.0e6 / max(int_hz, 1.0)))
     n_outer_ticks = int(sa.get("master_ticks_integrated", 0))
     n_sub_ticks = n_outer_ticks * ov_k
+    diam_top = float(tel.get("diameter_m", 7.95))
+    cobs_top = float(tel.get("cobs", 0.307)) * 100.0
+    tput_top = float(tel.get("tput_tel", 0.20)) * 100.0
+    sdeg_top = float(tel.get("spider_deg", 51.75))
+    soff_m = float(tel.get("spider_offset", 0.08289)) * diam_top
 
     lines = [
         f"# AO Optical & Control Report: {s.get('configuration', 'AO3k + SCExAO')}",
         "",
         "End-to-end closed-loop adaptive optics hardware-in-the-loop simulation coupling "
         "[cacao](https://github.com/cacao-org/cacao) real-time control, "
-        "[milk](https://github.com/milk-org/milk) shared-memory pipelines (`fpspipe` / `milk-script`), "
+        "[milk](https://github.com/milk-org/milk) shared-memory pipelines "
+        "(`fpspipe` / `milk-script`), "
         "[cacaosim](https://github.com/cacao-org/cacaosim) GPU polychromatic sub-stepping optics, "
-        "[milkatmturb](https://github.com/oguyon/AtmosphericTurbulenceSimul) Maunakea turbulence, and "
-        "[milk-mltools](https://github.com/milk-org/milk-mltools) telemetry & PSF reconstruction, "
-        "orchestrated by [cacao-work](https://github.com/cacao-org/cacao-work).",
+        "[milkatmturb](https://github.com/oguyon/AtmosphericTurbulenceSimul) Maunakea turbulence, "
+        "and [milk-mltools](https://github.com/milk-org/milk-mltools) telemetry & PSF "
+        "reconstruction, orchestrated by [cacao-work](https://github.com/cacao-org/cacao-work).",
         "",
+        f"- **Telescope & Throughput**: Subaru Nasmyth-IR `D = {diam_top:.2f} m` "
+        f"(`cobs = {cobs_top:.1f}%`, `4` V-spiders at `+/-{sdeg_top:.2f} deg` / "
+        f"`{soff_m:.3f} m` offset), optical throughput **`{tput_top:.0f}%`** (`tput_tel`)",
         f"- **Seeing**: `{sa.get('seeing_arcsec_500nm', 0):.2f}\"` at 0.50 um | "
         f"**Star**: mV={sa.get('star_mV', 6):.1f}, mH={sa.get('star_mH', 6):.1f}",
         f"- **Internal Optical-Bench Clock**: **`{int_khz:.1f} kHz` "
@@ -2940,14 +5125,58 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
         f"{l2.get('dm_pupil_diam_act', 46)}), `{l2.get('wfs_detector', '120x120')}` "
         f"polychromatic Vis PyWFS (`0.75 um, 20% BW, N=2ch, /{ov_k} sub-ticks`), "
         f"`{l2.get('n_cm_modes', 0)}` CM modes",
-        "- **Science Cameras**: Polychromatic Soummer-MFT PSFs in Visible I-band "
-        "(`0.75 um, 15% BW, N=3ch`) & Near-IR H-band (`1.65 um, 18% BW, N=3ch`) with "
-        "focal `lambda/D` scaling",
-        "",
-        "> Companion systems & optimization report: [COMPUTE_REPORT.md](COMPUTE_REPORT.md) "
-        "| GitHub repos & CLI/AI reproduction recipe: "
-        "[Reproducibility & GitHub Provenance](#reproducibility-github-provenance)",
     ]
+    if l3:
+        st3_mode = "Closed-loop" if l3.get("enabled", True) else "Open-loop"
+        lines.append(
+            f"- **Stage 3 (Reflective-Lyot LLOWFS)**: {st3_mode} `{l3.get('n_cm_modes', 14)}` "
+            f"Zernike modes (`Z2..Z15`) on `dm02disp04` with real-time `zpo-2` zero-point offset "
+            f"into Stage-2 PyWFS, driven by `{l3.get('wfs_detector', '64x64')}` H-band "
+            f"defocused (`200 nm` Z4) Lyot-stop reflection camera @ `500 Hz`"
+        )
+    pc_md = s.get("predictive_control")
+    if isinstance(pc_md, dict) and pc_md.get("enabled"):
+        p_o = int(pc_md.get("pf_order", 8))
+        p_mx = float(pc_md.get("pf_mix", 0.90))
+        ps1 = pc_md.get("stage1", {})
+        ps2 = pc_md.get("stage2", {})
+        lines.append(
+            f"- **PSOL Predictive Control (`mkARPF` + `applyARPF` + `mfilt`)**: Online "
+            f"regularized Wiener `AR({p_o})` modal predictors (`mix = {p_mx:.2f}`) driven by "
+            f"`testOL`-calibrated pseudo-open-loop telemetry (`Stage 1`: lag "
+            f"`{ps1.get('pflatency_fr', 0):.2f} fr`, `-{ps1.get('var_red_pct', 0):.1f}%` lag "
+            f"variance; `Stage 2`: lag `{ps2.get('pflatency_fr', 0):.2f} fr`, "
+            f"`-{ps2.get('var_red_pct', 0):.1f}%` lag variance; `0` real-time timeouts)"
+        )
+    c2d_md = s.get("calib_2wfs1dm")
+    if isinstance(c2d_md, dict) and c2d_md.get("enabled"):
+        w_o = int(c2d_md.get("whiten_order", 4))
+        lines.append(
+            f"- **Two-WFS + Inter-Stage DM Calibration (`mlt.calib2wfs1dm` / `mlt.sysid`)**: "
+            f"Probe-free calibration of `B = Mab A + Mdb D + b0` and virtual upstream "
+            f"`A = Mba B - Mda_virt D + a0` on `{int(c2d_md.get('nframes', 0))}` aligned frames "
+            f"using shared `AR({w_o})` whitening `W(z)` (`eta_D`: "
+            f"`{float(c2d_md.get('eta_d_raw_med', 0)):.3f}` -> "
+            f"`{float(c2d_md.get('eta_d_white_med', 0)):.3f}`, "
+            f"`diag(Mdb)` = `{float(c2d_md.get('mdb_diag_med', 0)):.3f}`, "
+            f"virtual `A` held-out `R^2` = `{float(c2d_md.get('r2_a_raw_med', 0)):.3f}`)"
+        )
+    coro_cam_note = (
+        ", plus post-Lyot H-band coronagraphic dark-hole camera (`nir_coro`, `3.0 l/D` spot)"
+        if coro_m
+        else ""
+    )
+    lines.extend(
+        [
+            "- **Science Cameras**: Polychromatic Soummer-MFT PSFs in Visible I-band "
+            "(`0.75 um, 15% BW, N=3ch`) & Near-IR H-band (`1.65 um, 18% BW, N=3ch`) with "
+            f"focal `lambda/D` scaling{coro_cam_note}",
+            "",
+            "> Companion systems & optimization report: [COMPUTE_REPORT.md](COMPUTE_REPORT.md) "
+            "| GitHub repos & CLI/AI reproduction recipe: "
+            "[Reproducibility & GitHub Provenance](#reproducibility-github-provenance)",
+        ]
+    )
 
     schem_png = os.path.join(out_dir, "cacaosim_gui_schematic.png")
     has_extra_gui = any(
@@ -2962,22 +5191,29 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
         lines.extend(["", "## Optical Bench & Hardware Configuration (`cacaosim-CTRL`)", ""])
         if bench_filename and os.path.isfile(os.path.join(out_dir, bench_filename)):
             nwf_v = tel.get("nwf", 256)
-            diam_v = tel.get("diameter_m", 8.2)
-            cobs_pct = tel.get("cobs", 0.30) * 100.0
-            pscale_v = tel.get("pupil_scale_m_pix", 8.2 / 240.0)
+            diam_v = tel.get("diameter_m", 7.95)
+            cobs_pct = tel.get("cobs", 0.307) * 100.0
+            pscale_v = tel.get("pupil_scale_m_pix", diam_v / 240.0)
             lines.append(
                 f"- **Declarative Bench**: [{bench_filename}]({bench_filename}) "
                 f"(`{nwf_v}x{nwf_v}` grid, `D = {diam_v:.2f} m`, "
-                f"`cobs = {cobs_pct:.0f}%`, `{pscale_v:.4f} m/pix`, "
-                f"`{outer_khz:.1f} kHz` outer `x{ov_k}` = "
+                f"`cobs = {cobs_pct:.1f}%`, `tput_tel = {tput_top:.0f}%`, "
+                f"`{pscale_v:.4f} m/pix`, `{outer_khz:.1f} kHz` outer `x{ov_k}` = "
                 f"`{int_khz:.1f} kHz` / `{int_dt_us:.0f} us` internal)"
             )
+        h_arm_desc = (
+            "H-band science beam (`b_nir_sci`) -> unocculted `nir_final` monitor + "
+            "`3.0 l/D` Lyot coronagraph (`T` -> `nir_coro`; `Lyot R` -> `200 nm` Z4 defocus -> "
+            "`64x64` `wfs_lowfs` @ `500 Hz`)"
+            if coro_m
+            else "`1.65 um` H-band camera"
+        )
         lines.append(
             f"- **Optical Relay**: Entrance pupil (`b_pup`) -> Stage-1 AO3k "
             f"`{l1.get('dm_grid', '64x64')}` DM (`dm01disp`) -> `1.22 um` J-band dichroic "
             f"(`R` -> `{l1.get('wfs_detector', '160x160')}` NIR PyWFS @ `1 kHz`; `T` -> Stage-2) "
             f"-> Stage-2 SCExAO `{l2.get('dm_grid', '50x50')}` DM (`dm02disp`) -> `1.00 um` LP "
-            f"dichroic (`T` -> `1.65 um` H-band camera; `R` -> `90/10` Vis splitter -> "
+            f"dichroic (`T` -> {h_arm_desc}; `R` -> `90/10` Vis splitter -> "
             f"`{l2.get('wfs_detector', '120x120')}` Vis PyWFS @ `2 kHz` + `0.75 um` Vis camera)"
         )
         if has_extra_gui:
@@ -3015,6 +5251,7 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
         if wm and "n_frames" in wm
         else int(sa.get("physical_time_s", 10) * outer_hz)
     )
+    n_sci_cams = 7 if coro_m else 6
     lines.extend(
         [
             "",
@@ -3046,7 +5283,17 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
             f"| **Stage-1 NIR PyWFS (`wfs_nir`)** | `1.0 kHz` (`1.00 ms`) | "
             f"`1000 (/{2*ov_k})` | Propagated every sub-tick (`stride = 1`): "
             f"`{2*ov_k}` sub-samples `x 2ch x 16` pts |",
-            f"| **Science Cameras (`fpcam.*`, 6x)** | `100 Hz` (`10.0 ms`) | "
+        ]
+    )
+    if coro_m:
+        lines.append(
+            f"| **Stage-3 Lyot LLOWFS (`wfs_lowfs`)** | `500 Hz` (`2.00 ms`) | "
+            f"`500 (/{4*ov_k})` | Defocused (`200 nm` Z4) Lyot-stop reflection camera: "
+            f"`{4*ov_k}` sub-samples `x 3ch` |"
+        )
+    lines.extend(
+        [
+            f"| **Science Cameras (`fpcam.*`, {n_sci_cams}x)** | `100 Hz` (`10.0 ms`) | "
             f"`100 (/{20*ov_k})` | `stride = {ov_k}` (staggered `0..{ov_k-1}`): `20` evals "
             f"(`{outer_khz:.1f} kHz`) `x 3ch` / frame |",
             f"| **Wavefront OPD Stats (`wfstat`)** | "
@@ -3118,6 +5365,171 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
                 f"{m['ee50_radius_mas']:.1f} |"
             )
 
+    if coro_m:
+        ly_s = coro_m["lyot_stop"]
+        lo_s = coro_m["llowfs"]
+        cl_c = coro_m["closed_loop"]
+        dl_c = coro_m["dl"]
+        lo_ctrl_txt = (
+            f"**LOOP CLOSED**, controlling `{lo_s['n_zernike_modes']}` Zernike modes "
+            f"(`Z2..Z15`) on `dm02disp04` (`aol3_dmC` stroke RMS = "
+            f"`{lo_s['dm3_stroke_rms_nm']:.1f} nm`) with real-time Stage-2 zero-point "
+            f"offset (`aol2_wfszpo` RMS = `{lo_s['stg2_zpo_wfs_rms']*1e4:.2f}e-4`)"
+            if lo_s.get("enabled_closed_loop", True)
+            else f"**LOOP OPEN (`--no-lowfs`)**, passive `500 Hz` telemetry only "
+            f"(`aol3_dmC` = `0.0 nm`, `aol2_wfszpo` = `0.0`)"
+        )
+        lines.extend(
+            [
+                "",
+                "## Lyot Coronagraph & Reflective-Lyot LLOWFS Performance",
+                "",
+                f"- **Coronagraph Masking (`coro_nir`)**: Polychromatic H-band "
+                f"(`{coro_m['lambda_um']:.2f} um`, `{coro_m['bw_frac']*100:.0f}%` BW, "
+                f"`N={coro_m['nlambda']}ch`) circular occulting spot of radius "
+                f"**`{coro_m['spot_radius_ld']:.1f} l/D` (`{coro_m['spot_iwa_mas']:.1f} mas`)** "
+                f"paired with an undersized Subaru V-spider Lyot stop (`outer = "
+                f"{ly_s['outer']:.2f}`, `obs = {ly_s['obs']:.2f}`, `spider_w = "
+                f"{ly_s['spider_w']:.3f}`): clear-pupil intensity throughput "
+                f"**`T_Lyot = {ly_s['intensity_throughput']*100:.1f}%`**, off-axis planet PSF "
+                f"peak factor **`eta_peak = {ly_s['planet_peak_throughput']*100:.1f}%`**",
+                f"- **Reflective-Lyot Defocused LLOWFS (`wfs_lowfs` + `aol3`)**: Light rejected "
+                f"by the Lyot stop (`lowfs_mode = \"{coro_m['lowfs_mode']}\"`, `r = "
+                f"{coro_m['lowfs_refl']:.2f}`) passes through **`+{lo_s['defocus_nm']:.0f} nm` "
+                f"RMS Z4 defocus** onto a `{lo_s['detector']}` detector @ "
+                f"`{lo_s['rate_hz']:.0f} Hz` (`{lo_s['flux_ph_per_frame']:.2e} e-/fr`): "
+                f"{lo_ctrl_txt}",
+                f"- **Integrated Starlight Suppression**: Total focal-plane leakage reduced to "
+                f"**`{cl_c['total_leakage_frac']*100:.2f}%`** closed-loop "
+                f"(`{dl_c['total_leakage_frac']*100:.3f}%` diffraction-limited); mean planet "
+                f"contrast **`{cl_c['mean_planet_contrast_3_10ld']:.2e}`** (`3..10 l/D`) and "
+                f"**`{cl_c['mean_planet_contrast_5_20ld']:.2e}`** (`5..20 l/D`)",
+                "",
+                "| Separation | Unocc CL PSF | Coro DL Raw | Coro CL Raw | "
+                "Coro CL Planet Contrast | Coro CL 5-sigma Speckle | Suppression |",
+                "| :---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for row in coro_m.get("contrast_table", []):
+            lines.append(
+                f"| `{row['sep_ld']:.0f} l/D` (`{row['sep_mas']:.0f} mas`) | "
+                f"`{row['unocc_cl_intensity']:.2e}` | "
+                f"`{row['dl_raw_contrast']:.2e}` | "
+                f"`{row['cl_raw_contrast']:.2e}` | "
+                f"`{row['cl_planet_contrast']:.2e}` | "
+                f"`{row['cl_5sigma_planet_contrast']:.2e}` | "
+                f"`{row['coro_suppression_factor']:.1f}x` |"
+            )
+
+        lbud = coro_m.get("lowfs_light_budget") or {}
+        bdl_md = lbud.get("diffraction_limited") or {}
+        bcl_md = lbud.get("closed_loop") or {}
+        if bdl_md and bcl_md:
+            up_md = float(lbud.get("upstream_ao_h_tput", 0.867))
+            tp_md = float(lbud.get("tput_tel", 0.20))
+            ph_ci = float(lbud.get("hband_coro_input_ph_s", 0.0))
+            lo_hz = max(float(lo_s.get("rate_hz", 500.0)), 1.0)
+            lines.extend(
+                [
+                    "",
+                    "### Coronagraph & LOWFS Light-Fraction Budget",
+                    "",
+                    "| Optical Stage / Plane | Coro-In H (`DL` / `CL`) | "
+                    "Telescope-Exit H (`DL` / `CL`) | Sky H (`DL` / `CL`) | "
+                    "CL Flux @ `500 Hz` |",
+                    "| :--- | :---: | :---: | :---: | ---: |",
+                ]
+            )
+            bud_rows = [
+                (
+                    "Coronagraph Input (`b_nir_sci`)",
+                    1.0,
+                    1.0,
+                    "`ph/fr`",
+                    ph_ci / lo_hz,
+                ),
+                (
+                    "Absorbed by `3.0 l/D` Focal Spot",
+                    bdl_md["frac_coro_in_fpm_absorbed"],
+                    bcl_md["frac_coro_in_fpm_absorbed"],
+                    "`ph/fr`",
+                    ph_ci * bcl_md["frac_coro_in_fpm_absorbed"] / lo_hz,
+                ),
+                (
+                    "Incident on Lyot Stop (`coro_pre_lyot`)",
+                    bdl_md["frac_coro_in_incident_on_lyot"],
+                    bcl_md["frac_coro_in_incident_on_lyot"],
+                    "`ph/fr`",
+                    ph_ci * bcl_md["frac_coro_in_incident_on_lyot"] / lo_hz,
+                ),
+                (
+                    "Transmitted Past Lyot Stop (`nir_coro`)",
+                    bdl_md["frac_coro_in_lyot_transmitted_sci"],
+                    bcl_md["frac_coro_in_lyot_transmitted_sci"],
+                    "`ph/fr`",
+                    ph_ci * bcl_md["frac_coro_in_lyot_transmitted_sci"] / lo_hz,
+                ),
+                (
+                    "Reflected by Lyot Stop (`b_lowfs`)",
+                    bdl_md["frac_coro_in_reflected_to_lowfs_beam"],
+                    bcl_md["frac_coro_in_reflected_to_lowfs_beam"],
+                    "`ph/fr`",
+                    ph_ci * bcl_md["frac_coro_in_reflected_to_lowfs_beam"] / lo_hz,
+                ),
+                (
+                    "**Reaching `wfs_lowfs` `64x64` FOV**",
+                    bdl_md["frac_coro_in_reaching_lowfs_cam_fov"],
+                    bcl_md["frac_coro_in_reaching_lowfs_cam_fov"],
+                    "`ph/fr`",
+                    bcl_md["lowfs_cam_incident_ph_per_frame"],
+                ),
+            ]
+            for stg_lbl, f_d, f_c, unit_s, flx_c in bud_rows:
+                lines.append(
+                    f"| {stg_lbl} | `{f_d*100:.2f}%` / **`{f_c*100:.2f}%`** | "
+                    f"`{f_d*up_md*100:.2f}%` / **`{f_c*up_md*100:.2f}%`** | "
+                    f"`{f_d*up_md*tp_md*100:.2f}%` / **`{f_c*up_md*tp_md*100:.2f}%`** | "
+                    f"`{flx_c:.2e}` {unit_s} |"
+                )
+            ts_md = lbud.get("timeseries")
+            if ts_md:
+                sc_ci = (
+                    bcl_md["frac_coro_in_reaching_lowfs_cam_fov"]
+                    / max(bcl_md["frac_coro_in_reflected_to_lowfs_beam"], 1e-9)
+                )
+                lines.append(
+                    f"\n- **`500 Hz` Tracked LOWFS Camera Fraction** "
+                    f"([{ts_md['csv_file']}]({ts_md['csv_file']}), "
+                    f"`N={ts_md['n_samples']}` samples): "
+                    f"**`{ts_md['frac_coro_in_cam_fov_mean']*100:.2f}% +/- "
+                    f"{ts_md['frac_coro_in_lowfs_beam_std']*sc_ci*100:.2f}%`** of coro-input "
+                    f"H-band light (`P05-P95 = "
+                    f"{ts_md['frac_coro_in_lowfs_beam_p05']*sc_ci*100:.2f}%-"
+                    f"{ts_md['frac_coro_in_lowfs_beam_p95']*sc_ci*100:.2f}%`), corresponding to "
+                    f"**`{ts_md['frac_pup_h_cam_fov_mean']*100:.2f}%`** of telescope-exit H-band "
+                    f"light (`{bcl_md['frac_entrance_broadband_reaching_lowfs_cam_fov']*100:.2f}%` "
+                    f"of `0.40-2.40 um` entrance-pupil photons; "
+                    f"`{bcl_md['lowfs_cam_detected_phe_per_frame']:.2e} e-/fr` @ "
+                    f"`QE={lbud['lowfs_qe']*100:.0f}%`)."
+                )
+
+        for alt_c, fn_c in (
+            (
+                "H-Band Focal-Plane PSF Before vs After Lyot Coronagraph (2x3)",
+                "coro_before_after_psf.png",
+            ),
+            (
+                "Light Incident on Pupil-Plane Lyot Stop & LOWFS Power Budget (2x3)",
+                "coro_lyot_stop_illumination.png",
+            ),
+            (
+                "Subaru Lyot Coronagraph & Reflective-Lyot Defocused LLOWFS Summary (2x3)",
+                "coro_lowfs_summary.png",
+            ),
+        ):
+            if os.path.isfile(os.path.join(out_dir, fn_c)):
+                lines.extend(["", f"![{alt_c}]({fn_c})"])
+
     if wm and wm.get("locations"):
         lines.extend(
             [
@@ -3139,6 +5551,139 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
                     f"{loc['marechal_sr_vis_750nm']*100:.1f}% / "
                     f"{loc['marechal_sr_nir_1650nm']*100:.1f}% |"
                 )
+
+    pc_sec = s.get("predictive_control")
+    if isinstance(pc_sec, dict) and pc_sec.get("enabled"):
+        p_ord_s = int(pc_sec.get("pf_order", 8))
+        p_mix_s = float(pc_sec.get("pf_mix", 0.90))
+        p_reg_s = float(pc_sec.get("pf_reg", 0.005))
+        lines.extend(
+            [
+                "",
+                f"## PSOL Predictive Control Performance (`AR({p_ord_s})`, "
+                "`mkARPF` + `applyARPF` + `mfilt`)",
+                "",
+                "- **Architecture**: `mfilt` reconstructs per-frame pseudo-open-loop (PSOL) "
+                "modal wavefronts `aolN_modevalOL[t] = WFSfact * modevalWFS[t] - modevalDM[t - d]` "
+                "using fractional lag `d` and optical gain `WFSfact` identified in-loop by "
+                "`mfilt.testOL`. Double-buffered `aolN_modevalOL_buff` slices (`256` frames) "
+                f"feed `cacaopc.mkARPF`, which solves per-mode regularized Wiener `AR({p_ord_s})` "
+                f"predictors (`reglambda = {p_reg_s}`, strict DC stability cap `|sum(w)| <= 0.985` "
+                "and L2 noise-gain bound `||w||_2^2 <= 1.35`). `cacaopc.applyARPF` evaluates "
+                "forward-predicted `aolN_modevalPF` in `< 1 us`/frame and synchronizes with "
+                f"`mfilt` (`PF.mixcoeff = {p_mix_s:.2f}` weighted by modal `mPFmixfact`).",
+                "",
+                "| Loop Stage | Modes | Rate [Hz] | PSOL Lag [fr / ms] | `WFSfact` | "
+                "Updates (`N_train`) | OL / ZOH / Pred RMS | Lag Var Red. | Timeouts |",
+                "| :--- | ---: | ---: | :---: | ---: | :---: | :---: | ---: | ---: |",
+            ]
+        )
+        for st_lbl, st_k in (
+            ("Stage 1 (`AO3k`)", "stage1"),
+            ("Stage 2 (`SCExAO`)", "stage2"),
+        ):
+            stp = pc_sec.get(st_k, {})
+            if not stp:
+                continue
+            lines.append(
+                f"| {st_lbl} | `{stp.get('n_modes', 0)}` | "
+                f"`{stp.get('loop_rate_hz', 0):.0f}` | "
+                f"`{stp.get('pflatency_fr', 0):.2f}` / `{stp.get('pflatency_ms', 0):.2f}` | "
+                f"`{stp.get('wfsfact', 1.0):.3f}` | "
+                f"`{stp.get('n_updates', 0)}` (`{stp.get('n_samples', 0)}`) | "
+                f"`{stp.get('rms_ol', 0):.4f}` / `{stp.get('rms_zoh', 0):.4f}` / "
+                f"**`{stp.get('rms_pred', 0):.4f}`** | "
+                f"**`{stp.get('var_red_pct', 0):.1f}%`** | "
+                f"`{stp.get('timeout_cnt', 0)}` |"
+            )
+        pc_fig_p = os.path.join(out_dir, "predictive_control_summary_2x2.png")
+        if os.path.isfile(pc_fig_p):
+            lines.extend(
+                [
+                    "",
+                    "![PSOL Auto-Regressive Predictive Control Filter & "
+                    "Modal Residual Summary (2x2)](predictive_control_summary_2x2.png)",
+                ]
+            )
+
+    c2d_sec = s.get("calib_2wfs1dm")
+    if isinstance(c2d_sec, dict) and c2d_sec.get("enabled"):
+        w_ord_s = int(c2d_sec.get("whiten_order", 4))
+        taps_s = c2d_sec.get("ar_taps") or []
+        taps_fmt = ", ".join(f"{float(v):+.3f}" for v in taps_s)
+        lines.extend(
+            [
+                "",
+                "## Two-WFS + Inter-Stage DM Telemetry Calibration "
+                "(`B = Mab A + Mdb D`, `mlt.sysid`)",
+                "",
+                "- **Method**: Synchronizes upstream Stage-1 WFS `A` (`aol1_modevalWFS`, "
+                f"`{int(c2d_sec.get('dim_a', 60))}` modes), downstream Stage-2 WFS `B` "
+                f"(`aol2_modevalWFS`, `{int(c2d_sec.get('dim_b', 40))}` modes), and inter-stage "
+                f"DM `D` (`aol2_modevalDM`, `{int(c2d_sec.get('dim_d', 40))}` modes) onto the "
+                "common `1 kHz` exposure window using `mlt.tlmsync` (`window` + piecewise-ZOH "
+                f"`expint` at auto-identified lags `lag_DB = {float(c2d_sec.get('lag_db_fr', 2.5)):.2f} fr`, "
+                f"`lag_AB = {float(c2d_sec.get('lag_ab_fr', 0.0)):+.2f} fr`). Applying the identical "
+                f"scalar causal `AR({w_ord_s})` whitening filter `W(z)` (taps `[{taps_fmt}]`) to "
+                "`(A, B, D)` preserves `Mab` and `Mdb` exactly while breaking low-frequency "
+                "closed-loop collinearity (`D ≈ -Mdb^+ Mab A`), enabling unbiased block-regularized "
+                "Schur-complement identification of `Mdb`, DM-free open-loop refinement of `Mab`, "
+                "and virtual upstream `DM2 -> WFS A` (`Mda_virt = -Mda`) calibration for "
+                "`DM2 -> DM1` offloading.",
+                "",
+                "| Calibration Metric | Unwhitened Baseline | "
+                f"AR({w_ord_s})-Whitened `W(z)` + Schur Solver |",
+                "| :--- | ---: | ---: |",
+                f"| Aligned Frames (`Train` / `Test`) | `{int(c2d_sec.get('nframes', 0))}` "
+                f"(`{int(c2d_sec.get('n_train', 0))}` / `{int(c2d_sec.get('n_test', 0))}`) | "
+                f"CV Ridge `reg_A = {float(c2d_sec.get('reg_a_opt', 0)):.1e}`, "
+                f"`reg_D = {float(c2d_sec.get('reg_d_opt', 0)):.1e}` |",
+                f"| Conditional DM Excitation `eta_D = S_D / Sigma_DD` (med) | "
+                f"`{float(c2d_sec.get('eta_d_raw_med', 0)):.3f}` | "
+                f"**`{float(c2d_sec.get('eta_d_white_med', 0)):.3f}`** |",
+                f"| Recovered `DM2 -> WFS B` Gain `diag(Mdb)` (med / IQR) | "
+                f"`{float(c2d_sec.get('mdb_diag_raw_med', 0)):.3f}` | "
+                f"**`{float(c2d_sec.get('mdb_diag_med', 0)):.3f}`** "
+                f"(IQR `{float(c2d_sec.get('mdb_diag_iqr', 0)):.3f}`, "
+                f"off-diag RMS `{float(c2d_sec.get('mdb_offdiag_rms', 0)):.4f}`) |",
+            ]
+        )
+        if c2d_sec.get("has_selfrm") and float(c2d_sec.get("selfrm_og_med", 0.0)) > 0.0:
+            lines.append(
+                f"| Independent Active `selfRM` On-Sky Optical Gain Cross-Check | "
+                f"`{float(c2d_sec.get('selfrm_og_med', 0)):.3f}` (active probe) | "
+                f"Relative Error **`{float(c2d_sec.get('selfrm_rel_err', 0))*100:.2f}%`** "
+                "(probe-free) |"
+            )
+        lines.extend(
+            [
+                f"| Held-Out Forward Whitened `W(z)[B]` `R^2` (med) | &mdash; | "
+                f"`{float(c2d_sec.get('r2_b_w_med', 0)):.3f}` |",
+                f"| Held-Out Pseudo-OL `R^2` (`B - Mdb D` vs `Mab A`, med) | &mdash; | "
+                f"**`{float(c2d_sec.get('r2_ol_raw_med', 0)):.3f}`** |",
+                f"| Held-Out Virtual Upstream `A = Mba B - Mda_virt D` `R^2` (med) | &mdash; | "
+                f"**`{float(c2d_sec.get('r2_a_raw_med', 0)):.3f}`** (enables `DM2 -> DM1` offload) |",
+                f"| Algebraic Cross-Consistency `||Mab Mda_virt - Mdb||_F / ||Mdb||_F` | &mdash; | "
+                f"`{float(c2d_sec.get('cross_rel_err', 0)):.3f}` |",
+                f"| Static Inter-Stage Differential NCPA `b0` RMS | &mdash; | "
+                f"`{float(c2d_sec.get('b0_rms', 0)):.3e}` |",
+            ]
+        )
+        if "geom_col_cos_med" in c2d_sec:
+            lines.append(
+                f"| Independent Geometric `DM2 -> DM1` Modal Overlap (`Mda_virt` vs `M_geom`) | "
+                f"&mdash; | Median Col. Cosine **`{float(c2d_sec['geom_col_cos_med']):.3f}`** "
+                f"(Matrix Corr `{float(c2d_sec.get('geom_matrix_corr', 0)):.3f}`) |"
+            )
+        c2d_fig_p = os.path.join(out_dir, "calib_2wfs1dm_summary_2x2.png")
+        if os.path.isfile(c2d_fig_p):
+            lines.extend(
+                [
+                    "",
+                    "![Two-WFS + Inter-Stage DM Telemetry Calibration Summary (2x2)]"
+                    "(calib_2wfs1dm_summary_2x2.png)",
+                ]
+            )
 
     tsm = s.get("timeseries_metrics")
     samples = wm.get("samples", []) if wm else []
@@ -3651,9 +6196,9 @@ def main():
         return
     if any(a in ("-h2", "--help-description") for a in sys.argv[1:]):
         print(
-            "Analyze FITS PSFs, wavefront stats, mlat hardware latency, and selfRM cubes\n"
-            "from two-stage AO3k + SCExAO simulation runs to generate REPORT.md,\n"
-            "ao3k_scexao_metrics.json, and 12 publication figures."
+            "Analyze FITS PSFs, coronagraph dark holes, wavefront stats, mlat latency, and\n"
+            "selfRM cubes from Subaru AO3k + SCExAO + LLOWFS simulation runs to generate\n"
+            "REPORT.md, ao3k_scexao_metrics.json, and 13 publication figures."
         )
         return
     if len(sys.argv) < 11 or any(a in ("-h", "--help", "-hm", "--help-mono") for a in sys.argv[1:]):
@@ -3679,6 +6224,23 @@ def main():
     mgain_alpha = float(sys.argv[11]) if len(sys.argv) > 11 else 0.8
     mgain_floor = float(sys.argv[12]) if len(sys.argv) > 12 else 0.10
     mgain_tt = float(sys.argv[13]) if len(sys.argv) > 13 else 1.0
+    gain3 = float(os.environ.get("CACAOSIM_GAIN3", "0.20"))
+    mult3 = float(os.environ.get("CACAOSIM_MULT3", "0.995"))
+    svdlim3_env = float(os.environ.get("CACAOSIM_SVDLIM3", "0.02"))
+    enable_lowfs = os.environ.get("CACAOSIM_ENABLE_LOWFS", "1").lower() not in (
+        "0",
+        "off",
+        "false",
+    )
+
+    bench_filename = ensure_gui_screenshots(work_dir, out_dir)
+    chrom_info = (
+        analyze_bench_chromaticity(os.path.join(out_dir, bench_filename))
+        if bench_filename
+        else None
+    )
+    bcfg_parsed = (chrom_info or {}).get("bench", {})
+    tel_diam_m = float(bcfg_parsed.get("tel_diam_m", TEL_DIAM_M))
 
     tmp_npys = []
     psf_metrics = {}
@@ -3696,7 +6258,9 @@ def main():
             npy_p = os.path.join(out_dir, f"psf_{bkey}_{skey}.npy")
             np.save(npy_p, img.astype(np.float32))
             tmp_npys.append(npy_p)
-            psf_metrics[bkey][skey] = analyze_band_stage(img, dl_sum, bcfg)
+            psf_metrics[bkey][skey] = analyze_band_stage(
+                img, dl_sum, bcfg, tel_diam_m=tel_diam_m
+            )
 
     wf_metrics = None
     wf_json_p = os.path.join(out_dir, "wf_stats.json")
@@ -3735,7 +6299,7 @@ def main():
             core_m = np.hypot(xx - c0, yy - c0) <= 20.0
             dl_core_sum = max(float(np.sum(dl_img[core_m])), 1e-6)
             dl_tot_sum = max(float(np.sum(dl_img)), 1e-6)
-            ld_mas = (bcfg["lam_um"] * 1e-6 / TEL_DIAM_M) * RAD2MAS
+            ld_mas = (bcfg["lam_um"] * 1e-6 / tel_diam_m) * RAD2MAS
             pix_mas = ld_mas / bcfg["pixscale_ld"]
             rr_mas = np.hypot(xx - c0, yy - c0) * pix_mas
             rgrid_mas = np.linspace(0.5 * pix_mas, 1500.0, 200)
@@ -3784,83 +6348,158 @@ def main():
 
     stage1_info = load_loop_calib(work_dir, "ao3k", 1, out_dir, tmp_npys)
     stage2_info = load_loop_calib(work_dir, "scexao", 2, out_dir, tmp_npys)
+    stage3_raw = load_loop_calib(
+        work_dir, "llowfs", 3, out_dir, tmp_npys, phys_hz_override=500.0
+    )
+    has_stg3 = any(
+        k in stage3_raw for k in ("n_cm_modes", "dm_rms_um", "mlat", "selfrm")
+    )
+    stage3_info = (
+        {
+            **stage3_raw,
+            "enabled": enable_lowfs,
+            "dm_grid": "50x50 (dm02disp04 ZPO)",
+            "dm_pupil_diam_act": 46,
+            "wfs_detector": "64x64",
+            "wfs_band": (
+                "H-band 1.65 um Lyot-Refl Defocused LLOWFS "
+                "(18% BW, N=3ch, +200 nm Z4)"
+            ),
+            "phys_rate_hz": 500.0,
+            "gain": gain3 if enable_lowfs else 0.0,
+            "mult": mult3,
+            "svdlim": stage3_raw.get("svdlim", svdlim3_env),
+        }
+        if has_stg3
+        else None
+    )
+
     ts_metrics = load_and_summarize_timeseries(out_dir, wf_metrics, tmp_npys)
+    pred_info = load_predictive_control_metrics(out_dir, tmp_npys)
+    calib_2wfs_info = load_calib_2wfs1dm_metrics(out_dir, work_dir, tmp_npys)
+    coro_metrics = analyze_coronagraph_and_lowfs(
+        out_dir,
+        chrom_info,
+        psf_metrics,
+        stage2_info,
+        stage3_info,
+        tel_diam_m,
+        tmp_npys,
+    )
+
+    nwf_tel = int(bcfg_parsed.get("nwf", 256))
+    pup_dpix = float(bcfg_parsed.get("pup_diam_pix", 240.0))
+    lowfs_mode_lbl = "LLOWFS Loop Closed" if enable_lowfs else "LLOWFS Loop Open"
+    if pred_info is None:
+        pred_mode_lbl = ""
+    elif pred_info.get("pf_mode") == "eof":
+        pred_mode_lbl = (
+            f" + PSOL Block-EOF(B={pred_info.get('pf_blocksize', 128)}, "
+            f"P={pred_info['pf_order']}) Predictive Control"
+        )
+    else:
+        pred_mode_lbl = f" + PSOL AR({pred_info['pf_order']}) Predictive Control"
+    c2d_mode_lbl = (
+        " + 2-WFS/1-DM Telemetry Calib"
+        if calib_2wfs_info is not None
+        else ""
+    )
+    cfg_label = (
+        f"Subaru {tel_diam_m:.2f}m AO3k + SCExAO + Lyot Coronagraph "
+        f"({lowfs_mode_lbl}{pred_mode_lbl}{c2d_mode_lbl})"
+        if coro_metrics is not None
+        else f"Subaru {tel_diam_m:g}m AO3k + SCExAO "
+        f"(Two-Stage Pyramid WFS{pred_mode_lbl}{c2d_mode_lbl})"
+    )
+
+    loops_dict = {
+        "stage1_ao3k": {
+            **stage1_info,
+            "dm_grid": "64x64",
+            "dm_pupil_diam_act": 60,
+            "wfs_detector": "160x160",
+            "wfs_band": "J-band 1.22 um PyWFS (20% BW, N=2ch, 160x160, mod 3.0 l0/D)",
+            "phys_rate_hz": 1000.0,
+            "gain": float(gain1),
+            "mult": float(mult1),
+            "mgain_alpha": mgain_alpha,
+            "mgain_floor": mgain_floor,
+            "mgain_tt_factor": mgain_tt,
+        },
+        "stage2_scexao": {
+            **stage2_info,
+            "dm_grid": "50x50",
+            "dm_pupil_diam_act": 46,
+            "wfs_detector": "120x120",
+            "wfs_band": "Visible 0.75 um PyWFS (20% BW, N=2ch, 120x120, mod 3.0 l0/D)",
+            "phys_rate_hz": 2000.0,
+            "gain": float(gain2),
+            "mult": float(mult2),
+            "mgain_alpha": mgain_alpha,
+            "mgain_floor": mgain_floor,
+            "mgain_tt_factor": mgain_tt,
+        },
+    }
+    if stage3_info is not None:
+        loops_dict["stage3_llowfs"] = stage3_info
 
     summary = {
-        "configuration": "Subaru 8.2m AO3k + SCExAO (Two-Stage Pyramid WFS)",
+        "configuration": cfg_label,
         "telescope": {
-            "diameter_m": 8.2,
-            "cobs": 0.30,
-            "nspider": 4,
-            "nwf": 256,
-            "pup_diam_pix": 240.0,
-            "pupil_scale_m_pix": 8.2 / 240.0,
+            "pupil_geom": bcfg_parsed.get("pupil_geom", "subaru"),
+            "diameter_m": tel_diam_m,
+            "cobs": float(bcfg_parsed.get("cobs", 0.307)),
+            "nspider": int(bcfg_parsed.get("nspider", 4)),
+            "spider_w": float(bcfg_parsed.get("spider_w", 0.02314)),
+            "spider_deg": float(bcfg_parsed.get("spider_deg", 51.75)),
+            "spider_offset": float(bcfg_parsed.get("spider_offset", 0.08289)),
+            "tput_tel": float(bcfg_parsed.get("tput_tel", 0.20)),
+            "nwf": nwf_tel,
+            "pup_diam_pix": pup_dpix,
+            "pupil_scale_m_pix": tel_diam_m / max(pup_dpix, 1.0),
         },
         "star_and_atmosphere": {
-            "star_mV": 6.0,
-            "star_mH": 6.0,
-            "star_teff_K": 9600.0,
+            "star_mV": float(bcfg_parsed.get("star_mag", 6.0)),
+            "star_mH": float(bcfg_parsed.get("star_mag", 6.0)),
+            "star_teff_K": float(bcfg_parsed.get("star_teff", 9600.0)),
             "seeing_arcsec_500nm": float(seeing),
             "profile": "7-layer Maunakea (4.2..23.7 km, wind 6.5..22.0 m/s)",
             "physical_time_s": float(phys_time),
             "master_rate_phys_hz": 2000.0,
             "stage1_rate_phys_hz": 1000.0,
             "stage2_rate_phys_hz": 2000.0,
+            "stage3_rate_phys_hz": 500.0 if stage3_info is not None else 0.0,
             "master_ticks_integrated": int(master_ticks),
             "wall_elapsed_s": float(wall_elapsed),
             "calibration_turbulence_gain": 0.0,
         },
-        "loops": {
-            "stage1_ao3k": {
-                **stage1_info,
-                "dm_grid": "64x64",
-                "dm_pupil_diam_act": 60,
-                "wfs_detector": "160x160",
-                "wfs_band": "J-band 1.22 um PyWFS (20% BW, N=2ch, 160x160, mod 3.0 l0/D)",
-                "phys_rate_hz": 1000.0,
-                "gain": float(gain1),
-                "mult": float(mult1),
-                "mgain_alpha": mgain_alpha,
-                "mgain_floor": mgain_floor,
-                "mgain_tt_factor": mgain_tt,
-            },
-            "stage2_scexao": {
-                **stage2_info,
-                "dm_grid": "50x50",
-                "dm_pupil_diam_act": 46,
-                "wfs_detector": "120x120",
-                "wfs_band": "Visible 0.75 um PyWFS (20% BW, N=2ch, 120x120, mod 3.0 l0/D)",
-                "phys_rate_hz": 2000.0,
-                "gain": float(gain2),
-                "mult": float(mult2),
-                "mgain_alpha": mgain_alpha,
-                "mgain_floor": mgain_floor,
-                "mgain_tt_factor": mgain_tt,
-            },
-        },
+        "loops": loops_dict,
         "psf_metrics": psf_metrics,
     }
+    if coro_metrics is not None:
+        summary["coronagraph_metrics"] = coro_metrics
     if wf_metrics is not None:
         summary["wavefront_metrics"] = wf_metrics
     if ts_metrics is not None:
         summary["timeseries_metrics"] = ts_metrics
+    if pred_info is not None:
+        summary["predictive_control"] = pred_info
+    if calib_2wfs_info is not None:
+        summary["calib_2wfs1dm"] = calib_2wfs_info
 
-    bench_filename = ensure_gui_screenshots(work_dir, out_dir)
-    if bench_filename:
-        chrom_info = analyze_bench_chromaticity(os.path.join(out_dir, bench_filename))
-        if chrom_info is not None:
-            summary["chromaticity"] = chrom_info
-            t_b = chrom_info.get("timing", {})
-            if t_b:
-                summary["timing"] = t_b
-                sa_blk = summary["star_and_atmosphere"]
-                sa_blk["oversample"] = int(t_b["oversample"])
-                sa_blk["internal_bench_hz"] = float(t_b["internal_bench_hz"])
-                sa_blk["internal_dt_ms"] = float(t_b["internal_dt_ms"])
-                sa_blk["internal_dt_us"] = float(t_b["internal_dt_us"])
-                sa_blk["internal_subticks_integrated"] = (
-                    int(master_ticks) * int(t_b["oversample"])
-                )
+    if chrom_info is not None:
+        summary["chromaticity"] = chrom_info
+        t_b = chrom_info.get("timing", {})
+        if t_b:
+            summary["timing"] = t_b
+            sa_blk = summary["star_and_atmosphere"]
+            sa_blk["oversample"] = int(t_b["oversample"])
+            sa_blk["internal_bench_hz"] = float(t_b["internal_bench_hz"])
+            sa_blk["internal_dt_ms"] = float(t_b["internal_dt_ms"])
+            sa_blk["internal_dt_us"] = float(t_b["internal_dt_us"])
+            sa_blk["internal_subticks_integrated"] = (
+                int(master_ticks) * int(t_b["oversample"])
+            )
 
     vid_meta = ensure_telemetry_video(out_dir)
     if vid_meta is not None:
@@ -3881,7 +6520,10 @@ def main():
         if os.path.exists(npy_p):
             os.remove(npy_p)
 
-    print("\n=== Subaru AO3k + SCExAO 10.0s Performance Summary ===")
+    print(
+        f"\n=== Subaru {tel_diam_m:.2f}m AO3k + SCExAO "
+        f"{float(phys_time):.1f}s Performance Summary ==="
+    )
     t_prt = summary.get("timing", {})
     if t_prt:
         print(
@@ -3902,6 +6544,57 @@ def main():
                 f"r50={m['ee50_radius_mas']:5.1f} mas"
             )
 
+    if coro_metrics is not None:
+        ly_p = coro_metrics["lyot_stop"]
+        lo_p = coro_metrics["llowfs"]
+        cl_p = coro_metrics["closed_loop"]
+        print(
+            f"\n[H-Band Lyot Coronagraph (R={coro_metrics['spot_radius_ld']:.1f} l/D) & "
+            f"Reflective-Lyot LLOWFS]"
+        )
+        print(
+            f"  Lyot Stop      : outer={ly_p['outer']:.2f}, obs={ly_p['obs']:.2f}, "
+            f"T_Lyot={ly_p['intensity_throughput']*100:.1f}%, "
+            f"eta_planet={ly_p['planet_peak_throughput']*100:.1f}%"
+        )
+        print(
+            f"  LLOWFS (aol3)  : {'CLOSED' if lo_p['enabled_closed_loop'] else 'OPEN'} "
+            f"({lo_p['n_zernike_modes']} Zernikes @ {lo_p['rate_hz']:.0f} Hz, "
+            f"+{lo_p['defocus_nm']:.0f} nm Z4), "
+            f"dmC_RMS={lo_p['dm3_stroke_rms_nm']:.1f} nm, "
+            f"ZPO_WFS={lo_p['stg2_zpo_wfs_rms']*1e4:.2f}e-4"
+        )
+        lb_p = coro_metrics.get("lowfs_light_budget") or {}
+        bdl_p = lb_p.get("diffraction_limited") or {}
+        bcl_p = lb_p.get("closed_loop") or {}
+        if bdl_p and bcl_p:
+            print(
+                f"  Pre-Lyot Light : DL={bdl_p['frac_coro_in_incident_on_lyot']*100:.2f}% coro-in "
+                f"(FPM abs {bdl_p['frac_coro_in_fpm_absorbed']*100:.2f}%), "
+                f"CL={bcl_p['frac_coro_in_incident_on_lyot']*100:.2f}% coro-in "
+                f"(FPM abs {bcl_p['frac_coro_in_fpm_absorbed']*100:.2f}%)"
+            )
+            print(
+                f"  LOWFS Cam Light: CL={bcl_p['frac_coro_in_reaching_lowfs_cam_fov']*100:.2f}% "
+                f"coro-in ({bcl_p['frac_entrance_pup_h_reaching_lowfs_cam_fov']*100:.2f}% H-pup, "
+                f"{bcl_p['frac_sky_h_reaching_lowfs_cam_fov']*100:.2f}% Sky-H, "
+                f"{bcl_p['frac_entrance_broadband_reaching_lowfs_cam_fov']*100:.2f}% 0.4-2.4um) | "
+                f"DL={bdl_p['frac_coro_in_reaching_lowfs_cam_fov']*100:.2f}% coro-in"
+            )
+            print(
+                f"  LOWFS Cam Flux : {bcl_p['lowfs_cam_incident_ph_per_frame']:.2e} ph/fr "
+                f"({bcl_p['lowfs_cam_detected_phe_per_frame']:.2e} e-/fr @ "
+                f"QE={lb_p['lowfs_qe']*100:.0f}%, {lo_p['rate_hz']:.0f} Hz)"
+            )
+        for row in coro_metrics["contrast_table"]:
+            print(
+                f"  r = {row['sep_ld']:4.0f} l/D ({row['sep_mas']:4.0f} mas): "
+                f"CL_Raw={row['cl_raw_contrast']:.2e}, "
+                f"CL_Planet={row['cl_planet_contrast']:.2e}, "
+                f"5sig_Planet={row['cl_5sigma_planet_contrast']:.2e}, "
+                f"Supp={row['coro_suppression_factor']:5.1f}x"
+            )
+
     if wf_metrics is not None:
         print(
             f"\n[Wavefront OPD Telemetry ({wf_metrics['n_frames']} frames, "
@@ -3916,9 +6609,16 @@ def main():
                 f"StdMapRMS={lm['std_map_rms_nm']:6.1f} nm)"
             )
 
-    if stage1_info.get("mlat") or stage2_info.get("mlat"):
+    loop_print_list = [
+        ("Stage 1 (AO3k)", stage1_info),
+        ("Stage 2 (SCExAO)", stage2_info),
+    ]
+    if stage3_info is not None:
+        loop_print_list.append(("Stage 3 (LLOWFS)", stage3_info))
+
+    if any(sinf.get("mlat") for _, sinf in loop_print_list):
         print("\n[Hardware Latency (mlat) & RM Timing]")
-        for tag, sinf in [("Stage 1 (AO3k)", stage1_info), ("Stage 2 (SCExAO)", stage2_info)]:
+        for tag, sinf in loop_print_list:
             ml = sinf.get("mlat")
             if ml:
                 fit = ml["fit"]
@@ -3930,9 +6630,9 @@ def main():
                     f"RMdelayfr={ml['rm_delay_fr']} (+{ml['rm_subframe_wait_fr']:.2f} fr)"
                 )
 
-    if stage1_info.get("selfrm") or stage2_info.get("selfrm"):
+    if any(sinf.get("selfrm") for _, sinf in loop_print_list):
         print("\n[Modal Self-Response Matrix (selfRM) — Calibration vs On-Sky]")
-        for tag, sinf in [("Stage 1 (AO3k)", stage1_info), ("Stage 2 (SCExAO)", stage2_info)]:
+        for tag, sinf in loop_print_list:
             sr = sinf.get("selfrm")
             if sr:
                 print(

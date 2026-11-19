@@ -140,20 +140,21 @@ cacaosim.deploy() {
     fi
 
     local meta_FLAT=0 meta_NWF=128 meta_PUP_DIAM=0.9375 meta_COBS=0.30
-    local meta_NSPIDER=4 meta_SPIDER_W=0.01 meta_SPIDER_DEG=45.0
+    local meta_NSPIDER=4 meta_SPIDER_W=0.01 meta_SPIDER_DEG=45.0 meta_SPIDER_OFFSET=0.0
     local meta_MKPUPIL_OUT="" meta_SIGNATURE=""
     local mkey mval
     while IFS=$'\t' read -r mkey mval || [[ -n "${mkey}" ]]; do
         case "${mkey}" in
-            FLAT)        meta_FLAT="${mval}" ;;
-            NWF)         meta_NWF="${mval}" ;;
-            PUP_DIAM)    meta_PUP_DIAM="${mval}" ;;
-            COBS)        meta_COBS="${mval}" ;;
-            NSPIDER)     meta_NSPIDER="${mval}" ;;
-            SPIDER_W)    meta_SPIDER_W="${mval}" ;;
-            SPIDER_DEG)  meta_SPIDER_DEG="${mval}" ;;
-            MKPUPIL_OUT) meta_MKPUPIL_OUT="${mval}" ;;
-            SIGNATURE)   meta_SIGNATURE="${mval}" ;;
+            FLAT)          meta_FLAT="${mval}" ;;
+            NWF)           meta_NWF="${mval}" ;;
+            PUP_DIAM)      meta_PUP_DIAM="${mval}" ;;
+            COBS)          meta_COBS="${mval}" ;;
+            NSPIDER)       meta_NSPIDER="${mval}" ;;
+            SPIDER_W)      meta_SPIDER_W="${mval}" ;;
+            SPIDER_DEG)    meta_SPIDER_DEG="${mval}" ;;
+            SPIDER_OFFSET) meta_SPIDER_OFFSET="${mval}" ;;
+            MKPUPIL_OUT)   meta_MKPUPIL_OUT="${mval}" ;;
+            SIGNATURE)     meta_SIGNATURE="${mval}" ;;
         esac
     done < "${plan_dir}/meta.tsv"
 
@@ -254,6 +255,7 @@ cacaosim.deploy() {
                 ".nspider=${meta_NSPIDER}" \
                 ".spider_w=${meta_SPIDER_W}" \
                 ".spider_deg=${meta_SPIDER_DEG}" \
+                ".spider_offset=${meta_SPIDER_OFFSET}" \
                 ".out_pup=${meta_MKPUPIL_OUT}" >/dev/null 2>&1; then
                 rm -rf "${plan_dir}"
                 return 1

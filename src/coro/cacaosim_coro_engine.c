@@ -502,11 +502,27 @@ void MILK_HOT cacaosim_coro_step_poly_cpu(
     const float    c_one[2]  = { 1.0f, 0.0f };
     const float    c_zero[2] = { 0.0f, 0.0f };
 
-    const float *__restrict lp_msk = MILK_ASSUME_ALIGNED(ctx->lowfs_pup_mask);
-    float *__restrict       ep     = MILK_ASSUME_ALIGNED(ctx->cpu_epup_cplx);
+    const float *__restrict lp_msk  = MILK_ASSUME_ALIGNED(ctx->lowfs_pup_mask);
+    float *__restrict       ep      = MILK_ASSUME_ALIGNED(ctx->cpu_epup_cplx);
+    float *__restrict       pre_int = MILK_ASSUME_ALIGNED(ctx->cpu_pre_lyot_int);
+    const float             w_c     = 1.0f / (float) ((nlam >= 1) ? nlam : 1);
+    double                  step_e_in   = 0.0;
+    double                  step_e_pre  = 0.0;
+    double                  step_e_post = 0.0;
+    double                  step_e_lo   = 0.0;
+
+    if (pre_int != NULL)
+    {
+        __builtin_memset(pre_int, 0, npix_wf * sizeof(float));
+    }
 
     for (int32_t c = 0; c < nlam; c++)
     {
+        double ch_e_in   = 0.0;
+        double ch_e_pre  = 0.0;
+        double ch_e_post = 0.0;
+        double ch_e_lo   = 0.0;
+
         /* Broadcast slice 0 when monochromatic input (in_nlam == 1) feeds a polychromatic coro */
         uint32_t ic = (in_nlam > 1u)
                           ? (((uint32_t) c < in_nlam) ? (uint32_t) c : (in_nlam - 1u))
@@ -554,6 +570,7 @@ void MILK_HOT cacaosim_coro_step_poly_cpu(
             }
             ep[2u * p]      = pr;
             ep[2u * p + 1u] = pi;
+            ch_e_in += (double) pr * pr + (double) pi * pi;
         }
 
         if (ctx->skip_fpm)
@@ -561,15 +578,22 @@ void MILK_HOT cacaosim_coro_step_poly_cpu(
             /* Fast path 1: pure pupil/Lyot apodizer with no focal-plane mask */
             for (uint64_t p = 0; p < npix_wf; p++)
             {
-                float ur  = ep[2u * p];
-                float ui  = ep[2u * p + 1u];
-                float lyr = ly_c[2u * p];
-                float lyi = ly_c[2u * p + 1u];
-                float lr  = ur * lyr - ui * lyi;
-                float li  = ur * lyi + ui * lyr;
-                float amp = hypotf(lr, li);
+                float  ur   = ep[2u * p];
+                float  ui   = ep[2u * p + 1u];
+                double u2   = (double) ur * ur + (double) ui * ui;
+                float  lyr  = ly_c[2u * p];
+                float  lyi  = ly_c[2u * p + 1u];
+                float  lr   = ur * lyr - ui * lyi;
+                float  li   = ur * lyi + ui * lyr;
+                float  amp  = hypotf(lr, li);
                 out_amp_c[p] = amp;
                 out_opd_c[p] = (amp > 1e-12f) ? (atan2f(li, lr) * rad_to_opd) : 0.0f;
+                if (pre_int != NULL)
+                {
+                    pre_int[p] += w_c * (float) u2;
+                }
+                ch_e_pre += u2;
+                ch_e_post += (double) amp * amp;
 
                 if (do_lo)
                 {
@@ -581,6 +605,7 @@ void MILK_HOT cacaosim_coro_step_poly_cpu(
                         float la     = r_ly * hypotf(ur, ui);
                         lo_amp_c[p]  = la;
                         lo_opd_c[p]  = (la > 1e-12f) ? (atan2f(ui, ur) * rad_to_opd) : 0.0f;
+                        ch_e_lo += (double) la * la;
                     }
                     else
                     {
@@ -636,6 +661,7 @@ void MILK_HOT cacaosim_coro_step_poly_cpu(
                     float la    = refl * pm * hypotf(cr, ci);
                     lo_amp_c[p] = la;
                     lo_opd_c[p] = (la > 1e-12f) ? (atan2f(ci, cr) * rad_to_opd) : 0.0f;
+                    ch_e_lo += (double) la * la;
                 }
             }
 
@@ -662,15 +688,22 @@ void MILK_HOT cacaosim_coro_step_poly_cpu(
             /* Babinet superposition U_Lyot_in = ep + ec, followed by complex Lyot stop L_c */
             for (uint64_t p = 0; p < npix_wf; p++)
             {
-                float ur  = ep[2u * p] + ec[2u * p];
-                float ui  = ep[2u * p + 1u] + ec[2u * p + 1u];
-                float lyr = ly_c[2u * p];
-                float lyi = ly_c[2u * p + 1u];
-                float lr  = ur * lyr - ui * lyi;
-                float li  = ur * lyi + ui * lyr;
-                float amp = hypotf(lr, li);
+                float  ur   = ep[2u * p] + ec[2u * p];
+                float  ui   = ep[2u * p + 1u] + ec[2u * p + 1u];
+                double u2   = (double) ur * ur + (double) ui * ui;
+                float  lyr  = ly_c[2u * p];
+                float  lyi  = ly_c[2u * p + 1u];
+                float  lr   = ur * lyr - ui * lyi;
+                float  li   = ur * lyi + ui * lyr;
+                float  amp  = hypotf(lr, li);
                 out_amp_c[p] = amp;
                 out_opd_c[p] = (amp > 1e-12f) ? (atan2f(li, lr) * rad_to_opd) : 0.0f;
+                if (pre_int != NULL)
+                {
+                    pre_int[p] += w_c * (float) u2;
+                }
+                ch_e_pre += u2;
+                ch_e_post += (double) amp * amp;
 
                 if (do_lo && lo_lyot)
                 {
@@ -679,6 +712,7 @@ void MILK_HOT cacaosim_coro_step_poly_cpu(
                     float la    = r_ly * hypotf(ur, ui);
                     lo_amp_c[p] = la;
                     lo_opd_c[p] = (la > 1e-12f) ? (atan2f(ui, ur) * rad_to_opd) : 0.0f;
+                    ch_e_lo += (double) la * la;
                 }
             }
         }
@@ -761,6 +795,7 @@ void MILK_HOT cacaosim_coro_step_poly_cpu(
                         float    la    = refl * pm * hypotf(ur, ui);
                         lo_amp_c[p]    = la;
                         lo_opd_c[p]    = (la > 1e-12f) ? (atan2f(ui, ur) * rad_to_opd) : 0.0f;
+                        ch_e_lo += (double) la * la;
                     }
                 }
             }
@@ -800,6 +835,7 @@ void MILK_HOT cacaosim_coro_step_poly_cpu(
                     float    ei    = src[2u * xp + 1u];
                     float    ur    = er * sr - ei * si;
                     float    ui    = er * si + ei * sr;
+                    double   u2    = (double) ur * ur + (double) ui * ui;
 
                     float lyr    = ly_c[2u * p];
                     float lyi    = ly_c[2u * p + 1u];
@@ -808,6 +844,12 @@ void MILK_HOT cacaosim_coro_step_poly_cpu(
                     float amp    = hypotf(lr, li);
                     out_amp_c[p] = amp;
                     out_opd_c[p] = (amp > 1e-12f) ? (atan2f(li, lr) * rad_to_opd) : 0.0f;
+                    if (pre_int != NULL)
+                    {
+                        pre_int[p] += w_c * (float) u2;
+                    }
+                    ch_e_pre += u2;
+                    ch_e_post += (double) amp * amp;
 
                     if (do_lo && lo_lyot)
                     {
@@ -816,11 +858,41 @@ void MILK_HOT cacaosim_coro_step_poly_cpu(
                         float la    = r_ly * hypotf(ur, ui);
                         lo_amp_c[p] = la;
                         lo_opd_c[p] = (la > 1e-12f) ? (atan2f(ui, ur) * rad_to_opd) : 0.0f;
+                        ch_e_lo += (double) la * la;
                     }
                 }
             }
         }
+
+        step_e_in += (double) w_c * ch_e_in;
+        step_e_pre += (double) w_c * ch_e_pre;
+        step_e_post += (double) w_c * ch_e_post;
+        step_e_lo += (double) w_c * ch_e_lo;
     }
+
+    if (ctx->cpu_pre_lyot_long != NULL && pre_int != NULL)
+    {
+        float *__restrict pre_long = MILK_ASSUME_ALIGNED(ctx->cpu_pre_lyot_long);
+#pragma omp simd
+        for (uint64_t p = 0; p < npix_wf; p++)
+        {
+            pre_long[p] += pre_int[p];
+        }
+    }
+    ctx->long_cnt++;
+    ctx->sum_e_in += step_e_in;
+    ctx->sum_e_pre_lyot += step_e_pre;
+    ctx->sum_e_post_lyot += step_e_post;
+    ctx->sum_e_lowfs += step_e_lo;
+
+    double den_i              = (step_e_in > 1e-30) ? step_e_in : 1.0;
+    double den_l              = (ctx->sum_e_in > 1e-30) ? ctx->sum_e_in : 1.0;
+    ctx->last_frac_pre_lyot   = (float) (step_e_pre / den_i);
+    ctx->last_frac_lyot_trans = (float) (step_e_post / den_i);
+    ctx->last_frac_lowfs      = (float) (step_e_lo / den_i);
+    ctx->long_frac_pre_lyot   = (float) (ctx->sum_e_pre_lyot / den_l);
+    ctx->long_frac_lyot_trans = (float) (ctx->sum_e_post_lyot / den_l);
+    ctx->long_frac_lowfs      = (float) (ctx->sum_e_lowfs / den_l);
 }
 
 /**
@@ -1036,12 +1108,15 @@ int MILK_COLD cacaosim_coro_init_masks(
         openblas_set_num_threads(1);
     }
 
-    ctx->lyot_mask      = (float *) cacaosim_aligned_calloc(ctx->npix_wf, sizeof(float));
-    ctx->lowfs_pup_mask = (float *) cacaosim_aligned_calloc(ctx->npix_wf, sizeof(float));
-    ctx->lyot_cplx      = (float *) cacaosim_aligned_calloc((size_t) nlam * ctx->npix_wf * 2u,
-                                                            sizeof(float));
-    ctx->cpu_epup_cplx  = (float *) cacaosim_aligned_calloc(ctx->npix_wf * 2u, sizeof(float));
-    if (!ctx->lyot_mask || !ctx->lowfs_pup_mask || !ctx->lyot_cplx || !ctx->cpu_epup_cplx)
+    ctx->lyot_mask         = (float *) cacaosim_aligned_calloc(ctx->npix_wf, sizeof(float));
+    ctx->lowfs_pup_mask    = (float *) cacaosim_aligned_calloc(ctx->npix_wf, sizeof(float));
+    ctx->lyot_cplx         = (float *) cacaosim_aligned_calloc((size_t) nlam * ctx->npix_wf * 2u,
+                                                               sizeof(float));
+    ctx->cpu_epup_cplx     = (float *) cacaosim_aligned_calloc(ctx->npix_wf * 2u, sizeof(float));
+    ctx->cpu_pre_lyot_int  = (float *) cacaosim_aligned_calloc(ctx->npix_wf, sizeof(float));
+    ctx->cpu_pre_lyot_long = (float *) cacaosim_aligned_calloc(ctx->npix_wf, sizeof(float));
+    if (!ctx->lyot_mask || !ctx->lowfs_pup_mask || !ctx->lyot_cplx || !ctx->cpu_epup_cplx ||
+        !ctx->cpu_pre_lyot_int || !ctx->cpu_pre_lyot_long)
     {
         cacaosim_coro_free(ctx);
         return -1;
@@ -1122,12 +1197,13 @@ int MILK_COLD cacaosim_coro_init_masks(
         float outer = (cfg->lyot_outer > 0.05f) ? cfg->lyot_outer : 0.85f;
         float obs_p = (cfg->lyot_obs >= 0.0f) ? cfg->lyot_obs : 0.36f;
         cacaosim_pupil_cfg_t lcfg = {
-            .nwf        = cfg->nwf,
-            .pup_diam   = pdim * outer,
-            .cobs       = (outer > 1e-4f) ? (obs_p / outer) : 0.0f,
-            .nspider    = cfg->lyot_nspider,
-            .spider_w   = (outer > 1e-4f) ? (cfg->lyot_spider_w / outer) : 0.0f,
-            .spider_deg = cfg->lyot_spider_deg,
+            .nwf           = cfg->nwf,
+            .pup_diam      = pdim * outer,
+            .cobs          = (outer > 1e-4f) ? (obs_p / outer) : 0.0f,
+            .nspider       = cfg->lyot_nspider,
+            .spider_w      = (outer > 1e-4f) ? (cfg->lyot_spider_w / outer) : 0.0f,
+            .spider_deg    = cfg->lyot_spider_deg,
+            .spider_offset = (outer > 1e-4f) ? (cfg->lyot_spider_offset / outer) : 0.0f,
         };
         if (lcfg.cobs > 0.95f)
         {
@@ -1346,6 +1422,8 @@ void MILK_COLD cacaosim_coro_free(cacaosim_coro_ctx_t *ctx)
     free(ctx->cpu_poly_amp);
     free(ctx->cpu_poly_lo_opd);
     free(ctx->cpu_poly_lo_amp);
+    free(ctx->cpu_pre_lyot_int);
+    free(ctx->cpu_pre_lyot_long);
     __builtin_memset(ctx, 0, sizeof(*ctx));
 }
 
@@ -1474,4 +1552,75 @@ void MILK_HOT cacaosim_coro_step_beam(
     cacaosim_coro_step_poly(ctx, in_opd, in_amp, 1u, ctx->npix_wf, out_opd, out_amp, ctx->npix_wf,
                             lowfs_opd, lowfs_amp, d_in_opd, d_in_amp, d_out_opd, d_out_amp,
                             d_lowfs_opd, d_lowfs_amp);
+}
+
+/**
+ * cacaosim_coro_reset_long() - Clear cumulative pre-Lyot intensity and LOWFS power accumulators
+ */
+void cacaosim_coro_reset_long(cacaosim_coro_ctx_t *ctx)
+{
+    if (ctx == NULL)
+    {
+        return;
+    }
+    if (ctx->cpu_pre_lyot_long != NULL)
+    {
+        __builtin_memset(ctx->cpu_pre_lyot_long, 0, ctx->npix_wf * sizeof(float));
+    }
+    if (ctx->use_cuda)
+    {
+        cacaosim_coro_cuda_reset_long(ctx);
+    }
+    ctx->long_cnt             = 0ULL;
+    ctx->sum_e_in             = 0.0;
+    ctx->sum_e_pre_lyot       = 0.0;
+    ctx->sum_e_post_lyot      = 0.0;
+    ctx->sum_e_lowfs          = 0.0;
+    ctx->long_frac_pre_lyot   = 0.0f;
+    ctx->long_frac_lyot_trans = 0.0f;
+    ctx->long_frac_lowfs      = 0.0f;
+}
+
+/**
+ * cacaosim_coro_readout_telemetry_async() - Stage pre-Lyot intensity maps and energy fractions
+ */
+void MILK_HOT cacaosim_coro_readout_telemetry_async(
+    cacaosim_coro_ctx_t *ctx,
+    float               *out_pre_lyot,
+    float               *out_pre_lyot_long,
+    int                  sync_stream)
+{
+    if (ctx == NULL)
+    {
+        return;
+    }
+    if (ctx->use_cuda)
+    {
+        cacaosim_coro_cuda_readout_telemetry(ctx, out_pre_lyot, out_pre_lyot_long, sync_stream);
+        return;
+    }
+    if (out_pre_lyot != NULL && ctx->cpu_pre_lyot_int != NULL)
+    {
+        __builtin_memcpy(out_pre_lyot, ctx->cpu_pre_lyot_int, ctx->npix_wf * sizeof(float));
+    }
+    if (out_pre_lyot_long != NULL && ctx->cpu_pre_lyot_long != NULL)
+    {
+        const float inv = (ctx->long_cnt > 0ULL) ? (1.0f / (float) ctx->long_cnt) : 0.0f;
+        const float *__restrict src = MILK_ASSUME_ALIGNED(ctx->cpu_pre_lyot_long);
+        for (uint64_t p = 0; p < ctx->npix_wf; p++)
+        {
+            out_pre_lyot_long[p] = src[p] * inv;
+        }
+    }
+}
+
+/**
+ * cacaosim_coro_readout_telemetry_finish() - Finalize host power-budget fractions after GPU sync
+ */
+void MILK_HOT cacaosim_coro_readout_telemetry_finish(cacaosim_coro_ctx_t *ctx)
+{
+    if (ctx != NULL && ctx->use_cuda)
+    {
+        cacaosim_coro_cuda_readout_finish(ctx);
+    }
 }

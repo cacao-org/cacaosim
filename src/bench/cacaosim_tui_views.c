@@ -565,7 +565,20 @@ void cs_render_view_tables(cs_tui_app_t *app, int x, int y, int w, int h)
         }
         else
         {
-            snprintf(mstr, sizeof(mstr), "%.0fnm x%.2f [OPD m]", nd->wfe_rms_nm, nd->wfe_gain);
+            if (fabsf(nd->wfe_defocus_nm) > 1.0e-3f && nd->wfe_rms_nm <= 1.0e-3f)
+            {
+                snprintf(mstr, sizeof(mstr), "Z4=%+.0fnm x%.2f [OPD m]", nd->wfe_defocus_nm,
+                         nd->wfe_gain);
+            }
+            else if (fabsf(nd->wfe_defocus_nm) > 1.0e-3f)
+            {
+                snprintf(mstr, sizeof(mstr), "%.0f/Z4=%+.0fnm x%.2f", nd->wfe_rms_nm,
+                         nd->wfe_defocus_nm, nd->wfe_gain);
+            }
+            else
+            {
+                snprintf(mstr, sizeof(mstr), "%.0fnm x%.2f [OPD m]", nd->wfe_rms_nm, nd->wfe_gain);
+            }
             snprintf(arms, sizeof(arms), "Out:%s  SHM:%s", nd->out_beam, nd->in_wfe);
         }
 

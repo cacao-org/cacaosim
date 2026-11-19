@@ -93,11 +93,12 @@ def find_ffmpeg_bin() -> str | None:
 
 
 def parse_bench_timing(bench_path: str | None) -> dict[str, float]:
-    """Extract master_hz and oversample from an optical .bench configuration file."""
-    info = {"master_hz": 2000.0, "oversample": 4.0}
+    """Extract master_hz, oversample, and tel_diam_m from an optical .bench file."""
+    info = {"master_hz": 2000.0, "oversample": 4.0, "tel_diam_m": TEL_DIAM_M}
     if not bench_path or not os.path.isfile(bench_path):
         return info
     sec = ""
+    explicit_diam = False
     with open(bench_path, "r", encoding="utf-8", errors="replace") as fh:
         for raw in fh:
             line = raw.split("#", 1)[0].strip()
@@ -119,6 +120,14 @@ def parse_bench_timing(bench_path: str | None) -> dict[str, float]:
                         info["oversample"] = max(1.0, float(v))
                     except ValueError:
                         pass
+                elif k == "tel_diam_m":
+                    try:
+                        info["tel_diam_m"] = float(v)
+                        explicit_diam = True
+                    except ValueError:
+                        pass
+                elif k == "pupil_geom" and v.lower() == "subaru" and not explicit_diam:
+                    info["tel_diam_m"] = 7.95
     return info
 
 
@@ -416,6 +425,7 @@ def render_telemetry_video(
     ]
     bench_p = next((p for p in bench_cands if os.path.isfile(p)), None)
     btiming = parse_bench_timing(bench_p)
+    tel_diam_m = float(manifest.get("tel_diam_m", btiming.get("tel_diam_m", TEL_DIAM_M)))
     outer_hz = float(btiming.get("master_hz", fs_stg2))
     oversample = int(round(btiming.get("oversample", 4.0)))
     internal_hz = outer_hz * oversample
@@ -488,7 +498,7 @@ def render_telemetry_video(
     psf_peak_sr: dict[tuple[str, str], np.ndarray] = {}
 
     for bkey, bm in BAND_META.items():
-        ld_mas = (bm["lam_um"] * 1.0e-6 / TEL_DIAM_M) * RAD2MAS
+        ld_mas = (bm["lam_um"] * 1.0e-6 / tel_diam_m) * RAD2MAS
         pix_arcsec = (ld_mas / bm["pixscale_ld"]) / 1000.0
         psf_ld_arcsec[bkey] = ld_mas / 1000.0
         for skey in ("stg1", "final"):
@@ -589,7 +599,7 @@ def render_telemetry_video(
     fig.text(
         0.5,
         0.978,
-        f"Subaru 8.2 m AO3k + SCExAO — Short-Timescale WFS & PSF Evolution "
+        f"Subaru {tel_diam_m:.2f} m AO3k + SCExAO — Short-Timescale WFS & PSF Evolution "
         f"(Seeing = {seeing_arcsec:.2f}\", mV = mH = 6.0)",
         ha="center",
         va="top",

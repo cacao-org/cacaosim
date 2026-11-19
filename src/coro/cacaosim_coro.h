@@ -187,10 +187,11 @@ typedef struct
     float    lowfs_refl;      /**< Amplitude reflectivity of FPM/Lyot to LOWFS (default: 0.95) */
     float    lyot_outer;      /**< Lyot stop outer diameter fraction of pup_diam (default: 0.85) */
     float    lyot_obs;        /**< Lyot stop central obscuration fraction of pup_diam (def: 0.36) */
-    int32_t  lyot_nspider;    /**< Number of Lyot spider vanes (default: 0 or 4) */
-    float    lyot_spider_w;   /**< Lyot spider width fraction of pup_diam (default: 0.02) */
-    float    lyot_spider_deg; /**< Lyot spider orientation [deg] (default: 45.0) */
-    int32_t  backend;         /**< cacaosim_backend_t: 0 = auto, 1 = CPU, 2 = CUDA */
+    int32_t  lyot_nspider;       /**< Number of Lyot spider vanes (default: 0 or 4) */
+    float    lyot_spider_w;      /**< Lyot spider width fraction of pup_diam (default: 0.02) */
+    float    lyot_spider_deg;    /**< Lyot spider orientation [deg] (default: 45.0) */
+    float    lyot_spider_offset; /**< Lyot V-spider X-vertex offset fraction of pup_diam (0=rad) */
+    int32_t  backend;            /**< cacaosim_backend_t: 0 = auto, 1 = CPU, 2 = CUDA */
     float    fpm_pixscale_ld; /**< Custom MFT focal sampling [pixels per lambda0/D] (def: 8.0) */
     float    bw_frac;         /**< Fractional bandpass dlambda/lambda0 (def: 0.20 for 3D masks) */
     int32_t  nlambda;         /**< Spectral channels (0/1 = auto from 3D masks, >1 = explicit) */
@@ -300,9 +301,24 @@ typedef struct
     float              *cpu_poly_amp;
     float              *cpu_poly_lo_opd;
     float              *cpu_poly_lo_amp;
+    float              *cpu_pre_lyot_int;  /**< Broadband intensity incident on Lyot [npix_wf] */
+    float              *cpu_pre_lyot_long; /**< Cumulative pre-Lyot intensity sum [npix_wf] */
     void               *fftw_fwd;
     void               *fftw_inv;
     void               *fftw_lo_inv;
+
+    /* Instantaneous & cumulative coronagraph / LOWFS optical power-budget tracking */
+    uint64_t            long_cnt;
+    double              sum_e_in;
+    double              sum_e_pre_lyot;
+    double              sum_e_post_lyot;
+    double              sum_e_lowfs;
+    float               last_frac_pre_lyot;
+    float               last_frac_lyot_trans;
+    float               last_frac_lowfs;
+    float               long_frac_pre_lyot;
+    float               long_frac_lyot_trans;
+    float               long_frac_lowfs;
 
     /* Opaque CUDA state allocated by cacaosim_coro_cuda.cu */
     void               *cuda_priv;
@@ -599,6 +615,33 @@ void cacaosim_coro_cuda_step_poly(cacaosim_coro_ctx_t *ctx,
                                   float               *d_out_amp,
                                   float               *d_lowfs_opd,
                                   float               *d_lowfs_amp);
+
+/**
+ * cacaosim_coro_reset_long() - Clear cumulative pre-Lyot intensity and LOWFS power accumulators
+ */
+void cacaosim_coro_reset_long(cacaosim_coro_ctx_t *ctx);
+
+/**
+ * cacaosim_coro_readout_telemetry_async() - Stage pre-Lyot intensity maps and energy fractions
+ */
+void cacaosim_coro_readout_telemetry_async(
+    cacaosim_coro_ctx_t *ctx,
+    float               *out_pre_lyot,
+    float               *out_pre_lyot_long,
+    int                  sync_stream);
+
+/**
+ * cacaosim_coro_readout_telemetry_finish() - Finalize host power-budget fractions after GPU sync
+ */
+void cacaosim_coro_readout_telemetry_finish(cacaosim_coro_ctx_t *ctx);
+
+void cacaosim_coro_cuda_reset_long(cacaosim_coro_ctx_t *ctx);
+void cacaosim_coro_cuda_readout_telemetry(
+    cacaosim_coro_ctx_t *ctx,
+    float               *out_pre_lyot,
+    float               *out_pre_lyot_long,
+    int                  sync_stream);
+void cacaosim_coro_cuda_readout_finish(cacaosim_coro_ctx_t *ctx);
 
 #ifdef __cplusplus
 }

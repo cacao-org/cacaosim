@@ -244,12 +244,15 @@ void cs_tui_refresh_analysis(cs_tui_app_t *app)
         return;
     }
     cacaosim_pupil_cfg_t pcfg = {
-        .nwf        = 16u,
-        .pup_diam   = app->cfg.pup_diam,
-        .cobs       = app->cfg.cobs,
-        .nspider    = app->cfg.nspider,
-        .spider_w   = app->cfg.spider_w,
-        .spider_deg = app->cfg.spider_deg,
+        .nwf           = 16u,
+        .pup_diam      = app->cfg.pup_diam,
+        .cobs          = app->cfg.cobs,
+        .nspider       = app->cfg.nspider,
+        .spider_w      = (app->cfg.spider_w > 0.0f && app->cfg.spider_w < 0.05f)
+                             ? 0.05f
+                             : app->cfg.spider_w,
+        .spider_deg    = app->cfg.spider_deg,
+        .spider_offset = app->cfg.spider_offset,
     };
     app->pup16_sum = cacaosim_make_pupil(&pcfg, app->pup16);
 

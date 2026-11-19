@@ -113,6 +113,14 @@ typedef struct
     float         *d_fft_refl_w;
     cuComplex     *d_fft_buf;
     cuComplex     *d_fft_lo_buf;
+
+    /* Pre-Lyot intensity & optical power-budget telemetry buffers */
+    float         *d_pre_u2;
+    float         *d_pre_lyot_inst;
+    float         *d_pre_lyot_accum;
+    float         *d_pre_lyot_norm;
+    double        *d_energy_stats;
+    double         h_energy_stage[8];
 } coro_cuda_state_t;
 
 /**
@@ -216,6 +224,7 @@ __global__ static void k_coro_apply_lyot_batch(
     int32_t                       eff_nlam,
     uint64_t                      out_stride,
     uint64_t                      lo_stride,
+    float *__restrict__           pre_u2,
     float *__restrict__           out_opd,
     float *__restrict__           out_amp,
     float *__restrict__           lowfs_opd,
@@ -234,6 +243,7 @@ __global__ static void k_coro_apply_lyot_batch(
     cuComplex ly         = lyot_cplx[cidx];
     float     rad_to_opd = lam_um[c] / CACAOSIM_TWO_PI_F;
 
+    pre_u2[cidx]  = u.x * u.x + u.y * u.y;
     float lr      = u.x * ly.x - u.y * ly.y;
     float li      = u.x * ly.y + u.y * ly.x;
     float amp     = hypotf(lr, li);
@@ -392,6 +402,7 @@ __global__ static void k_coro_babinet_finalize_batch(
     int32_t                       eff_nlam,
     uint64_t                      out_stride,
     uint64_t                      lo_stride,
+    float *__restrict__           pre_u2,
     float *__restrict__           out_opd,
     float *__restrict__           out_amp,
     float *__restrict__           lowfs_opd,
@@ -416,6 +427,7 @@ __global__ static void k_coro_babinet_finalize_batch(
     float     rad_to_opd = lam_um[c] / CACAOSIM_TWO_PI_F;
     float     amp        = hypotf(lr, li);
 
+    pre_u2[cidx]  = ur * ur + ui * ui;
     out_amp[oidx] = amp;
     out_opd[oidx] = (amp > 1e-12f) ? (atan2f(li, lr) * rad_to_opd) : 0.0f;
 
@@ -600,6 +612,7 @@ __global__ static void k_coro_fft_extract_cplx(
     float                         rad_to_opd,
     uint32_t                      nwf,
     uint32_t                      nfft,
+    float *__restrict__           pre_u2,
     float *__restrict__           out_opd,
     float *__restrict__           out_amp,
     float *__restrict__           lowfs_opd,
@@ -628,6 +641,7 @@ __global__ static void k_coro_fft_extract_cplx(
     float     ui = e.x * si + e.y * sr;
     cuComplex ly = lyot_c[p];
 
+    pre_u2[p]  = ur * ur + ui * ui;
     float lr   = ur * ly.x - ui * ly.y;
     float li   = ur * ly.y + ui * ly.x;
     float amp  = hypotf(lr, li);
@@ -641,6 +655,104 @@ __global__ static void k_coro_fft_extract_cplx(
         float la     = r_ly * hypotf(ur, ui);
         lowfs_amp[p] = la;
         lowfs_opd[p] = (la > 1e-12f) ? (atan2f(ui, ur) * rad_to_opd) : 0.0f;
+    }
+}
+
+__global__ static void k_coro_pre_lyot_accum(
+    const float *__restrict__ pre_u2,
+    uint64_t                  npix_wf,
+    int32_t                   eff_nlam,
+    float *__restrict__       pre_inst,
+    float *__restrict__       pre_accum)
+{
+    uint64_t p = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= npix_wf)
+    {
+        return;
+    }
+    float w_c = 1.0f / (float) ((eff_nlam >= 1) ? eff_nlam : 1);
+    float acc = 0.0f;
+    for (int32_t c = 0; c < eff_nlam; c++)
+    {
+        acc += w_c * pre_u2[(uint64_t) c * npix_wf + p];
+    }
+    pre_inst[p] = acc;
+    pre_accum[p] += acc;
+}
+
+__global__ static void k_coro_scale_long(
+    const float *__restrict__ pre_accum,
+    float                     inv_cnt,
+    uint64_t                  npix_wf,
+    float *__restrict__       pre_norm)
+{
+    uint64_t p = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (p < npix_wf)
+    {
+        pre_norm[p] = pre_accum[p] * inv_cnt;
+    }
+}
+
+__global__ static void k_coro_energy_reduce(
+    const cuComplex *__restrict__ epup,
+    const float *__restrict__     pre_inst,
+    const float *__restrict__     out_amp,
+    uint64_t                      out_stride,
+    const float *__restrict__     lo_amp,
+    uint64_t                      lo_stride,
+    uint64_t                      npix_wf,
+    int32_t                       eff_nlam,
+    double *__restrict__          energy_stats)
+{
+    __shared__ double sh[4][256];
+    const double      w_c  = 1.0 / (double) ((eff_nlam >= 1) ? eff_nlam : 1);
+    double            s_in = 0.0;
+    double            s_pr = 0.0;
+    double            s_po = 0.0;
+    double            s_lo = 0.0;
+
+    for (uint64_t p = threadIdx.x; p < npix_wf; p += blockDim.x)
+    {
+        s_pr += (double) pre_inst[p];
+        for (int32_t c = 0; c < eff_nlam; c++)
+        {
+            cuComplex ep = epup[(uint64_t) c * npix_wf + p];
+            float     oa = out_amp[(uint64_t) c * out_stride + p];
+            s_in += w_c * ((double) ep.x * ep.x + (double) ep.y * ep.y);
+            s_po += w_c * ((double) oa * oa);
+            if (lo_amp != NULL)
+            {
+                float la = lo_amp[(uint64_t) c * lo_stride + p];
+                s_lo += w_c * ((double) la * la);
+            }
+        }
+    }
+
+    sh[0][threadIdx.x] = s_in;
+    sh[1][threadIdx.x] = s_pr;
+    sh[2][threadIdx.x] = s_po;
+    sh[3][threadIdx.x] = s_lo;
+    __syncthreads();
+
+    for (unsigned s = blockDim.x / 2u; s > 0u; s >>= 1u)
+    {
+        if (threadIdx.x < s)
+        {
+            sh[0][threadIdx.x] += sh[0][threadIdx.x + s];
+            sh[1][threadIdx.x] += sh[1][threadIdx.x + s];
+            sh[2][threadIdx.x] += sh[2][threadIdx.x + s];
+            sh[3][threadIdx.x] += sh[3][threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0u)
+    {
+        for (int k = 0; k < 4; k++)
+        {
+            energy_stats[k] = sh[k][0];
+            energy_stats[4 + k] += sh[k][0];
+        }
     }
 }
 
@@ -699,11 +811,19 @@ extern "C" int cacaosim_coro_cuda_init(cacaosim_coro_ctx_t *ctx, void *ext_strea
         cudaMalloc((void **) &cs->d_out_amp, poly_f) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_lowfs_opd, poly_f) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_lowfs_amp, poly_f) != cudaSuccess ||
-        cudaMalloc((void **) &cs->d_epup, poly_c) != cudaSuccess)
+        cudaMalloc((void **) &cs->d_epup, poly_c) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_pre_u2, poly_f) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_pre_lyot_inst, wf_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_pre_lyot_accum, wf_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_pre_lyot_norm, wf_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_energy_stats, 8u * sizeof(double)) != cudaSuccess)
     {
         cacaosim_coro_cuda_free(ctx);
         return -1;
     }
+
+    cudaMemsetAsync(cs->d_pre_lyot_accum, 0, wf_bytes, cs->stream);
+    cudaMemsetAsync(cs->d_energy_stats, 0, 8u * sizeof(double), cs->stream);
 
     cudaMemcpyAsync(cs->d_lam_um, ctx->lam_um, nlam * sizeof(float), cudaMemcpyHostToDevice,
                     cs->stream);
@@ -850,6 +970,11 @@ extern "C" void cacaosim_coro_cuda_free(cacaosim_coro_ctx_t *ctx)
     cudaFree(cs->d_fft_refl_w);
     cudaFree(cs->d_fft_buf);
     cudaFree(cs->d_fft_lo_buf);
+    cudaFree(cs->d_pre_u2);
+    cudaFree(cs->d_pre_lyot_inst);
+    cudaFree(cs->d_pre_lyot_accum);
+    cudaFree(cs->d_pre_lyot_norm);
+    cudaFree(cs->d_energy_stats);
     if (cs->owns_stream && cs->stream)
     {
         cudaStreamDestroy(cs->stream);
@@ -975,7 +1100,7 @@ extern "C" void cacaosim_coro_cuda_step_poly(
     {
         k_coro_apply_lyot_batch<<<grd_wf, 256, 0, cs->stream>>>(
             cs->d_epup, cs->d_lyot_cplx, cs->d_lam_um, refl, lo_lyot, npix_wf, eff_nlam,
-            dev_out_str, dev_lo_str, dout_o, dout_a, dlo_o, dlo_a);
+            dev_out_str, dev_lo_str, cs->d_pre_u2, dout_o, dout_a, dlo_o, dlo_a);
     }
     else if (ctx->is_babinet)
     {
@@ -1033,8 +1158,8 @@ extern "C" void cacaosim_coro_cuda_step_poly(
 
         k_coro_babinet_finalize_batch<<<grd_wf, 256, 0, cs->stream>>>(
             cs->d_epup, cs->d_ecore, cs->d_lyot_cplx, cs->d_lam_um, refl, npix_wf, eff_nlam,
-            dev_out_str, dev_lo_str, dout_o, dout_a, (want_lo && lo_lyot) ? dlo_o : NULL,
-            (want_lo && lo_lyot) ? dlo_a : NULL);
+            dev_out_str, dev_lo_str, cs->d_pre_u2, dout_o, dout_a,
+            (want_lo && lo_lyot) ? dlo_o : NULL, (want_lo && lo_lyot) ? dlo_a : NULL);
     }
     else
     {
@@ -1071,10 +1196,19 @@ extern "C" void cacaosim_coro_cuda_step_poly(
             cufftExecC2C(cs->fft_plan, cs->d_fft_buf, cs->d_fft_buf, CUFFT_INVERSE);
             k_coro_fft_extract_cplx<<<bl_wf, 256, 0, cs->stream>>>(
                 cs->d_fft_buf, sh_x, sh_y, cs->d_lyot_cplx + (size_t) c * npix_wf, refl, r2o_c,
-                ctx->cfg.nwf, ctx->nfft, dout_o + (size_t) c * dev_out_str,
-                dout_a + (size_t) c * dev_out_str, lo_o_c, lo_a_c);
+                ctx->cfg.nwf, ctx->nfft, cs->d_pre_u2 + (size_t) c * npix_wf,
+                dout_o + (size_t) c * dev_out_str, dout_a + (size_t) c * dev_out_str, lo_o_c,
+                lo_a_c);
         }
     }
+
+    /* Accumulate pre-Lyot intensity map and exact FP64 optical power budget on GPU */
+    k_coro_pre_lyot_accum<<<bl_wf, 256, 0, cs->stream>>>(
+        cs->d_pre_u2, npix_wf, eff_nlam, cs->d_pre_lyot_inst, cs->d_pre_lyot_accum);
+    k_coro_energy_reduce<<<1, 256, 0, cs->stream>>>(
+        cs->d_epup, cs->d_pre_lyot_inst, dout_a, dev_out_str, want_lo ? dlo_a : NULL, dev_lo_str,
+        npix_wf, eff_nlam, cs->d_energy_stats);
+    ctx->long_cnt++;
 
     /* Scatter GPU outputs back to host SHM buffers and synchronize when in host staging mode */
     if (!dev_mode)
@@ -1133,8 +1267,93 @@ extern "C" void cacaosim_coro_cuda_step_poly(
                                   cs->stream);
             }
         }
+        if (ctx->cpu_pre_lyot_int != NULL)
+        {
+            cudaMemcpyAsync(ctx->cpu_pre_lyot_int, cs->d_pre_lyot_inst, wf_bytes,
+                            cudaMemcpyDeviceToHost, cs->stream);
+        }
+        cudaMemcpyAsync(cs->h_energy_stage, cs->d_energy_stats, 8u * sizeof(double),
+                        cudaMemcpyDeviceToHost, cs->stream);
         cudaStreamSynchronize(cs->stream);
+        cacaosim_coro_cuda_readout_finish(ctx);
     }
+}
+
+extern "C" void cacaosim_coro_cuda_reset_long(cacaosim_coro_ctx_t *ctx)
+{
+    coro_cuda_state_t *cs = (ctx != NULL) ? (coro_cuda_state_t *) ctx->cuda_priv : NULL;
+    if (cs == NULL)
+    {
+        return;
+    }
+    cudaMemsetAsync(cs->d_pre_lyot_accum, 0, (size_t) ctx->npix_wf * sizeof(float), cs->stream);
+    cudaMemsetAsync(cs->d_energy_stats, 0, 8u * sizeof(double), cs->stream);
+}
+
+extern "C" void cacaosim_coro_cuda_readout_telemetry(
+    cacaosim_coro_ctx_t *ctx,
+    float               *out_pre_lyot,
+    float               *out_pre_lyot_long,
+    int                  sync_stream)
+{
+    coro_cuda_state_t *cs = (ctx != NULL) ? (coro_cuda_state_t *) ctx->cuda_priv : NULL;
+    if (cs == NULL)
+    {
+        return;
+    }
+    const size_t   wf_bytes = (size_t) ctx->npix_wf * sizeof(float);
+    const uint32_t bl_wf    = (uint32_t) ((ctx->npix_wf + 255ULL) / 256ULL);
+
+    cudaMemcpyAsync(cs->h_energy_stage, cs->d_energy_stats, 8u * sizeof(double),
+                    cudaMemcpyDeviceToHost, cs->stream);
+    if (out_pre_lyot != NULL)
+    {
+        cudaMemcpyAsync(out_pre_lyot, cs->d_pre_lyot_inst, wf_bytes, cudaMemcpyDeviceToHost,
+                        cs->stream);
+    }
+    if (out_pre_lyot_long != NULL)
+    {
+        float inv = (ctx->long_cnt > 0ULL) ? (1.0f / (float) ctx->long_cnt) : 0.0f;
+        k_coro_scale_long<<<bl_wf, 256, 0, cs->stream>>>(
+            cs->d_pre_lyot_accum, inv, ctx->npix_wf, cs->d_pre_lyot_norm);
+        cudaMemcpyAsync(out_pre_lyot_long, cs->d_pre_lyot_norm, wf_bytes, cudaMemcpyDeviceToHost,
+                        cs->stream);
+    }
+    if (sync_stream)
+    {
+        cudaStreamSynchronize(cs->stream);
+        cacaosim_coro_cuda_readout_finish(ctx);
+    }
+}
+
+extern "C" void cacaosim_coro_cuda_readout_finish(cacaosim_coro_ctx_t *ctx)
+{
+    coro_cuda_state_t *cs = (ctx != NULL) ? (coro_cuda_state_t *) ctx->cuda_priv : NULL;
+    if (cs == NULL)
+    {
+        return;
+    }
+    double e_in   = cs->h_energy_stage[0];
+    double e_pre  = cs->h_energy_stage[1];
+    double e_post = cs->h_energy_stage[2];
+    double e_lo   = cs->h_energy_stage[3];
+    double s_in   = cs->h_energy_stage[4];
+    double s_pre  = cs->h_energy_stage[5];
+    double s_post = cs->h_energy_stage[6];
+    double s_lo   = cs->h_energy_stage[7];
+
+    ctx->sum_e_in             = s_in;
+    ctx->sum_e_pre_lyot       = s_pre;
+    ctx->sum_e_post_lyot      = s_post;
+    ctx->sum_e_lowfs          = s_lo;
+    double den_i              = (e_in > 1e-30) ? e_in : 1.0;
+    double den_l              = (s_in > 1e-30) ? s_in : 1.0;
+    ctx->last_frac_pre_lyot   = (float) (e_pre / den_i);
+    ctx->last_frac_lyot_trans = (float) (e_post / den_i);
+    ctx->last_frac_lowfs      = (float) (e_lo / den_i);
+    ctx->long_frac_pre_lyot   = (float) (s_pre / den_l);
+    ctx->long_frac_lyot_trans = (float) (s_post / den_l);
+    ctx->long_frac_lowfs      = (float) (s_lo / den_l);
 }
 
 #endif /* HAVE_CUDA */

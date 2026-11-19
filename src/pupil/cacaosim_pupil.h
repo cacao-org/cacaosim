@@ -57,16 +57,20 @@ extern "C" {
  *   - Radial spider vanes are half-rays originating at `(ctr, ctr)` spaced
  *     uniformly by `360 / nspider` degrees counter-clockwise starting from
  *     `spider_deg` relative to the `+X` axis, with full width
- *     `spider_w * pup_diam * nwf` pixels.
+ *     `spider_w * pup_diam * nwf` pixels. When `nspider == 4` and
+ *     `|spider_offset| > 1e-6`, two symmetric V-pairs originate at
+ *     `(ctr +/- spider_offset * pup_diam * nwf, ctr)` at angles `+/-spider_deg`
+ *     and `180 +/- spider_deg` (e.g. Subaru Telescope Nasmyth-IR pupil).
  */
 typedef struct
 {
-    uint32_t nwf;        /**< Square pupil grid dimension [pixels] (> 0) */
-    float    pup_diam;   /**< Outer clear diameter as fraction of nwf (0.01 < pup_diam <= 1.0) */
-    float    cobs;       /**< Linear central obstruction ratio D_sec / D_tel [0.0 .. 0.98) */
-    int32_t  nspider;    /**< Number of radial spider support vanes [0 .. 16] (0 = none) */
-    float    spider_w;   /**< Full spider vane thickness as fraction of pup_diam (>= 0) */
-    float    spider_deg; /**< Counter-clockwise azimuth of first spider vane from +X [degrees] */
+    uint32_t nwf;           /**< Square pupil grid dimension [pixels] (> 0) */
+    float    pup_diam;      /**< Outer clear diameter as fraction of nwf (0.01 < pup_diam <= 1.0) */
+    float    cobs;          /**< Linear central obstruction ratio D_sec / D_tel [0.0 .. 0.98) */
+    int32_t  nspider;       /**< Number of radial spider support vanes [0 .. 16] (0 = none) */
+    float    spider_w;      /**< Full spider vane thickness as fraction of pup_diam (>= 0) */
+    float    spider_deg;    /**< Counter-clockwise azimuth of first spider vane from +X [degrees] */
+    float    spider_offset; /**< V-spider X-vertex offset as fraction of pup_diam (0 = radial) */
 } cacaosim_pupil_cfg_t;
 
 /**
@@ -158,6 +162,31 @@ void cacaosim_make_wfe_m(
     float        psd_alpha,
     uint64_t     seed,
     float       *wfe_out_m);
+
+/**
+ * cacaosim_add_defocus_m() - Accumulate smooth quadratic Zernike Z4 defocus OPD [meter]
+ * @nwf:           Square pupil grid dimension [pixels] (`> 0`)
+ * @pup_diam:      Outer pupil diameter as fraction of `nwf` (`> 0.0`)
+ * @defocus_rms_m: Noll-normalized Z4 defocus RMS amplitude on unit disk [meter]
+ * @wfe_io_m:      In-place row-major `float` OPD buffer `[nwf * nwf]` in SI meters `[m]`
+ *
+ * Role:
+ *   Cold-path quadratic phase synthesizer adding pure Noll Z4 defocus
+ *   `defocus_rms_m * sqrt(3) * (2 * r^2 - 1)` smoothly across the entire
+ *   `[nwf x nwf]` array without radial truncation.
+ *
+ * Rationale:
+ *   Defocused focal-plane wavefront sensors (such as SCExAO's Lyot-stop
+ *   reflected LLOWFS) apply a physical lens or detector defocus to beams whose
+ *   post-FPM diffracted support extends across spider vanes, central
+ *   obstructions, and outside `r = 1.0`. Evaluating the continuous quadratic
+ *   phase over all grid pixels avoids artificial phase cliffs outside `r = 1`.
+ */
+void cacaosim_add_defocus_m(
+    uint32_t nwf,
+    float    pup_diam,
+    float    defocus_rms_m,
+    float   *wfe_io_m);
 
 #ifdef __cplusplus
 }

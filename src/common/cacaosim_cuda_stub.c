@@ -1238,6 +1238,28 @@ void cacaosim_coro_cuda_step_poly(
     (void) d_lowfs_amp;
 }
 
+void cacaosim_coro_cuda_reset_long(cacaosim_coro_ctx_t *ctx)
+{
+    (void) ctx;
+}
+
+void cacaosim_coro_cuda_readout_telemetry(
+    cacaosim_coro_ctx_t *ctx,
+    float               *out_pre_lyot,
+    float               *out_pre_lyot_long,
+    int                  sync_stream)
+{
+    (void) ctx;
+    (void) out_pre_lyot;
+    (void) out_pre_lyot_long;
+    (void) sync_stream;
+}
+
+void cacaosim_coro_cuda_readout_finish(cacaosim_coro_ctx_t *ctx)
+{
+    (void) ctx;
+}
+
 /**
  * cacaosim_cuda_beam_apply_wfe() - No-op GPU static WFE injection stub for CPU-only builds
  * @d_in_opd:    Unused device input OPD

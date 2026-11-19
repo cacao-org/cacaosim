@@ -55,10 +55,12 @@
  *   - Analytic Lyot stop geometry & backend: lyot_outer, lyot_obs, lyot_nspider, lyot_spid_w,
  *     lyot_spid_deg, backend.
  */
-static char     param_in_beam[FUNCTION_PARAMETER_STRMAXLEN]    = "csim_beam0";
-static char     param_out_beam[FUNCTION_PARAMETER_STRMAXLEN]   = "csim_beam_coro";
-static char     param_out_lowfs[FUNCTION_PARAMETER_STRMAXLEN]  = "";
-static char     param_in_pup_amp[FUNCTION_PARAMETER_STRMAXLEN] = "";
+static char     param_in_beam[FUNCTION_PARAMETER_STRMAXLEN]       = "csim_beam0";
+static char     param_out_beam[FUNCTION_PARAMETER_STRMAXLEN]      = "csim_beam_coro";
+static char     param_out_lowfs[FUNCTION_PARAMETER_STRMAXLEN]     = "";
+static char     param_out_pre_lyot[FUNCTION_PARAMETER_STRMAXLEN]  = "";
+static char     param_out_pre_long[FUNCTION_PARAMETER_STRMAXLEN]  = "";
+static char     param_in_pup_amp[FUNCTION_PARAMETER_STRMAXLEN]    = "";
 static char     param_in_pup_pha[FUNCTION_PARAMETER_STRMAXLEN] = "";
 static char     param_in_fpm_amp[FUNCTION_PARAMETER_STRMAXLEN] = "";
 static char     param_in_fpm_pha[FUNCTION_PARAMETER_STRMAXLEN] = "";
@@ -87,6 +89,8 @@ static float    param_lyot_obs                                 = 0.36f;
 static int32_t  param_lyot_nspider                             = 4;
 static float    param_lyot_spid_w                              = 0.02f;
 static float    param_lyot_spid_deg                            = 45.0f;
+static float    param_lyot_spid_off                            = 0.0f;
+static int64_t  param_reset_long                               = 0;
 static int32_t  param_backend                                  = 0;
 
 /**
@@ -105,7 +109,11 @@ static int32_t  param_backend                                  = 0;
     X(".out_beam", param_out_beam, FPTYPE_STREAMNAME, 1, FPFLAG_DEFAULT_INPUT,          \
       "Output post-Lyot [nwf x nwf x 2*Nlam] coronagraphic beam stream")                \
     X(".out_lowfs", param_out_lowfs, FPTYPE_STRING, 0, FPFLAG_DEFAULT_INPUT,            \
-      "Optional FPM-reflected [nwf x nwf x 2] LOWFS pupil beam stream")                 \
+      "Optional FPM/Lyot-reflected [nwf x nwf x 2*Nlam] LOWFS pupil beam stream")       \
+    X(".out_pre_lyot", param_out_pre_lyot, FPTYPE_STRING, 0, FPFLAG_DEFAULT_INPUT,      \
+      "Optional 2D [nwf x nwf] instantaneous pupil intensity incident on Lyot stop")    \
+    X(".out_pre_lyot_long", param_out_pre_long, FPTYPE_STRING, 0, FPFLAG_DEFAULT_INPUT, \
+      "Optional 2D [nwf x nwf] cumulative long-exposure pre-Lyot intensity stream")     \
     X(".in_pup_amp", param_in_pup_amp, FPTYPE_STRING, 0, FPFLAG_DEFAULT_INPUT,          \
       "Optional custom pre-FPM pupil amplitude mask (FITS or SHM, 2D/3D)")              \
     X(".in_pup_pha", param_in_pup_pha, FPTYPE_STRING, 0, FPFLAG_DEFAULT_INPUT,          \
@@ -167,6 +175,12 @@ static int32_t  param_backend                                  = 0;
       "Lyot spider width fraction of pup_diam (default: 0.02)")                         \
     X(".lyot_spider_deg", &param_lyot_spid_deg, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,\
       "Lyot spider orientation [deg] (default: 45.0)")                                  \
+    X(".lyot_spider_offset", &param_lyot_spid_off, FPTYPE_FLOAT32, 0,                   \
+      FPFLAG_DEFAULT_INPUT,                                                             \
+      "Lyot V-spider X-vertex offset fraction of pup_diam (default: 0.0)")              \
+    X(".reset_long", &param_reset_long, FPTYPE_ONOFF, 0,                                \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Toggle ON to reset cumulative pre-Lyot intensity and LOWFS power counters")      \
     X(".backend", &param_backend, FPTYPE_INT32, 0, FPFLAG_DEFAULT_INPUT,                \
       "Compute backend: 0=auto, 1=CPU, 2=CUDA")
 
@@ -241,7 +255,7 @@ static MILK_COLD errno_t coro_confcheck(void)
 {
     if (dcfpsptr != NULL)
     {
-        const char *live_keys[] = { ".lowfs_mode", ".lowfs_refl", ".tput" };
+        const char *live_keys[] = { ".lowfs_mode", ".lowfs_refl", ".tput", ".reset_long" };
         for (size_t i = 0; i < sizeof(live_keys) / sizeof(live_keys[0]); i++)
         {
             long idx = functionparameter_GetParamIndex(dcfpsptr, live_keys[i]);
@@ -318,10 +332,11 @@ static MILK_HOT errno_t coro_compute(const MILK_RUNNABLE *self)
         .lowfs_refl      = param_lowfs_refl,
         .lyot_outer      = param_lyot_outer,
         .lyot_obs        = param_lyot_obs,
-        .lyot_nspider    = param_lyot_nspider,
-        .lyot_spider_w   = param_lyot_spid_w,
-        .lyot_spider_deg = param_lyot_spid_deg,
-        .backend         = param_backend,
+        .lyot_nspider       = param_lyot_nspider,
+        .lyot_spider_w      = param_lyot_spid_w,
+        .lyot_spider_deg    = param_lyot_spid_deg,
+        .lyot_spider_offset = param_lyot_spid_off,
+        .backend            = param_backend,
         .fpm_pixscale_ld = param_fpm_pixscale,
         .bw_frac         = param_bw_frac,
         .nlambda         = param_nlambda,
@@ -367,12 +382,44 @@ static MILK_HOT errno_t coro_compute(const MILK_RUNNABLE *self)
         }
     }
 
+    IMGID img_pre_lyot = { 0 };
+    IMGID img_pre_long = { 0 };
+    img_pre_lyot.ID    = -1;
+    img_pre_long.ID    = -1;
+    if (param_out_pre_lyot[0] != '\0')
+    {
+        img_pre_lyot = stream_connect_create_2Df32(param_out_pre_lyot, nwf, nwf);
+        if (img_pre_lyot.ID != -1)
+        {
+            cacaosim_coro_shm_write_kw(img_pre_lyot.im, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0ULL);
+        }
+    }
+    if (param_out_pre_long[0] != '\0')
+    {
+        img_pre_long = stream_connect_create_2Df32(param_out_pre_long, nwf, nwf);
+        if (img_pre_long.ID != -1)
+        {
+            cacaosim_coro_shm_write_kw(img_pre_long.im, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0ULL);
+        }
+    }
+
     cacaosim_spec_t fallback_spec;
     cacaosim_spec_star(&fallback_spec, 8.2f, 0.30f, 8.0f, 5778.0f, 0.75f);
 
     MILK_PROCINFO_INIT(self)
     MILK_PROCINFO_LOOPSTART(self)
     {
+        if (param_reset_long)
+        {
+            cacaosim_coro_reset_long(&coro_ctx);
+            if (img_pre_long.ID != -1)
+            {
+                cacaosim_coro_shm_write_kw(img_pre_long.im, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                           0ULL);
+            }
+            param_reset_long = 0;
+        }
+
         const float *in_opd  = img_in.im->array.F;
         const float *in_amp  = (img_in.md->naxis == 3 && img_in.md->size[2] >= 2)
                                    ? (img_in.im->array.F + npix)
@@ -423,10 +470,51 @@ static MILK_HOT errno_t coro_compute(const MILK_RUNNABLE *self)
                                             coro_ctx.lam_um[coro_ctx.eff_nlam - 1]);
             processinfo_update_output_stream(processinfo, img_lowfs.im, img_in.im);
         }
+
+        if (img_pre_lyot.ID != -1 || img_pre_long.ID != -1)
+        {
+            if (img_pre_lyot.ID != -1)
+            {
+                img_pre_lyot.md->write = 1;
+            }
+            if (img_pre_long.ID != -1)
+            {
+                img_pre_long.md->write = 1;
+            }
+            cacaosim_coro_readout_telemetry_async(
+                &coro_ctx, (img_pre_lyot.ID != -1) ? img_pre_lyot.im->array.F : NULL,
+                (img_pre_long.ID != -1) ? img_pre_long.im->array.F : NULL, 1);
+            if (img_pre_lyot.ID != -1)
+            {
+                cacaosim_coro_shm_write_kw(
+                    img_pre_lyot.im, coro_ctx.long_frac_lowfs, coro_ctx.last_frac_lowfs,
+                    coro_ctx.long_frac_pre_lyot, coro_ctx.last_frac_pre_lyot,
+                    coro_ctx.long_frac_lyot_trans, coro_ctx.last_frac_lyot_trans,
+                    coro_ctx.long_cnt);
+                processinfo_update_output_stream(processinfo, img_pre_lyot.im, img_in.im);
+            }
+            if (img_pre_long.ID != -1)
+            {
+                cacaosim_coro_shm_write_kw(
+                    img_pre_long.im, coro_ctx.long_frac_lowfs, coro_ctx.last_frac_lowfs,
+                    coro_ctx.long_frac_pre_lyot, coro_ctx.last_frac_pre_lyot,
+                    coro_ctx.long_frac_lyot_trans, coro_ctx.last_frac_lyot_trans,
+                    coro_ctx.long_cnt);
+                processinfo_update_output_stream(processinfo, img_pre_long.im, img_in.im);
+            }
+        }
     }
     MILK_PROCINFO_END(self)
 
     cacaosim_coro_free(&coro_ctx);
+    if (img_pre_long.ID != -1)
+    {
+        imgid_free(&img_pre_long);
+    }
+    if (img_pre_lyot.ID != -1)
+    {
+        imgid_free(&img_pre_lyot);
+    }
     if (img_lowfs.ID != -1)
     {
         imgid_free(&img_lowfs);

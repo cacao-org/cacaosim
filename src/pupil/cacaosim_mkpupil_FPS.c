@@ -46,6 +46,7 @@ static float    param_cobs                                   = 0.30f;
 static int32_t  param_nspider                                = 4;
 static float    param_spider_w                               = 0.01f;
 static float    param_spider_deg                             = 45.0f;
+static float    param_spider_offset                          = 0.0f;
 static char     param_out_ncpa[FUNCTION_PARAMETER_STRMAXLEN] = "";
 static float    param_ncpa_rms                               = 0.0f;
 static uint64_t param_ncpa_seed                              = 42;
@@ -82,6 +83,8 @@ static uint64_t param_ncpa_seed                              = 42;
       "Spider vane width as fraction of pup_diam (default: 0.01)")                      \
     X(".spider_deg", &param_spider_deg, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,        \
       "Spider vane azimuth offset [deg] (default: 45)")                                 \
+    X(".spider_offset", &param_spider_offset, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,  \
+      "V-spider X-vertex offset fraction of pup_diam (default: 0.0 = radial)")          \
     X(".out_ncpa", param_out_ncpa, FPTYPE_STRING, 0, FPFLAG_DEFAULT_INPUT,              \
       "Optional output static NCPA OPD stream [um] (empty = skip)")                     \
     X(".ncpa_rms", &param_ncpa_rms, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,            \
@@ -144,12 +147,13 @@ static MILK_HOT errno_t mkpupil_compute(const MILK_RUNNABLE *self)
     MILK_PROCINFO_LOOPSTART(self)
     {
         cacaosim_pupil_cfg_t cfg = {
-            .nwf        = param_nwf,
-            .pup_diam   = param_pup_diam,
-            .cobs       = param_cobs,
-            .nspider    = param_nspider,
-            .spider_w   = param_spider_w,
-            .spider_deg = param_spider_deg,
+            .nwf           = param_nwf,
+            .pup_diam      = param_pup_diam,
+            .cobs          = param_cobs,
+            .nspider       = param_nspider,
+            .spider_w      = param_spider_w,
+            .spider_deg    = param_spider_deg,
+            .spider_offset = param_spider_offset,
         };
 
         /* Flag SHM write-in-progress, render 4x4 anti-aliased pupil, and post semaphores */

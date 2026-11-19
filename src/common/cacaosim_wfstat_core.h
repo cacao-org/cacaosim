@@ -33,8 +33,25 @@ extern "C" {
 
 #define CACAOSIM_WFSTAT_NB_LOC    3
 #define CACAOSIM_WFSTAT_NB_SAMP   5
-#define CACAOSIM_WFSTAT_NB_EXTRA  14
-#define CACAOSIM_WFSTAT_NB_STREHL 7
+#define CACAOSIM_WFSTAT_NB_EXTRA  19
+#define CACAOSIM_WFSTAT_NB_STREHL 8
+
+/**
+ * struct cacaosim_wfstat_coro_t - Coronagraph & LOWFS optical power-fraction time-series track
+ */
+typedef struct
+{
+    IMGID     img;
+    uint64_t  last_cnt0;
+    uint64_t  cap;
+    uint64_t  len;
+    uint64_t *frame;
+    float    *f_lowfs_inst;
+    float    *f_lowfs_long;
+    float    *f_pre_inst;
+    float    *f_trans_inst;
+    int       active;
+} cacaosim_wfstat_coro_t;
 
 /**
  * struct cacaosim_wfstat_strehl_t - Per-camera Strehl time-series capture track
@@ -119,6 +136,7 @@ typedef struct
     uint64_t                 ts_len;
     float                   *ts_rms[CACAOSIM_WFSTAT_NB_LOC];
     cacaosim_wfstat_strehl_t strehl[CACAOSIM_WFSTAT_NB_STREHL];
+    cacaosim_wfstat_coro_t   coro_ts;
 
     int   use_cuda;
     void *gpu;

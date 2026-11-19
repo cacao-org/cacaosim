@@ -778,6 +778,48 @@ int cacaosim_fpcam_shm_read_kw(
     double      *sr_inst,
     double      *sr_axis);
 
+/**
+ * cacaosim_coro_shm_write_kw() - Write fixed-slot power-budget keywords to a coronagraph 2D SHM
+ * @im:           Target 2D pre-Lyot intensity `IMAGE` (`NBkw >= 7`; no-op if NULL or undersized)
+ * @f_lowfs_long: Cumulative fraction of coronagraph input entering `out_lowfs` (`kw[0]`: `F_LOWFS`)
+ * @f_lowfs_inst: Instantaneous fraction entering `out_lowfs` (`kw[1]`: `F_LOWFSI`)
+ * @f_pre_long:   Cumulative fraction incident on the Lyot stop (`kw[2]`: `F_PRELYO`)
+ * @f_pre_inst:   Instantaneous fraction incident on the Lyot stop (`kw[3]`: `F_PRELYI`)
+ * @f_trans_long: Cumulative fraction transmitted past the Lyot stop (`kw[4]`: `F_LYOTTR`)
+ * @f_trans_inst: Instantaneous fraction transmitted past the Lyot stop (`kw[5]`: `F_LYOTTI`)
+ * @long_cnt:     Cumulative coronagraph frame count (`kw[6]`: `LONGC`)
+ */
+void cacaosim_coro_shm_write_kw(
+    IMAGE   *im,
+    float    f_lowfs_long,
+    float    f_lowfs_inst,
+    float    f_pre_long,
+    float    f_pre_inst,
+    float    f_trans_long,
+    float    f_trans_inst,
+    uint64_t long_cnt);
+
+/**
+ * cacaosim_coro_shm_read_kw() - Read fixed-slot coronagraph & LOWFS power-budget SHM keywords
+ * @im:           Source 2D pre-Lyot intensity `IMAGE` (`NULL` returns `0`)
+ * @f_lowfs_long: Optional output for cumulative LOWFS beam power fraction
+ * @f_lowfs_inst: Optional output for instantaneous LOWFS beam power fraction
+ * @f_pre_long:   Optional output for cumulative pre-Lyot incident power fraction
+ * @f_pre_inst:   Optional output for instantaneous pre-Lyot incident power fraction
+ * @f_trans_long: Optional output for cumulative post-Lyot transmitted power fraction
+ * @f_trans_inst: Optional output for instantaneous post-Lyot transmitted power fraction
+ *
+ * Return: `1` if valid `F_LOWFS` metadata was read, `0` otherwise.
+ */
+int cacaosim_coro_shm_read_kw(
+    const IMAGE *im,
+    double      *f_lowfs_long,
+    double      *f_lowfs_inst,
+    double      *f_pre_long,
+    double      *f_pre_inst,
+    double      *f_trans_long,
+    double      *f_trans_inst);
+
 #ifdef __cplusplus
 }
 #endif

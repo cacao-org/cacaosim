@@ -44,13 +44,16 @@ static const wfstat_extra_def_t s_extra_defs[CACAOSIM_WFSTAT_NB_EXTRA] = {
     { "psf_inst_vis_raw", "psf_vis_raw", 4 },     { "psf_inst_vis_stg1", "psf_vis_stg1", 4 },
     { "psf_inst_vis_final", "psf_vis_final", 4 }, { "psf_inst_nir_raw", "psf_nir_raw", 4 },
     { "psf_inst_nir_stg1", "psf_nir_stg1", 4 },   { "psf_inst_nir_final", "psf_nir_final", 4 },
+    { "wfs_raw_stg3", "csim_wfs_lowfs", 2 },      { "wfs_sig_stg3", "aol3_imWFS2", 3 },
+    { "dm_cmd_stg3", "aol3_dmC", 1 },             { "psf_inst_nir_coro", "psf_nir_coro", 4 },
+    { "coro_pre_lyot", "coro_pre_lyot", 5 },
 };
 
 static const wfstat_strehl_def_t s_strehl_defs[CACAOSIM_WFSTAT_NB_STREHL] = {
     { "vis_raw", "psf_vis_raw_long" },     { "vis_stg1", "psf_vis_stg1_long" },
     { "vis_final", "psf_vis_final_long" }, { "nir_raw", "psf_nir_raw_long" },
     { "nir_stg1", "psf_nir_stg1_long" },   { "nir_final", "psf_nir_final_long" },
-    { "sci", "csim_fplong" },
+    { "sci", "csim_fplong" },              { "nir_coro", "psf_nir_coro_long" },
 };
 
 static const char *s_loc_keys[CACAOSIM_WFSTAT_NB_LOC] = { "raw", "stg1", "final" };
@@ -101,6 +104,7 @@ int cacaosim_wfstat_init(
     {
         ws->strehl[c].img.ID = -1;
     }
+    ws->coro_ts.img.ID = -1;
     ws->nwf        = nwf;
     ws->npix       = (uint64_t) nwf * nwf;
     ws->snap_extra = snap_extra;
@@ -203,6 +207,24 @@ int cacaosim_wfstat_init(
                 st->last_cnt0 = st->img.md->cnt0;
                 st->active    = 1;
             }
+        }
+        ws->coro_ts.img = stream_connect("coro_pre_lyot_long");
+        if (ws->coro_ts.img.ID != -1 && ws->coro_ts.img.md != NULL)
+        {
+            ws->coro_ts.cap          = ws->ts_cap;
+            ws->coro_ts.frame        = (uint64_t *) calloc(ws->ts_cap, sizeof(uint64_t));
+            ws->coro_ts.f_lowfs_inst = (float *) calloc(ws->ts_cap, sizeof(float));
+            ws->coro_ts.f_lowfs_long = (float *) calloc(ws->ts_cap, sizeof(float));
+            ws->coro_ts.f_pre_inst   = (float *) calloc(ws->ts_cap, sizeof(float));
+            ws->coro_ts.f_trans_inst = (float *) calloc(ws->ts_cap, sizeof(float));
+            if (!ws->coro_ts.frame || !ws->coro_ts.f_lowfs_inst || !ws->coro_ts.f_lowfs_long ||
+                !ws->coro_ts.f_pre_inst || !ws->coro_ts.f_trans_inst)
+            {
+                cacaosim_wfstat_free(ws);
+                return -1;
+            }
+            ws->coro_ts.last_cnt0 = ws->coro_ts.img.md->cnt0;
+            ws->coro_ts.active    = 1;
         }
     }
 
@@ -339,6 +361,22 @@ static void snapshot_extras(cacaosim_wfstat_t *ws)
             es->m1[s] = sm;
             es->m2[s] = mx;
         }
+        else if (kind == 5)
+        {
+            double sm = 0.0, mx = 0.0;
+            for (uint64_t i = 0; i < epix; i++)
+            {
+                float v = src[i];
+                dst[i]  = v;
+                sm += (double) v;
+                if ((double) v > mx)
+                {
+                    mx = (double) v;
+                }
+            }
+            es->m1[s] = mx;
+            es->m2[s] = sm;
+        }
         else
         {
             double sm = 0.0, mx = 0.0;
@@ -429,6 +467,26 @@ void cacaosim_wfstat_frame(cacaosim_wfstat_t *ws, const float *const opd_um[])
                 }
             }
         }
+        if (ws->coro_ts.active && ws->coro_ts.img.md != NULL)
+        {
+            uint64_t cnt0 = ws->coro_ts.img.md->cnt0;
+            if (cnt0 != ws->coro_ts.last_cnt0)
+            {
+                ws->coro_ts.last_cnt0 = cnt0;
+                double fl_l = 0.0, fl_i = 0.0, fp_l = 0.0, fp_i = 0.0, ft_l = 0.0, ft_i = 0.0;
+                if (cacaosim_coro_shm_read_kw(ws->coro_ts.img.im, &fl_l, &fl_i, &fp_l, &fp_i,
+                                              &ft_l, &ft_i) &&
+                    ws->coro_ts.len < ws->coro_ts.cap)
+                {
+                    uint64_t idx                  = ws->coro_ts.len++;
+                    ws->coro_ts.frame[idx]        = ws->n_frames;
+                    ws->coro_ts.f_lowfs_inst[idx] = (float) fl_i;
+                    ws->coro_ts.f_lowfs_long[idx] = (float) fl_l;
+                    ws->coro_ts.f_pre_inst[idx]   = (float) fp_i;
+                    ws->coro_ts.f_trans_inst[idx] = (float) ft_i;
+                }
+            }
+        }
     }
 }
 
@@ -493,6 +551,10 @@ static void write_samples_json(FILE *jfp, const cacaosim_wfstat_t *ws, double dt
             case 4:
                 k1 = "peak_adu";
                 k2 = "sum_adu";
+                break;
+            case 5:
+                k1 = "peak_int";
+                k2 = "sum_int";
                 break;
             default:
                 break;
@@ -570,13 +632,19 @@ static uint64_t write_strehl_timeseries_csv(
         {
             return 0;
         }
+        int has_coro = (ws->strehl[7].active && ws->strehl[7].len > 0) ? 1 : 0;
         fprintf(fp, "exposure,frame,t_phys_s");
         for (int c = 0; c < 6; c++)
         {
             fprintf(fp, ",%s_inst,%s_long", s_strehl_defs[c].key, s_strehl_defs[c].key);
         }
+        if (has_coro)
+        {
+            fprintf(fp, ",nir_coro_inst,nir_coro_long,nir_coro_axis");
+        }
         fprintf(fp, "\n");
-        uint64_t cur[6] = { 0, 0, 0, 0, 0, 0 };
+        uint64_t cur[6]   = { 0, 0, 0, 0, 0, 0 };
+        uint64_t cur_coro = 0;
         for (uint64_t r = 0; r < ao3k_max_len; r++)
         {
             uint64_t exp_id = r + 1U;
@@ -603,6 +671,24 @@ static uint64_t write_strehl_timeseries_csv(
                 else
                 {
                     fprintf(fp, ",nan,nan");
+                }
+            }
+            if (has_coro)
+            {
+                const cacaosim_wfstat_strehl_t *sc = &ws->strehl[7];
+                while (cur_coro + 1U < sc->len && sc->frame[cur_coro] < fr)
+                {
+                    cur_coro++;
+                }
+                if (cur_coro < sc->len && sc->frame[cur_coro] == fr)
+                {
+                    fprintf(fp, ",%.6e,%.6e,%.6e", (double) sc->sr_inst[cur_coro],
+                            (double) sc->sr_long[cur_coro], (double) sc->sr_axis[cur_coro]);
+                    cur_coro++;
+                }
+                else
+                {
+                    fprintf(fp, ",nan,nan,nan");
                 }
             }
             fprintf(fp, "\n");
@@ -677,6 +763,44 @@ void cacaosim_wfstat_sync_gpu(cacaosim_wfstat_t *ws)
             ws->strehl[c].img.ID = -1;
         }
     }
+    if (ws->coro_ts.img.ID != -1)
+    {
+        imgid_free(&ws->coro_ts.img);
+        ws->coro_ts.img.ID = -1;
+    }
+}
+
+static uint64_t write_coro_light_timeseries_csv(
+    const cacaosim_wfstat_t *ws,
+    const char              *out_dir,
+    double                   dt_phys)
+{
+    if (!ws->coro_ts.active || ws->coro_ts.len == 0)
+    {
+        return 0;
+    }
+    char tmp[1280], dst[1280];
+    snprintf(tmp, sizeof(tmp), "%s/.lowfs_light_timeseries.csv.tmp", out_dir);
+    snprintf(dst, sizeof(dst), "%s/lowfs_light_timeseries.csv", out_dir);
+    FILE *fp = fopen(tmp, "w");
+    if (fp == NULL)
+    {
+        return 0;
+    }
+    fprintf(fp, "sample,frame,t_phys_s,frac_lowfs_inst,frac_lowfs_long,"
+                "frac_pre_lyot_inst,frac_lyot_trans_inst,frac_fpm_abs_inst\n");
+    for (uint64_t r = 0; r < ws->coro_ts.len; r++)
+    {
+        uint64_t fr    = ws->coro_ts.frame[r];
+        double   f_pre = (double) ws->coro_ts.f_pre_inst[r];
+        double   f_abs = (1.0 - f_pre > 0.0) ? (1.0 - f_pre) : 0.0;
+        fprintf(fp, "%" PRIu64 ",%" PRIu64 ",%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n", r + 1U, fr,
+                (double) fr * dt_phys, (double) ws->coro_ts.f_lowfs_inst[r],
+                (double) ws->coro_ts.f_lowfs_long[r], f_pre,
+                (double) ws->coro_ts.f_trans_inst[r], f_abs);
+    }
+    fclose(fp);
+    return (rename(tmp, dst) == 0) ? ws->coro_ts.len : 0;
 }
 
 int cacaosim_wfstat_write(cacaosim_wfstat_t *ws, const char *out_dir, double dt_phys)
@@ -774,8 +898,9 @@ int cacaosim_wfstat_write(cacaosim_wfstat_t *ws, const char *out_dir, double dt_
     }
 
     /* Flush CSV time series before publishing wf_stats.json so pollers see complete artifacts */
-    uint64_t wf_rows = write_wf_timeseries_csv(ws, out_dir, dt_phys);
-    uint64_t sr_rows = write_strehl_timeseries_csv(ws, out_dir, dt_phys);
+    uint64_t wf_rows   = write_wf_timeseries_csv(ws, out_dir, dt_phys);
+    uint64_t sr_rows   = write_strehl_timeseries_csv(ws, out_dir, dt_phys);
+    uint64_t coro_rows = write_coro_light_timeseries_csv(ws, out_dir, dt_phys);
 
     int rc = -1;
     if (jfp)
@@ -787,7 +912,10 @@ int cacaosim_wfstat_write(cacaosim_wfstat_t *ws, const char *out_dir, double dt_
         fprintf(jfp, "    \"wf_rms_rows\": %" PRIu64 ",\n", wf_rows);
         fprintf(jfp, "    \"strehl_csv\": %s,\n",
                 (sr_rows > 0) ? "\"strehl_timeseries.csv\"" : "null");
-        fprintf(jfp, "    \"strehl_rows\": %" PRIu64 "\n", sr_rows);
+        fprintf(jfp, "    \"strehl_rows\": %" PRIu64 ",\n", sr_rows);
+        fprintf(jfp, "    \"lowfs_light_csv\": %s,\n",
+                (coro_rows > 0) ? "\"lowfs_light_timeseries.csv\"" : "null");
+        fprintf(jfp, "    \"lowfs_light_rows\": %" PRIu64 "\n", coro_rows);
         fprintf(jfp, "  },\n");
         write_samples_json(jfp, ws, dt_phys);
         fprintf(jfp, "}\n");
@@ -832,6 +960,16 @@ void cacaosim_wfstat_free(cacaosim_wfstat_t *ws)
             ws->strehl[c].img.ID = -1;
         }
     }
+    free(ws->coro_ts.frame);
+    free(ws->coro_ts.f_lowfs_inst);
+    free(ws->coro_ts.f_lowfs_long);
+    free(ws->coro_ts.f_pre_inst);
+    free(ws->coro_ts.f_trans_inst);
+    if (ws->coro_ts.img.ID != -1)
+    {
+        imgid_free(&ws->coro_ts.img);
+        ws->coro_ts.img.ID = -1;
+    }
     for (int k = 0; k < CACAOSIM_WFSTAT_NB_LOC; k++)
     {
         free(ws->sum_wf[k]);
@@ -853,4 +991,5 @@ void cacaosim_wfstat_free(cacaosim_wfstat_t *ws)
     {
         ws->strehl[c].img.ID = -1;
     }
+    ws->coro_ts.img.ID = -1;
 }

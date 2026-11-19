@@ -203,6 +203,8 @@ typedef struct
     char                 in_wfe[CACAOSIM_BENCH_NAME_LEN];
     char                 out_cam[CACAOSIM_BENCH_NAME_LEN];
     char                 out_long[CACAOSIM_BENCH_NAME_LEN];
+    char                 out_pre_lyot[CACAOSIM_BENCH_NAME_LEN];
+    char                 out_pre_lyot_long[CACAOSIM_BENCH_NAME_LEN];
     char                 in_ncpa[CACAOSIM_BENCH_NAME_LEN];
     char                 in_pup_amp[CACAOSIM_BENCH_PATH_LEN];
     char                 in_pup_pha[CACAOSIM_BENCH_PATH_LEN];
@@ -226,7 +228,9 @@ typedef struct
     float                bw_frac;
     float                qe;
     int32_t              use_beam_flux;
+    int32_t              is_wfs;
     float                wfe_rms_nm;
+    float                wfe_defocus_nm;
     float                wfe_alpha;
     float                wfe_gain;
     uint64_t             wfe_seed;
@@ -284,6 +288,7 @@ typedef struct
     int32_t             nspider;
     float               spider_w;
     float               spider_deg;
+    float               spider_offset;
     float               tel_diam_m;
     float               star_mag;
     float               star_teff;
@@ -474,6 +479,8 @@ typedef struct
     IMGID               img_long;
     IMGID               img_ncpa;
     IMGID               img_lyot;
+    IMGID               img_pre_lyot;
+    IMGID               img_pre_lyot_long;
     IMGID               img_ncpa_refl;
     IMGID               img_ncpa_trans;
     IMGID               img_pup_refl;

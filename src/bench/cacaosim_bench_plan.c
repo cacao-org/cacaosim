@@ -757,6 +757,7 @@ int cacaosim_bench_emit_plan(
         fprintf(f_meta, "NSPIDER\t4\n");
         fprintf(f_meta, "SPIDER_W\t0.01\n");
         fprintf(f_meta, "SPIDER_DEG\t45.0\n");
+        fprintf(f_meta, "SPIDER_OFFSET\t0.0\n");
         fprintf(f_meta, "MKPUPIL_OUT\tcsim_pup\n");
         fprintf(f_meta, "IN_PUP\tcsim_pup\n");
         fprintf(f_meta, "IN_WF\toutarraypha\n");
@@ -1055,6 +1056,8 @@ int cacaosim_bench_emit_plan(
             fprintf(f_bat, "csim_mkbeam.obs_frac = %.8g\n", cfg.cobs);
             fprintf(f_bat, "csim_mkbeam.n_spiders = %d\n", cfg.nspider);
             fprintf(f_bat, "csim_mkbeam.spider_w = %.8g\n", cfg.spider_w);
+            fprintf(f_bat, "csim_mkbeam.spider_deg = %.8g\n", cfg.spider_deg);
+            fprintf(f_bat, "csim_mkbeam.spider_offset = %.8g\n", cfg.spider_offset);
             fprintf(f_bat, "csim_mkbeam.tel_diam_m = %.8g\n", cfg.tel_diam_m);
             fprintf(f_bat, "csim_mkbeam.star_mag = %.8g\n", cfg.star_mag);
             fprintf(f_bat, "csim_mkbeam.star_teff = %.8g\n", cfg.star_teff);
@@ -1174,12 +1177,15 @@ int cacaosim_bench_emit_plan(
                 else if (nd->cfg.kind == CACAOSIM_NODE_CORO)
                 {
                     fprintf(f_man,
-                            "%s milk-fpsexec-cacaosim-coro .out_lowfs= .in_pup_amp= .in_pup_pha="
-                            " .in_fpm_amp= .in_fpm_pha= .in_lyot= .in_lyot_pha=\n",
+                            "%s milk-fpsexec-cacaosim-coro .out_lowfs= .out_pre_lyot="
+                            " .out_pre_lyot_long= .in_pup_amp= .in_pup_pha= .in_fpm_amp="
+                            " .in_fpm_pha= .in_lyot= .in_lyot_pha=\n",
                             fps);
                     fprintf(f_bat, "%s.in_beam = %s\n", fps, inb);
                     fprintf(f_bat, "%s.out_beam = %s\n", fps, nd->cfg.out_beam);
                     emit_str_if_set(f_bat, fps, ".out_lowfs", nd->cfg.out_lowfs);
+                    emit_str_if_set(f_bat, fps, ".out_pre_lyot", nd->cfg.out_pre_lyot);
+                    emit_str_if_set(f_bat, fps, ".out_pre_lyot_long", nd->cfg.out_pre_lyot_long);
                     emit_str_if_set(f_bat, fps, ".in_pup_amp", nd->cfg.in_pup_amp);
                     emit_str_if_set(f_bat, fps, ".in_pup_pha", nd->cfg.in_pup_pha);
                     emit_str_if_set(f_bat, fps, ".in_fpm_amp", nd->cfg.in_fpm_amp);
@@ -1210,10 +1216,15 @@ int cacaosim_bench_emit_plan(
                     fprintf(f_bat, "%s.lyot_spider_w = %.8g\n", fps, nd->cfg.coro.lyot_spider_w);
                     fprintf(f_bat, "%s.lyot_spider_deg = %.8g\n", fps,
                             nd->cfg.coro.lyot_spider_deg);
+                    fprintf(f_bat, "%s.lyot_spider_offset = %.8g\n", fps,
+                            nd->cfg.coro.lyot_spider_offset);
                     fprintf(f_bat, "%s.backend = %d\n", fps, cfg.backend);
 
                     add_unique_item(streams, &n_streams, PLAN_MAX_STREAMS, nd->cfg.out_beam);
                     add_unique_item(streams, &n_streams, PLAN_MAX_STREAMS, nd->cfg.out_lowfs);
+                    add_unique_item(streams, &n_streams, PLAN_MAX_STREAMS, nd->cfg.out_pre_lyot);
+                    add_unique_item(streams, &n_streams, PLAN_MAX_STREAMS,
+                                    nd->cfg.out_pre_lyot_long);
                 }
                 else if (nd->cfg.kind == CACAOSIM_NODE_WFE)
                 {
@@ -1236,6 +1247,7 @@ int cacaosim_bench_emit_plan(
                     fprintf(f_bat, "%s.nwf = %u\n", fps, cfg.nwf);
                     fprintf(f_bat, "%s.pup_diam = %.8g\n", fps, cfg.pup_diam);
                     fprintf(f_bat, "%s.rms_nm = %.8g\n", fps, nd->cfg.wfe_rms_nm);
+                    fprintf(f_bat, "%s.defocus_nm = %.8g\n", fps, nd->cfg.wfe_defocus_nm);
                     fprintf(f_bat, "%s.psd_alpha = %.8g\n", fps, nd->cfg.wfe_alpha);
                     fprintf(f_bat, "%s.wfe_seed = %llu\n", fps,
                             (unsigned long long) nd->cfg.wfe_seed);
@@ -1494,6 +1506,17 @@ int cacaosim_bench_emit_plan(
                     {
                         EMIT_BEAM_WAIT(nd->out_idx);
                         EMIT_BEAM_WAIT(nd->lowfs_idx);
+                        if (nd->cfg.out_pre_lyot[0] != '\0')
+                        {
+                            EMIT_W_SEP();
+                            fprintf(f_wav, "%s:%ux%u+1", nd->cfg.out_pre_lyot, cfg.nwf, cfg.nwf);
+                        }
+                        if (nd->cfg.out_pre_lyot_long[0] != '\0')
+                        {
+                            EMIT_W_SEP();
+                            fprintf(f_wav, "%s:%ux%u+1", nd->cfg.out_pre_lyot_long, cfg.nwf,
+                                    cfg.nwf);
+                        }
                     }
                     else if (nd->cfg.kind == CACAOSIM_NODE_WFE)
                     {
@@ -1550,6 +1573,7 @@ int cacaosim_bench_emit_plan(
         fprintf(f_meta, "NSPIDER\t%d\n", cfg.nspider);
         fprintf(f_meta, "SPIDER_W\t%.8g\n", cfg.spider_w);
         fprintf(f_meta, "SPIDER_DEG\t%.8g\n", cfg.spider_deg);
+        fprintf(f_meta, "SPIDER_OFFSET\t%.8g\n", cfg.spider_offset);
         fprintf(f_meta, "MKPUPIL_OUT\t%s\n", mkpupil_out);
         fprintf(f_meta, "IN_PUP\t%s\n", cfg.in_pup);
         fprintf(f_meta, "IN_WF\t%s\n", cfg.in_wf);

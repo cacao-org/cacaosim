@@ -4938,6 +4938,307 @@ static void test_chromaticity_and_poly_wfs(void)
     free(pup);
 }
 
+static void test_subaru_lyot_coro_and_llowfs(void)
+{
+    printf("\n[17] Subaru Telescope Pupil, Lyot Coronagraph & Defocused Lyot-Refl LLOWFS\n");
+
+    const uint32_t nwf  = 128u;
+    const uint64_t npix = (uint64_t) nwf * nwf;
+    float         *pup  = (float *) calloc(npix, sizeof(float));
+    float         *opd  = (float *) calloc(npix, sizeof(float));
+    char           err[256] = { 0 };
+    char           det[256] = { 0 };
+
+    /* 1. Subaru Nasmyth-IR offset-V spider geometry & 4-quadrant mirror symmetry */
+    cacaosim_pupil_cfg_t scfg = {
+        .nwf           = nwf,
+        .pup_diam      = 0.9375f,
+        .cobs          = 0.307f,
+        .nspider       = 4,
+        .spider_w      = 0.02314f,
+        .spider_deg    = 51.75f,
+        .spider_offset = 0.08289f,
+    };
+    double clear_area = cacaosim_make_pupil(&scfg, pup);
+
+    double max_sym_err = 0.0;
+    for (uint32_t y = 0; y < nwf; y++)
+    {
+        uint32_t ym = nwf - 1u - y;
+        for (uint32_t x = 0; x < nwf; x++)
+        {
+            uint32_t xm = nwf - 1u - x;
+            float    v  = pup[y * nwf + x];
+            max_sym_err = fmax(max_sym_err, fabs((double) v - (double) pup[y * nwf + xm]));
+            max_sym_err = fmax(max_sym_err, fabs((double) v - (double) pup[ym * nwf + x]));
+        }
+    }
+
+    const float ctr    = 0.5f * (float) (nwf - 1u);
+    const float d_px   = scfg.pup_diam * (float) nwf;
+    const float ang    = 51.75f * (CACAOSIM_PI_F / 180.0f);
+    /* Sample midpoint along the Q1 Subaru V-vane: (off_px + s*cos(51.75), s*sin(51.75)) */
+    const float s_test = 0.32f * d_px;
+    uint32_t    vx     = (uint32_t) lroundf(ctr + 0.08289f * d_px + s_test * cosf(ang));
+    uint32_t    vy     = (uint32_t) lroundf(ctr + s_test * sinf(ang));
+    /* Sample radial 45-deg point at r = 0.25*D (clear on Subaru because V-vane is offset +X) */
+    uint32_t    dx45   = (uint32_t) lroundf(ctr + 0.175f * d_px);
+    uint32_t    dy45   = (uint32_t) lroundf(ctr + 0.175f * d_px);
+    float       v_vane = pup[vy * nwf + vx];
+    float       v_diag = pup[dy45 * nwf + dx45];
+
+    snprintf(det, sizeof(det), "area=%.1f px, sym_err=%.1e, amp_subaru_vane=%.3f, amp_45deg=%.3f",
+             clear_area, max_sym_err, v_vane, v_diag);
+    check_cond(clear_area > 8000.0 && max_sym_err < 1e-6 && v_vane < 0.05f && v_diag > 0.99f,
+               "Subaru Nasmyth-IR offset-V spider pupil geometry", det);
+
+    /* 2. .bench round-trip, skip_fpcam & calib_fast focal-plane WFS, and LLOWFS sensitivity */
+    const char *bench_txt =
+        "[bench]\n"
+        "name          = \"subaru_coro_llowfs\"\n"
+        "nwf           = 128\n"
+        "pup_diam      = 0.9375\n"
+        "pupil_geom    = \"subaru\"\n"
+        "tput_tel      = 0.20\n"
+        "star_mag      = 5.0\n"
+        "master_hz     = 2000.0\n"
+        "backend       = \"cpu\"\n"
+        "\n"
+        "[coro.coro_nir]\n"
+        "in                 = \"b_pup\"\n"
+        "out                = \"b_coro\"\n"
+        "out_lowfs          = \"b_lowfs\"\n"
+        "out_pre_lyot       = \"coro_pre_lyot\"\n"
+        "out_pre_lyot_long  = \"coro_pre_lyot_long\"\n"
+        "mode               = \"lyot_spot\"\n"
+        "lambda_um          = 1.65\n"
+        "bw_frac            = 0.18\n"
+        "nlambda            = 3\n"
+        "fpm_rad_ld         = 3.0\n"
+        "fpm_amp            = 0.0\n"
+        "lowfs_mode         = \"lyot_refl\"\n"
+        "lowfs_refl         = 0.95\n"
+        "tput               = 0.92\n"
+        "lyot_outer         = 0.85\n"
+        "lyot_obs           = 0.38\n"
+        "lyot_nspider       = 4\n"
+        "lyot_spider_w      = 0.040\n"
+        "lyot_spider_deg    = 51.75\n"
+        "lyot_spider_offset = 0.08289\n"
+        "\n"
+        "[fpcam.nir_coro]\n"
+        "in            = \"b_coro\"\n"
+        "out_cam       = \"psf_nir_coro\"\n"
+        "out_long      = \"psf_nir_coro_long\"\n"
+        "ncam          = 64\n"
+        "prop_mode     = \"mft\"\n"
+        "lambda_um     = 1.65\n"
+        "bw_frac       = 0.18\n"
+        "nlambda       = 3\n"
+        "pixscale_ld   = 2.5\n"
+        "photon_noise  = 0\n"
+        "ron_e         = 0.0\n"
+        "bias_adu      = 0.0\n"
+        "out_dtype     = \"float32\"\n"
+        "\n"
+        "[wfe.lowfs_defoc]\n"
+        "in         = \"b_lowfs\"\n"
+        "out        = \"b_lowfs_defoc\"\n"
+        "in_wfe     = \"csim_lowfs_defoc\"\n"
+        "rms_nm     = 0.0\n"
+        "defocus_nm = 200.0\n"
+        "wfe_gain   = 1.0\n"
+        "tput       = 0.98\n"
+        "\n"
+        "[fpcam.wfs_lowfs]\n"
+        "in            = \"b_lowfs_defoc\"\n"
+        "out_cam       = \"csim_wfs_lowfs\"\n"
+        "is_wfs        = 1\n"
+        "ncam          = 64\n"
+        "prop_mode     = \"mft\"\n"
+        "lambda_um     = 1.65\n"
+        "bw_frac       = 0.18\n"
+        "nlambda       = 3\n"
+        "pixscale_ld   = 2.0\n"
+        "photon_noise  = 0\n"
+        "ron_e         = 0.0\n"
+        "bias_adu      = 0.0\n"
+        "out_dtype     = \"float32\"\n";
+
+    cacaosim_bench_cfg_t b0, b1;
+    char                 fmt_buf[8192];
+    int ok_p0 = (cacaosim_bench_parse_str(bench_txt, &b0, err, sizeof(err)) == 0);
+    int flen  = ok_p0 ? cacaosim_bench_format_str(&b0, fmt_buf, sizeof(fmt_buf)) : -1;
+    int ok_rt = (flen > 0 && cacaosim_bench_parse_str(fmt_buf, &b1, err, sizeof(err)) == 0 &&
+                 fabsf(b1.tel_diam_m - 7.95f) < 1e-4f &&
+                 fabsf(b1.cobs - 0.307f) < 1e-4f &&
+                 fabsf(b1.spider_offset - 0.08289f) < 1e-4f &&
+                 fabsf(b1.tput_tel - 0.20f) < 1e-4f &&
+                 fabsf(b1.nodes[0].coro.lyot_spider_offset - 0.08289f) < 1e-4f &&
+                 strcmp(b1.nodes[0].out_pre_lyot, "coro_pre_lyot") == 0 &&
+                 strcmp(b1.nodes[0].out_pre_lyot_long, "coro_pre_lyot_long") == 0 &&
+                 fabsf(b1.nodes[2].wfe_defocus_nm - 200.0f) < 1e-3f &&
+                 b1.nodes[3].is_wfs == 1);
+
+    cacaosim_bench_ctx_t ctx;
+    int ok_init = ok_rt && (cacaosim_bench_init(&ctx, &b1, NULL, 0, err, sizeof(err)) == 0);
+    if (ok_init)
+    {
+        /* Verify oversized Lyot stop masks 100% of entrance spider vanes inside [0.39, 0.84] D */
+        const float *lyot = ctx.nodes[0].coro_ctx.lyot_mask;
+        float        leak = 0.0f;
+        for (uint32_t y = 0; y < nwf; y++)
+        {
+            float dy = ((float) y - ctr) / (0.5f * d_px);
+            for (uint32_t x = 0; x < nwf; x++)
+            {
+                float dx = ((float) x - ctr) / (0.5f * d_px);
+                float r  = hypotf(dx, dy);
+                if (r > 0.39f && r < 0.84f)
+                {
+                    float blocked_in = 1.0f - ctx.pup_ptr[y * nwf + x];
+                    if (blocked_in > 0.5f && lyot[y * nwf + x] > leak)
+                    {
+                        leak = lyot[y * nwf + x];
+                    }
+                }
+            }
+        }
+
+        /* Nominal flat wavefront step: check coronagraph rejection & skip_fpcam WFS preservation */
+        cacaosim_bench_step(&ctx, NULL, NULL, 0.0f, NULL);
+        float  coro_sr    = ctx.last_strehl_inst;
+        float  f_pre_dl   = ctx.nodes[0].coro_ctx.last_frac_pre_lyot;
+        float  f_tr_dl    = ctx.nodes[0].coro_ctx.last_frac_lyot_trans;
+        float  f_lo_dl    = ctx.nodes[0].coro_ctx.last_frac_lowfs;
+        double e_part_err = fabs((double) f_tr_dl + (double) f_lo_dl / (0.95 * 0.95) -
+                                 (double) f_pre_dl);
+
+        int s_coro  = cacaosim_bench_find_sensor(&ctx, "nir_coro");
+        int s_lowfs = cacaosim_bench_find_sensor(&ctx, "wfs_lowfs");
+        float *i0   = (float *) calloc(64u * 64u, sizeof(float));
+        float *ip   = (float *) calloc(64u * 64u, sizeof(float));
+        float *im   = (float *) calloc(64u * 64u, sizeof(float));
+        memcpy(i0, cacaosim_bench_sensor_f32(&ctx, s_lowfs), 64u * 64u * sizeof(float));
+
+        ctx.skip_fpcam = 1;
+        cacaosim_bench_step(&ctx, NULL, NULL, 0.0f, NULL);
+        int skip_ok = (ctx.nodes[ctx.sensor_node_idx[s_coro]].ready_this_tick == 0 &&
+                       ctx.nodes[ctx.sensor_node_idx[s_lowfs]].ready_this_tick == 1 &&
+                       fabsf(ctx.last_strehl_inst - coro_sr) < 1e-7f);
+        ctx.skip_fpcam = 0;
+
+        /* Test +/-10 nm tip and +/-10 nm defocus push-pull linearity in calib_fast mode */
+        ctx.calib_fast = 1;
+        snprintf(ctx.calib_wfs_out, sizeof(ctx.calib_wfs_out), "csim_wfs_lowfs");
+        b1.wf_unit = CACAOSIM_WFUNIT_OPD_UM;
+        ctx.cfg.wf_unit = CACAOSIM_WFUNIT_OPD_UM;
+
+        for (uint32_t y = 0; y < nwf; y++)
+        {
+            for (uint32_t x = 0; x < nwf; x++)
+            {
+                float xn         = ((float) x - ctr) / (0.5f * d_px);
+                opd[y * nwf + x] = 0.010f * 2.0f * xn; /* +10 nm RMS Tip */
+            }
+        }
+        cacaosim_bench_step(&ctx, opd, NULL, 1.0f, NULL);
+        memcpy(ip, cacaosim_bench_sensor_f32(&ctx, s_lowfs), 64u * 64u * sizeof(float));
+        cacaosim_bench_step(&ctx, opd, NULL, -1.0f, NULL);
+        memcpy(im, cacaosim_bench_sensor_f32(&ctx, s_lowfs), 64u * 64u * sizeof(float));
+
+        double tip_dot = 0.0, tip_np = 0.0, tip_nm = 0.0;
+        for (size_t k = 0; k < 64u * 64u; k++)
+        {
+            double dp = (double) ip[k] - (double) i0[k];
+            double dm = (double) im[k] - (double) i0[k];
+            tip_dot += dp * dm;
+            tip_np += dp * dp;
+            tip_nm += dm * dm;
+        }
+        double tip_cos = tip_dot / (sqrt(tip_np * tip_nm) + 1e-30);
+
+        for (uint32_t y = 0; y < nwf; y++)
+        {
+            float yn = ((float) y - ctr) / (0.5f * d_px);
+            for (uint32_t x = 0; x < nwf; x++)
+            {
+                float xn         = ((float) x - ctr) / (0.5f * d_px);
+                float r2         = xn * xn + yn * yn;
+                opd[y * nwf + x] = 0.010f * 1.7320508f * (2.0f * r2 - 1.0f); /* +10 nm Z4 */
+            }
+        }
+        cacaosim_bench_step(&ctx, opd, NULL, 1.0f, NULL);
+        memcpy(ip, cacaosim_bench_sensor_f32(&ctx, s_lowfs), 64u * 64u * sizeof(float));
+        cacaosim_bench_step(&ctx, opd, NULL, -1.0f, NULL);
+        memcpy(im, cacaosim_bench_sensor_f32(&ctx, s_lowfs), 64u * 64u * sizeof(float));
+
+        double foc_dot = 0.0, foc_np = 0.0, foc_nm = 0.0;
+        for (size_t k = 0; k < 64u * 64u; k++)
+        {
+            double dp = (double) ip[k] - (double) i0[k];
+            double dm = (double) im[k] - (double) i0[k];
+            foc_dot += dp * dm;
+            foc_np += dp * dp;
+            foc_nm += dm * dm;
+        }
+        double foc_cos = foc_dot / (sqrt(foc_np * foc_nm) + 1e-30);
+
+        double gpu_err = 0.0;
+        if (cacaosim_cuda_available())
+        {
+            ctx.calib_fast       = 0;
+            ctx.calib_wfs_out[0] = '\0';
+            cacaosim_bench_step(&ctx, opd, NULL, 1.0f, NULL);
+
+            cacaosim_bench_cfg_t bg = b1;
+            bg.backend              = CACAOSIM_BACKEND_CUDA;
+            bg.wf_unit              = CACAOSIM_WFUNIT_OPD_UM;
+            cacaosim_bench_ctx_t cg;
+            if (cacaosim_bench_init(&cg, &bg, NULL, 0, err, sizeof(err)) == 0)
+            {
+                cacaosim_bench_step(&cg, opd, NULL, 1.0f, NULL);
+                gpu_err = fmax(rel_l2_f32(cacaosim_bench_sensor_f32(&ctx, s_coro),
+                                          cacaosim_bench_sensor_f32(&cg, s_coro), 64u * 64u),
+                               rel_l2_f32(cacaosim_bench_sensor_f32(&ctx, s_lowfs),
+                                          cacaosim_bench_sensor_f32(&cg, s_lowfs), 64u * 64u));
+                gpu_err = fmax(gpu_err,
+                               rel_l2_f32(ctx.nodes[0].coro_ctx.cpu_pre_lyot_int,
+                                          cg.nodes[0].coro_ctx.cpu_pre_lyot_int, nwf * nwf));
+                gpu_err = fmax(gpu_err,
+                               fabs((double) ctx.nodes[0].coro_ctx.last_frac_lowfs -
+                                    (double) cg.nodes[0].coro_ctx.last_frac_lowfs));
+                cacaosim_bench_free(&cg);
+            }
+            else
+            {
+                gpu_err = 1.0;
+            }
+        }
+
+        snprintf(det, sizeof(det),
+                 "f_pre=%.3f, f_lo=%.3f, part=%.2e, coro_sr=%.2e, tip=%.3f, foc=%.3f, gpu=%.2e",
+                 f_pre_dl, f_lo_dl, e_part_err, coro_sr, tip_cos, foc_cos, gpu_err);
+        check_cond(leak < 1e-6f && coro_sr < 3e-3f && f_pre_dl > 0.08f && f_pre_dl < 0.20f &&
+                       f_lo_dl > 0.07f && f_lo_dl < 0.18f && e_part_err < 1e-5 && skip_ok &&
+                       tip_np > 1.0 && tip_cos < -0.98 && foc_np > 1.0 && foc_cos < -0.95 &&
+                       gpu_err < 5e-5,
+                   "Subaru Lyot coro rejection, pre-Lyot/LOWFS budget & GPU parity", det);
+
+        free(im);
+        free(ip);
+        free(i0);
+        cacaosim_bench_free(&ctx);
+    }
+    else
+    {
+        check_cond(0, "Subaru Lyot coro .bench parse/init", err);
+    }
+
+    free(opd);
+    free(pup);
+}
+
 int main(void)
 {
     printf("======================================================================\n");
@@ -4961,6 +5262,7 @@ int main(void)
     test_wfstat_cpu_gpu_parity();
     test_temporal_oversampling_physics();
     test_chromaticity_and_poly_wfs();
+    test_subaru_lyot_coro_and_llowfs();
 
     printf("\n======================================================================\n");
     printf("  Summary: %d passed, %d failed\n", g_pass, g_fail);

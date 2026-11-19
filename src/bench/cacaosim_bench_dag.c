@@ -173,9 +173,11 @@ static void init_node_imgids(cacaosim_bench_node_t *nd)
     nd->img_wfe.ID        = -1;
     nd->img_cam.ID        = -1;
     nd->img_long.ID       = -1;
-    nd->img_ncpa.ID       = -1;
-    nd->img_lyot.ID       = -1;
-    nd->img_ncpa_refl.ID  = -1;
+    nd->img_ncpa.ID          = -1;
+    nd->img_lyot.ID          = -1;
+    nd->img_pre_lyot.ID      = -1;
+    nd->img_pre_lyot_long.ID = -1;
+    nd->img_ncpa_refl.ID     = -1;
     nd->img_ncpa_trans.ID = -1;
     nd->img_pup_refl.ID   = -1;
     nd->img_pup_trans.ID  = -1;
@@ -587,9 +589,8 @@ static void propagate_spectra(cacaosim_bench_ctx_t *ctx)
             cacaosim_spec_scale(in_spec, nd->cfg.tput, &ctx->beams[nd->out_idx].spec);
             if (nd->lowfs_idx >= 0)
             {
-                /* lowfs_refl is field-amplitude reflectivity; optical power scales as r^2 */
-                float r2 = nd->cfg.coro.lowfs_refl * nd->cfg.coro.lowfs_refl;
-                cacaosim_spec_scale(in_spec, nd->cfg.tput * r2, &ctx->beams[nd->lowfs_idx].spec);
+                /* lowfs_refl amplitude weight is applied directly inside coro lo_amp */
+                cacaosim_spec_scale(in_spec, nd->cfg.tput, &ctx->beams[nd->lowfs_idx].spec);
             }
         }
         else
@@ -937,12 +938,13 @@ int cacaosim_bench_init(
             return -1;
         }
         cacaosim_pupil_cfg_t pcfg = {
-            .nwf        = ctx->nwf,
-            .pup_diam   = cfg->pup_diam,
-            .cobs       = cfg->cobs,
-            .nspider    = cfg->nspider,
-            .spider_w   = cfg->spider_w,
-            .spider_deg = cfg->spider_deg,
+            .nwf           = ctx->nwf,
+            .pup_diam      = cfg->pup_diam,
+            .cobs          = cfg->cobs,
+            .nspider       = cfg->nspider,
+            .spider_w      = cfg->spider_w,
+            .spider_deg    = cfg->spider_deg,
+            .spider_offset = cfg->spider_offset,
         };
         cacaosim_make_pupil(&pcfg, ctx->fallback_pup);
         ctx->pup_ptr = ctx->fallback_pup;
@@ -1238,11 +1240,35 @@ int cacaosim_bench_init(
                 cacaosim_bench_free(ctx);
                 return -1;
             }
+            if (connect_shm)
+            {
+                if (nd->cfg.out_pre_lyot[0] != '\0')
+                {
+                    nd->img_pre_lyot =
+                        stream_connect_create_2Df32(nd->cfg.out_pre_lyot, ctx->nwf, ctx->nwf);
+                    if (nd->img_pre_lyot.ID != -1)
+                    {
+                        cacaosim_coro_shm_write_kw(nd->img_pre_lyot.im, 0.0f, 0.0f, 0.0f, 0.0f,
+                                                   0.0f, 0.0f, 0ULL);
+                    }
+                }
+                if (nd->cfg.out_pre_lyot_long[0] != '\0')
+                {
+                    nd->img_pre_lyot_long =
+                        stream_connect_create_2Df32(nd->cfg.out_pre_lyot_long, ctx->nwf, ctx->nwf);
+                    if (nd->img_pre_lyot_long.ID != -1)
+                    {
+                        cacaosim_coro_shm_write_kw(nd->img_pre_lyot_long.im, 0.0f, 0.0f, 0.0f,
+                                                   0.0f, 0.0f, 0.0f, 0ULL);
+                    }
+                }
+            }
         }
         else if (nd->cfg.kind == CACAOSIM_NODE_WFE)
         {
             /* Static WFE maps are stored in SI meters [m] in SHM; auto-synthesize if absent */
-            float rms_m = (nd->cfg.wfe_rms_nm > 0.0f) ? (nd->cfg.wfe_rms_nm * 1.0e-9f) : 0.0f;
+            float rms_m   = (nd->cfg.wfe_rms_nm > 0.0f) ? (nd->cfg.wfe_rms_nm * 1.0e-9f) : 0.0f;
+            float defoc_m = nd->cfg.wfe_defocus_nm * 1.0e-9f;
             if (connect_shm)
             {
                 nd->img_wfe = stream_connect(nd->cfg.in_wfe);
@@ -1263,6 +1289,11 @@ int cacaosim_bench_init(
                     cacaosim_make_wfe_m(ctx->nwf, cfg->pup_diam, ctx->pup_ptr, rms_m,
                                         nd->cfg.wfe_alpha, nd->cfg.wfe_seed,
                                         nd->img_wfe.im->array.F);
+                    if (fabsf(defoc_m) > 1e-15f)
+                    {
+                        cacaosim_add_defocus_m(ctx->nwf, cfg->pup_diam, defoc_m,
+                                               nd->img_wfe.im->array.F);
+                    }
                     if (nd->img_wfe.im->kw != NULL && nd->img_wfe.md->NBkw >= 1)
                     {
                         snprintf(nd->img_wfe.im->kw[0].name, KEYWORD_MAX_STRING, "BUNIT");
@@ -1286,6 +1317,10 @@ int cacaosim_bench_init(
                 }
                 cacaosim_make_wfe_m(ctx->nwf, cfg->pup_diam, ctx->pup_ptr, rms_m,
                                     nd->cfg.wfe_alpha, nd->cfg.wfe_seed, nd->wfe_m_buf);
+                if (fabsf(defoc_m) > 1e-15f)
+                {
+                    cacaosim_add_defocus_m(ctx->nwf, cfg->pup_diam, defoc_m, nd->wfe_m_buf);
+                }
             }
 
             if (ctx->use_cuda)
@@ -1664,6 +1699,8 @@ void cacaosim_bench_free(cacaosim_bench_ctx_t *ctx)
         free_imgid_if_valid(&nd->img_long);
         free_imgid_if_valid(&nd->img_ncpa);
         free_imgid_if_valid(&nd->img_lyot);
+        free_imgid_if_valid(&nd->img_pre_lyot);
+        free_imgid_if_valid(&nd->img_pre_lyot_long);
         free_imgid_if_valid(&nd->img_ncpa_refl);
         free_imgid_if_valid(&nd->img_ncpa_trans);
         free_imgid_if_valid(&nd->img_pup_refl);
@@ -1926,10 +1963,11 @@ MILK_HOT void cacaosim_bench_step(
     uint8_t node_live[CACAOSIM_BENCH_MAX_NODES]      = { 0 };
     uint8_t sens_accum[CACAOSIM_BENCH_MAX_NODES]     = { 0 };
     uint8_t sens_read[CACAOSIM_BENCH_MAX_NODES]      = { 0 };
-    uint8_t dm_pend_d2h[CACAOSIM_BENCH_MAX_NODES]    = { 0 };
-    uint8_t fp_pend_finish[CACAOSIM_BENCH_MAX_NODES] = { 0 };
-    int     any_dm_d2h                               = 0;
-    int     any_async_readout                        = 0;
+    uint8_t dm_pend_d2h[CACAOSIM_BENCH_MAX_NODES]      = { 0 };
+    uint8_t fp_pend_finish[CACAOSIM_BENCH_MAX_NODES]   = { 0 };
+    uint8_t coro_pend_finish[CACAOSIM_BENCH_MAX_NODES] = { 0 };
+    int     any_dm_d2h                                 = 0;
+    int     any_async_readout                          = 0;
 
     if (do_export)
     {
@@ -1962,14 +2000,20 @@ MILK_HOT void cacaosim_bench_step(
         {
             continue;
         }
-        if (ctx->skip_fpcam && nd->cfg.kind == CACAOSIM_NODE_FPCAM)
+        int fpcam_is_wfs = (nd->cfg.kind == CACAOSIM_NODE_FPCAM) &&
+                           (nd->cfg.is_wfs ||
+                            (ctx->calib_wfs_out[0] != '\0' &&
+                             strcmp(ctx->calib_wfs_out, "none") != 0 &&
+                             (strcmp(nd->cfg.out_cam, ctx->calib_wfs_out) == 0 ||
+                              strcmp(nd->cfg.id, ctx->calib_wfs_out) == 0)));
+        if (ctx->skip_fpcam && nd->cfg.kind == CACAOSIM_NODE_FPCAM && !fpcam_is_wfs)
         {
             continue;
         }
 
         if (ctx->calib_fast)
         {
-            if (nd->cfg.kind == CACAOSIM_NODE_FPCAM)
+            if (nd->cfg.kind == CACAOSIM_NODE_FPCAM && !fpcam_is_wfs)
             {
                 continue;
             }
@@ -2401,6 +2445,36 @@ MILK_HOT void cacaosim_bench_step(
                                     blow ? blow->amp : NULL, bin->d_opd, bin->d_amp, bout->d_opd,
                                     bout->d_amp, blow ? blow->d_opd : NULL,
                                     blow ? blow->d_amp : NULL);
+            if (!ctx->connect_shm)
+            {
+                if (ctx->use_cuda)
+                {
+                    cacaosim_coro_readout_telemetry_async(
+                        &nd->coro_ctx, nd->coro_ctx.cpu_pre_lyot_int, NULL, 0);
+                    coro_pend_finish[i] = 1u;
+                    any_async_readout   = 1;
+                }
+            }
+            else if (!ctx->calib_fast &&
+                     (nd->img_pre_lyot.ID != -1 || nd->img_pre_lyot_long.ID != -1) &&
+                     (((nd->coro_ctx.long_cnt % 8ULL) == 0ULL) || ctx->wfstat_snap_active ||
+                      nd->coro_ctx.long_cnt <= 2ULL))
+            {
+                if (nd->img_pre_lyot.ID != -1)
+                {
+                    nd->img_pre_lyot.md->write = 1;
+                }
+                if (nd->img_pre_lyot_long.ID != -1)
+                {
+                    nd->img_pre_lyot_long.md->write = 1;
+                }
+                cacaosim_coro_readout_telemetry_async(
+                    &nd->coro_ctx,
+                    (nd->img_pre_lyot.ID != -1) ? nd->img_pre_lyot.im->array.F : NULL,
+                    (nd->img_pre_lyot_long.ID != -1) ? nd->img_pre_lyot_long.im->array.F : NULL, 0);
+                coro_pend_finish[i] = 1u;
+                any_async_readout   = 1;
+            }
         }
         else if (nd->cfg.kind == CACAOSIM_NODE_WFE)
         {
@@ -2579,8 +2653,9 @@ MILK_HOT void cacaosim_bench_step(
                     {
                         nd->img_long.md->write = 1;
                     }
-                    cacaosim_fpcam_readout_async(&nd->fpcam_ctx, &nd->cfg.fpcam.det, dst_u16,
-                                                 dst_f32, dst_long);
+                    cacaosim_det_cfg_t det_cfg = bench_sensor_det(ctx, &nd->cfg.fpcam.det);
+                    cacaosim_fpcam_readout_async(&nd->fpcam_ctx, &det_cfg, dst_u16, dst_f32,
+                                                 dst_long);
                     nd->ready_this_tick = 1;
                     fp_pend_finish[i]   = 1u;
                     any_async_readout   = 1;
@@ -2654,6 +2729,31 @@ MILK_HOT void cacaosim_bench_step(
     for (uint32_t i = 0; i < ctx->n_nodes; i++)
     {
         cacaosim_bench_node_t *nd = &ctx->nodes[i];
+        if (coro_pend_finish[i])
+        {
+            cacaosim_coro_readout_telemetry_finish(&nd->coro_ctx);
+            if (ctx->connect_shm)
+            {
+                if (nd->img_pre_lyot.ID != -1)
+                {
+                    cacaosim_coro_shm_write_kw(
+                        nd->img_pre_lyot.im, nd->coro_ctx.long_frac_lowfs,
+                        nd->coro_ctx.last_frac_lowfs, nd->coro_ctx.long_frac_pre_lyot,
+                        nd->coro_ctx.last_frac_pre_lyot, nd->coro_ctx.long_frac_lyot_trans,
+                        nd->coro_ctx.last_frac_lyot_trans, nd->coro_ctx.long_cnt);
+                    processinfo_update_output_stream(pinfo, nd->img_pre_lyot.im, trig_im);
+                }
+                if (nd->img_pre_lyot_long.ID != -1)
+                {
+                    cacaosim_coro_shm_write_kw(
+                        nd->img_pre_lyot_long.im, nd->coro_ctx.long_frac_lowfs,
+                        nd->coro_ctx.last_frac_lowfs, nd->coro_ctx.long_frac_pre_lyot,
+                        nd->coro_ctx.last_frac_pre_lyot, nd->coro_ctx.long_frac_lyot_trans,
+                        nd->coro_ctx.last_frac_lyot_trans, nd->coro_ctx.long_cnt);
+                    processinfo_update_output_stream(pinfo, nd->img_pre_lyot_long.im, trig_im);
+                }
+            }
+        }
         if (!nd->ready_this_tick)
         {
             continue;
@@ -2661,8 +2761,11 @@ MILK_HOT void cacaosim_bench_step(
         if (fp_pend_finish[i])
         {
             cacaosim_fpcam_readout_finish(&nd->fpcam_ctx);
-            ctx->last_strehl_inst = nd->fpcam_ctx.last_strehl_peak;
-            ctx->last_strehl_ave  = nd->fpcam_ctx.long_strehl_peak;
+            if (!nd->cfg.is_wfs)
+            {
+                ctx->last_strehl_inst = nd->fpcam_ctx.last_strehl_peak;
+                ctx->last_strehl_ave  = nd->fpcam_ctx.long_strehl_peak;
+            }
             if (ctx->connect_shm && nd->img_long.ID != -1)
             {
                 cacaosim_fpcam_shm_write_kw(

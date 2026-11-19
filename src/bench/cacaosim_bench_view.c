@@ -2012,7 +2012,18 @@ static void render_beam_subtree(
         sb_fg(&line, ev->lvl, ev->pal->fg_dim);
         sb_puts(&line, sep);
         sb_fg(&line, ev->lvl, ev->pal->fg_text);
-        sb_printf(&line, "rms=%.0fnm", nd->cfg.wfe_rms_nm);
+        if (fabsf(nd->cfg.wfe_defocus_nm) > 1.0e-3f && nd->cfg.wfe_rms_nm <= 1.0e-3f)
+        {
+            sb_printf(&line, "Z4=%+.0fnm", nd->cfg.wfe_defocus_nm);
+        }
+        else if (fabsf(nd->cfg.wfe_defocus_nm) > 1.0e-3f)
+        {
+            sb_printf(&line, "rms=%.0fnm Z4=%+.0fnm", nd->cfg.wfe_rms_nm, nd->cfg.wfe_defocus_nm);
+        }
+        else
+        {
+            sb_printf(&line, "rms=%.0fnm", nd->cfg.wfe_rms_nm);
+        }
         sb_fg(&line, ev->lvl, ev->pal->fg_dim);
         sb_puts(&line, sep);
         sb_fg(&line, ev->lvl, ev->pal->fg_muted);
@@ -2629,14 +2640,15 @@ void cacaosim_bench_render(
      * (< 4% of pupil diameter) up to 0.04 so ~1%-wide spiders remain visible at 16x16 sampling */
     float                pup16[256] = { 0 };
     cacaosim_pupil_cfg_t pcfg       = {
-        .nwf        = 16,
-        .pup_diam   = ctx->cfg.pup_diam,
-        .cobs       = ctx->cfg.cobs,
-        .nspider    = ctx->cfg.nspider,
-        .spider_w   = (ctx->cfg.spider_w > 0.0f && ctx->cfg.spider_w < 0.04f)
-                          ? 0.04f
-                          : ctx->cfg.spider_w,
-        .spider_deg = ctx->cfg.spider_deg,
+        .nwf           = 16,
+        .pup_diam      = ctx->cfg.pup_diam,
+        .cobs          = ctx->cfg.cobs,
+        .nspider       = ctx->cfg.nspider,
+        .spider_w      = (ctx->cfg.spider_w > 0.0f && ctx->cfg.spider_w < 0.04f)
+                             ? 0.04f
+                             : ctx->cfg.spider_w,
+        .spider_deg    = ctx->cfg.spider_deg,
+        .spider_offset = ctx->cfg.spider_offset,
     };
     cacaosim_make_pupil(&pcfg, pup16);
 
@@ -3207,8 +3219,16 @@ void cacaosim_bench_render(
                 {
                     sb_fg(&rline, ev.lvl, ev.pal->fg_warn);
                     sb_pad_col(&rline, "WFE", 9);
-                    snprintf(mspec, sizeof(mspec), "OPD [m] %.0fnm x%.2f", nd->cfg.wfe_rms_nm,
-                             nd->cfg.wfe_gain);
+                    if (fabsf(nd->cfg.wfe_defocus_nm) > 1.0e-3f && nd->cfg.wfe_rms_nm <= 1.0e-3f)
+                    {
+                        snprintf(mspec, sizeof(mspec), "OPD [m] Z4=%+.0fnm x%.2f",
+                                 nd->cfg.wfe_defocus_nm, nd->cfg.wfe_gain);
+                    }
+                    else
+                    {
+                        snprintf(mspec, sizeof(mspec), "OPD [m] %.0fnm x%.2f", nd->cfg.wfe_rms_nm,
+                                 nd->cfg.wfe_gain);
+                    }
                     sb_fg(&rline, ev.lvl, ev.pal->fg_text);
                     sb_pad_col(&rline, mspec, 26);
                     sb_fg(&rline, ev.lvl, ev.pal->fg_accent);

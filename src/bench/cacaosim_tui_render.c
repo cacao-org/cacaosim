@@ -309,7 +309,19 @@ static void node_short_spec(
         break;
     }
     case CACAOSIM_NODE_WFE:
-        snprintf(out, cap, "%.0fnm [OPD m]", nd->wfe_rms_nm * fabsf(nd->wfe_gain));
+        if (fabsf(nd->wfe_defocus_nm) > 1.0e-3f && nd->wfe_rms_nm <= 1.0e-3f)
+        {
+            snprintf(out, cap, "Z4=%+.0fnm [OPD m]", nd->wfe_defocus_nm * nd->wfe_gain);
+        }
+        else if (fabsf(nd->wfe_defocus_nm) > 1.0e-3f)
+        {
+            snprintf(out, cap, "%.0fnm Z4=%+.0fnm", nd->wfe_rms_nm * fabsf(nd->wfe_gain),
+                     nd->wfe_defocus_nm * nd->wfe_gain);
+        }
+        else
+        {
+            snprintf(out, cap, "%.0fnm [OPD m]", nd->wfe_rms_nm * fabsf(nd->wfe_gain));
+        }
         break;
     }
 }

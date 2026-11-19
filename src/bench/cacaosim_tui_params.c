@@ -59,6 +59,7 @@ enum
     PID_B_NSPIDER,
     PID_B_SPIDER_W,
     PID_B_SPIDER_DEG,
+    PID_B_SPIDER_OFF,
     PID_B_TEL_DIAM,
     PID_B_STAR_MAG,
     PID_B_STAR_TEFF,
@@ -141,6 +142,8 @@ enum
     PID_CO_LYOT_OBS,
     PID_CO_LYOT_NSP,
     PID_CO_LYOT_SPW,
+    PID_CO_LYOT_SPDEG,
+    PID_CO_LYOT_SPOFF,
     PID_CO_IN_PUP_AMP,
     PID_CO_IN_PUP_PHA,
     PID_CO_IN_FPM_AMP,
@@ -176,6 +179,7 @@ enum
 
     /* Static Wavefront Error ([wfe.<id>], OPD in [meter]) synthesis & scaling parameters */
     PID_WFE_RMS_NM = 600,
+    PID_WFE_DEFOCUS_NM,
     PID_WFE_ALPHA,
     PID_WFE_GAIN,
     PID_WFE_SEED
@@ -396,6 +400,9 @@ int cs_params_build(
                    CS_PTYPE_FLOAT, 0.0, 0.15, 0.002, "Spider vane width as fraction of pupil diam");
             add_pd(out, &n, max_out, PID_B_SPIDER_DEG, "spider_deg", "Spider Angle", "deg",
                    CS_PTYPE_FLOAT, 0.0, 180.0, 5.0, "Azimuth angle of first spider vane [deg]");
+            add_pd(out, &n, max_out, PID_B_SPIDER_OFF, "spider_offset", "Spider Offset", "D",
+                   CS_PTYPE_FLOAT, 0.0, 0.45, 0.005,
+                   "V-spider X-vertex offset fraction of pupil diam (0 = radial)");
         }
         else if (subtab == 1)
         {
@@ -659,6 +666,11 @@ int cs_params_build(
                    CS_PTYPE_INT, 0, 12, 1, "Lyot spider mask vane count");
             add_pd(out, &n, max_out, PID_CO_LYOT_SPW, "lyot_spider_w", "Lyot Spider W", "D",
                    CS_PTYPE_FLOAT, 0.0, 0.15, 0.005, "Lyot spider vane width fraction");
+            add_pd(out, &n, max_out, PID_CO_LYOT_SPDEG, "lyot_spider_deg", "Lyot Spid Ang", "deg",
+                   CS_PTYPE_FLOAT, 0.0, 180.0, 5.0, "Lyot spider orientation angle [deg]");
+            add_pd(out, &n, max_out, PID_CO_LYOT_SPOFF, "lyot_spider_offset", "Lyot Spid Off",
+                   "D", CS_PTYPE_FLOAT, 0.0, 0.45, 0.005,
+                   "Lyot V-spider X-vertex offset fraction of pup_diam");
             add_enum_pd(out, &n, max_out, PID_CO_LOWFS_MODE, "lowfs_mode", "LOWFS Pickoff", 2,
                         "fpm_refl", "lyot_refl", NULL, NULL,
                         "0 = FPM-absorbed light reflected, 1 = Reflective Lyot stop");
@@ -687,6 +699,9 @@ int cs_params_build(
             add_pd(out, &n, max_out, PID_WFE_RMS_NM, "rms_nm", "Init Pupil RMS", "nm",
                    CS_PTYPE_FLOAT, 0.0, 5000.0, 5.0,
                    "Target pupil-weighted RMS OPD when initializing map [nm]");
+            add_pd(out, &n, max_out, PID_WFE_DEFOCUS_NM, "defocus_nm", "Z4 Defocus RMS", "nm",
+                   CS_PTYPE_FLOAT, -5000.0, 5000.0, 10.0,
+                   "Additive smooth Zernike Z4 defocus RMS across grid [nm]");
             add_pd(out, &n, max_out, PID_WFE_ALPHA, "psd_alpha", "PSD Slope Alpha", "",
                    CS_PTYPE_FLOAT, 0.5, 4.0, 0.1,
                    "Spatial amplitude power-law exponent k^-alpha");
@@ -925,7 +940,10 @@ void cs_param_format_val(
             snprintf(buf, cap, "%.4f", cfg->spider_w);
             break;
         case PID_B_SPIDER_DEG:
-            snprintf(buf, cap, "%.1f", cfg->spider_deg);
+            snprintf(buf, cap, "%.2f", cfg->spider_deg);
+            break;
+        case PID_B_SPIDER_OFF:
+            snprintf(buf, cap, "%.5f", cfg->spider_offset);
             break;
         case PID_B_TEL_DIAM:
             snprintf(buf, cap, "%.2f", cfg->tel_diam_m);
@@ -1170,6 +1188,12 @@ void cs_param_format_val(
     case PID_CO_LYOT_SPW:
         snprintf(buf, cap, "%.4f", nd->coro.lyot_spider_w);
         break;
+    case PID_CO_LYOT_SPDEG:
+        snprintf(buf, cap, "%.2f", nd->coro.lyot_spider_deg);
+        break;
+    case PID_CO_LYOT_SPOFF:
+        snprintf(buf, cap, "%.5f", nd->coro.lyot_spider_offset);
+        break;
     case PID_CO_IN_PUP_AMP:
         snprintf(buf, cap, "%s", nd->in_pup_amp);
         break;
@@ -1276,6 +1300,9 @@ void cs_param_format_val(
         break;
     case PID_WFE_RMS_NM:
         snprintf(buf, cap, "%.1f", nd->wfe_rms_nm);
+        break;
+    case PID_WFE_DEFOCUS_NM:
+        snprintf(buf, cap, "%.1f", nd->wfe_defocus_nm);
         break;
     case PID_WFE_ALPHA:
         snprintf(buf, cap, "%.2f", nd->wfe_alpha);
@@ -1456,6 +1483,9 @@ int cs_param_set_str(
             break;
         case PID_B_SPIDER_DEG:
             cfg->spider_deg = (float) dv;
+            break;
+        case PID_B_SPIDER_OFF:
+            cfg->spider_offset = (float) dv;
             break;
         case PID_B_TEL_DIAM:
             cfg->tel_diam_m = (float) dv;
@@ -1742,6 +1772,12 @@ int cs_param_set_str(
     case PID_CO_LYOT_SPW:
         nd->coro.lyot_spider_w = (float) dv;
         break;
+    case PID_CO_LYOT_SPDEG:
+        nd->coro.lyot_spider_deg = (float) dv;
+        break;
+    case PID_CO_LYOT_SPOFF:
+        nd->coro.lyot_spider_offset = (float) dv;
+        break;
     case PID_CO_IN_PUP_AMP:
         snprintf(nd->in_pup_amp, sizeof(nd->in_pup_amp), "%s", val_str);
         break;
@@ -1879,6 +1915,9 @@ int cs_param_set_str(
         break;
     case PID_WFE_RMS_NM:
         nd->wfe_rms_nm = (float) dv;
+        break;
+    case PID_WFE_DEFOCUS_NM:
+        nd->wfe_defocus_nm = (float) dv;
         break;
     case PID_WFE_ALPHA:
         nd->wfe_alpha = (float) dv;

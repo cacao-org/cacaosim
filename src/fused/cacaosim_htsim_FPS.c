@@ -492,15 +492,20 @@ static int htsim_find_dm_node_idx(const cacaosim_bench_ctx_t *bctx, const char *
 /* Resolve target WFS eff_navg for temporal calibration stepping */
 static uint32_t htsim_calib_wfs_navg(const cacaosim_bench_ctx_t *bctx, const char *spec)
 {
-    uint32_t best = 1u;
+    uint32_t best     = 1u;
+    int      has_spec = (spec != NULL && spec[0] != '\0' && strcmp(spec, "none") != 0);
     for (uint32_t i = 0; i < bctx->n_nodes; i++)
     {
         const cacaosim_bench_node_t *nd = &bctx->nodes[i];
-        if (nd->cfg.kind < CACAOSIM_NODE_PYRWFS || nd->cfg.kind >= CACAOSIM_NODE_FPCAM)
+        if (nd->cfg.kind < CACAOSIM_NODE_PYRWFS || nd->cfg.kind > CACAOSIM_NODE_FPCAM)
         {
             continue;
         }
-        if (spec != NULL && spec[0] != '\0' && strcmp(spec, "none") != 0)
+        if (nd->cfg.kind == CACAOSIM_NODE_FPCAM && !has_spec && !nd->cfg.is_wfs)
+        {
+            continue;
+        }
+        if (has_spec)
         {
             if (strcmp(nd->cfg.out_cam, spec) == 0 || strcmp(nd->cfg.id, spec) == 0)
             {
@@ -799,7 +804,7 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
                     bctx.calib_cmd_override = NULL;
                 }
 
-                /* One-shot reset of cumulative long-exposure PSFs across every FPCAM node in DAG */
+                /* One-shot reset of cumulative long-exposure PSFs & coro pre-Lyot maps in DAG */
                 if (param_reset_long)
                 {
                     for (uint32_t i = 0; i < bctx.n_nodes; i++)
@@ -811,6 +816,16 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
                             {
                                 cacaosim_fpcam_shm_write_kw(bctx.nodes[i].img_long.im, 0.0f, 0.0f,
                                                             0.0f, 0ULL);
+                            }
+                        }
+                        else if (bctx.nodes[i].cfg.kind == CACAOSIM_NODE_CORO)
+                        {
+                            cacaosim_coro_reset_long(&bctx.nodes[i].coro_ctx);
+                            if (bctx.connect_shm && bctx.nodes[i].img_pre_lyot_long.ID != -1)
+                            {
+                                cacaosim_coro_shm_write_kw(
+                                    bctx.nodes[i].img_pre_lyot_long.im, 0.0f, 0.0f, 0.0f, 0.0f,
+                                    0.0f, 0.0f, 0ULL);
                             }
                         }
                     }

@@ -32,6 +32,7 @@
  *     coronagraph relays (`cacaosim.coro`).
  */
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -54,6 +55,7 @@ static char     param_in_pup[FUNCTION_PARAMETER_STRMAXLEN]   = "";
 static uint32_t param_nwf                                    = 128;
 static float    param_pup_diam                               = 0.9375f;
 static float    param_rms_nm                                 = 50.0f;
+static float    param_defocus_nm                             = 0.0f;
 static float    param_psd_alpha                              = 1.6f;
 static uint64_t param_wfe_seed                               = 101;
 static float    param_wfe_gain                               = 1.0f;
@@ -102,6 +104,8 @@ static int64_t  param_init_only                              = 0;
       "Pupil diameter fraction of nwf for initial WFE map (default: 0.9375)")           \
     X(".rms_nm", &param_rms_nm, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,                \
       "Initial WFE pupil RMS [nm] (50 nm = 5e-8 m) when creating .in_wfe")              \
+    X(".defocus_nm", &param_defocus_nm, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,        \
+      "Additive smooth Zernike Z4 defocus RMS [nm] across full grid (default: 0.0)")    \
     X(".psd_alpha", &param_psd_alpha, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,          \
       "Spatial PSD amplitude slope k^-alpha for initial WFE map (default: 1.6)")        \
     X(".wfe_seed", &param_wfe_seed, FPTYPE_UINT64, 0, FPFLAG_DEFAULT_INPUT,             \
@@ -195,11 +199,16 @@ static void wfe_populate_stream(IMGID *img_wfe, uint32_t nwf)
         }
     }
 
-    float rms_m       = (param_rms_nm > 0.0f) ? (param_rms_nm * 1.0e-9f) : 0.0f;
+    float rms_m        = (param_rms_nm > 0.0f) ? (param_rms_nm * 1.0e-9f) : 0.0f;
+    float defoc_m      = param_defocus_nm * 1.0e-9f;
     img_wfe->md->write = 1;
     cacaosim_make_wfe_m(nwf, param_pup_diam, pup_ptr, rms_m, param_psd_alpha, param_wfe_seed,
                         img_wfe->im->array.F);
-    wfe_write_unit_kw(img_wfe->im, rms_m);
+    if (fabsf(defoc_m) > 1e-15f)
+    {
+        cacaosim_add_defocus_m(nwf, param_pup_diam, defoc_m, img_wfe->im->array.F);
+    }
+    wfe_write_unit_kw(img_wfe->im, hypotf(rms_m, defoc_m));
     ImageStreamIO_UpdateIm(img_wfe->im);
 
     if (img_pup.ID != -1)

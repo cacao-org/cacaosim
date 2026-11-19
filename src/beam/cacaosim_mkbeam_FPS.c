@@ -57,6 +57,8 @@ static float    param_pup_diam                               = 0.9375f;
 static float    param_obs_frac                               = 0.30f;
 static int32_t  param_n_spiders                              = 4;
 static float    param_spider_w                               = 0.012f;
+static float    param_spider_deg                             = 45.0f;
+static float    param_spider_offset                          = 0.0f;
 static float    param_tel_diam_m                             = 8.2f;
 static float    param_star_mag                               = 8.0f;
 static float    param_star_teff                              = 5778.0f;
@@ -118,6 +120,10 @@ static float    param_frame_rate                             = 0.0f;
       "Spider count when auto-generating pupil (default: 4)")                           \
     X(".spider_w", &param_spider_w, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,            \
       "Spider width fraction of pupil diameter (default: 0.012)")                       \
+    X(".spider_deg", &param_spider_deg, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,        \
+      "Spider orientation angle [deg] when auto-generating pupil (default: 45)")        \
+    X(".spider_offset", &param_spider_offset, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,  \
+      "V-spider X-vertex offset fraction of pup_diam (default: 0.0)")                   \
     X(".tel_diam_m", &param_tel_diam_m, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,        \
       "Primary mirror diameter [m] for photon budget (default: 8.2)")                   \
     X(".star_mag", &param_star_mag, FPTYPE_FLOAT32, 0,                                  \
@@ -240,12 +246,13 @@ static MILK_HOT errno_t mkbeam_compute(const MILK_RUNNABLE *self)
             return RETURN_FAILURE;
         }
         cacaosim_pupil_cfg_t pcfg = {
-            .nwf        = nwf,
-            .pup_diam   = param_pup_diam,
-            .cobs       = param_obs_frac,
-            .nspider    = param_n_spiders,
-            .spider_w   = param_spider_w,
-            .spider_deg = 45.0f,
+            .nwf           = nwf,
+            .pup_diam      = param_pup_diam,
+            .cobs          = param_obs_frac,
+            .nspider       = param_n_spiders,
+            .spider_w      = param_spider_w,
+            .spider_deg    = param_spider_deg,
+            .spider_offset = param_spider_offset,
         };
         cacaosim_make_pupil(&pcfg, fallback_pup);
         pup_ptr = fallback_pup;

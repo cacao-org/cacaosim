@@ -1382,3 +1382,114 @@ int cacaosim_fpcam_shm_read_kw(
     }
     return 1;
 }
+
+/**
+ * cacaosim_coro_shm_write_kw() - Update fixed-slot optical power-budget keywords on pre-Lyot SHM
+ */
+void MILK_HOT cacaosim_coro_shm_write_kw(
+    IMAGE   *im,
+    float    f_lowfs_long,
+    float    f_lowfs_inst,
+    float    f_pre_long,
+    float    f_pre_inst,
+    float    f_trans_long,
+    float    f_trans_inst,
+    uint64_t long_cnt)
+{
+    if (im == NULL || im->md == NULL || im->kw == NULL || im->md->NBkw < 7)
+    {
+        return;
+    }
+    if (im->kw[0].type != 'D' || strcmp(im->kw[0].name, "F_LOWFS") != 0 ||
+        im->kw[1].type != 'D' || strcmp(im->kw[1].name, "F_LOWFSI") != 0)
+    {
+        snprintf(im->kw[0].name, KEYWORD_MAX_STRING, "F_LOWFS");
+        im->kw[0].type = 'D';
+        snprintf(im->kw[0].comment, KEYWORD_MAX_COMMENT,
+                 "Mean fraction of coro input reflected to LOWFS");
+
+        snprintf(im->kw[1].name, KEYWORD_MAX_STRING, "F_LOWFSI");
+        im->kw[1].type = 'D';
+        snprintf(im->kw[1].comment, KEYWORD_MAX_COMMENT,
+                 "Inst fraction of coro input reflected to LOWFS");
+
+        snprintf(im->kw[2].name, KEYWORD_MAX_STRING, "F_PRELYO");
+        im->kw[2].type = 'D';
+        snprintf(im->kw[2].comment, KEYWORD_MAX_COMMENT,
+                 "Mean fraction of coro input incident on Lyot stop");
+
+        snprintf(im->kw[3].name, KEYWORD_MAX_STRING, "F_PRELYI");
+        im->kw[3].type = 'D';
+        snprintf(im->kw[3].comment, KEYWORD_MAX_COMMENT,
+                 "Inst fraction of coro input incident on Lyot stop");
+
+        snprintf(im->kw[4].name, KEYWORD_MAX_STRING, "F_LYOTTR");
+        im->kw[4].type = 'D';
+        snprintf(im->kw[4].comment, KEYWORD_MAX_COMMENT,
+                 "Mean fraction of coro input transmitted past Lyot");
+
+        snprintf(im->kw[5].name, KEYWORD_MAX_STRING, "F_LYOTTI");
+        im->kw[5].type = 'D';
+        snprintf(im->kw[5].comment, KEYWORD_MAX_COMMENT,
+                 "Inst fraction of coro input transmitted past Lyot");
+
+        snprintf(im->kw[6].name, KEYWORD_MAX_STRING, "LONGC");
+        im->kw[6].type = 'L';
+        snprintf(im->kw[6].comment, KEYWORD_MAX_COMMENT,
+                 "Cumulative coronagraph frame count");
+    }
+    im->kw[0].value.numf = (double) f_lowfs_long;
+    im->kw[1].value.numf = (double) f_lowfs_inst;
+    im->kw[2].value.numf = (double) f_pre_long;
+    im->kw[3].value.numf = (double) f_pre_inst;
+    im->kw[4].value.numf = (double) f_trans_long;
+    im->kw[5].value.numf = (double) f_trans_inst;
+    im->kw[6].value.numl = (int64_t) long_cnt;
+}
+
+/**
+ * cacaosim_coro_shm_read_kw() - Read fixed-slot coronagraph & LOWFS power-budget SHM keywords
+ */
+int cacaosim_coro_shm_read_kw(
+    const IMAGE *im,
+    double      *f_lowfs_long,
+    double      *f_lowfs_inst,
+    double      *f_pre_long,
+    double      *f_pre_inst,
+    double      *f_trans_long,
+    double      *f_trans_inst)
+{
+    if (im == NULL || im->md == NULL || im->kw == NULL || im->md->NBkw < 6)
+    {
+        return 0;
+    }
+    if (im->kw[0].type != 'D' || strcmp(im->kw[0].name, "F_LOWFS") != 0)
+    {
+        return 0;
+    }
+    if (f_lowfs_long != NULL)
+    {
+        *f_lowfs_long = im->kw[0].value.numf;
+    }
+    if (f_lowfs_inst != NULL)
+    {
+        *f_lowfs_inst = im->kw[1].value.numf;
+    }
+    if (f_pre_long != NULL)
+    {
+        *f_pre_long = im->kw[2].value.numf;
+    }
+    if (f_pre_inst != NULL)
+    {
+        *f_pre_inst = im->kw[3].value.numf;
+    }
+    if (f_trans_long != NULL)
+    {
+        *f_trans_long = im->kw[4].value.numf;
+    }
+    if (f_trans_inst != NULL)
+    {
+        *f_trans_inst = im->kw[5].value.numf;
+    }
+    return 1;
+}

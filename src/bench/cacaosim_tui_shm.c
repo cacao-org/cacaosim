@@ -841,9 +841,9 @@ int cs_tui_exec_mkpupil(cs_tui_app_t *app)
     char        cmd[1024];
     snprintf(cmd, sizeof(cmd),
              "\"%.450s\" --no-procinfo exec .nwf=%u .pup_diam=%.6g .cobs=%.4g .nspider=%d"
-             " .spider_w=%.4g .spider_deg=%.4g .out_pup=\"%.60s\" 2>&1",
+             " .spider_w=%.5g .spider_deg=%.5g .spider_offset=%.5g .out_pup=\"%.60s\" 2>&1",
              pup_bin, app->cfg.nwf, app->cfg.pup_diam, app->cfg.cobs, app->cfg.nspider,
-             app->cfg.spider_w, app->cfg.spider_deg, pup_name);
+             app->cfg.spider_w, app->cfg.spider_deg, app->cfg.spider_offset, pup_name);
 
     char last[200];
     int  rc    = run_logged_cmd(app, cmd, last, sizeof(last));
@@ -862,10 +862,11 @@ int cs_tui_exec_mkpupil(cs_tui_app_t *app)
                 char wcmd[1024];
                 snprintf(wcmd, sizeof(wcmd),
                          "\"%.420s\" --no-procinfo exec .init_only=ON .nwf=%u .pup_diam=%.6g"
-                         " .in_pup=\"%.60s\" .in_wfe=\"%.60s\" .rms_nm=%.4g .psd_alpha=%.4g"
-                         " .wfe_seed=%llu 2>&1",
+                         " .in_pup=\"%.60s\" .in_wfe=\"%.60s\" .rms_nm=%.4g .defocus_nm=%.4g"
+                         " .psd_alpha=%.4g .wfe_seed=%llu 2>&1",
                          wfe_bin, app->cfg.nwf, app->cfg.pup_diam, pup_name, nd->in_wfe,
-                         nd->wfe_rms_nm, nd->wfe_alpha, (unsigned long long) nd->wfe_seed);
+                         nd->wfe_rms_nm, nd->wfe_defocus_nm, nd->wfe_alpha,
+                         (unsigned long long) nd->wfe_seed);
                 if (run_logged_cmd(app, wcmd, last, sizeof(last)) == 0)
                 {
                     n_wfe++;
