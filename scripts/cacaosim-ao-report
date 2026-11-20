@@ -1770,7 +1770,12 @@ def _fast_savefig(self, fname, *args, **kwargs):
     return _orig_savefig(self, fname, *args, **kwargs)
 matplotlib.figure.Figure.savefig = _fast_savefig
 
-_n_shards = min(16, max(1, os.cpu_count() or 1)) if hasattr(os, "fork") else 1
+_only_slot = os.environ.get("CACAOSIM_PLOT_SLOT", "").strip()
+_n_shards = (
+    1
+    if _only_slot
+    else (min(16, max(1, os.cpu_count() or 1)) if hasattr(os, "fork") else 1)
+)
 _child_pids = []
 _my_shard = 0
 if _n_shards > 1:
@@ -1783,6 +1788,8 @@ if _n_shards > 1:
         _child_pids.append(_pid)
 
 def _want_plot(slot):
+    if _only_slot:
+        return slot == int(_only_slot)
     return (slot % _n_shards) == _my_shard
 
 tel_info = data.get("telescope", {})
@@ -4590,7 +4597,7 @@ if (
         x_lbls = ["|Mdb| (DM2→B)", "|Mab| (A→B)"]
     cmap_m = plt.get_cmap("magma").copy()
     cmap_m.set_bad(color="#ffffff")
-    im10 = ax10.imshow(np.clip(mosaic, 0.0, 1.0), origin="upper", cmap=cmap_m, aspect="auto")
+    im10 = ax10.imshow(np.clip(mosaic, 0.0, 1.0), origin="lower", cmap=cmap_m, aspect="auto")
     ax10.set_xticks(x_ticks)
     ax10.set_xticklabels(x_lbls, fontsize=9.0, fontweight="bold")
     ax10.set_ylabel(f"Output Mode Index (0..{kshow - 1})")
@@ -6200,6 +6207,37 @@ def main():
             "selfRM cubes from Subaru AO3k + SCExAO + LLOWFS simulation runs to generate\n"
             "REPORT.md, ao3k_scexao_metrics.json, and 13 publication figures."
         )
+        return
+    if len(sys.argv) >= 3 and sys.argv[1] == "--replot-calib2wfs":
+        out_dir = os.path.abspath(sys.argv[2])
+        summary_path = os.path.join(out_dir, "ao3k_scexao_metrics.json")
+        if not os.path.isfile(summary_path):
+            raise FileNotFoundError(f"Missing {summary_path}")
+        tmp_npys = []
+        try:
+            c2d = load_calib_2wfs1dm_metrics(out_dir, out_dir, tmp_npys)
+            if c2d is None:
+                raise FileNotFoundError(f"Missing calib_2wfs1dm/sysid_summary.json in {out_dir}")
+            with open(summary_path, "r", encoding="utf-8") as fh:
+                summary = json.load(fh)
+            if not isinstance(summary.get("calib_2wfs1dm"), dict):
+                summary["calib_2wfs1dm"] = c2d
+                with open(summary_path, "w", encoding="utf-8") as fh:
+                    json.dump(summary, fh, indent=2)
+                    fh.write("\n")
+            prev_slot = os.environ.get("CACAOSIM_PLOT_SLOT")
+            os.environ["CACAOSIM_PLOT_SLOT"] = "17"
+            try:
+                render_plots_via_sys_python(out_dir, summary_path)
+            finally:
+                if prev_slot is None:
+                    os.environ.pop("CACAOSIM_PLOT_SLOT", None)
+                else:
+                    os.environ["CACAOSIM_PLOT_SLOT"] = prev_slot
+        finally:
+            for npy_p in tmp_npys:
+                if os.path.exists(npy_p):
+                    os.remove(npy_p)
         return
     if len(sys.argv) < 11 or any(a in ("-h", "--help", "-hm", "--help-mono") for a in sys.argv[1:]):
         print(
