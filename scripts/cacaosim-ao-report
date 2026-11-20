@@ -1502,6 +1502,43 @@ def load_predictive_control_metrics(out_dir, tmp_npys):
                 npy_w = os.path.join(out_dir, f"pf_wmat_stg{stg_idx}.npy")
                 np.save(npy_w, wmat.astype(np.float32))
                 tmp_npys.append(npy_w)
+                npy_eof = os.path.join(out_dir, f"pf_eofmat_stg{stg_idx}.npy")
+                np.save(npy_eof, fmat[:, :pb_len].astype(np.float32))
+                tmp_npys.append(npy_eof)
+                nblocks = (n_m + b_sz - 1) // b_sz
+                lag_e = np.zeros(p_ord, dtype=np.float64)
+                lag_off = np.zeros(p_ord, dtype=np.float64)
+                off_by_blk = []
+                for bk in range(nblocks):
+                    s0 = bk * b_sz
+                    b_cur = min(b_sz, n_m - s0)
+                    sub_b = fmat[s0 : s0 + b_cur, :pb_len].reshape(b_cur, p_ord, b_sz)[
+                        :, :, :b_cur
+                    ]
+                    b_tot = float(np.sum(sub_b**2))
+                    b_diag = float(np.sum(np.diagonal(sub_b, axis1=0, axis2=2) ** 2))
+                    off_by_blk.append(float((b_tot - b_diag) / max(b_tot, 1e-30)))
+                    for k_i in range(p_ord):
+                        sl_k = sub_b[:, k_i, :]
+                        tk = float(np.sum(sl_k**2))
+                        dk = float(np.sum(np.diag(sl_k) ** 2))
+                        lag_e[k_i] += tk
+                        lag_off[k_i] += max(0.0, tk - dk)
+                tot_e_all = max(float(np.sum(lag_e)), 1e-30)
+                lag_energy_frac = [float(x / tot_e_all) for x in lag_e]
+                lag_offdiag_frac = [
+                    float(lag_off[k_i] / max(lag_e[k_i], 1e-30)) for k_i in range(p_ord)
+                ]
+                b0 = min(b_sz, n_m)
+                sub0 = fmat[:b0, :pb_len].reshape(b0, p_ord, b_sz)[:, :, :b0]
+                c0 = np.sqrt(np.sum(sub0**2, axis=1))
+                np.fill_diagonal(c0, 0.0)
+                flat_top = np.argsort(c0.ravel())[::-1][:6]
+                blk0_top_pairs = [
+                    [int(idx // b0), int(idx % b0), float(c0.ravel()[idx])]
+                    for idx in flat_top
+                    if c0.ravel()[idx] > 0.0
+                ]
                 dc_g = np.sum(wmat, axis=0)
                 if diag_tail > 0:
                     dc_g = dc_g + np.sum(fmat[:, pb_len:], axis=1)
@@ -1514,6 +1551,7 @@ def load_predictive_control_metrics(out_dir, tmp_npys):
                         "n_modes": int(n_m),
                         "tap_order": int(p_ord),
                         "blocksize": int(b_sz),
+                        "n_blocks": int(nblocks),
                         "w0_median": float(np.median(wmat[0])),
                         "w0_max": float(np.max(wmat[0])),
                         "w1_median": float(np.median(wmat[1])) if p_ord > 1 else 0.0,
@@ -1521,6 +1559,10 @@ def load_predictive_control_metrics(out_dir, tmp_npys):
                         "dc_gain_max": float(np.max(dc_g)),
                         "norm2_median": float(np.median(n2_g)),
                         "norm2_max": float(np.max(n2_g)),
+                        "lag_energy_frac": lag_energy_frac,
+                        "lag_offdiag_frac": lag_offdiag_frac,
+                        "offdiag_by_block": off_by_blk,
+                        "blk0_top_pairs": blk0_top_pairs,
                     }
                 )
         elif os.path.isfile(pf_mat_p):
@@ -1754,7 +1796,9 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import LogNorm, SymLogNorm
+from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
 from matplotlib.patches import Circle, Patch
 from matplotlib.ticker import MaxNLocator
@@ -1771,9 +1815,10 @@ def _fast_savefig(self, fname, *args, **kwargs):
 matplotlib.figure.Figure.savefig = _fast_savefig
 
 _only_slot = os.environ.get("CACAOSIM_PLOT_SLOT", "").strip()
+_only_slots = {int(x) for x in _only_slot.split(",") if x.strip()} if _only_slot else None
 _n_shards = (
     1
-    if _only_slot
+    if _only_slots is not None
     else (min(16, max(1, os.cpu_count() or 1)) if hasattr(os, "fork") else 1)
 )
 _child_pids = []
@@ -1788,8 +1833,8 @@ if _n_shards > 1:
         _child_pids.append(_pid)
 
 def _want_plot(slot):
-    if _only_slot:
-        return slot == int(_only_slot)
+    if _only_slots is not None:
+        return slot in _only_slots
     return (slot % _n_shards) == _my_shard
 
 tel_info = data.get("telescope", {})
@@ -4658,6 +4703,308 @@ if (
     fig2w.savefig(os.path.join(out_dir, "calib_2wfs1dm_summary_2x2.png"), dpi=180)
     plt.close(fig2w)
 
+def _signed_maxpool_2d(sl, n_grid):
+    h, w = sl.shape
+    if h <= n_grid and w <= n_grid:
+        return sl
+    out = np.zeros((n_grid, n_grid), dtype=np.float64)
+    for bi in range(n_grid):
+        i0 = (bi * h) // n_grid
+        i1 = max(i0 + 1, ((bi + 1) * h) // n_grid)
+        for bj in range(n_grid):
+            j0 = (bj * w) // n_grid
+            j1 = max(j0 + 1, ((bj + 1) * w) // n_grid)
+            blk = sl[i0:i1, j0:j1]
+            idx = int(np.argmax(np.abs(blk)))
+            out[bi, bj] = float(blk.ravel()[idx])
+    return out
+
+def _load_eof_stage_tensors(pc_d):
+    stages = []
+    b_cfg = int(pc_d.get("pf_blocksize", 128))
+    p_cfg = int(pc_d.get("pf_order", 8))
+    for stg_i, stg_k, stg_lbl, rate_hz in (
+        (1, "stage1", "Stage 1 (AO3k, 1.0 kHz)", 1000.0),
+        (2, "stage2", "Stage 2 (SCExAO, 2.0 kHz)", 2000.0),
+    ):
+        fp = os.path.join(out_dir, f"pf_eofmat_stg{stg_i}.npy")
+        if not os.path.exists(fp):
+            continue
+        fmat = np.load(fp).astype(np.float64)
+        st_pc = pc_d.get(stg_k, {})
+        b_sz = max(1, int(st_pc.get("blocksize", b_cfg)))
+        p_o = max(1, int(st_pc.get("tap_order", p_cfg)))
+        n_m, pb = fmat.shape
+        if pb < p_o * b_sz:
+            p_o = max(1, pb // b_sz)
+        b0 = min(b_sz, n_m)
+        sub0 = fmat[:b0, : p_o * b_sz].reshape(b0, p_o, b_sz)[:, :, :b0]
+        stages.append((stg_i, stg_k, stg_lbl, rate_hz, n_m, b_sz, p_o, sub0, st_pc))
+    return stages
+
+eof_pc = data.get("predictive_control")
+if (
+    (_want_plot(18) or _want_plot(19))
+    and isinstance(eof_pc, dict)
+    and eof_pc.get("enabled")
+    and str(eof_pc.get("pf_mode", "")).lower() == "eof"
+):
+    eof_stages = _load_eof_stage_tensors(eof_pc)
+    if eof_stages and _want_plot(18):
+        p_blk_e = int(eof_pc.get("pf_blocksize", 128))
+        p_ord_e = int(eof_pc.get("pf_order", 8))
+        fig3d = plt.figure(figsize=(17.2, 10.6))
+        nrows_e = len(eof_stages)
+        gs3 = GridSpec(
+            nrows_e,
+            3,
+            figure=fig3d,
+            width_ratios=[1.18, 1.02, 0.96],
+            hspace=0.35,
+            wspace=0.28,
+            top=0.89,
+            bottom=0.06,
+            left=0.04,
+            right=0.96,
+        )
+        fig3d.suptitle(
+            f"Subaru {tel_d:.2f} m AO3k + SCExAO — 3D Modal Predictive Matrix "
+            f"PF[out_i, lag_k, in_j] (Block-EOF B={p_blk_e}, P={p_ord_e})\n"
+            f"(Block 0 Volumetric Tensor Slices, Cross-Mode L2 Coupling Norm "
+            f"& Spatial-Block / Temporal-Lag Energy Structure)",
+            fontsize=12.0,
+            fontweight="bold",
+        )
+        cmap3 = plt.get_cmap("RdBu_r")
+        for r_i, (stg_i, stg_k, stg_lbl, rate_hz, n_m, b_sz, p_o, sub0, st_pc) in enumerate(
+            eof_stages
+        ):
+            b0 = sub0.shape[0]
+            vmax3 = max(float(np.max(np.abs(sub0))), 0.1)
+            norm3 = SymLogNorm(linthresh=0.015, linscale=0.6, vmin=-vmax3, vmax=vmax3)
+            n_grid = min(b0, 32)
+            edges = np.linspace(0.0, float(b0), n_grid + 1)
+            xg, yg = np.meshgrid(edges, edges)
+
+            ax3d = fig3d.add_subplot(gs3[r_i, 0], projection="3d")
+            for k_i in range(p_o):
+                sl_pool = _signed_maxpool_2d(sub0[:, k_i, :], n_grid)
+                fc = cmap3(norm3(sl_pool))
+                mag = np.clip(np.abs(sl_pool) / vmax3, 0.0, 1.0)
+                fc[:, :, 3] = np.where(mag > 0.008, 0.16 + 0.80 * np.sqrt(mag), 0.045)
+                zg = np.full_like(xg, float(k_i))
+                ax3d.plot_surface(
+                    xg,
+                    yg,
+                    zg,
+                    facecolors=fc,
+                    rstride=1,
+                    cstride=1,
+                    shade=False,
+                    antialiased=False,
+                    edgecolor="none",
+                )
+                ax3d.plot(
+                    [0.0, b0, b0, 0.0, 0.0],
+                    [0.0, 0.0, b0, b0, 0.0],
+                    [float(k_i)] * 5,
+                    color="#64748b",
+                    lw=0.45,
+                    alpha=0.42,
+                )
+            ax3d.set_xlim(0.0, float(b0))
+            ax3d.set_ylim(0.0, float(b0))
+            ax3d.set_zlim(-0.35, float(p_o) - 0.65)
+            ax3d.set_zticks(list(range(p_o)))
+            ax3d.view_init(elev=23, azim=-53)
+            for pan in (ax3d.xaxis.pane, ax3d.yaxis.pane, ax3d.zaxis.pane):
+                pan.set_facecolor((0.97, 0.98, 1.0, 0.65))
+                pan.set_edgecolor("#cbd5e1")
+            ax3d.set_xlabel("Input Mode j", fontsize=8.5, labelpad=4)
+            ax3d.set_ylabel("Output Mode i", fontsize=8.5, labelpad=4)
+            ax3d.set_zlabel("Lag k [fr]", fontsize=8.5, labelpad=4)
+            ax3d.tick_params(labelsize=7.5)
+            dt_ms = 1000.0 / rate_hz
+            ax3d.set_title(
+                f"{stg_lbl} — 3D PF Tensor ({b0}x{p_o}x{b0})\n"
+                f"k=0..{p_o-1} (0..{(p_o-1)*dt_ms:.1f} ms), "
+                f"PFlat={st_pc.get('pflatency_fr', 0):.2f} fr",
+                fontsize=9.8,
+                fontweight="bold",
+                pad=4,
+            )
+            sm3 = ScalarMappable(norm=norm3, cmap=cmap3)
+            sm3.set_array([])
+            cb3 = fig3d.colorbar(sm3, ax=ax3d, fraction=0.036, pad=0.07, shrink=0.78)
+            cb3.ax.tick_params(labelsize=7.5)
+            cb3.set_label("F[i, k, j]", fontsize=8.2)
+
+            ax2d = fig3d.add_subplot(gs3[r_i, 1])
+            c0_norm = np.maximum(np.sqrt(np.sum(sub0**2, axis=1)), 1e-4)
+            im2 = ax2d.imshow(
+                c0_norm,
+                origin="lower",
+                cmap="magma",
+                norm=LogNorm(vmin=3e-3, vmax=max(1.0, float(c0_norm.max()))),
+                aspect="equal",
+            )
+            cb2 = fig3d.colorbar(im2, ax=ax2d, fraction=0.044, pad=0.03, shrink=0.88)
+            cb2.ax.tick_params(labelsize=7.5)
+            cb2.set_label("‖F[i, :, j]‖₂", fontsize=8.5)
+            ax2d.set_xlabel("Input Mode j (Past History)", fontsize=8.8)
+            ax2d.set_ylabel("Predicted Output Mode i", fontsize=8.8)
+            off_b_list = st_pc.get("offdiag_by_block") or []
+            b0_off_pct = off_b_list[0] * 100.0 if off_b_list else 0.0
+            ax2d.set_title(
+                f"{stg_lbl} — Block 0 L2 Coupling (Off-Diag = {b0_off_pct:.1f}%)",
+                fontsize=9.8,
+                fontweight="bold",
+            )
+            top_p = st_pc.get("blk0_top_pairs") or []
+            if top_p:
+                p_txt = ", ".join(f"({p[0]}<-{p[1]}:{p[2]:.2f})" for p in top_p[:4])
+                ax2d.text(
+                    0.97,
+                    0.03,
+                    f"Top off-diag: {p_txt}",
+                    transform=ax2d.transAxes,
+                    ha="right",
+                    va="bottom",
+                    fontsize=7.0,
+                    color="#f8fafc",
+                    bbox={
+                        "boxstyle": "round,pad=0.28",
+                        "fc": "#0f172a",
+                        "ec": "#334155",
+                        "alpha": 0.86,
+                    },
+                )
+
+            gs_sub = gs3[r_i, 2].subgridspec(2, 1, hspace=0.48)
+            ax_blk = fig3d.add_subplot(gs_sub[0, 0])
+            off_pcts = [v * 100.0 for v in off_b_list] if off_b_list else [0.0]
+            xb = np.arange(len(off_pcts))
+            ax_blk.bar(xb, off_pcts, color="#d97706", alpha=0.85, edgecolor="#78350f", lw=0.6)
+            ax_blk.axhline(
+                st_pc.get("offdiag_frac", 0.0) * 100.0,
+                color="#0f172a",
+                ls="--",
+                lw=1.1,
+                label=f"Global: {st_pc.get('offdiag_frac', 0.0)*100.0:.1f}%",
+            )
+            ax_blk.set_xlim(-0.6, max(0.6, len(off_pcts) - 0.4))
+            ax_blk.set_ylim(0.0, max(max(off_pcts) * 1.25, 10.0))
+            ax_blk.set_xlabel("Spatial Mode Block Index", fontsize=8.0)
+            ax_blk.set_ylabel("Off-Diag [%]", fontsize=8.0)
+            ax_blk.tick_params(labelsize=7.5)
+            ax_blk.set_title(
+                f"Off-Diagonal Energy vs Block ({len(off_pcts)} blocks, {n_m} modes)",
+                fontsize=8.8,
+                fontweight="bold",
+            )
+            ax_blk.grid(axis="y", alpha=0.25)
+            ax_blk.legend(loc="upper left", fontsize=7.2, framealpha=0.88)
+
+            ax_lag = fig3d.add_subplot(gs_sub[1, 0])
+            le_pcts = [v * 100.0 for v in (st_pc.get("lag_energy_frac") or [])]
+            lo_pcts = [v * 100.0 for v in (st_pc.get("lag_offdiag_frac") or [])]
+            if not le_pcts:
+                e_k = np.array([np.sum(sub0[:, k_i, :] ** 2) for k_i in range(p_o)])
+                o_k = np.array(
+                    [np.sum(sub0[:, k_i, :] ** 2) - np.sum(np.diag(sub0[:, k_i, :]) ** 2)
+                     for k_i in range(p_o)]
+                )
+                le_pcts = (e_k / max(float(np.sum(e_k)), 1e-30) * 100.0).tolist()
+                lo_pcts = (o_k / np.maximum(e_k, 1e-30) * 100.0).tolist()
+            xk = np.arange(len(le_pcts))
+            ax_lag.bar(xk - 0.18, le_pcts, width=0.35, color="#2563eb", label="Lag Energy %")
+            ax_lag.bar(xk + 0.18, lo_pcts, width=0.35, color="#059669", label="Off-Diag % in Lag")
+            ax_lag.set_xticks(xk)
+            ax_lag.set_xlim(-0.6, max(0.6, len(xk) - 0.4))
+            ax_lag.set_ylim(0.0, 108.0)
+            ax_lag.set_xlabel("Lookback Lag k [frames]", fontsize=8.0)
+            ax_lag.set_ylabel("Share [%]", fontsize=8.0)
+            ax_lag.tick_params(labelsize=7.5)
+            ax_lag.set_title(
+                "Per-Lag Energy Share & Cross-Mode Fraction", fontsize=8.8, fontweight="bold"
+            )
+            ax_lag.grid(axis="y", alpha=0.25)
+            ax_lag.legend(loc="upper center", fontsize=7.0, ncol=2, framealpha=0.88)
+
+        fig3d.savefig(os.path.join(out_dir, "eof_pf_matrix_3d.png"), dpi=180)
+        plt.close(fig3d)
+
+    if eof_stages and _want_plot(19):
+        p_o_max = max(st[6] for st in eof_stages)
+        lag_idxs = (
+            list(range(p_o_max))
+            if p_o_max <= 8
+            else [int(round(x)) for x in np.linspace(0, p_o_max - 1, 8)]
+        )
+        n_cols_s = len(lag_idxs)
+        n_rows_s = len(eof_stages)
+        figsl, axessl = plt.subplots(
+            n_rows_s,
+            n_cols_s,
+            figsize=(max(9.0, 2.25 * n_cols_s + 1.2), 3.1 * n_rows_s + 0.9),
+            squeeze=False,
+            constrained_layout=True,
+        )
+        p_blk_e = int(eof_pc.get("pf_blocksize", 128))
+        p_ord_e = int(eof_pc.get("pf_order", 8))
+        figsl.suptitle(
+            f"3D Modal Predictive Matrix PF[out_i, k, in_j] — Signed Block-0 Lag Slices "
+            f"(Block-EOF B={p_blk_e}, P={p_ord_e})",
+            fontsize=11.5,
+            fontweight="bold",
+        )
+        vmax_s = max(max(float(np.max(np.abs(st[7]))) for st in eof_stages), 0.1)
+        norm_s = SymLogNorm(linthresh=0.015, linscale=0.6, vmin=-vmax_s, vmax=vmax_s)
+        last_im = None
+        for r_i, (stg_i, stg_k, stg_lbl, rate_hz, n_m, b_sz, p_o, sub0, st_pc) in enumerate(
+            eof_stages
+        ):
+            dt_ms = 1000.0 / rate_hz
+            lo_list = st_pc.get("lag_offdiag_frac") or []
+            for c_i, k_idx in enumerate(lag_idxs):
+                ax_s = axessl[r_i, c_i]
+                if k_idx >= p_o:
+                    ax_s.axis("off")
+                    continue
+                sl = sub0[:, k_idx, :]
+                last_im = ax_s.imshow(
+                    sl,
+                    origin="lower",
+                    cmap="RdBu_r",
+                    norm=norm_s,
+                    aspect="equal",
+                )
+                off_k = (
+                    lo_list[k_idx] * 100.0
+                    if k_idx < len(lo_list)
+                    else (
+                        (np.sum(sl**2) - np.sum(np.diag(sl) ** 2))
+                        / max(float(np.sum(sl**2)), 1e-30)
+                        * 100.0
+                    )
+                )
+                ax_s.set_title(
+                    f"k={k_idx} (t-{k_idx*dt_ms:.1f}ms)\nOff={off_k:.0f}%",
+                    fontsize=8.3,
+                    fontweight="bold",
+                )
+                ax_s.tick_params(labelsize=7.0)
+                if r_i == n_rows_s - 1:
+                    ax_s.set_xlabel("Input Mode j", fontsize=7.8)
+                if c_i == 0:
+                    short_s = "Stg1" if stg_i == 1 else "Stg2"
+                    ax_s.set_ylabel(f"{short_s} Out i", fontsize=8.0)
+        if last_im is not None:
+            cb_s = figsl.colorbar(last_im, ax=axessl, fraction=0.018, pad=0.02, shrink=0.90)
+            cb_s.set_label("Signed EOF Weight F[out_i, k, in_j]", fontsize=8.8)
+        figsl.savefig(os.path.join(out_dir, "eof_pf_lag_slices.png"), dpi=180)
+        plt.close(figsl)
+
 if _my_shard != 0:
     os._exit(0)
 _fail = 0
@@ -5143,18 +5490,33 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
         )
     pc_md = s.get("predictive_control")
     if isinstance(pc_md, dict) and pc_md.get("enabled"):
+        p_mode_m = str(pc_md.get("pf_mode", "ar")).lower()
+        p_blk_m = int(pc_md.get("pf_blocksize", 128))
         p_o = int(pc_md.get("pf_order", 8))
         p_mx = float(pc_md.get("pf_mix", 0.90))
         ps1 = pc_md.get("stage1", {})
         ps2 = pc_md.get("stage2", {})
-        lines.append(
-            f"- **PSOL Predictive Control (`mkARPF` + `applyARPF` + `mfilt`)**: Online "
-            f"regularized Wiener `AR({p_o})` modal predictors (`mix = {p_mx:.2f}`) driven by "
-            f"`testOL`-calibrated pseudo-open-loop telemetry (`Stage 1`: lag "
-            f"`{ps1.get('pflatency_fr', 0):.2f} fr`, `-{ps1.get('var_red_pct', 0):.1f}%` lag "
-            f"variance; `Stage 2`: lag `{ps2.get('pflatency_fr', 0):.2f} fr`, "
-            f"`-{ps2.get('var_red_pct', 0):.1f}%` lag variance; `0` real-time timeouts)"
-        )
+        if p_mode_m == "eof":
+            lines.append(
+                f"- **PSOL Predictive Control (`Block-EOF(B={p_blk_m}, P={p_o})`, "
+                "`mkEOFPF` + `applyEOFPF` + `mfilt`)**: Online 3D cross-mode transition tensor "
+                f"predictors (`mix = {p_mx:.2f}`) driven by `testOL`-calibrated "
+                "pseudo-open-loop telemetry (`Stage 1`: lag "
+                f"`{ps1.get('pflatency_fr', 0):.2f} fr`, "
+                f"`-{ps1.get('var_red_pct', 0):.1f}%` lag variance, "
+                f"`{ps1.get('offdiag_frac', 0)*100:.1f}%` off-diag; `Stage 2`: lag "
+                f"`{ps2.get('pflatency_fr', 0):.2f} fr`, `-{ps2.get('var_red_pct', 0):.1f}%` lag "
+                f"variance, `{ps2.get('offdiag_frac', 0)*100:.1f}%` off-diag; `0` RT timeouts)"
+            )
+        else:
+            lines.append(
+                f"- **PSOL Predictive Control (`mkARPF` + `applyARPF` + `mfilt`)**: Online "
+                f"regularized Wiener `AR({p_o})` modal predictors (`mix = {p_mx:.2f}`) driven by "
+                f"`testOL`-calibrated pseudo-open-loop telemetry (`Stage 1`: lag "
+                f"`{ps1.get('pflatency_fr', 0):.2f} fr`, `-{ps1.get('var_red_pct', 0):.1f}%` lag "
+                f"variance; `Stage 2`: lag `{ps2.get('pflatency_fr', 0):.2f} fr`, "
+                f"`-{ps2.get('var_red_pct', 0):.1f}%` lag variance; `0` real-time timeouts)"
+            )
     c2d_md = s.get("calib_2wfs1dm")
     if isinstance(c2d_md, dict) and c2d_md.get("enabled"):
         w_o = int(c2d_md.get("whiten_order", 4))
@@ -5561,57 +5923,135 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
 
     pc_sec = s.get("predictive_control")
     if isinstance(pc_sec, dict) and pc_sec.get("enabled"):
+        p_mode_s = str(pc_sec.get("pf_mode", "ar")).lower()
+        p_blk_s = int(pc_sec.get("pf_blocksize", 128))
         p_ord_s = int(pc_sec.get("pf_order", 8))
         p_mix_s = float(pc_sec.get("pf_mix", 0.90))
         p_reg_s = float(pc_sec.get("pf_reg", 0.005))
-        lines.extend(
-            [
-                "",
-                f"## PSOL Predictive Control Performance (`AR({p_ord_s})`, "
-                "`mkARPF` + `applyARPF` + `mfilt`)",
-                "",
-                "- **Architecture**: `mfilt` reconstructs per-frame pseudo-open-loop (PSOL) "
-                "modal wavefronts `aolN_modevalOL[t] = WFSfact * modevalWFS[t] - modevalDM[t - d]` "
-                "using fractional lag `d` and optical gain `WFSfact` identified in-loop by "
-                "`mfilt.testOL`. Double-buffered `aolN_modevalOL_buff` slices (`256` frames) "
-                f"feed `cacaopc.mkARPF`, which solves per-mode regularized Wiener `AR({p_ord_s})` "
-                f"predictors (`reglambda = {p_reg_s}`, strict DC stability cap `|sum(w)| <= 0.985` "
-                "and L2 noise-gain bound `||w||_2^2 <= 1.35`). `cacaopc.applyARPF` evaluates "
-                "forward-predicted `aolN_modevalPF` in `< 1 us`/frame and synchronizes with "
-                f"`mfilt` (`PF.mixcoeff = {p_mix_s:.2f}` weighted by modal `mPFmixfact`).",
-                "",
-                "| Loop Stage | Modes | Rate [Hz] | PSOL Lag [fr / ms] | `WFSfact` | "
-                "Updates (`N_train`) | OL / ZOH / Pred RMS | Lag Var Red. | Timeouts |",
-                "| :--- | ---: | ---: | :---: | ---: | :---: | :---: | ---: | ---: |",
-            ]
-        )
-        for st_lbl, st_k in (
-            ("Stage 1 (`AO3k`)", "stage1"),
-            ("Stage 2 (`SCExAO`)", "stage2"),
-        ):
-            stp = pc_sec.get(st_k, {})
-            if not stp:
-                continue
-            lines.append(
-                f"| {st_lbl} | `{stp.get('n_modes', 0)}` | "
-                f"`{stp.get('loop_rate_hz', 0):.0f}` | "
-                f"`{stp.get('pflatency_fr', 0):.2f}` / `{stp.get('pflatency_ms', 0):.2f}` | "
-                f"`{stp.get('wfsfact', 1.0):.3f}` | "
-                f"`{stp.get('n_updates', 0)}` (`{stp.get('n_samples', 0)}`) | "
-                f"`{stp.get('rms_ol', 0):.4f}` / `{stp.get('rms_zoh', 0):.4f}` / "
-                f"**`{stp.get('rms_pred', 0):.4f}`** | "
-                f"**`{stp.get('var_red_pct', 0):.1f}%`** | "
-                f"`{stp.get('timeout_cnt', 0)}` |"
-            )
-        pc_fig_p = os.path.join(out_dir, "predictive_control_summary_2x2.png")
-        if os.path.isfile(pc_fig_p):
+        if p_mode_s == "eof":
             lines.extend(
                 [
                     "",
-                    "![PSOL Auto-Regressive Predictive Control Filter & "
-                    "Modal Residual Summary (2x2)](predictive_control_summary_2x2.png)",
+                    f"## PSOL Predictive Control Performance (`Block-EOF(B={p_blk_s}, "
+                    f"P={p_ord_s})`, `mkEOFPF` + `applyEOFPF` + `mfilt`)",
+                    "",
+                    "- **Architecture**: `mfilt` reconstructs per-frame pseudo-open-loop (PSOL) "
+                    "modal wavefronts `aolN_modevalOL[t] = WFSfact * modevalWFS[t] - "
+                    "modevalDM[t - d]` using fractional lag `d` and optical gain `WFSfact` "
+                    "identified in-loop by `mfilt.testOL`. Sliding `aolN_modevalOL_buff` buffers "
+                    "feed `cacaopc.mkEOFPF`, which bootstraps via diagonal `AR(16)` before "
+                    f"solving per-block 3D cross-mode `VAR({p_ord_s})` transition tensors "
+                    f"`PF[out_i, lag_k, in_j]` (`B = {p_blk_s}` modes/block, "
+                    f"`reglambda = {p_reg_s}`, OpenBLAS `dsyrk`/`dgemm` + LAPACKE Cholesky). "
+                    "`cacaopc.applyEOFPF` evaluates `aolN_modevalPF` in real time via "
+                    f"OpenMP + SIMD and synchronizes with `mfilt` (`PF.mixcoeff = {p_mix_s:.2f}` "
+                    "weighted by modal `mPFmixfact`).",
+                    "",
+                    "| Loop Stage | Modes | Rate [Hz] | PSOL Lag [fr / ms] | `WFSfact` | "
+                    "Updates (`N_train`) | OL / ZOH / Pred RMS | Lag Var Red. | Off-Diag | "
+                    "Timeouts |",
+                    "| :--- | ---: | ---: | :---: | ---: | :---: | :---: | ---: | ---: | ---: |",
                 ]
             )
+            for st_lbl, st_k in (
+                ("Stage 1 (`AO3k`)", "stage1"),
+                ("Stage 2 (`SCExAO`)", "stage2"),
+            ):
+                stp = pc_sec.get(st_k, {})
+                if not stp:
+                    continue
+                lines.append(
+                    f"| {st_lbl} | `{stp.get('n_modes', 0)}` | "
+                    f"`{stp.get('loop_rate_hz', 0):.0f}` | "
+                    f"`{stp.get('pflatency_fr', 0):.2f}` / "
+                    f"`{stp.get('pflatency_ms', 0):.2f}` | "
+                    f"`{stp.get('wfsfact', 1.0):.3f}` | "
+                    f"`{stp.get('n_updates', 0)}` (`{stp.get('n_samples', 0)}`) | "
+                    f"`{stp.get('rms_ol', 0):.4f}` / `{stp.get('rms_zoh', 0):.4f}` / "
+                    f"**`{stp.get('rms_pred', 0):.4f}`** | "
+                    f"**`{stp.get('var_red_pct', 0):.1f}%`** | "
+                    f"`{stp.get('offdiag_frac', 0)*100:.1f}%` | "
+                    f"`{stp.get('timeout_cnt', 0)}` |"
+                )
+            pc_fig_p = os.path.join(out_dir, "predictive_control_summary_2x2.png")
+            if os.path.isfile(pc_fig_p):
+                lines.extend(
+                    [
+                        "",
+                        "![PSOL Block-EOF Predictive Control Filter & "
+                        "Modal Residual Summary (2x2)](predictive_control_summary_2x2.png)",
+                    ]
+                )
+            eof_3d_p = os.path.join(out_dir, "eof_pf_matrix_3d.png")
+            if os.path.isfile(eof_3d_p):
+                lines.extend(
+                    [
+                        "",
+                        "![3D Modal Predictive Matrix PF(out_i, lag_k, in_j) — Volumetric "
+                        "Slices, Cross-Mode Coupling & Block/Lag Structure (2x3)]"
+                        "(eof_pf_matrix_3d.png)",
+                    ]
+                )
+            eof_sl_p = os.path.join(out_dir, "eof_pf_lag_slices.png")
+            if os.path.isfile(eof_sl_p):
+                lines.extend(
+                    [
+                        "",
+                        "![3D Modal Predictive Matrix PF — Signed 2D Cross-Mode Lag Slices "
+                        "Across Lookback Taps (2x8)](eof_pf_lag_slices.png)",
+                    ]
+                )
+        else:
+            lines.extend(
+                [
+                    "",
+                    f"## PSOL Predictive Control Performance (`AR({p_ord_s})`, "
+                    "`mkARPF` + `applyARPF` + `mfilt`)",
+                    "",
+                    "- **Architecture**: `mfilt` reconstructs per-frame pseudo-open-loop (PSOL) "
+                    "modal wavefronts `aolN_modevalOL[t] = WFSfact * modevalWFS[t] - "
+                    "modevalDM[t - d]` using fractional lag `d` and optical gain `WFSfact` "
+                    "identified in-loop by `mfilt.testOL`. Double-buffered `aolN_modevalOL_buff` "
+                    f"slices (`256` frames) feed `cacaopc.mkARPF`, which solves per-mode "
+                    f"regularized Wiener `AR({p_ord_s})` predictors (`reglambda = {p_reg_s}`, "
+                    "strict DC stability cap `|sum(w)| <= 0.985` and L2 noise-gain bound "
+                    "`||w||_2^2 <= 1.35`). `cacaopc.applyARPF` evaluates forward-predicted "
+                    "`aolN_modevalPF` in `< 1 us`/frame and synchronizes with `mfilt` "
+                    f"(`PF.mixcoeff = {p_mix_s:.2f}` weighted by modal `mPFmixfact`).",
+                    "",
+                    "| Loop Stage | Modes | Rate [Hz] | PSOL Lag [fr / ms] | `WFSfact` | "
+                    "Updates (`N_train`) | OL / ZOH / Pred RMS | Lag Var Red. | Timeouts |",
+                    "| :--- | ---: | ---: | :---: | ---: | :---: | :---: | ---: | ---: |",
+                ]
+            )
+            for st_lbl, st_k in (
+                ("Stage 1 (`AO3k`)", "stage1"),
+                ("Stage 2 (`SCExAO`)", "stage2"),
+            ):
+                stp = pc_sec.get(st_k, {})
+                if not stp:
+                    continue
+                lines.append(
+                    f"| {st_lbl} | `{stp.get('n_modes', 0)}` | "
+                    f"`{stp.get('loop_rate_hz', 0):.0f}` | "
+                    f"`{stp.get('pflatency_fr', 0):.2f}` / "
+                    f"`{stp.get('pflatency_ms', 0):.2f}` | "
+                    f"`{stp.get('wfsfact', 1.0):.3f}` | "
+                    f"`{stp.get('n_updates', 0)}` (`{stp.get('n_samples', 0)}`) | "
+                    f"`{stp.get('rms_ol', 0):.4f}` / `{stp.get('rms_zoh', 0):.4f}` / "
+                    f"**`{stp.get('rms_pred', 0):.4f}`** | "
+                    f"**`{stp.get('var_red_pct', 0):.1f}%`** | "
+                    f"`{stp.get('timeout_cnt', 0)}` |"
+                )
+            pc_fig_p = os.path.join(out_dir, "predictive_control_summary_2x2.png")
+            if os.path.isfile(pc_fig_p):
+                lines.extend(
+                    [
+                        "",
+                        "![PSOL Auto-Regressive Predictive Control Filter & "
+                        "Modal Residual Summary (2x2)](predictive_control_summary_2x2.png)",
+                    ]
+                )
 
     c2d_sec = s.get("calib_2wfs1dm")
     if isinstance(c2d_sec, dict) and c2d_sec.get("enabled"):
@@ -6234,6 +6674,43 @@ def main():
                     os.environ.pop("CACAOSIM_PLOT_SLOT", None)
                 else:
                     os.environ["CACAOSIM_PLOT_SLOT"] = prev_slot
+        finally:
+            for npy_p in tmp_npys:
+                if os.path.exists(npy_p):
+                    os.remove(npy_p)
+        return
+    if len(sys.argv) >= 3 and sys.argv[1] == "--replot-eof-pf":
+        out_dir = os.path.abspath(sys.argv[2])
+        summary_path = os.path.join(out_dir, "ao3k_scexao_metrics.json")
+        if not os.path.isfile(summary_path):
+            raise FileNotFoundError(f"Missing {summary_path}")
+        tmp_npys = []
+        try:
+            pc_upd = load_predictive_control_metrics(out_dir, tmp_npys)
+            if not isinstance(pc_upd, dict) or str(pc_upd.get("pf_mode", "")).lower() != "eof":
+                raise FileNotFoundError(f"Missing EOF predictive control FITS/stats in {out_dir}")
+            with open(summary_path, "r", encoding="utf-8") as fh:
+                summary = json.load(fh)
+            summary["predictive_control"] = pc_upd
+            with open(summary_path, "w", encoding="utf-8") as fh:
+                json.dump(summary, fh, indent=2)
+                fh.write("\n")
+            prev_slot = os.environ.get("CACAOSIM_PLOT_SLOT")
+            os.environ["CACAOSIM_PLOT_SLOT"] = "18,19"
+            try:
+                render_plots_via_sys_python(out_dir, summary_path)
+            finally:
+                if prev_slot is None:
+                    os.environ.pop("CACAOSIM_PLOT_SLOT", None)
+                else:
+                    os.environ["CACAOSIM_PLOT_SLOT"] = prev_slot
+            benches = sorted(
+                fn
+                for fn in os.listdir(out_dir)
+                if fn.endswith(".bench") and fn != "csim_active.bench"
+            )
+            bench_fn = benches[0] if benches else None
+            write_ao_report_md(out_dir, summary, bench_filename=bench_fn)
         finally:
             for npy_p in tmp_npys:
                 if os.path.exists(npy_p):
