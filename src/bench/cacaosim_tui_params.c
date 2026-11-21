@@ -65,6 +65,9 @@ enum
     PID_B_STAR_TEFF,
     PID_B_TPUT_TEL,
     PID_B_MASTER_HZ,
+    PID_B_OVERSAMPLE,
+    PID_B_ATM_INTERP,
+    PID_B_TELEM_STRIDE,
     PID_B_WF_UNIT,
     PID_B_REF_LAMBDA,
     PID_B_TURB_GAIN,
@@ -100,6 +103,7 @@ enum
     PID_DM_MODE = 200,
     PID_DM_NACT_X,
     PID_DM_NACT_Y,
+    PID_DM_DIAM,
     PID_DM_IF_COUPLING,
     PID_DM_MAX_STROKE,
     PID_DM_REFL_SCALE,
@@ -108,6 +112,8 @@ enum
     PID_DM_F0_HZ,
     PID_DM_ZETA,
     PID_DM_DELAY,
+    PID_DM_DELAY_US,
+    PID_DM_ZOH_MEAN,
     PID_DM_DAC_BITS,
     PID_DM_NONLIN,
 
@@ -122,6 +128,16 @@ enum
     PID_BS_EFF_TRANS,
     PID_BS_NCPA_REFL,
     PID_BS_NCPA_TRANS,
+    PID_BS_PUP_REFL,
+    PID_BS_PUP_TRANS,
+    PID_BS_REFL_DX,
+    PID_BS_REFL_DY,
+    PID_BS_REFL_ROT,
+    PID_BS_REFL_SCALE,
+    PID_BS_TRANS_DX,
+    PID_BS_TRANS_DY,
+    PID_BS_TRANS_ROT,
+    PID_BS_TRANS_SCALE,
 
     /* Coronagraph focal/pupil/Lyot masks & dual-mode LOWFS pickoff parameters */
     PID_CO_MODE = 400,
@@ -132,6 +148,7 @@ enum
     PID_CO_FPM_RAD,
     PID_CO_FPM_AMP,
     PID_CO_FPM_PHASE,
+    PID_CO_NMFT,
     PID_CO_FPM_PIXSCALE,
     PID_CO_PAD_FACTOR,
     PID_CO_VORTEX_Q,
@@ -144,6 +161,8 @@ enum
     PID_CO_LYOT_SPW,
     PID_CO_LYOT_SPDEG,
     PID_CO_LYOT_SPOFF,
+    PID_CO_OUT_PRE_LYOT,
+    PID_CO_OUT_PRE_LYOT_LONG,
     PID_CO_IN_PUP_AMP,
     PID_CO_IN_PUP_PHA,
     PID_CO_IN_FPM_AMP,
@@ -157,24 +176,42 @@ enum
     PID_S_NLAMBDA,
     PID_S_NAVG,
     PID_S_RATE_HZ,
+    PID_S_CLOCK_OFF,
+    PID_S_CLOCK_DRIFT,
+    PID_S_SUB_STRIDE,
+    PID_S_SIM_HZ,
     PID_S_QE,
     PID_S_USE_BFLUX,
     PID_S_FLUX_PH,
     PID_S_RON_E,
+    PID_S_DARK_E,
+    PID_S_GAIN_EADU,
+    PID_S_BIAS_ADU,
+    PID_S_SAT_ADU,
+    PID_S_SHUTTER,
     PID_S_PHOT_NOISE,
     PID_S_OUT_DTYPE,
+    PID_S_RNG_SEED,
     PID_S_PAD_FACTOR,
     PID_PYR_MOD_RAD,
     PID_PYR_MOD_NPTS,
+    PID_PYR_MOD_MODE,
+    PID_PYR_MOD_REV,
+    PID_PYR_MOD_PHASE,
     PID_PYR_PUP_SEP,
     PID_PYR_ROOF_LD,
+    PID_PYR_FSTOP,
+    PID_PYR_CHROM_SEP,
     PID_SH_NSUB,
     PID_SH_PIX_SUB,
     PID_ZW_DIMPLE_LD,
     PID_ZW_DIMPLE_RAD,
+    PID_ZW_DIMPLE_AMP,
+    PID_ZW_ACHROM,
     PID_ZW_NMFT,
     PID_FP_PROP_MODE,
     PID_FP_PIXSCALE,
+    PID_FP_IS_WFS,
     PID_FP_NLAMBDA,
 
     /* Static Wavefront Error ([wfe.<id>], OPD in [meter]) synthesis & scaling parameters */
@@ -370,6 +407,7 @@ int cs_params_build(
     const cacaosim_bench_cfg_t *cfg,
     int                         sel_item,
     int                         subtab,
+    int                         show_advanced,
     cs_param_desc_t            *out,
     int                         max_out)
 {
@@ -408,6 +446,18 @@ int cs_params_build(
         {
             add_pd(out, &n, max_out, PID_B_MASTER_HZ, "master_hz", "Master Clock", "Hz",
                    CS_PTYPE_FLOAT, 1.0, 20000.0, 100.0, "Master bench simulation loop rate [Hz]");
+            if (show_advanced)
+            {
+                add_pd(out, &n, max_out, PID_B_OVERSAMPLE, "oversample", "Oversample K", "x",
+                       CS_PTYPE_UINT, 1, 64, 1,
+                       "Temporal oversampling factor K (dt_int = 1/(K*master_hz))");
+                add_pd(out, &n, max_out, PID_B_ATM_INTERP, "atm_interp", "Atm Sub-Interp", "",
+                       CS_PTYPE_BOOL, 0, 1, 1,
+                       "Interpolate atmosphere across oversampled substeps (fused)");
+                add_pd(out, &n, max_out, PID_B_TELEM_STRIDE, "telemetry_stride", "Telem Stride",
+                       "ticks", CS_PTYPE_UINT, 0, 1000, 1,
+                       "Decimation stride for diagnostic beam exports (0 = every tick)");
+            }
             add_pd(out, &n, max_out, PID_B_STAR_MAG, "star_mag", "Guide Star Mag", "mV",
                    CS_PTYPE_FLOAT, -2.0, 22.0, 0.5, "Apparent Vega V-band magnitude");
             add_pd(out, &n, max_out, PID_B_STAR_TEFF, "star_teff", "Star Teff", "K",
@@ -470,6 +520,29 @@ int cs_params_build(
                    CS_PTYPE_STR, 0, 0, 0, "Optional reflected arm static NCPA stream");
             add_pd(out, &n, max_out, PID_BS_NCPA_TRANS, "ncpa_trans", "Trans NCPA SHM", "shm",
                    CS_PTYPE_STR, 0, 0, 0, "Optional transmitted arm static NCPA stream");
+            if (show_advanced)
+            {
+                add_pd(out, &n, max_out, PID_BS_PUP_REFL, "pup_refl", "Refl Pupil SHM", "shm",
+                       CS_PTYPE_STR, 0, 0, 0, "Optional reflected arm pupil mask SHM stream");
+                add_pd(out, &n, max_out, PID_BS_PUP_TRANS, "pup_trans", "Trans Pupil SHM", "shm",
+                       CS_PTYPE_STR, 0, 0, 0, "Optional transmitted arm pupil mask SHM stream");
+                add_pd(out, &n, max_out, PID_BS_REFL_DX, "refl_dx", "Refl Shift X", "px",
+                       CS_PTYPE_FLOAT, -32.0, 32.0, 0.25, "Reflected-arm lateral X shift [px]");
+                add_pd(out, &n, max_out, PID_BS_REFL_DY, "refl_dy", "Refl Shift Y", "px",
+                       CS_PTYPE_FLOAT, -32.0, 32.0, 0.25, "Reflected-arm lateral Y shift [px]");
+                add_pd(out, &n, max_out, PID_BS_REFL_ROT, "refl_rot", "Refl Rotation", "deg",
+                       CS_PTYPE_FLOAT, -180.0, 180.0, 1.0, "Reflected-arm pupil clocking [deg]");
+                add_pd(out, &n, max_out, PID_BS_REFL_SCALE, "refl_scale", "Refl Mag Scale", "x",
+                       CS_PTYPE_FLOAT, 0.50, 1.50, 0.01, "Reflected-arm radial magnification");
+                add_pd(out, &n, max_out, PID_BS_TRANS_DX, "trans_dx", "Trans Shift X", "px",
+                       CS_PTYPE_FLOAT, -32.0, 32.0, 0.25, "Transmitted-arm lateral X shift [px]");
+                add_pd(out, &n, max_out, PID_BS_TRANS_DY, "trans_dy", "Trans Shift Y", "px",
+                       CS_PTYPE_FLOAT, -32.0, 32.0, 0.25, "Transmitted-arm lateral Y shift [px]");
+                add_pd(out, &n, max_out, PID_BS_TRANS_ROT, "trans_rot", "Trans Rotation", "deg",
+                       CS_PTYPE_FLOAT, -180.0, 180.0, 1.0, "Transmitted-arm pupil clocking [deg]");
+                add_pd(out, &n, max_out, PID_BS_TRANS_SCALE, "trans_scale", "Trans Mag Scale", "x",
+                       CS_PTYPE_FLOAT, 0.50, 1.50, 0.01, "Transmitted-arm radial magnification");
+            }
         }
         else if (nd->kind == CACAOSIM_NODE_CORO)
         {
@@ -477,6 +550,15 @@ int cs_params_build(
                    0, 0, 0, "Post-Lyot coronagraphic output beam");
             add_pd(out, &n, max_out, PID_N_OUT_LOWFS, "out_lowfs", "LOWFS Pickoff", "beam",
                    CS_PTYPE_STR, 0, 0, 0, "Reflected FPM or Lyot stop pickoff beam for LOWFS");
+            if (show_advanced)
+            {
+                add_pd(out, &n, max_out, PID_CO_OUT_PRE_LYOT, "out_pre_lyot", "Pre-Lyot SHM",
+                       "shm", CS_PTYPE_STR, 0, 0, 0,
+                       "Optional pre-Lyot pupil intensity telemetry SHM");
+                add_pd(out, &n, max_out, PID_CO_OUT_PRE_LYOT_LONG, "out_pre_lyot_long",
+                       "Pre-Lyot Avg", "shm", CS_PTYPE_STR, 0, 0, 0,
+                       "Optional cumulative pre-Lyot pupil average SHM");
+            }
             add_pd(out, &n, max_out, PID_CO_IN_PUP_AMP, "in_pup_amp", "Pupil Amp Mask", "mask",
                    CS_PTYPE_STR, 0, 0, 0, "Custom 2D/3D pupil apodizer amplitude (FITS or SHM)");
             add_pd(out, &n, max_out, PID_CO_IN_PUP_PHA, "in_pup_pha", "Pupil Pha Mask", "mask",
@@ -539,6 +621,12 @@ int cs_params_build(
                        CS_PTYPE_UINT, 2, 128, 2, "Actuator count along X across pupil");
                 add_pd(out, &n, max_out, PID_DM_NACT_Y, "nact_y", "Actuators Y", "act",
                        CS_PTYPE_UINT, 2, 128, 2, "Actuator count along Y across pupil");
+                if (show_advanced)
+                {
+                    add_pd(out, &n, max_out, PID_DM_DIAM, "dm_diam", "Active DM Diam", "act",
+                           CS_PTYPE_FLOAT, 0.0, 128.0, 1.0,
+                           "Pupil diameter in actuator pitches (0 = auto nact_x - 2)");
+                }
                 add_pd(out, &n, max_out, PID_DM_IF_COUPLING, "if_coupling", "IF Coupling", "",
                        CS_PTYPE_FLOAT, 0.02, 0.60, 0.02, "Gaussian inter-actuator coupling");
             }
@@ -561,6 +649,15 @@ int cs_params_build(
                    2.0, 0.05, "2nd-order damping ratio (0.7 = critically damped)");
             add_pd(out, &n, max_out, PID_DM_DELAY, "delay_frames", "Frame Delay", "fr",
                    CS_PTYPE_FLOAT, 0.0, 7.0, 0.25, "Fractional master-clock latency [frames]");
+            if (show_advanced)
+            {
+                add_pd(out, &n, max_out, PID_DM_DELAY_US, "delay_us", "Physical Delay", "us",
+                       CS_PTYPE_FLOAT, 0.0, 100000.0, 25.0,
+                       "Physical transport delay [us] (>0 overrides delay_frames)");
+                add_pd(out, &n, max_out, PID_DM_ZOH_MEAN, "zoh_mean", "ZOH Sub-Avg", "",
+                       CS_PTYPE_BOOL, 0, 1, 1,
+                       "Integrate ZOH exposure average across tick (fused)");
+            }
             add_pd(out, &n, max_out, PID_DM_DAC_BITS, "dac_bits", "DAC Resolution", "bits",
                    CS_PTYPE_INT, 0, 24, 2, "Drive electronics quantization bits (0 = float)");
             add_pd(out, &n, max_out, PID_DM_NONLIN, "nonlin_quad", "Quad Nonlin", "",
@@ -635,6 +732,12 @@ int cs_params_build(
                 {
                     add_pd(out, &n, max_out, PID_CO_FPM_PHASE, "fpm_phase", "Core Phase", "rad",
                            CS_PTYPE_FLOAT, 0.0, 6.2832, 0.157, "Phase shift inside dimple [rad]");
+                }
+                if (show_advanced)
+                {
+                    add_pd(out, &n, max_out, PID_CO_NMFT, "n_mft", "FPM MFT Grid", "px",
+                           CS_PTYPE_UINT, 16, 256, 8,
+                           "Babinet Matrix-DFT sampling points across analytic FPM");
                 }
             }
             else if (nd->coro.mode == CACAOSIM_CORO_VORTEX)
@@ -748,6 +851,25 @@ int cs_params_build(
                    CS_PTYPE_FLOAT, 0.25, 0.75, 0.02, "Sub-pupil center separation fraction");
             add_pd(out, &n, max_out, PID_PYR_ROOF_LD, "roof_ld", "Roof Defect", "l/D",
                    CS_PTYPE_FLOAT, 0.0, 2.0, 0.05, "Pyramid apex roof width [lambda/D]");
+            if (show_advanced)
+            {
+                add_pd(out, &n, max_out, PID_S_PAD_FACTOR, "pad_factor", "FFT Pad Factor", "x",
+                       CS_PTYPE_UINT, 2, 8, 1, "Focal-plane FFT zero-padding factor");
+                add_enum_pd(out, &n, max_out, PID_PYR_MOD_MODE, "mod_mode", "Subframe Mod", 3,
+                            "full", "sync_arc", "interleaved", NULL,
+                            "Subframe modulation partitioning across oversampled ticks");
+                add_pd(out, &n, max_out, PID_PYR_MOD_REV, "mod_rev", "Mod Revolutions", "rev",
+                       CS_PTYPE_INT, 1, 16, 1, "Modulation revolutions per camera exposure");
+                add_pd(out, &n, max_out, PID_PYR_MOD_PHASE, "mod_phase_deg", "Mod Phase Zero",
+                       "deg", CS_PTYPE_FLOAT, 0.0, 360.0, 15.0,
+                       "Initial modulation ring azimuth angle [deg]");
+                add_pd(out, &n, max_out, PID_PYR_FSTOP, "fstop_frac", "Field Stop Frac", "",
+                       CS_PTYPE_FLOAT, 0.0, 1.0, 0.05,
+                       "Focal field-stop radius fraction (fused-only)");
+                add_pd(out, &n, max_out, PID_PYR_CHROM_SEP, "chrom_sep", "Chrom Pup Sep", "",
+                       CS_PTYPE_FLOAT, -0.5, 0.5, 0.02,
+                       "Glass dispersion d(pup_sep)/d(ln lam) (fused-only)");
+            }
         }
         else if (nd->kind == CACAOSIM_NODE_SHWFS)
         {
@@ -780,6 +902,14 @@ int cs_params_build(
                    CS_PTYPE_FLOAT, 0.1, 3.1416, 0.05, "Dimple phase shift [rad] (pi/2 = 1.5708)");
             add_pd(out, &n, max_out, PID_ZW_NMFT, "n_mft", "MFT Grid Pts", "px", CS_PTYPE_UINT, 16,
                    96, 8, "Babinet Matrix-DFT sampling across dimple");
+            if (show_advanced)
+            {
+                add_pd(out, &n, max_out, PID_ZW_DIMPLE_AMP, "dimple_amp", "Dimple Amp Tr", "",
+                       CS_PTYPE_FLOAT, 0.0, 1.0, 0.05, "Dimple field amplitude transmission");
+                add_pd(out, &n, max_out, PID_ZW_ACHROM, "achrom_dimple", "Achrom Dimple", "",
+                       CS_PTYPE_BOOL, 0, 1, 1,
+                       "Wavelength-independent dimple phase shift (fused-only)");
+            }
         }
         else if (nd->kind == CACAOSIM_NODE_FPCAM)
         {
@@ -795,6 +925,14 @@ int cs_params_build(
                    CS_PTYPE_INT, 0, 32, 1, "Polychromatic slices (0 = auto -> 2 when bw_frac > 0)");
             add_pd(out, &n, max_out, PID_FP_PIXSCALE, "pixscale_ld", "Sampling", "px/lD",
                    CS_PTYPE_FLOAT, 1.0, 10.0, 0.25, "Detector pixels per lambda/D (MFT mode)");
+            if (show_advanced)
+            {
+                add_pd(out, &n, max_out, PID_S_PAD_FACTOR, "pad_factor", "FFT Pad Factor", "x",
+                       CS_PTYPE_UINT, 2, 8, 1, "Zero-padding factor when prop_mode == fft");
+                add_pd(out, &n, max_out, PID_FP_IS_WFS, "is_wfs", "Focal-Plane WFS", "",
+                       CS_PTYPE_BOOL, 0, 1, 1,
+                       "Keep active as WFS during calib_fast / skip_fpcam (fused)");
+            }
         }
     }
     else
@@ -803,22 +941,60 @@ int cs_params_build(
                1000, 1, "Master ticks co-added per detector readout");
         add_pd(out, &n, max_out, PID_S_RATE_HZ, "rate_hz", "Target Rate", "Hz", CS_PTYPE_FLOAT, 0.0,
                20000.0, 50.0, "Optional explicit camera rate [Hz] (0 = use navg)");
+        if (show_advanced)
+        {
+            add_pd(out, &n, max_out, PID_S_CLOCK_OFF, "clock_offset_us", "Clock Offset", "us",
+                   CS_PTYPE_FLOAT, -100000.0, 100000.0, 10.0,
+                   "Static camera trigger phase offset vs master clock (fused)");
+            add_pd(out, &n, max_out, PID_S_CLOCK_DRIFT, "clock_drift_ppm", "Clock Drift", "ppm",
+                   CS_PTYPE_FLOAT, -5000.0, 5000.0, 10.0,
+                   "Relative camera oscillator clock drift [ppm] (fused)");
+            add_pd(out, &n, max_out, PID_S_SUB_STRIDE, "subframe_stride", "Subframe Stride",
+                   "ticks", CS_PTYPE_UINT, 0, 64, 1,
+                   "Optical propagation decimation stride (0 = auto, fused)");
+            add_pd(out, &n, max_out, PID_S_SIM_HZ, "sim_hz", "Optical Sim Rate", "Hz",
+                   CS_PTYPE_FLOAT, 0.0, 50000.0, 100.0,
+                   "Target propagation sampling rate [Hz] deriving stride (fused)");
+        }
         add_pd(out, &n, max_out, PID_S_QE, "qe", "Quantum Eff", "", CS_PTYPE_FLOAT, 0.05, 1.0, 0.05,
                "Detector quantum efficiency [e-/photon]");
+        if (show_advanced)
+        {
+            add_pd(out, &n, max_out, PID_N_TPUT, "tput", "Arm Throughput", "", CS_PTYPE_FLOAT, 0.01,
+                   1.0, 0.02, "Sensor-arm optical intensity throughput (fused)");
+        }
         add_pd(out, &n, max_out, PID_S_USE_BFLUX, "use_beam_flux", "Auto Star Flux", "",
                CS_PTYPE_BOOL, 0, 1, 1, "Derive flux from stellar spectrum & upstream optics");
-        /* Manual photon budget row is exposed only when automatic stellar photometry is disabled */
-        if (!nd->use_beam_flux)
+        /* Manual photon budget row is exposed when auto flux is off or Advanced is enabled */
+        if (!nd->use_beam_flux || show_advanced)
         {
             add_pd(out, &n, max_out, PID_S_FLUX_PH, "flux_ph", "Manual Flux", "ph/fr",
                    CS_PTYPE_FLOAT, 0.0, 1.0e10, 1000.0, "Manual photon count per exposure");
         }
         add_pd(out, &n, max_out, PID_S_RON_E, "ron_e", "Readout Noise", "e-", CS_PTYPE_FLOAT, 0.0,
                100.0, 0.2, "Detector RMS readout noise [electrons/pixel]");
+        if (show_advanced)
+        {
+            add_pd(out, &n, max_out, PID_S_DARK_E, "dark_e", "Dark Current", "e-/fr",
+                   CS_PTYPE_FLOAT, 0.0, 10000.0, 0.5, "Dark current + sky background [e-/px/fr]");
+            add_pd(out, &n, max_out, PID_S_GAIN_EADU, "gain_eadu", "Conv Gain", "e-/ADU",
+                   CS_PTYPE_FLOAT, 0.01, 100.0, 0.1, "Detector conversion gain [e-/ADU]");
+            add_pd(out, &n, max_out, PID_S_BIAS_ADU, "bias_adu", "Bias Pedestal", "ADU",
+                   CS_PTYPE_FLOAT, 0.0, 32768.0, 10.0, "Electronic bias offset [ADU]");
+            add_pd(out, &n, max_out, PID_S_SAT_ADU, "sat_adu", "Saturation Cap", "ADU",
+                   CS_PTYPE_FLOAT, 100.0, 1.0e7, 1000.0, "Detector saturation ceiling [ADU]");
+            add_pd(out, &n, max_out, PID_S_SHUTTER, "shutter", "Optical Shutter", "", CS_PTYPE_BOOL,
+                   0, 1, 1, "Open sky light (ON) or dark/bias frame only (OFF)");
+        }
         add_pd(out, &n, max_out, PID_S_PHOT_NOISE, "photon_noise", "Photon Shot", "",
                CS_PTYPE_BOOL, 0, 1, 1, "Enable Poisson photon shot noise");
         add_enum_pd(out, &n, max_out, PID_S_OUT_DTYPE, "out_dtype", "Pixel Dtype", 2, "uint16",
                     "float32", NULL, NULL, "Output SHM pixel format (ADU uint16 or float32)");
+        if (show_advanced)
+        {
+            add_pd(out, &n, max_out, PID_S_RNG_SEED, "rng_seed", "Detector Seed", "", CS_PTYPE_UINT,
+                   1, 99999999, 1, "Deterministic per-detector PRNG seed");
+        }
     }
 
     return n;
@@ -960,6 +1136,15 @@ void cs_param_format_val(
         case PID_B_MASTER_HZ:
             snprintf(buf, cap, "%.1f", cfg->master_hz);
             break;
+        case PID_B_OVERSAMPLE:
+            snprintf(buf, cap, "%u", (cfg->oversample >= 1u) ? cfg->oversample : 1u);
+            break;
+        case PID_B_ATM_INTERP:
+            snprintf(buf, cap, "%s", cfg->atm_interp ? "ON" : "OFF");
+            break;
+        case PID_B_TELEM_STRIDE:
+            snprintf(buf, cap, "%u", cfg->telemetry_stride);
+            break;
         case PID_B_WF_UNIT:
             snprintf(buf, cap, "%s", (cfg->wf_unit == CACAOSIM_WFUNIT_PHASE_RAD) ? "rad" : "um");
             break;
@@ -1066,6 +1251,9 @@ void cs_param_format_val(
     case PID_DM_NACT_Y:
         snprintf(buf, cap, "%u", nd->dm.nact_y);
         break;
+    case PID_DM_DIAM:
+        snprintf(buf, cap, "%.2f", nd->dm.dm_diam);
+        break;
     case PID_DM_IF_COUPLING:
         snprintf(buf, cap, "%.3f", nd->dm.if_coupling);
         break;
@@ -1090,6 +1278,12 @@ void cs_param_format_val(
         break;
     case PID_DM_DELAY:
         snprintf(buf, cap, "%.2f", nd->dm.delay_frames);
+        break;
+    case PID_DM_DELAY_US:
+        snprintf(buf, cap, "%.1f", nd->dm.delay_sec * 1.0e6f);
+        break;
+    case PID_DM_ZOH_MEAN:
+        snprintf(buf, cap, "%s", nd->dm.no_zoh_mean ? "OFF" : "ON");
         break;
     case PID_DM_DAC_BITS:
         snprintf(buf, cap, "%d", nd->dm.dac_bits);
@@ -1129,6 +1323,36 @@ void cs_param_format_val(
     case PID_BS_NCPA_TRANS:
         snprintf(buf, cap, "%s", nd->ncpa_trans);
         break;
+    case PID_BS_PUP_REFL:
+        snprintf(buf, cap, "%s", nd->pup_refl);
+        break;
+    case PID_BS_PUP_TRANS:
+        snprintf(buf, cap, "%s", nd->pup_trans);
+        break;
+    case PID_BS_REFL_DX:
+        snprintf(buf, cap, "%.2f", nd->reg_refl.shift_x);
+        break;
+    case PID_BS_REFL_DY:
+        snprintf(buf, cap, "%.2f", nd->reg_refl.shift_y);
+        break;
+    case PID_BS_REFL_ROT:
+        snprintf(buf, cap, "%.2f", nd->reg_refl.rot_deg);
+        break;
+    case PID_BS_REFL_SCALE:
+        snprintf(buf, cap, "%.4f", (nd->reg_refl.scale > 0.0f) ? nd->reg_refl.scale : 1.0f);
+        break;
+    case PID_BS_TRANS_DX:
+        snprintf(buf, cap, "%.2f", nd->reg_trans.shift_x);
+        break;
+    case PID_BS_TRANS_DY:
+        snprintf(buf, cap, "%.2f", nd->reg_trans.shift_y);
+        break;
+    case PID_BS_TRANS_ROT:
+        snprintf(buf, cap, "%.2f", nd->reg_trans.rot_deg);
+        break;
+    case PID_BS_TRANS_SCALE:
+        snprintf(buf, cap, "%.4f", (nd->reg_trans.scale > 0.0f) ? nd->reg_trans.scale : 1.0f);
+        break;
 
     case PID_CO_MODE:
         snprintf(buf, cap, "%s",
@@ -1154,6 +1378,9 @@ void cs_param_format_val(
         break;
     case PID_CO_FPM_PHASE:
         snprintf(buf, cap, "%.3f", nd->coro.fpm_phase_rad);
+        break;
+    case PID_CO_NMFT:
+        snprintf(buf, cap, "%u", (nd->coro.n_mft >= 16u) ? nd->coro.n_mft : 48u);
         break;
     case PID_CO_FPM_PIXSCALE:
         snprintf(buf, cap, "%.2f",
@@ -1193,6 +1420,12 @@ void cs_param_format_val(
         break;
     case PID_CO_LYOT_SPOFF:
         snprintf(buf, cap, "%.5f", nd->coro.lyot_spider_offset);
+        break;
+    case PID_CO_OUT_PRE_LYOT:
+        snprintf(buf, cap, "%s", nd->out_pre_lyot);
+        break;
+    case PID_CO_OUT_PRE_LYOT_LONG:
+        snprintf(buf, cap, "%s", nd->out_pre_lyot_long);
         break;
     case PID_CO_IN_PUP_AMP:
         snprintf(buf, cap, "%s", nd->in_pup_amp);
@@ -1244,6 +1477,18 @@ void cs_param_format_val(
     case PID_S_RATE_HZ:
         snprintf(buf, cap, "%.1f", nd->rate_hz);
         break;
+    case PID_S_CLOCK_OFF:
+        snprintf(buf, cap, "%.2f", nd->clock_offset_us);
+        break;
+    case PID_S_CLOCK_DRIFT:
+        snprintf(buf, cap, "%.2f", nd->clock_drift_ppm);
+        break;
+    case PID_S_SUB_STRIDE:
+        snprintf(buf, cap, "%u", nd->subframe_stride);
+        break;
+    case PID_S_SIM_HZ:
+        snprintf(buf, cap, "%.1f", nd->sim_hz);
+        break;
     case PID_S_QE:
         snprintf(buf, cap, "%.3f", nd->qe);
         break;
@@ -1256,14 +1501,44 @@ void cs_param_format_val(
     case PID_S_RON_E:
         snprintf(buf, cap, "%.2f", det->ron_e);
         break;
+    case PID_S_DARK_E:
+        snprintf(buf, cap, "%.2f", det->dark_e);
+        break;
+    case PID_S_GAIN_EADU:
+        snprintf(buf, cap, "%.3f", det->gain_eadu);
+        break;
+    case PID_S_BIAS_ADU:
+        snprintf(buf, cap, "%.1f", det->bias_adu);
+        break;
+    case PID_S_SAT_ADU:
+        snprintf(buf, cap, "%.0f", det->sat_adu);
+        break;
+    case PID_S_SHUTTER:
+        snprintf(buf, cap, "%s", det->shutter ? "ON" : "OFF");
+        break;
     case PID_S_PHOT_NOISE:
         snprintf(buf, cap, "%s", det->photon_noise ? "ON" : "OFF");
         break;
     case PID_S_OUT_DTYPE:
         snprintf(buf, cap, "%s", (det->out_dtype == CACAOSIM_DTYPE_F32) ? "float32" : "uint16");
         break;
+    case PID_S_RNG_SEED:
+    {
+        uint64_t sd = (nd->kind == CACAOSIM_NODE_PYRWFS)
+                          ? nd->pyrwfs.rng_seed
+                          : (nd->kind == CACAOSIM_NODE_SHWFS
+                                 ? nd->shwfs.rng_seed
+                                 : (nd->kind == CACAOSIM_NODE_ZWFS ? nd->zwfs.rng_seed
+                                                                   : nd->fpcam.rng_seed));
+        snprintf(buf, cap, "%llu", (unsigned long long) sd);
+        break;
+    }
     case PID_S_PAD_FACTOR:
-        snprintf(buf, cap, "%u", nd->shwfs.pad_factor);
+        snprintf(buf, cap, "%u",
+                 (nd->kind == CACAOSIM_NODE_PYRWFS)
+                     ? nd->pyrwfs.pad_factor
+                     : (nd->kind == CACAOSIM_NODE_SHWFS ? nd->shwfs.pad_factor
+                                                        : nd->fpcam.pad_factor));
         break;
     case PID_PYR_MOD_RAD:
         snprintf(buf, cap, "%.2f", nd->pyrwfs.mod_rad_ld);
@@ -1271,11 +1546,30 @@ void cs_param_format_val(
     case PID_PYR_MOD_NPTS:
         snprintf(buf, cap, "%d", nd->pyrwfs.mod_npts);
         break;
+    case PID_PYR_MOD_MODE:
+        snprintf(buf, cap, "%s",
+                 (nd->pyrwfs.mod_subframe_mode == CACAOSIM_PYRMOD_FULL)
+                     ? "full"
+                     : (nd->pyrwfs.mod_subframe_mode == CACAOSIM_PYRMOD_INTERLEAVED ? "interleaved"
+                                                                                    : "sync_arc"));
+        break;
+    case PID_PYR_MOD_REV:
+        snprintf(buf, cap, "%d", (nd->pyrwfs.mod_rev >= 1) ? nd->pyrwfs.mod_rev : 1);
+        break;
+    case PID_PYR_MOD_PHASE:
+        snprintf(buf, cap, "%.1f", nd->pyrwfs.mod_phase_deg);
+        break;
     case PID_PYR_PUP_SEP:
         snprintf(buf, cap, "%.3f", nd->pyrwfs.pup_sep);
         break;
     case PID_PYR_ROOF_LD:
         snprintf(buf, cap, "%.3f", nd->pyrwfs.roof_ld);
+        break;
+    case PID_PYR_FSTOP:
+        snprintf(buf, cap, "%.3f", nd->pyrwfs.fstop_frac);
+        break;
+    case PID_PYR_CHROM_SEP:
+        snprintf(buf, cap, "%.3f", nd->pyrwfs.chrom_sep);
         break;
     case PID_SH_NSUB:
         snprintf(buf, cap, "%u", nd->shwfs.n_sub);
@@ -1289,6 +1583,12 @@ void cs_param_format_val(
     case PID_ZW_DIMPLE_RAD:
         snprintf(buf, cap, "%.4f", nd->zwfs.dimple_rad);
         break;
+    case PID_ZW_DIMPLE_AMP:
+        snprintf(buf, cap, "%.3f", nd->zwfs.dimple_amp);
+        break;
+    case PID_ZW_ACHROM:
+        snprintf(buf, cap, "%s", nd->zwfs.achrom_dimple ? "ON" : "OFF");
+        break;
     case PID_ZW_NMFT:
         snprintf(buf, cap, "%u", nd->zwfs.n_mft);
         break;
@@ -1297,6 +1597,9 @@ void cs_param_format_val(
         break;
     case PID_FP_PIXSCALE:
         snprintf(buf, cap, "%.2f", nd->fpcam.pixscale_ld);
+        break;
+    case PID_FP_IS_WFS:
+        snprintf(buf, cap, "%s", nd->is_wfs ? "ON" : "OFF");
         break;
     case PID_WFE_RMS_NM:
         snprintf(buf, cap, "%.1f", nd->wfe_rms_nm);
@@ -1502,6 +1805,15 @@ int cs_param_set_str(
         case PID_B_MASTER_HZ:
             cfg->master_hz = (float) dv;
             break;
+        case PID_B_OVERSAMPLE:
+            cfg->oversample = (iv >= 1) ? (uint32_t) iv : 1u;
+            break;
+        case PID_B_ATM_INTERP:
+            cfg->atm_interp = iv ? 1 : 0;
+            break;
+        case PID_B_TELEM_STRIDE:
+            cfg->telemetry_stride = (iv >= 0) ? (uint32_t) iv : 0u;
+            break;
         case PID_B_WF_UNIT:
             cfg->wf_unit = (iv == 1) ? CACAOSIM_WFUNIT_PHASE_RAD : CACAOSIM_WFUNIT_OPD_UM;
             break;
@@ -1651,6 +1963,9 @@ int cs_param_set_str(
     case PID_DM_NACT_Y:
         nd->dm.nact_y = (uint32_t) iv;
         break;
+    case PID_DM_DIAM:
+        nd->dm.dm_diam = (float) dv;
+        break;
     case PID_DM_IF_COUPLING:
         nd->dm.if_coupling = (float) dv;
         break;
@@ -1675,6 +1990,13 @@ int cs_param_set_str(
         break;
     case PID_DM_DELAY:
         nd->dm.delay_frames = (float) dv;
+        nd->dm.delay_sec    = 0.0f;
+        break;
+    case PID_DM_DELAY_US:
+        nd->dm.delay_sec = (float) dv * 1.0e-6f;
+        break;
+    case PID_DM_ZOH_MEAN:
+        nd->dm.no_zoh_mean = iv ? 0 : 1;
         break;
     case PID_DM_DAC_BITS:
         nd->dm.dac_bits = iv;
@@ -1713,6 +2035,36 @@ int cs_param_set_str(
     case PID_BS_NCPA_TRANS:
         snprintf(nd->ncpa_trans, sizeof(nd->ncpa_trans), "%s", val_str);
         break;
+    case PID_BS_PUP_REFL:
+        snprintf(nd->pup_refl, sizeof(nd->pup_refl), "%s", val_str);
+        break;
+    case PID_BS_PUP_TRANS:
+        snprintf(nd->pup_trans, sizeof(nd->pup_trans), "%s", val_str);
+        break;
+    case PID_BS_REFL_DX:
+        nd->reg_refl.shift_x = (float) dv;
+        break;
+    case PID_BS_REFL_DY:
+        nd->reg_refl.shift_y = (float) dv;
+        break;
+    case PID_BS_REFL_ROT:
+        nd->reg_refl.rot_deg = (float) dv;
+        break;
+    case PID_BS_REFL_SCALE:
+        nd->reg_refl.scale = (float) dv;
+        break;
+    case PID_BS_TRANS_DX:
+        nd->reg_trans.shift_x = (float) dv;
+        break;
+    case PID_BS_TRANS_DY:
+        nd->reg_trans.shift_y = (float) dv;
+        break;
+    case PID_BS_TRANS_ROT:
+        nd->reg_trans.rot_deg = (float) dv;
+        break;
+    case PID_BS_TRANS_SCALE:
+        nd->reg_trans.scale = (float) dv;
+        break;
 
     case PID_CO_MODE:
         nd->coro.mode = iv;
@@ -1739,6 +2091,9 @@ int cs_param_set_str(
         break;
     case PID_CO_FPM_PHASE:
         nd->coro.fpm_phase_rad = (float) dv;
+        break;
+    case PID_CO_NMFT:
+        nd->coro.n_mft = (uint32_t) iv;
         break;
     case PID_CO_FPM_PIXSCALE:
         nd->coro.fpm_pixscale_ld = (float) dv;
@@ -1777,6 +2132,12 @@ int cs_param_set_str(
         break;
     case PID_CO_LYOT_SPOFF:
         nd->coro.lyot_spider_offset = (float) dv;
+        break;
+    case PID_CO_OUT_PRE_LYOT:
+        snprintf(nd->out_pre_lyot, sizeof(nd->out_pre_lyot), "%s", val_str);
+        break;
+    case PID_CO_OUT_PRE_LYOT_LONG:
+        snprintf(nd->out_pre_lyot_long, sizeof(nd->out_pre_lyot_long), "%s", val_str);
         break;
     case PID_CO_IN_PUP_AMP:
         snprintf(nd->in_pup_amp, sizeof(nd->in_pup_amp), "%s", val_str);
@@ -1859,6 +2220,18 @@ int cs_param_set_str(
     case PID_S_RATE_HZ:
         nd->rate_hz = (float) dv;
         break;
+    case PID_S_CLOCK_OFF:
+        nd->clock_offset_us = (float) dv;
+        break;
+    case PID_S_CLOCK_DRIFT:
+        nd->clock_drift_ppm = (float) dv;
+        break;
+    case PID_S_SUB_STRIDE:
+        nd->subframe_stride = (uint32_t) iv;
+        break;
+    case PID_S_SIM_HZ:
+        nd->sim_hz = (float) dv;
+        break;
     case PID_S_QE:
         nd->qe = (float) dv;
         break;
@@ -1871,14 +2244,61 @@ int cs_param_set_str(
     case PID_S_RON_E:
         det->ron_e = (float) dv;
         break;
+    case PID_S_DARK_E:
+        det->dark_e = (float) dv;
+        break;
+    case PID_S_GAIN_EADU:
+        det->gain_eadu = (float) dv;
+        break;
+    case PID_S_BIAS_ADU:
+        det->bias_adu = (float) dv;
+        break;
+    case PID_S_SAT_ADU:
+        det->sat_adu = (float) dv;
+        break;
+    case PID_S_SHUTTER:
+        det->shutter = iv ? 1 : 0;
+        break;
     case PID_S_PHOT_NOISE:
         det->photon_noise = iv;
         break;
     case PID_S_OUT_DTYPE:
         det->out_dtype = (iv == 1) ? CACAOSIM_DTYPE_F32 : CACAOSIM_DTYPE_U16;
         break;
+    case PID_S_RNG_SEED:
+    {
+        uint64_t sd = (uint64_t) llround(dv);
+        if (nd->kind == CACAOSIM_NODE_PYRWFS)
+        {
+            nd->pyrwfs.rng_seed = sd;
+        }
+        else if (nd->kind == CACAOSIM_NODE_SHWFS)
+        {
+            nd->shwfs.rng_seed = sd;
+        }
+        else if (nd->kind == CACAOSIM_NODE_ZWFS)
+        {
+            nd->zwfs.rng_seed = sd;
+        }
+        else
+        {
+            nd->fpcam.rng_seed = sd;
+        }
+        break;
+    }
     case PID_S_PAD_FACTOR:
-        nd->shwfs.pad_factor = (uint32_t) iv;
+        if (nd->kind == CACAOSIM_NODE_PYRWFS)
+        {
+            nd->pyrwfs.pad_factor = (uint32_t) iv;
+        }
+        else if (nd->kind == CACAOSIM_NODE_SHWFS)
+        {
+            nd->shwfs.pad_factor = (uint32_t) iv;
+        }
+        else
+        {
+            nd->fpcam.pad_factor = (uint32_t) iv;
+        }
         break;
     case PID_PYR_MOD_RAD:
         nd->pyrwfs.mod_rad_ld = (float) dv;
@@ -1886,11 +2306,29 @@ int cs_param_set_str(
     case PID_PYR_MOD_NPTS:
         nd->pyrwfs.mod_npts = iv;
         break;
+    case PID_PYR_MOD_MODE:
+        nd->pyrwfs.mod_subframe_mode = (iv == 0)
+                                           ? CACAOSIM_PYRMOD_FULL
+                                           : (iv == 2 ? CACAOSIM_PYRMOD_INTERLEAVED
+                                                      : CACAOSIM_PYRMOD_SYNC_ARC);
+        break;
+    case PID_PYR_MOD_REV:
+        nd->pyrwfs.mod_rev = iv;
+        break;
+    case PID_PYR_MOD_PHASE:
+        nd->pyrwfs.mod_phase_deg = (float) dv;
+        break;
     case PID_PYR_PUP_SEP:
         nd->pyrwfs.pup_sep = (float) dv;
         break;
     case PID_PYR_ROOF_LD:
         nd->pyrwfs.roof_ld = (float) dv;
+        break;
+    case PID_PYR_FSTOP:
+        nd->pyrwfs.fstop_frac = (float) dv;
+        break;
+    case PID_PYR_CHROM_SEP:
+        nd->pyrwfs.chrom_sep = (float) dv;
         break;
     case PID_SH_NSUB:
         nd->shwfs.n_sub = (uint32_t) iv;
@@ -1904,6 +2342,12 @@ int cs_param_set_str(
     case PID_ZW_DIMPLE_RAD:
         nd->zwfs.dimple_rad = (float) dv;
         break;
+    case PID_ZW_DIMPLE_AMP:
+        nd->zwfs.dimple_amp = (float) dv;
+        break;
+    case PID_ZW_ACHROM:
+        nd->zwfs.achrom_dimple = iv ? 1 : 0;
+        break;
     case PID_ZW_NMFT:
         nd->zwfs.n_mft = (uint32_t) iv;
         break;
@@ -1912,6 +2356,9 @@ int cs_param_set_str(
         break;
     case PID_FP_PIXSCALE:
         nd->fpcam.pixscale_ld = (float) dv;
+        break;
+    case PID_FP_IS_WFS:
+        nd->is_wfs = iv ? 1 : 0;
         break;
     case PID_WFE_RMS_NM:
         nd->wfe_rms_nm = (float) dv;

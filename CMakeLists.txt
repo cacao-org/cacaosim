@@ -65,6 +65,7 @@ set(SOURCEFILES
     src/bench/cacaosim_bench_edit.c
     src/bench/cacaosim_bench_dag.c
     src/bench/cacaosim_bench_plan.c
+    src/bench/cacaosim_bench_schema.c
     src/bench/cacaosim_bench_view.c
     src/bench/cacaosim_tui_ansi.c
     src/bench/cacaosim_tui_shm.c
@@ -104,6 +105,7 @@ set(INCLUDEFILES
     src/fpcam/cacaosim_fpcam.h
     src/fpcam/cacaosim_fpcam_FPS.h
     src/bench/cacaosim_bench.h
+    src/bench/cacaosim_bench_schema.h
     src/bench/cacaosim_bench_view.h
     src/bench/cacaosim_tui.h
     src/fused/cacaosim_htsim_FPS.h
@@ -507,4 +509,21 @@ int main(int argc, char *argv[])
         INSTALL_RPATH "$ORIGIN/../lib;${CMAKE_INSTALL_RPATH}"
     )
     install(TARGETS cacaosim-benchmark DESTINATION bin)
+endif()
+
+# ── Export and install machine-readable options schema JSON ──────────────────
+if(TARGET cacaosim-bench-view)
+    set(_OPTIONS_SCHEMA_JSON "${CMAKE_CURRENT_BINARY_DIR}/options_schema.json")
+    add_custom_command(
+        OUTPUT "${_OPTIONS_SCHEMA_JSON}"
+        COMMAND ${CMAKE_COMMAND} -E env
+                "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:${LIBNAME}>:${MILK_ROOT}/lib:$ENV{LD_LIBRARY_PATH}"
+                $<TARGET_FILE:cacaosim-bench-view> --list-options --format json
+                --output "${_OPTIONS_SCHEMA_JSON}"
+        DEPENDS cacaosim-bench-view ${LIBNAME}
+        COMMENT "Generating options_schema.json from compiled cacaosim schema and MILK_RUNNABLE units"
+        VERBATIM
+    )
+    add_custom_target(cacaosim-options-schema ALL DEPENDS "${_OPTIONS_SCHEMA_JSON}")
+    install(FILES "${_OPTIONS_SCHEMA_JSON}" DESTINATION share/${SRCNAME})
 endif()

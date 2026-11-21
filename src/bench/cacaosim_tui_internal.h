@@ -263,7 +263,9 @@ typedef enum
     CS_HIT_MODAL_ROW    = 28, /**< Selectable list item inside active modal; `arg` = row index */
     CS_HIT_MODAL_OK     = 29, /**< Modal primary confirm / `[OK]` button */
     CS_HIT_MODAL_CANCEL = 30, /**< Modal dismiss / `[Cancel]` button */
-    CS_HIT_MODAL_EXTRA  = 31  /**< Modal auxiliary control (e.g., target-beam cycle in Add modal) */
+    CS_HIT_MODAL_EXTRA  = 31, /**< Modal auxiliary control (e.g., target-beam cycle in Add modal) */
+    CS_HIT_ACT_ADVANCED = 32, /**< Inspector `[v:Adv]` toggle for advanced `.bench` options */
+    CS_HIT_ACT_OPTREF   = 33  /**< Top/Inspector `[?:Opts]` searchable option reference button */
 } cs_hit_kind_t;
 
 /**
@@ -354,7 +356,7 @@ typedef struct
 /* ── Declarative Inspector Parameter Descriptors ──────────────────────────── */
 
 /** Maximum parameter rows exposed simultaneously in any single Inspector subtab. */
-#define CS_MAX_PARAMS 24
+#define CS_MAX_PARAMS 40
 
 /**
  * @brief Value and UI-widget classification for a schema-driven Inspector row (`cs_param_desc_t`).
@@ -431,7 +433,8 @@ typedef enum
     CS_MODAL_OPEN    = 5, /**< Open / load `.bench` file path prompt */
     CS_MODAL_THEME   = 6, /**< Color palette theme selector popup */
     CS_MODAL_CONFIRM = 7, /**< Destructive action confirmation (unsaved quit / preset overwrite) */
-    CS_MODAL_HELP    = 8  /**< `[F1]` keyboard, mouse, and workflow quick-reference overlay */
+    CS_MODAL_HELP    = 8, /**< `[F1]` keyboard, mouse, and workflow quick-reference overlay */
+    CS_MODAL_OPTIONS = 9  /**< `[?]` searchable `.bench` & schema option reference overlay */
 } cs_modal_t;
 
 /**
@@ -480,6 +483,7 @@ typedef struct
     int                  schem_scroll_y;/**< Vertical scroll offset of 2D Schematic canvas */
     int                  schem_scroll_x;/**< Horizontal scroll offset of 2D Schematic canvas */
     int                  subtab;        /**< Inspector tab: `0`=OPTICS, `1`=DYN/DET, `2`=WIRING */
+    int                  show_advanced; /**< 1 to expose all advanced `.bench` keys in Inspector */
     int                  param_sel;     /**< Highlighted row index in `params[0..n_params-1]` */
     int                  param_scroll;  /**< Vertical scroll offset of Inspector parameter rows */
     int                  table_scroll;  /**< Vertical scroll offset in `F4:TABLES` view */
@@ -505,6 +509,9 @@ typedef struct
     int                  pending_preset;/**< Preset index awaiting confirmation when `dirty != 0` */
     char                 modal_input[512]; /**< Text input buffer for Save/Open path modals */
     int                  modal_cursor;  /**< Cursor offset inside `modal_input` */
+    char                 opt_search[64];/**< Live filter query inside `CS_MODAL_OPTIONS` */
+    int                  opt_scroll;    /**< Top visible filtered row in `CS_MODAL_OPTIONS` */
+    int                  opt_sel;       /**< Highlighted filtered row in `CS_MODAL_OPTIONS` */
 
     /* Mouse tracking & hover tooltips */
     int                  mouse_x;       /**< Latest observed 0-based mouse column (`-1` if none) */
@@ -1135,6 +1142,7 @@ int cs_params_build(
     const cacaosim_bench_cfg_t *cfg,
     int                         sel_item,
     int                         subtab,
+    int                         show_advanced,
     cs_param_desc_t            *out,
     int                         max_out);
 

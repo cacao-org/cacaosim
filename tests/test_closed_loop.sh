@@ -82,7 +82,7 @@ cd "${TEST_WORK}"
 #   only lightweight `milk_fps` / `ImageStreamIO` libraries and never pull in `libCLIcore.so`
 #   (which brings heavy interactive CLI interpreter state and startup overhead).
 echo "=== [1/8] Checking fpsexec & visualizer -h1 help & zero CLIcore linkage ==="
-ALL_UNITS=(mkpupil mkbeam wfe dmsim beamsplit coro pyrwfs shwfs zwfs fpcam htsim)
+ALL_UNITS=(mkpupil mkbeam wfe dmsim beamsplit coro pyrwfs shwfs zwfs fpcam htsim wfstat)
 for unit in "${ALL_UNITS[@]}"; do
     exe="milk-fpsexec-cacaosim-${unit}"
     "${exe}" -h1 >/dev/null
@@ -95,6 +95,11 @@ done
 cacaosim-bench-view -h1 >/dev/null
 cacaosim-bench-view -h2 >/dev/null
 cacaosim-bench-view -hm >/dev/null
+cacaosim-bench options --section pyrwfs | grep -q "clock_offset_us"
+cacaosim-bench options --fps wfstat | grep -q "snap_extra"
+if command -v python3 >/dev/null 2>&1; then
+    cacaosim-bench options --format json | python3 -m json.tool >/dev/null
+fi
 if ldd "$(command -v cacaosim-bench-view)" | grep -q "libCLIcore"; then
     echo "[FAIL] cacaosim-bench-view must NEVER link libCLIcore!" >&2
     exit 1

@@ -61,6 +61,7 @@ Commands:
   ctrl        Alias for 'gui' (cacaosim-CTRL)
   tui         Alias for 'gui' (cacaosim-CTRL)
   view        Render milk-styled ANSI/UTF-8 graphical optical bench schematic
+  options     Browse/export all .bench, FPS compute unit & CLI options (--section/--search/--fps)
   edit        Edit a .bench text file in \$EDITOR (creates template if new) & visualize
   start       Deploy and start AO hardware simulator via fpspipe (default)
   deploy      Alias for 'start' (idempotent warm deploy unless --restart is set)
@@ -97,6 +98,9 @@ fi
 case "${CMD}" in
     view|show)
         exec cacaosim-bench-view "$@"
+        ;;
+    options|opts)
+        exec cacaosim-bench-view --list-options "$@"
         ;;
     gui|ctrl|config|tui)
         exec cacaosim-CTRL "$@"

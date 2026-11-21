@@ -11,7 +11,7 @@
  *   runnable dispatch table for `libmilkcacaosim.so` when loaded into the `milk` framework
  *   (`feat/bash-engine` architecture) and `cacao` real-time control environments.
  *
- *   Exposes all 11 `cacaosim` compute units under the `"cacaosim"` namespace:
+ *   Exposes all 12 `cacaosim` compute units under the `"cacaosim"` namespace:
  *     - `cacaosim.mkpupil`   : Anti-aliased telescope pupil & static NCPA generator
  *     - `cacaosim.mkbeam`    : Optical `[OPD, Amp]` beam + 32-bin stellar spectrum synthesizer
  *     - `cacaosim.wfe`       : Inline static wavefront error optical element in OPD `[meter]`
@@ -23,6 +23,7 @@
  *     - `cacaosim.zwfs`      : Babinet Matrix-DFT Zernike phase-contrast WFS + detector simulator
  *     - `cacaosim.fpcam`     : Polychromatic MFT/FFT focal plane science PSF + detector simulator
  *     - `cacaosim.htsim`     : Fused zero-hop single- or multi-stage (`.bench`) HT AO simulator
+ *     - `cacaosim.wfstat`    : Synchronized optical wavefront & PSF telemetry statistics collector
  *
  * Design Rationale & Motivation:
  *   Following the declarative `milk_module_example` (`milk_runnable.h`) plugin pattern instead of
@@ -72,6 +73,15 @@ static const MILK_RUNNABLE *const runnables[] = {
     &runnable_cacaosim_htsim,
     &runnable_cacaosim_wfstat,
 };
+
+const MILK_RUNNABLE *const *cacaosim_list_runnables(size_t *out_count)
+{
+    if (out_count != NULL)
+    {
+        *out_count = sizeof(runnables) / sizeof(runnables[0]);
+    }
+    return runnables;
+}
 
 /* Emit standard `milk` dynamic module init/registration hooks for `libmilkcacaosim.so` */
 MILK_MODULE_RUNNABLES(milkcacaosim, _module_deps, runnables);

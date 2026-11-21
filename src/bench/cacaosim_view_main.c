@@ -59,6 +59,7 @@
 #include <unistd.h>
 
 #include "milk_help.h"
+#include "bench/cacaosim_bench_schema.h"
 #include "bench/cacaosim_bench_view.h"
 #include "bench/cacaosim_tui.h"
 
@@ -247,6 +248,8 @@ static void print_help_full(const char *prog, int color)
     milk_help_section("Workflow Modes", color);
     print_opt_line(color, "(default)", NULL,
                    "Render optical schematic, spectra, and hardware tables once");
+    print_opt_line(color, "-c, --config", "<file.bench>",
+                   "Explicit .bench configuration path (or pass as positional arg)");
     print_opt_line(color, "-i, --interactive", NULL,
                    "Launch milk-CTRL-style builder & status TUI (cacaosim-CTRL)");
     print_opt_line(color, "-g, --gui", NULL,
@@ -255,14 +258,31 @@ static void print_help_full(const char *prog, int color)
                    "Auto-reload diagram live whenever <config.bench> is saved on disk");
     print_opt_line(color, "--init", "<file.bench>",
                    "Write a commented starter 2-stage .bench template to edit");
-    print_opt_line(color, "-d, --deploy", NULL,
+    print_opt_line(color, "-d, --deploy, --run", NULL,
                    "Validate, deploy & start via cacaosim-bench, then visualize");
     printf("\n");
 
+    milk_help_section("Options Reference & Schema Export", color);
+    print_opt_line(color, "--list-options", NULL,
+                   "List all .bench, FPS compute unit, and CLI options and exit");
+    print_opt_line(color, "--section", "<name>",
+                   "Filter --list-options by .bench section (bench, dm, pyrwfs, ...)");
+    print_opt_line(color, "--search", "<query>",
+                   "Filter --list-options by substring across keys & descriptions");
+    print_opt_line(color, "--fps", "<unit|all>",
+                   "Filter --list-options to one or all MILK_RUNNABLE FPS units");
+    print_opt_line(color, "--live", NULL,
+                   "Filter --list-options to FPFLAG_WRITERUN live-tunable FPS params");
+    print_opt_line(color, "--format", "<table|markdown|json>",
+                   "Output format for --list-options (default: table)");
+    print_opt_line(color, "--output", "<file>",
+                   "Write --list-options output to <file> instead of stdout");
+    printf("\n");
+
     milk_help_section("Display & Theme Options", color);
-    print_opt_line(color, "-p, --pretty", NULL,
+    print_opt_line(color, "-p, --pretty, --color", NULL,
                    "Force TrueColor ANSI output even when piped (e.g. | less -R)");
-    print_opt_line(color, "-t, --text", NULL,
+    print_opt_line(color, "-t, --text, --no-color", NULL,
                    "Plain monochrome text output (no ANSI color escapes)");
     print_opt_line(color, "--ascii", NULL, "Pure 7-bit ASCII box-drawing and spectrum bars");
     print_opt_line(color, "--theme", "<name>",
@@ -274,13 +294,33 @@ static void print_help_full(const char *prog, int color)
     print_opt_line(color, "-W, --width", "<cols>", "Override panel width in columns [76..124]");
     printf("\n");
 
-    milk_help_section("Deploy Options", color);
+    milk_help_section("Deploy & Plan-Compiler Options", color);
     print_opt_line(color, "--mode", "<fused|modular>",
-                   "Execution mode passed to cacaosim-bench (default: fused)");
+                   "Execution mode for deploy/plan, or filter for --list-options");
     print_opt_line(color, "--atmturb", NULL,
                    "Also launch milk-fpsexec-atmturb-mkwfs turbulence stream");
     print_opt_line(color, "--seeing", "<arcsec>",
                    "Seeing [arcsec] when --atmturb is enabled (default: 0.7)");
+    print_opt_line(color, "--emit-plan", "<dir>",
+                   "Compile .bench (or --flat) into fpspipe plan files in <dir>");
+    print_opt_line(color, "--flat", NULL,
+                   "Emit flat single-stage plan without a .bench file (--emit-plan)");
+    print_opt_line(color, "--staged-bench", "<path>",
+                   "Write staged .bench copy for htsim (--emit-plan)");
+    print_opt_line(color, "--active-bench-arg", "<str>",
+                   "Override .bench_file string written to params.batch");
+    print_opt_line(color, "--rate", "<hz>",
+                   "Override master frame rate [Hz] in emitted plan");
+    print_opt_line(color, "--oversample", "<int>",
+                   "Override temporal oversampling factor K in emitted plan");
+    print_opt_line(color, "--backend", "<0|1|2>",
+                   "Override compute backend (0=auto, 1=CPU, 2=CUDA) in plan");
+    print_opt_line(color, "--nwf / --nact", "<int>",
+                   "Flat-mode pupil grid [px] / DM actuator count (--flat)");
+    print_opt_line(color, "--wfs-ncam / --fp-ncam", "<int>",
+                   "Flat-mode WFS / science camera size [px] (--flat)");
+    print_opt_line(color, "--mod-rad", "<l/D>",
+                   "Flat-mode Pyramid modulation radius [lambda/D] (--flat)");
     printf("\n");
 
     milk_help_section("Help Options", color);
@@ -994,6 +1034,14 @@ int main(int argc, char **argv)
     const char *init_path     = NULL;
     const char *emit_plan_dir = NULL;
     const char *deploy_mode   = "fused";
+    const char *opt_section   = NULL;
+    const char *opt_search    = NULL;
+    const char *opt_fps       = NULL;
+    const char *opt_format    = "table";
+    const char *opt_output    = NULL;
+    int         list_options  = 0;
+    int         opt_live_only = 0;
+    int         mode_explicit = 0;
     int         watch_mode    = 0;
     int         inter_mode    = 0;
     int         do_deploy     = 0;
@@ -1049,6 +1097,34 @@ int main(int argc, char **argv)
         {
             popts.flat_mode = 1;
         }
+        else if (strcmp(a, "--list-options") == 0)
+        {
+            list_options = 1;
+        }
+        else if (strcmp(a, "--live") == 0)
+        {
+            opt_live_only = 1;
+        }
+        else if (strcmp(a, "--section") == 0 && i + 1 < argc)
+        {
+            opt_section = argv[++i];
+        }
+        else if (strcmp(a, "--search") == 0 && i + 1 < argc)
+        {
+            opt_search = argv[++i];
+        }
+        else if (strcmp(a, "--fps") == 0 && i + 1 < argc)
+        {
+            opt_fps = argv[++i];
+        }
+        else if (strcmp(a, "--format") == 0 && i + 1 < argc)
+        {
+            opt_format = argv[++i];
+        }
+        else if ((strcmp(a, "--output") == 0 || strcmp(a, "-o") == 0) && i + 1 < argc)
+        {
+            opt_output = argv[++i];
+        }
         else if ((strcmp(a, "--theme") == 0) && i + 1 < argc)
         {
             int th = cacaosim_view_theme_from_name(argv[++i]);
@@ -1087,7 +1163,8 @@ int main(int argc, char **argv)
         }
         else if (strcmp(a, "--mode") == 0 && i + 1 < argc)
         {
-            deploy_mode = argv[++i];
+            deploy_mode   = argv[++i];
+            mode_explicit = 1;
         }
         else if (strcmp(a, "--seeing") == 0 && i + 1 < argc)
         {
@@ -1134,6 +1211,75 @@ int main(int argc, char **argv)
         {
             bench_arg = a;
         }
+    }
+
+    /* Handle --list-options query / schema export without requiring a .bench argument */
+    if (list_options)
+    {
+        cacaosim_schema_filter_t flt;
+        cacaosim_schema_filter_defaults(&flt);
+        flt.section   = opt_section;
+        flt.search    = opt_search;
+        flt.mode      = mode_explicit ? deploy_mode : NULL;
+        flt.fps_unit  = opt_fps;
+        flt.live_only = opt_live_only;
+
+        if (opt_section != NULL && opt_fps == NULL && !opt_live_only)
+        {
+            flt.include_fps = 0;
+            flt.include_cli = 0;
+        }
+        else if ((opt_fps != NULL || opt_live_only) && opt_section == NULL)
+        {
+            flt.include_bench = 0;
+            flt.include_cli   = 0;
+        }
+        else if (mode_explicit && opt_fps == NULL && !opt_live_only)
+        {
+            flt.include_fps = 0;
+            flt.include_cli = 0;
+        }
+
+        FILE *out_fp = stdout;
+        if (opt_output != NULL && opt_output[0] != '\0')
+        {
+            out_fp = fopen(opt_output, "wb");
+            if (out_fp == NULL)
+            {
+                fprintf(stderr, "[cacaosim] Cannot open '%s' for writing: %s\n", opt_output,
+                        strerror(errno));
+                return 1;
+            }
+        }
+
+        int rc = 0;
+        if (strcmp(opt_format, "json") == 0)
+        {
+            rc = cacaosim_schema_render_json(&flt, out_fp);
+        }
+        else if (strcmp(opt_format, "markdown") == 0 || strcmp(opt_format, "md") == 0)
+        {
+            rc = cacaosim_schema_render_markdown(&flt, out_fp);
+        }
+        else if (strcmp(opt_format, "table") == 0)
+        {
+            int use_color = (opts.color_level > 0) ||
+                            (opts.color_level < 0 && opt_output == NULL && isatty(STDOUT_FILENO));
+            rc = cacaosim_schema_render_table(&flt, use_color, out_fp);
+        }
+        else
+        {
+            fprintf(stderr,
+                    "[cacaosim] Unknown --format '%s' (expected: table, markdown, json)\n",
+                    opt_format);
+            rc = -1;
+        }
+
+        if (out_fp != stdout && fclose(out_fp) != 0)
+        {
+            rc = -1;
+        }
+        return (rc == 0) ? 0 : 1;
     }
 
     /* Write starter .bench file if requested, and immediately render/open it unless overridden */

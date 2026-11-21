@@ -53,12 +53,14 @@
  *     terminal resizes, draggable pane dividers, and scrolled 2D schematics.
  */
 
+#include <ctype.h>
 #include <libgen.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
 
+#include "bench/cacaosim_bench_schema.h"
 #include "bench/cacaosim_tui_internal.h"
 
 /* ── Compact Formatting & Node Metadata Helpers ───────────────────────────── */
@@ -1596,6 +1598,15 @@ static void render_view_builder(cs_tui_app_t *app, int x, int y, int w, int h)
                        "Switch parameter category [1 / 2 / 3]");
         stx += len + 1;
     }
+    if (stx + 11 < rx + rw - 1)
+    {
+        const char  *albl = app->show_advanced ? "[v:Adv:ON]" : "[v:Adv]";
+        cs_tui_rgb_t afg  = app->show_advanced ? pal->fg_active : pal->fg_muted;
+        cs_tui_rgb_t abg  = app->show_advanced ? pal->bg_selected : pal->bg_panel_alt;
+        stx += draw_btn(app, stx + 1, iy + 1, albl, CS_HIT_ACT_ADVANCED, 0, afg, abg,
+                        "Toggle Advanced .bench options in Inspector [v]") +
+               1;
+    }
     if (app->sel_item > 0 && stx + 14 < rx + rw - 1)
     {
         draw_btn(app, stx + 1, iy + 1, "[w:Wire Beam]", CS_HIT_ACT_WIRE, 0, pal->fg_stream,
@@ -1784,7 +1795,7 @@ static void render_header_and_tabs(cs_tui_app_t *app)
     }
 
     /* Quick right-side action pills on Row 1 */
-    int rx = W - 47;
+    int rx = W - 56;
     if (rx > tx + 2)
     {
         rx += draw_btn(app, rx, 1, "[P:Presets]", CS_HIT_ACT_PRESET, 0, pal->fg_accent,
@@ -1798,6 +1809,9 @@ static void render_header_and_tabs(cs_tui_app_t *app)
               1;
         rx += draw_btn(app, rx, 1, "[S:Stop]", CS_HIT_ACT_STOP, 0, pal->fg_error,
                        pal->bg_panel_alt, "Stop running cacaosim FPS units [S]") +
+              1;
+        rx += draw_btn(app, rx, 1, "[?:Opts]", CS_HIT_ACT_OPTREF, 0, pal->fg_proc,
+                       pal->bg_panel_alt, "Search all .bench & simulator options [?]") +
               1;
         draw_btn(app, rx, 1, "[h:HELP]", CS_HIT_HELP_BTN, 0, pal->fg_bright, pal->bg_selected,
                  "Show keyboard & mouse shortcuts [h / F1]");
@@ -2162,6 +2176,8 @@ static void render_modal(cs_tui_app_t *app)
             "  u / Ctrl+R        Undo / Redo configuration edits (24-step history)",
             "PARAMETER INSPECTOR & DEPLOYMENT",
             "  1 / 2 / 3         Switch Inspector subtab (Optics, Dyn/Det, SHM/Wiring)",
+            "  v                 Toggle Advanced .bench options in Inspector",
+            "  ?                 Open searchable Option Reference across all .bench keys",
             "  Enter / Space     Edit parameter inline or cycle enum/boolean value",
             "  Left / Right      Step numeric/enum value ([ / ] for 5x coarse step)",
             "  P / s / A / o / e Presets / Save / Save As / Open / Edit in $EDITOR",
@@ -2179,7 +2195,7 @@ static void render_modal(cs_tui_app_t *app)
         int my = (H - mh) / 2;
         cs_draw_shadow(&app->scr, mx, my, mw, mh, pal);
         cs_draw_box(&app->scr, mx, my, mw, mh, 1, "cacaosim-CTRL KEYBOARD & MOUSE REFERENCE",
-                    "Esc / h: Close", pal->fg_border_focus, pal->fg_title, pal->fg_muted,
+                    "?:Options  Esc/h:Close", pal->fg_border_focus, pal->fg_title, pal->fg_muted,
                     pal->bg_popup);
         for (int i = 0; i < n_hl && i < mh - 3; i++)
         {
@@ -2189,6 +2205,177 @@ static void render_modal(cs_tui_app_t *app)
                        1);
         }
         cs_tui_add_hit(app, CS_HIT_MODAL_CANCEL, 0, mx, my, mw, mh, "Click to close help");
+        return;
+    }
+
+    /* 8. Searchable Option Reference Overlay (`?` or `[?:Opts]`) */
+    if (app->modal == CS_MODAL_OPTIONS)
+    {
+        size_t total = cacaosim_schema_bench_count();
+        size_t matches[256];
+        size_t n_match = 0u;
+        const char *q  = app->opt_search;
+        size_t qlen    = strlen(q);
+        for (size_t i = 0u; i < total && n_match < 256u; i++)
+        {
+            const cacaosim_bench_opt_t *o = cacaosim_schema_bench_get(i);
+            if (o == NULL)
+            {
+                continue;
+            }
+            if (qlen == 0u)
+            {
+                matches[n_match++] = i;
+                continue;
+            }
+            const char *fields[5] = { o->section, o->key, o->aliases, o->fps_param, o->description };
+            int         hit       = 0;
+            for (int f = 0; f < 5 && !hit; f++)
+            {
+                const char *h = fields[f];
+                if (h == NULL)
+                {
+                    continue;
+                }
+                for (const char *p = h; *p != '\0'; p++)
+                {
+                    size_t k = 0u;
+                    while (k < qlen && p[k] != '\0' &&
+                           tolower((unsigned char) p[k]) == tolower((unsigned char) q[k]))
+                    {
+                        k++;
+                    }
+                    if (k == qlen)
+                    {
+                        hit = 1;
+                        break;
+                    }
+                }
+            }
+            if (hit)
+            {
+                matches[n_match++] = i;
+            }
+        }
+
+        int mw = (W > 108) ? 104 : (W - 4);
+        int mh = (H > 26) ? (H - 4) : (H - 2);
+        if (mw < 50)
+        {
+            mw = W - 2;
+        }
+        if (mh < 12)
+        {
+            mh = H - 2;
+        }
+        int mx = (W - mw) / 2;
+        int my = (H - mh) / 2;
+
+        if (n_match == 0u)
+        {
+            app->opt_sel    = 0;
+            app->opt_scroll = 0;
+        }
+        else
+        {
+            if (app->opt_sel >= (int) n_match)
+            {
+                app->opt_sel = (int) n_match - 1;
+            }
+            if (app->opt_sel < 0)
+            {
+                app->opt_sel = 0;
+            }
+        }
+
+        int list_top  = my + 4;
+        int list_rows = mh - 8;
+        if (list_rows < 2)
+        {
+            list_rows = 2;
+        }
+        if (app->opt_sel < app->opt_scroll)
+        {
+            app->opt_scroll = app->opt_sel;
+        }
+        if (app->opt_sel >= app->opt_scroll + list_rows)
+        {
+            app->opt_scroll = app->opt_sel - list_rows + 1;
+        }
+        if (app->opt_scroll < 0)
+        {
+            app->opt_scroll = 0;
+        }
+
+        char rbadge[48];
+        snprintf(rbadge, sizeof(rbadge), "%zu/%zu  Esc:Close", n_match, total);
+        cs_draw_shadow(&app->scr, mx, my, mw, mh, pal);
+        cs_draw_box(&app->scr, mx, my, mw, mh, 1, "cacaosim .bench OPTION REFERENCE", rbadge,
+                    pal->fg_border_focus, pal->fg_title, pal->fg_muted, pal->bg_popup);
+
+        cs_put_str(&app->scr, mx + 2, my + 1, 9, "Search:", pal->fg_muted, pal->bg_popup, 0u, 1);
+        cs_fill_rect(&app->scr, mx + 10, my + 1, mw - 28, 1, pal->fg_bright, pal->bg_input);
+        cs_printf_at(&app->scr, mx + 11, my + 1, mw - 30, pal->fg_accent, pal->bg_input,
+                     CS_ATTR_BOLD, 1, "%s_", app->opt_search);
+        cs_put_str(&app->scr, mx + mw - 17, my + 1, 15, "Ctrl+U:Clear", pal->fg_dim, pal->bg_popup,
+                   0u, 1);
+
+        cs_printf_at(&app->scr, mx + 2, my + 3, mw - 4, pal->fg_dim, pal->bg_popup, 0u, 1,
+                     "%-8s %-17s %-6s %-11s %-10s %s", "SECTION", "KEY", "TYPE", "DEFAULT",
+                     "MODE", "DESCRIPTION");
+
+        for (int r = 0; r < list_rows; r++)
+        {
+            size_t mi = (size_t) (app->opt_scroll + r);
+            if (mi >= n_match)
+            {
+                break;
+            }
+            const cacaosim_bench_opt_t *o   = cacaosim_schema_bench_get(matches[mi]);
+            int                         ry  = list_top + r;
+            int                         sel = ((int) mi == app->opt_sel);
+            cs_tui_rgb_t                rbg = sel ? pal->bg_selected : pal->bg_popup;
+            cs_fill_rect(&app->scr, mx + 1, ry, mw - 2, 1, pal->fg_text, rbg);
+            const char *mstr = (o->mode == CACAOSIM_OPT_MODE_FUSED) ? "fused" : "fused+mod";
+            cs_printf_at(&app->scr, mx + 2, ry, 8, pal->fg_proc, rbg, 0u, 1, "%-8.8s", o->section);
+            cs_printf_at(&app->scr, mx + 11, ry, 17, sel ? pal->fg_bright : pal->fg_fps, rbg,
+                         sel ? CS_ATTR_BOLD : 0u, 1, "%-17.17s", o->key);
+            cs_printf_at(&app->scr, mx + 29, ry, 6, pal->fg_muted, rbg, 0u, 1, "%-6.6s", o->type);
+            cs_printf_at(&app->scr, mx + 36, ry, 11, pal->fg_stream, rbg, 0u, 1, "%-11.11s",
+                         o->default_str[0] ? o->default_str : "\"\"");
+            cs_printf_at(&app->scr, mx + 48, ry, 10,
+                         (o->mode == CACAOSIM_OPT_MODE_FUSED) ? pal->fg_warn : pal->fg_active, rbg,
+                         0u, 1, "%-10.10s", mstr);
+            if (mw > 61)
+            {
+                cs_printf_at(&app->scr, mx + 59, ry, mw - 61, sel ? pal->fg_bright : pal->fg_text,
+                             rbg, 0u, 1, "%s", o->description);
+            }
+            cs_tui_add_hit(app, CS_HIT_MODAL_ROW, (int) mi, mx + 1, ry, mw - 2, 1, o->description);
+        }
+
+        /* Detailed footer for currently highlighted option */
+        if (n_match > 0u && app->opt_sel >= 0 && (size_t) app->opt_sel < n_match)
+        {
+            const cacaosim_bench_opt_t *sel_o = cacaosim_schema_bench_get(matches[app->opt_sel]);
+            int                         fy    = my + mh - 3;
+            cs_printf_at(&app->scr, mx + 2, fy, mw - 4, pal->fg_accent, pal->bg_popup, CS_ATTR_BOLD,
+                         1, "[%s] %s  unit:%s  aliases:%s  fps:%s", sel_o->applies_to, sel_o->key,
+                         sel_o->unit[0] ? sel_o->unit : "-",
+                         sel_o->aliases[0] ? sel_o->aliases : "-",
+                         sel_o->fps_param[0] ? sel_o->fps_param : "-");
+            cs_printf_at(&app->scr, mx + 2, fy + 1, mw - 4, pal->fg_muted, pal->bg_popup, 0u, 1,
+                         "%s%s%s", sel_o->description, sel_o->enum_values[0] ? "  choices: " : "",
+                         sel_o->enum_values);
+        }
+        else
+        {
+            cs_put_str(&app->scr, mx + 2, my + mh - 3, mw - 4,
+                       "No matching .bench options (press Backspace or Ctrl+U to clear filter)",
+                       pal->fg_warn, pal->bg_popup, 0u, 1);
+        }
+        draw_btn(app, mx + mw - 12, my + mh - 2, "[Esc:Close]", CS_HIT_MODAL_CANCEL, 0,
+                 pal->fg_error, pal->bg_panel_alt, "Close option reference");
     }
 }
 
@@ -2275,8 +2462,8 @@ void cs_tui_render_frame(cs_tui_app_t *app)
         return;
     }
     cs_tui_refresh_analysis(app);
-    app->n_params = cs_params_build(&app->cfg, app->sel_item, app->subtab, app->params,
-                                    CS_MAX_PARAMS);
+    app->n_params = cs_params_build(&app->cfg, app->sel_item, app->subtab, app->show_advanced,
+                                    app->params, CS_MAX_PARAMS);
     app->n_hits   = 0;
 
     const cs_tui_pal_t *pal = cs_tui_get_palette(app->opts.theme);

@@ -54,6 +54,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "bench/cacaosim_bench_schema.h"
 #include "bench/cacaosim_tui_internal.h"
 #include "pupil/cacaosim_pupil.h"
 
@@ -925,10 +926,72 @@ static void handle_modal_event(cs_tui_app_t *app, const cs_input_ev_t *ev)
 
     if (app->modal == CS_MODAL_HELP)
     {
-        if (ev->key == 'h' || ev->key == 'H' || ev->key == 'q' || ev->key == '?' ||
-            ev->key == CS_KEY_F1 || ev->key == CS_KEY_ENTER)
+        if (ev->key == '?')
+        {
+            app->opt_search[0] = '\0';
+            app->opt_scroll    = 0;
+            app->opt_sel       = 0;
+            app->modal         = CS_MODAL_OPTIONS;
+        }
+        else if (ev->key == 'h' || ev->key == 'H' || ev->key == 'q' || ev->key == CS_KEY_F1 ||
+                 ev->key == CS_KEY_ENTER)
         {
             app->modal = CS_MODAL_NONE;
+        }
+        return;
+    }
+
+    if (app->modal == CS_MODAL_OPTIONS)
+    {
+        if (ev->key == CS_KEY_ENTER)
+        {
+            app->modal = CS_MODAL_NONE;
+        }
+        else if (ev->key == CS_KEY_UP)
+        {
+            if (app->opt_sel > 0)
+            {
+                app->opt_sel--;
+            }
+        }
+        else if (ev->key == CS_KEY_DOWN)
+        {
+            app->opt_sel++;
+        }
+        else if (ev->key == CS_KEY_PGUP)
+        {
+            app->opt_sel = (app->opt_sel > 10) ? (app->opt_sel - 10) : 0;
+        }
+        else if (ev->key == CS_KEY_PGDN)
+        {
+            app->opt_sel += 10;
+        }
+        else if (ev->key == 21) /* Ctrl+U: clear filter */
+        {
+            app->opt_search[0] = '\0';
+            app->opt_sel       = 0;
+            app->opt_scroll    = 0;
+        }
+        else if (ev->key == CS_KEY_BACKSPACE)
+        {
+            size_t l = strlen(app->opt_search);
+            if (l > 0u)
+            {
+                app->opt_search[l - 1u] = '\0';
+                app->opt_sel            = 0;
+                app->opt_scroll         = 0;
+            }
+        }
+        else if (ev->key >= 32 && ev->key < 127)
+        {
+            size_t l = strlen(app->opt_search);
+            if (l + 1u < sizeof(app->opt_search))
+            {
+                app->opt_search[l]      = (char) ev->key;
+                app->opt_search[l + 1u] = '\0';
+                app->opt_sel            = 0;
+                app->opt_scroll         = 0;
+            }
         }
         return;
     }
@@ -1177,9 +1240,16 @@ static void handle_mouse_event(cs_tui_app_t *app, const cs_input_ev_t *ev)
         {
             if (h->kind == CS_HIT_MODAL_ROW)
             {
-                app->modal_sel = h->arg;
-                cs_input_ev_t kev = { .key = CS_KEY_ENTER };
-                handle_modal_event(app, &kev);
+                if (app->modal == CS_MODAL_OPTIONS)
+                {
+                    app->opt_sel = h->arg;
+                }
+                else
+                {
+                    app->modal_sel = h->arg;
+                    cs_input_ev_t kev = { .key = CS_KEY_ENTER };
+                    handle_modal_event(app, &kev);
+                }
             }
             else if (h->kind == CS_HIT_MODAL_OK)
             {
@@ -1206,6 +1276,20 @@ static void handle_mouse_event(cs_tui_app_t *app, const cs_input_ev_t *ev)
             break;
         case CS_HIT_HELP_BTN:
             app->modal = CS_MODAL_HELP;
+            break;
+        case CS_HIT_ACT_OPTREF:
+            app->opt_search[0] = '\0';
+            app->opt_scroll    = 0;
+            app->opt_sel       = 0;
+            app->modal         = CS_MODAL_OPTIONS;
+            break;
+        case CS_HIT_ACT_ADVANCED:
+            app->editing       = 0;
+            app->show_advanced = !app->show_advanced;
+            app->param_sel     = 0;
+            app->param_scroll  = 0;
+            cs_tui_log(app, 0, "Inspector Advanced options %s",
+                       app->show_advanced ? "SHOWN" : "HIDDEN");
             break;
         case CS_HIT_ELEM_ROW:
             app->editing  = 0;
@@ -1551,9 +1635,26 @@ int cacaosim_tui_run(const char *bench_path, const cacaosim_tui_opts_t *opts)
             }
             continue;
         }
-        if (ev.key == CS_KEY_F1 || ev.key == 'h' || ev.key == '?')
+        if (ev.key == CS_KEY_F1 || ev.key == 'h')
         {
             app->modal = CS_MODAL_HELP;
+            continue;
+        }
+        if (ev.key == '?')
+        {
+            app->opt_search[0] = '\0';
+            app->opt_scroll    = 0;
+            app->opt_sel       = 0;
+            app->modal         = CS_MODAL_OPTIONS;
+            continue;
+        }
+        if (ev.key == 'v')
+        {
+            app->show_advanced = !app->show_advanced;
+            app->param_sel     = 0;
+            app->param_scroll  = 0;
+            cs_tui_log(app, 0, "Inspector Advanced options %s",
+                       app->show_advanced ? "SHOWN" : "HIDDEN");
             continue;
         }
         if (ev.key >= CS_KEY_F2 && ev.key <= CS_KEY_F6)

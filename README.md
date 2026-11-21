@@ -31,7 +31,7 @@ parameter inspector.*
 
 ## Compute Units & Source Architecture
 
-All 11 compute units follow `milk_module_example` (`MILK_RUNNABLE`, `MILK_PARAMS_DEFINE`,
+All 12 compute units follow `milk_module_example` (`MILK_RUNNABLE`, `MILK_PARAMS_DEFINE`,
 `MILK_MODULE_RUNNABLES`, `EXPORT_FPSEXEC`) with zero `libCLIcore` dependency in standalone
 `milk-fpsexec-*` binaries:
 
@@ -48,6 +48,11 @@ All 11 compute units follow `milk_module_example` (`MILK_RUNNABLE`, `MILK_PARAMS
 | `cacaosim.zwfs` | `milk-fpsexec-cacaosim-zwfs` | `zwfs/` | Babinet MFT Zernike WFS |
 | `cacaosim.fpcam` | `milk-fpsexec-cacaosim-fpcam` | `fpcam/` | Polychromatic MFT/FFT camera |
 | `cacaosim.htsim` | `milk-fpsexec-cacaosim-htsim` | `fused/` | Fused flat or `.bench` runner |
+| `cacaosim.wfstat` | `milk-fpsexec-cacaosim-wfstat` | `beam/` | Synchronized WF & PSF telemetry |
+
+For the complete auto-generated reference of every `.bench` key, FPS compute unit parameter, and
+CLI flag, see **[`docs/OPTIONS.md`](docs/OPTIONS.md)** or run `cacaosim-bench options` (supports
+`--section`, `--search`, `--mode`, `--fps`, `--live`, and `--format table|markdown|json`).
 
 Supporting infrastructure lives in `src/common/` (64-byte aligned memory, `CLOCK_MONOTONIC`
 `TIMER_ABSTIME` pacing, thread-local `xoshiro128++` & CUDA `Philox-2x32` PRNGs, 32-bin spectral
@@ -109,7 +114,8 @@ mouse + draggable splitters + hover tooltips, 5 `milk` themes, and `--ascii` 7-b
   splicing reorder, `[x]` branch swap, `[w]` upstream beam picker, `[d]` beam-bridging delete,
   `[u]`/`Ctrl+R` 24-step undo/redo, live `16x16` pupil dock with array/beam pix & `[m/pix]`,
   `[l/D/pix]`, `[arcsec/pix]` scales), **clickable 2D Optical Schematic**, and **Parameter
-  Inspector** (`1:OPTICS`, `2:DYN/DET`, `3:SHM/WIRING`).
+  Inspector** (`1:OPTICS`, `2:DYN/DET`, `3:SHM/WIRING`, `[v]` Advanced `.bench` keys toggle, and
+  `[?]` searchable Option Reference overlay).
 - **`F3:SCHEMATIC` / `F4:TABLES` / `F5:STATUS` / `F6:SOURCE`**: Full-screen optical diagram &
   32-bin (`0.40..2.40 um`) spectral deck, hardware summary tables, live `.im.shm` / `.fps.shm`
   rates + Strehl + one-key `fused`/`modular` deployment, and `.bench` INI/TOML preview.

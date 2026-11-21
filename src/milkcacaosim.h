@@ -12,8 +12,8 @@
  *   declarative `.bench` topology/TUI/schematic tools (`src/bench/`), low-level CPU/CUDA physics
  *   contexts (`cacaosim_pupil.h`, `cacaosim_dm.h`, `cacaosim_coro.h`, `cacaosim_pyrwfs.h`,
  *   `cacaosim_shwfs.h`, `cacaosim_zwfs.h`, `cacaosim_fpcam.h`), and `milk` Function Parameter
- *   Structure (`_FPS.h`) runnable descriptors for all 11 compute units including the fused
- *   multi-rate `cacaosim.htsim` engine.
+ *   Structure (`_FPS.h`) runnable descriptors for all 12 compute units including the fused
+ *   multi-rate `cacaosim.htsim` engine and `cacaosim.wfstat` telemetry collector.
  *
  * Design Rationale & Motivation:
  *   `cacaosim` deliberately splits its headers into fine-grained per-subsystem interfaces alongside
@@ -40,8 +40,9 @@
 #include "beam/cacaosim_wfe_FPS.h"
 #include "beam/cacaosim_wfstat_FPS.h"
 
-/* Declarative .bench parser/serializer, schematic viewer, and interactive TUI configurator */
+/* Declarative .bench parser/serializer, option schema, schematic viewer, and interactive TUI */
 #include "bench/cacaosim_bench.h"
+#include "bench/cacaosim_bench_schema.h"
 #include "bench/cacaosim_bench_view.h"
 #include "bench/cacaosim_tui.h"
 

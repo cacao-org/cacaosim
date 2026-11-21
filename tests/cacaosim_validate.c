@@ -56,6 +56,7 @@
 #include <unistd.h>
 
 #include "milkcacaosim.h"
+#include "bench/cacaosim_tui_internal.h"
 
 /** Cumulative count of passing validation assertions across all test sections. */
 static int g_pass = 0;
@@ -5239,6 +5240,448 @@ static void test_subaru_lyot_coro_and_llowfs(void)
     free(pup);
 }
 
+static const char *sample_val_for_opt(const cacaosim_bench_opt_t *o, char *buf, size_t cap)
+{
+    if (strcmp(o->key, "nwf") == 0)
+    {
+        return "64";
+    }
+    if (o->enum_values[0] != '\0')
+    {
+        const char *bar = strchr(o->enum_values, '|');
+        size_t      len = (bar != NULL) ? (size_t) (bar - o->enum_values) : strlen(o->enum_values);
+        if (len >= cap)
+        {
+            len = cap - 1u;
+        }
+        memcpy(buf, o->enum_values, len);
+        buf[len] = '\0';
+        return buf;
+    }
+    if (strcmp(o->type, "string") == 0)
+    {
+        return "test_tok";
+    }
+    if (strcmp(o->type, "bool") == 0)
+    {
+        return "1";
+    }
+    return "1";
+}
+
+static int tui_has_key_for_item(const cacaosim_bench_cfg_t *cfg, int sel_item, const char *key)
+{
+    cs_param_desc_t pds[CS_MAX_PARAMS];
+    for (int st = 0; st < 3; st++)
+    {
+        int n = cs_params_build(cfg, sel_item, st, 1, pds, CS_MAX_PARAMS);
+        for (int i = 0; i < n; i++)
+        {
+            if (pds[i].key != NULL && strcmp(pds[i].key, key) == 0)
+            {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static void test_options_schema_and_tui_coverage(void)
+{
+    printf("\n[18] Options Schema SSOT, FPS Introspection & TUI Advanced Coverage\n");
+
+    /* 1. Verify every canonical .bench key and alias parses cleanly through cacaosim_bench_parse */
+    size_t n_opts      = cacaosim_schema_bench_count();
+    int    parse_fails = 0;
+    char   first_fail[256] = { 0 };
+
+    for (size_t i = 0u; i < n_opts; i++)
+    {
+        const cacaosim_bench_opt_t *o = cacaosim_schema_bench_get(i);
+        char                        sec_tok[32];
+        const char                 *comma = strchr(o->applies_to, ',');
+        size_t                      slen =
+            (comma != NULL) ? (size_t) (comma - o->applies_to) : strlen(o->applies_to);
+        if (slen >= sizeof(sec_tok))
+        {
+            slen = sizeof(sec_tok) - 1u;
+        }
+        memcpy(sec_tok, o->applies_to, slen);
+        sec_tok[slen] = '\0';
+
+        char        sval_buf[64];
+        const char *sval = sample_val_for_opt(o, sval_buf, sizeof(sval_buf));
+
+        /* Test canonical key + each comma-separated alias */
+        char key_list[128];
+        if (o->aliases[0] != '\0')
+        {
+            snprintf(key_list, sizeof(key_list), "%s,%s", o->key, o->aliases);
+        }
+        else
+        {
+            snprintf(key_list, sizeof(key_list), "%s", o->key);
+        }
+        char *p = key_list;
+        while (*p != '\0')
+        {
+            char *next = strchr(p, ',');
+            if (next != NULL)
+            {
+                *next = '\0';
+            }
+            char                 doc[512];
+            cacaosim_bench_cfg_t tcfg;
+            char                 err[160] = { 0 };
+            if (strcmp(sec_tok, "bench") == 0)
+            {
+                snprintf(doc, sizeof(doc),
+                         "[bench]\n%s = \"%s\"\n[fpcam.d0]\nin = \"b_pup\"\n", p, sval);
+            }
+            else
+            {
+                snprintf(doc, sizeof(doc), "[bench]\nnwf = 64\n[%s.t0]\nin = \"b_pup\"\n%s = \"%s\"\n",
+                         sec_tok, p, sval);
+            }
+            if (cacaosim_bench_parse_str(doc, &tcfg, err, sizeof(err)) != 0)
+            {
+                if (parse_fails == 0)
+                {
+                    snprintf(first_fail, sizeof(first_fail), "%s.%s: %s", sec_tok, p, err);
+                }
+                parse_fails++;
+            }
+            p = (next != NULL) ? (next + 1) : (p + strlen(p));
+        }
+    }
+    char det[256];
+    snprintf(det, sizeof(det), "checked=%zu keys+aliases, fails=%d %s", n_opts, parse_fails,
+             first_fail);
+    check_cond(n_opts >= 120u && parse_fails == 0,
+               "Every schema .bench key & alias accepted by parser", det);
+
+    /* 2. Build exhaustive non-default .bench covering every node/mode & check schema + TUI */
+    cacaosim_bench_cfg_t ecfg;
+    cacaosim_bench_cfg_defaults(&ecfg);
+    ecfg.spider_offset    = 0.08f;
+    ecfg.oversample       = 4u;
+    ecfg.atm_interp       = 0;
+    ecfg.telemetry_stride = 2u;
+    snprintf(ecfg.in_amp, sizeof(ecfg.in_amp), "atm_amp");
+    snprintf(ecfg.in_ncpa, sizeof(ecfg.in_ncpa), "ent_ncpa");
+    ecfg.wf_unit    = CACAOSIM_WFUNIT_OPD_UM;
+    ecfg.ref_lambda = 0.65f;
+    ecfg.turb_gain  = 0.8f;
+    ecfg.backend    = CACAOSIM_BACKEND_CPU;
+
+    cacaosim_node_cfg_t *nd;
+    /* 0: DM zonal RC + delay_frames + reg */
+    nd = &ecfg.nodes[ecfg.n_nodes++];
+    cacaosim_bench_node_defaults(nd, CACAOSIM_NODE_DM, "dm_rc", 0, 0);
+    snprintf(nd->in_beam, sizeof(nd->in_beam), "b_pup");
+    snprintf(nd->out_beam, sizeof(nd->out_beam), "b_1");
+    snprintf(nd->out_opd, sizeof(nd->out_opd), "dm_opd");
+    snprintf(nd->in_flat, sizeof(nd->in_flat), "dm_flat");
+    nd->dm.dm_diam     = 14.0f;
+    nd->dm.refl_scale  = 1.8f;
+    nd->dm.nonlin_quad = 0.05f;
+    nd->reg.shift_x    = 0.5f;
+    nd->reg.shift_y    = -0.5f;
+    nd->reg.rot_deg    = 2.0f;
+    nd->reg.scale      = 1.02f;
+
+    /* 1: DM zonal OSC + delay_us + zoh_mean=0 */
+    nd = &ecfg.nodes[ecfg.n_nodes++];
+    cacaosim_bench_node_defaults(nd, CACAOSIM_NODE_DM, "dm_osc", 0, 1);
+    snprintf(nd->in_beam, sizeof(nd->in_beam), "b_1");
+    snprintf(nd->out_beam, sizeof(nd->out_beam), "b_2");
+    nd->dm.dyn_mode    = 2;
+    nd->dm.delay_sec   = 2.5e-4f;
+    nd->dm.no_zoh_mean = 1;
+
+    /* 2: TTM */
+    nd = &ecfg.nodes[ecfg.n_nodes++];
+    cacaosim_bench_node_defaults(nd, CACAOSIM_NODE_DM, "ttm0", 1, 2);
+    snprintf(nd->in_beam, sizeof(nd->in_beam), "b_2");
+    snprintf(nd->out_beam, sizeof(nd->out_beam), "b_3");
+
+    /* 3: Splitter dichroic_bp with all per-arm reg/ncpa/pup */
+    nd = &ecfg.nodes[ecfg.n_nodes++];
+    cacaosim_bench_node_defaults(nd, CACAOSIM_NODE_SPLITTER, "bs_bp", 0, 3);
+    snprintf(nd->in_beam, sizeof(nd->in_beam), "b_3");
+    snprintf(nd->out_refl, sizeof(nd->out_refl), "b_r1");
+    snprintf(nd->out_trans, sizeof(nd->out_trans), "b_t1");
+    nd->split.mode        = CACAOSIM_SPLIT_DICHROIC_BP;
+    nd->split.roll_um     = 0.05f;
+    nd->reg_refl.shift_x  = 0.2f;
+    nd->reg_refl.shift_y  = 0.3f;
+    nd->reg_refl.rot_deg  = 1.0f;
+    nd->reg_refl.scale    = 0.99f;
+    nd->reg_trans.shift_x = -0.2f;
+    nd->reg_trans.shift_y = -0.3f;
+    nd->reg_trans.rot_deg = -1.0f;
+    nd->reg_trans.scale   = 1.01f;
+    snprintf(nd->ncpa_refl, sizeof(nd->ncpa_refl), "nr");
+    snprintf(nd->ncpa_trans, sizeof(nd->ncpa_trans), "nt");
+    snprintf(nd->pup_refl, sizeof(nd->pup_refl), "pr");
+    snprintf(nd->pup_trans, sizeof(nd->pup_trans), "pt");
+
+    /* 4: Splitter gray */
+    nd = &ecfg.nodes[ecfg.n_nodes++];
+    cacaosim_bench_node_defaults(nd, CACAOSIM_NODE_SPLITTER, "bs_g", 0, 4);
+    snprintf(nd->in_beam, sizeof(nd->in_beam), "b_t1");
+    snprintf(nd->out_refl, sizeof(nd->out_refl), "b_r2");
+    snprintf(nd->out_trans, sizeof(nd->out_trans), "b_t2");
+    nd->split.mode = CACAOSIM_SPLIT_GRAY;
+
+    /* 5: Coro phase_dimple + pre_lyot + custom masks + lyot_spider_offset */
+    nd = &ecfg.nodes[ecfg.n_nodes++];
+    cacaosim_bench_node_defaults(nd, CACAOSIM_NODE_CORO, "co_pd", 0, 5);
+    snprintf(nd->in_beam, sizeof(nd->in_beam), "b_t2");
+    snprintf(nd->out_beam, sizeof(nd->out_beam), "b_c1");
+    snprintf(nd->out_lowfs, sizeof(nd->out_lowfs), "b_lo1");
+    snprintf(nd->out_pre_lyot, sizeof(nd->out_pre_lyot), "pl_s");
+    snprintf(nd->out_pre_lyot_long, sizeof(nd->out_pre_lyot_long), "pl_l");
+    snprintf(nd->in_pup_amp, sizeof(nd->in_pup_amp), "pa");
+    snprintf(nd->in_pup_pha, sizeof(nd->in_pup_pha), "pp");
+    snprintf(nd->in_fpm_amp, sizeof(nd->in_fpm_amp), "fa");
+    snprintf(nd->in_fpm_pha, sizeof(nd->in_fpm_pha), "fp");
+    snprintf(nd->in_lyot, sizeof(nd->in_lyot), "la");
+    snprintf(nd->in_lyot_pha, sizeof(nd->in_lyot_pha), "lp");
+    nd->coro.mode               = CACAOSIM_CORO_PHASE_DIMPLE;
+    nd->coro.bw_frac            = 0.15f;
+    nd->coro.nlambda            = 3;
+    nd->coro.mask_pha_unit      = 1;
+    nd->coro.n_mft              = 64u;
+    nd->coro.lowfs_pup_diam     = 0.9f;
+    nd->coro.lyot_spider_deg    = 51.0f;
+    nd->coro.lyot_spider_offset = 0.08f;
+
+    /* 6: Coro vortex + lyot_refl + pad_factor */
+    nd = &ecfg.nodes[ecfg.n_nodes++];
+    cacaosim_bench_node_defaults(nd, CACAOSIM_NODE_CORO, "co_vx", 0, 6);
+    snprintf(nd->in_beam, sizeof(nd->in_beam), "b_c1");
+    snprintf(nd->out_beam, sizeof(nd->out_beam), "b_c2");
+    nd->coro.mode       = CACAOSIM_CORO_VORTEX;
+    nd->coro.pad_factor = 6u;
+    nd->coro.lowfs_mode = CACAOSIM_LOWFS_LYOT_REFL;
+
+    /* 7: Coro custom_mft */
+    nd = &ecfg.nodes[ecfg.n_nodes++];
+    cacaosim_bench_node_defaults(nd, CACAOSIM_NODE_CORO, "co_cm", 0, 7);
+    snprintf(nd->in_beam, sizeof(nd->in_beam), "b_c2");
+    snprintf(nd->out_beam, sizeof(nd->out_beam), "b_c3");
+    nd->coro.mode = CACAOSIM_CORO_CUSTOM_MFT;
+
+    /* 8: WFE */
+    nd = &ecfg.nodes[ecfg.n_nodes++];
+    cacaosim_bench_node_defaults(nd, CACAOSIM_NODE_WFE, "wfe0", 0, 8);
+    snprintf(nd->in_beam, sizeof(nd->in_beam), "b_c3");
+    snprintf(nd->out_beam, sizeof(nd->out_beam), "b_w1");
+    nd->wfe_defocus_nm = 25.0f;
+    nd->wfe_alpha      = 2.2f;
+
+    /* 9: PyWFS with all advanced fields + det + timing + sim_hz */
+    nd = &ecfg.nodes[ecfg.n_nodes++];
+    cacaosim_bench_node_defaults(nd, CACAOSIM_NODE_PYRWFS, "pyr0", 0, 9);
+    snprintf(nd->in_beam, sizeof(nd->in_beam), "b_r1");
+    snprintf(nd->in_ncpa, sizeof(nd->in_ncpa), "p_ncpa");
+    nd->tput                     = 0.90f;
+    nd->rate_hz                  = 1000.0f;
+    nd->clock_offset_us          = 125.0f;
+    nd->clock_drift_ppm          = 15.0f;
+    nd->sim_hz                   = 4000.0f;
+    nd->use_beam_flux            = 0;
+    nd->pyrwfs.pad_factor        = 4u;
+    nd->pyrwfs.mod_subframe_mode = CACAOSIM_PYRMOD_FULL;
+    nd->pyrwfs.mod_rev           = 2;
+    nd->pyrwfs.mod_phase_deg     = 30.0f;
+    nd->pyrwfs.pup_sep           = 0.45f;
+    nd->pyrwfs.roof_ld           = 0.2f;
+    nd->pyrwfs.fstop_frac        = 0.40f;
+    nd->pyrwfs.chrom_sep         = 0.05f;
+    nd->pyrwfs.nlambda           = 3;
+    nd->pyrwfs.det.dark_e        = 1.5f;
+    nd->pyrwfs.det.gain_eadu     = 2.0f;
+    nd->pyrwfs.det.bias_adu      = 200.0f;
+    nd->pyrwfs.det.sat_adu       = 32000.0f;
+    nd->pyrwfs.det.shutter       = 0;
+
+    /* 10: SHWFS with subframe_stride & navg */
+    nd = &ecfg.nodes[ecfg.n_nodes++];
+    cacaosim_bench_node_defaults(nd, CACAOSIM_NODE_SHWFS, "sh0", 0, 10);
+    snprintf(nd->in_beam, sizeof(nd->in_beam), "b_r2");
+    nd->subframe_stride  = 2u;
+    nd->shwfs.pad_factor = 4u;
+    nd->shwfs.nlambda    = 2;
+
+    /* 11: ZWFS with dimple_amp & achrom_dimple */
+    nd = &ecfg.nodes[ecfg.n_nodes++];
+    cacaosim_bench_node_defaults(nd, CACAOSIM_NODE_ZWFS, "zw0", 0, 11);
+    snprintf(nd->in_beam, sizeof(nd->in_beam), "b_lo1");
+    nd->zwfs.n_mft         = 48u;
+    nd->zwfs.dimple_rad    = 1.2f;
+    nd->zwfs.dimple_amp    = 0.8f;
+    nd->zwfs.achrom_dimple = 1;
+    nd->zwfs.nlambda       = 2;
+
+    /* 12: FPCAM fft + is_wfs + out_long */
+    nd = &ecfg.nodes[ecfg.n_nodes++];
+    cacaosim_bench_node_defaults(nd, CACAOSIM_NODE_FPCAM, "fp0", 0, 12);
+    snprintf(nd->in_beam, sizeof(nd->in_beam), "b_w1");
+    snprintf(nd->out_long, sizeof(nd->out_long), "fp0_long");
+    nd->is_wfs           = 1;
+    nd->fpcam.prop_mode  = CACAOSIM_FPCAM_PROP_FFT;
+    nd->fpcam.pad_factor = 4u;
+    nd->fpcam.nlambda    = 3;
+
+    int   need = cacaosim_bench_format_str(&ecfg, NULL, 0u);
+    char *sbuf = (char *) malloc((size_t) need + 16u);
+    cacaosim_bench_format_str(&ecfg, sbuf, (size_t) need + 16u);
+
+    int  emitted_keys  = 0;
+    int  schema_misses = 0;
+    int  tui_misses    = 0;
+    char miss_msg[160] = { 0 };
+    char cur_sec[32]   = { 0 };
+    int  cur_sel       = 0;
+
+    char *lp = sbuf;
+    while (*lp != '\0')
+    {
+        char *nl = strchr(lp, '\n');
+        if (nl != NULL)
+        {
+            *nl = '\0';
+        }
+        while (*lp == ' ' || *lp == '\t')
+        {
+            lp++;
+        }
+        if (lp[0] == '[')
+        {
+            char *rb = strchr(lp, ']');
+            if (rb != NULL)
+            {
+                *rb = '\0';
+                char *dot = strchr(lp + 1, '.');
+                if (dot == NULL)
+                {
+                    snprintf(cur_sec, sizeof(cur_sec), "%s", lp + 1);
+                    cur_sel = 0;
+                }
+                else
+                {
+                    *dot = '\0';
+                    snprintf(cur_sec, sizeof(cur_sec), "%s", lp + 1);
+                    const char *nid = dot + 1;
+                    cur_sel         = 0;
+                    for (uint32_t ni = 0; ni < ecfg.n_nodes; ni++)
+                    {
+                        if (strcmp(ecfg.nodes[ni].id, nid) == 0)
+                        {
+                            cur_sel = (int) ni + 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        else if (lp[0] != '\0' && lp[0] != '#')
+        {
+            char *eq = strchr(lp, '=');
+            if (eq != NULL)
+            {
+                *eq = '\0';
+                char *ke = eq;
+                while (ke > lp && (ke[-1] == ' ' || ke[-1] == '\t'))
+                {
+                    *--ke = '\0';
+                }
+                emitted_keys++;
+                if (cacaosim_schema_find_bench_opt(cur_sec, lp) == NULL)
+                {
+                    if (schema_misses == 0)
+                    {
+                        snprintf(miss_msg, sizeof(miss_msg), "schema miss: %s.%s", cur_sec, lp);
+                    }
+                    schema_misses++;
+                }
+                if (!tui_has_key_for_item(&ecfg, cur_sel, lp))
+                {
+                    if (tui_misses == 0 && miss_msg[0] == '\0')
+                    {
+                        snprintf(miss_msg, sizeof(miss_msg), "tui miss: %s.%s (sel=%d)", cur_sec,
+                                 lp, cur_sel);
+                    }
+                    tui_misses++;
+                }
+            }
+        }
+        lp = (nl != NULL) ? (nl + 1) : (lp + strlen(lp));
+    }
+    free(sbuf);
+
+    snprintf(det, sizeof(det), "emitted=%d, schema_miss=%d, tui_miss=%d %s", emitted_keys,
+             schema_misses, tui_misses, miss_msg);
+    check_cond(emitted_keys >= 140 && schema_misses == 0 && tui_misses == 0,
+               "100% serializer -> schema & TUI Advanced inspector coverage", det);
+
+    /* 3. Verify runtime introspection of all 12 MILK_RUNNABLE FPS units & exporters */
+    size_t                      n_units   = 0u;
+    const MILK_RUNNABLE *const *units     = cacaosim_list_runnables(&n_units);
+    size_t                      n_bindings = 0u;
+    for (size_t u = 0u; u < n_units; u++)
+    {
+        n_bindings += (size_t) units[u]->nb_bindings;
+    }
+
+    FILE  *jf       = tmpfile();
+    int    jrc      = (jf != NULL) ? cacaosim_schema_render_json(NULL, jf) : -1;
+    long   jsz      = 0;
+    int    j_has_ok = 0;
+    if (jf != NULL && jrc == 0)
+    {
+        fflush(jf);
+        jsz = ftell(jf);
+        rewind(jf);
+        char *jb = (char *) malloc((size_t) jsz + 1u);
+        if (jb != NULL)
+        {
+            size_t nr = fread(jb, 1u, (size_t) jsz, jf);
+            jb[nr]    = '\0';
+            j_has_ok  = (strstr(jb, "\"bench_options\"") != NULL &&
+                         strstr(jb, "\"fps_units\"") != NULL &&
+                         strstr(jb, "\"wfstat\"") != NULL &&
+                         strstr(jb, "\"clock_offset_us\"") != NULL);
+            free(jb);
+        }
+        fclose(jf);
+    }
+
+    FILE *mf  = tmpfile();
+    int   mrc = (mf != NULL) ? cacaosim_schema_render_markdown(NULL, mf) : -1;
+    long  msz = (mf != NULL) ? (fflush(mf), ftell(mf)) : 0;
+    if (mf != NULL)
+    {
+        fclose(mf);
+    }
+
+    FILE *tf  = tmpfile();
+    int   trc = (tf != NULL) ? cacaosim_schema_render_table(NULL, 0, tf) : -1;
+    long  tsz = (tf != NULL) ? (fflush(tf), ftell(tf)) : 0;
+    if (tf != NULL)
+    {
+        fclose(tf);
+    }
+
+    snprintf(det, sizeof(det), "units=%zu, fps_params=%zu, json=%ldB, md=%ldB, tbl=%ldB", n_units,
+             n_bindings, jsz, msz, tsz);
+    check_cond(n_units == 12u && n_bindings >= 350u && jrc == 0 && j_has_ok && mrc == 0 &&
+                   msz > 10000L && trc == 0 && tsz > 10000L,
+               "12 MILK_RUNNABLE FPS units introspected & JSON/MD/Table exported", det);
+}
+
 int main(void)
 {
     printf("======================================================================\n");
@@ -5263,6 +5706,7 @@ int main(void)
     test_temporal_oversampling_physics();
     test_chromaticity_and_poly_wfs();
     test_subaru_lyot_coro_and_llowfs();
+    test_options_schema_and_tui_coverage();
 
     printf("\n======================================================================\n");
     printf("  Summary: %d passed, %d failed\n", g_pass, g_fail);
