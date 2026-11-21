@@ -95,8 +95,8 @@ done
 cacaosim-bench-view -h1 >/dev/null
 cacaosim-bench-view -h2 >/dev/null
 cacaosim-bench-view -hm >/dev/null
-cacaosim-bench options --section pyrwfs | grep -q "clock_offset_us"
-cacaosim-bench options --fps wfstat | grep -q "snap_extra"
+grep -q "clock_offset_us" <<<"$(cacaosim-bench options --section pyrwfs)"
+grep -q "snap_extra" <<<"$(cacaosim-bench options --fps wfstat)"
 if command -v python3 >/dev/null 2>&1; then
     cacaosim-bench options --format json | python3 -m json.tool >/dev/null
 fi

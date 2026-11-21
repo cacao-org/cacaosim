@@ -1130,6 +1130,16 @@ int cacaosim_bench_emit_plan(
                     fprintf(f_bat, "%s.tau_sec = %.7f\n", fps, nd->cfg.dm.tau_sec);
                     fprintf(f_bat, "%s.f0_hz = %.8g\n", fps, nd->cfg.dm.f0_hz);
                     fprintf(f_bat, "%s.zeta = %.8g\n", fps, nd->cfg.dm.zeta);
+                    if (nd->cfg.dm.dyn_mode == 3)
+                    {
+                        fprintf(f_bat, "%s.act_pitch_mm = %.8g\n", fps, nd->cfg.dm.act_pitch_mm);
+                        fprintf(f_bat, "%s.wave_c = %.8g\n", fps, nd->cfg.dm.wave_c_ms);
+                        fprintf(f_bat, "%s.bend_beta = %.8g\n", fps, nd->cfg.dm.bend_beta_m2s);
+                        fprintf(f_bat, "%s.damp_g0 = %.8g\n", fps, nd->cfg.dm.damp_g0);
+                        fprintf(f_bat, "%s.damp_g2 = %.8g\n", fps, nd->cfg.dm.damp_g2);
+                        fprintf(f_bat, "%s.plate_drive = %d\n", fps, nd->cfg.dm.plate_drive);
+                        fprintf(f_bat, "%s.rim_bc = %d\n", fps, nd->cfg.dm.rim_bc);
+                    }
                     fprintf(f_bat, "%s.delay_frames = %.8g\n", fps, nd->eff_delay_ticks);
                     emit_reg_params(f_bat, fps, &nd->cfg.reg);
                     fprintf(f_bat, "%s.backend = %d\n", fps, cfg.backend);

@@ -479,6 +479,22 @@ void cacaosim_dm_cuda_render(cacaosim_dm_ctx_t *ctx, float *host_opd_out)
     (void) host_opd_out;
 }
 
+void cacaosim_dm_cuda_plate_step(cacaosim_dm_ctx_t *ctx, float tau_sec)
+{
+    (void) ctx;
+    (void) tau_sec;
+}
+
+void cacaosim_dm_cuda_plate_reset(cacaosim_dm_ctx_t *ctx)
+{
+    (void) ctx;
+}
+
+void cacaosim_dm_cuda_plate_sync_host(cacaosim_dm_ctx_t *ctx)
+{
+    (void) ctx;
+}
+
 /**
  * cacaosim_pyrwfs_cuda_init() - Fail-safe Pyramid WFS CUDA init stub returning `-1` without CUDA
  * @ctx:        Unused Pyramid WFS context

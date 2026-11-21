@@ -395,6 +395,218 @@ static void test_dm_physics(void)
         free(opd_gpu);
     }
 
+    /* 3b. Coupled 2D circular-rim flexural+membrane plate PDE (dyn_mode == 3, ALPAO 64x64) */
+    {
+        const uint32_t pnact = 64u;
+        const uint32_t pnwf  = 128u;
+        cacaosim_dm_cfg_t pcfg = {
+            .nact_x        = pnact,
+            .nact_y        = pnact,
+            .nwf           = pnwf,
+            .dm_diam       = 0.984375f,
+            .if_coupling   = 0.20f,
+            .refl_scale    = 2.0f,
+            .max_stroke    = 8.0f,
+            .dac_bits      = 0,
+            .nonlin_quad   = 0.0f,
+            .dyn_mode      = 3,
+            .dt_sec        = 5.0e-5f, /* 20 kHz */
+            .tau_sec       = 2.0e-5f, /* 20 us voice-coil current step */
+            .f0_hz         = 1000.0f,
+            .act_pitch_mm  = 1.5f,
+            .wave_c_ms     = 14.0f,
+            .bend_beta_m2s = 0.0085f,
+            .damp_g0       = 195.0f,
+            .damp_g2       = 1.5f,
+            .plate_drive   = 1,
+            .rim_bc        = 1,
+            .delay_frames  = 0.0f,
+            .backend       = CACAOSIM_BACKEND_CPU,
+        };
+        cacaosim_dm_ctx_t pctx;
+        int init_ok = (cacaosim_dm_init(&pctx, &pcfg, NULL) == 0);
+        float *pcmd = (float *) cacaosim_aligned_calloc(pnact * pnact, sizeof(float));
+        float *popd = (float *) cacaosim_aligned_calloc(pnwf * pnwf, sizeof(float));
+
+        /* Store 440 frames (22 ms at 20 kHz) of 64x64 actuator displacement; poke at fr = 40 */
+        const uint32_t nfr = 440u;
+        float *hist        = (float *) calloc((size_t) nfr * pnact * pnact, sizeof(float));
+        const uint32_t px  = 19u;
+        const uint32_t py  = 42u;
+
+        for (uint32_t fr = 0; fr < nfr; fr++)
+        {
+            if (fr == 40u)
+            {
+                pcmd[py * pnact + px] = 5.0f; /* ~0.91 um peak physical poke (force drive) */
+            }
+            cacaosim_dm_step_actuators(&pctx, pcmd, 0.0f, 2.0e-5f, 8.0f);
+            memcpy(&hist[(size_t) fr * pnact * pnact], pctx.act_pos_render,
+                   pnact * pnact * sizeof(float));
+        }
+
+        /* Measure 1 ms consecutive-exposure boxcar diff in far ring (18..36 act from poke) */
+        double peak_5ms_nm  = 0.0;
+        double peak_18ms_nm = 0.0;
+        for (uint32_t ay = 0; ay < pnact; ay++)
+        {
+            for (uint32_t ax = 0; ax < pnact; ax++)
+            {
+                float rc = hypotf((float) ax - 31.5f, (float) ay - 31.5f);
+                float rp = hypotf((float) ax - (float) px, (float) ay - (float) py);
+                if (rc <= 30.5f && rp >= 18.0f && rp <= 36.0f)
+                {
+                    uint32_t id = ay * pnact + ax;
+                    double   c5 = 0.0, p5 = 0.0, c18 = 0.0, p18 = 0.0;
+                    for (uint32_t j = 0; j < 20u; j++)
+                    {
+                        c5  += (double) hist[(140u - j) * pnact * pnact + id];
+                        p5  += (double) hist[(120u - j) * pnact * pnact + id];
+                        c18 += (double) hist[(400u - j) * pnact * pnact + id];
+                        p18 += (double) hist[(380u - j) * pnact * pnact + id];
+                    }
+                    double d5  = fabs(c5 - p5) * (1000.0 / 20.0);
+                    double d18 = fabs(c18 - p18) * (1000.0 / 20.0);
+                    if (d5 > peak_5ms_nm)
+                    {
+                        peak_5ms_nm = d5;
+                    }
+                    if (d18 > peak_18ms_nm)
+                    {
+                        peak_18ms_nm = d18;
+                    }
+                }
+            }
+        }
+        /* Continue 800 more steps (60 ms total) to check continuous-facesheet static coupling */
+        for (uint32_t k = 0; k < 800u; k++)
+        {
+            cacaosim_dm_step_actuators(&pctx, pcmd, 0.0f, 2.0e-5f, 8.0f);
+        }
+        float poke_dc  = pctx.act_pos[py * pnact + px];
+        float nb_ratio = pctx.act_pos[py * pnact + px + 1u] / fmaxf(poke_dc, 1e-6f);
+
+        /* Verify static CG solver (calib_fast) matches t->inf dynamic plate PDE equilibrium */
+        float *stat_ref = (float *) calloc(pnact * pnact, sizeof(float));
+        memcpy(stat_ref, pctx.act_pos, pnact * pnact * sizeof(float));
+        cacaosim_dm_reset(&pctx);
+        cacaosim_dm_step_static_plate(&pctx, pcmd, NULL, 8.0f, popd);
+        float max_stat_err = 0.0f;
+        for (uint32_t a = 0; a < pnact * pnact; a++)
+        {
+            float e = fabsf(pctx.act_pos_render[a] - stat_ref[a]);
+            if (e > max_stat_err)
+            {
+                max_stat_err = e;
+            }
+        }
+        free(stat_ref);
+
+        /* Verify exact uniform piston DC = 1.0000 with force drive + free circular rim */
+        cacaosim_dm_reset(&pctx);
+        for (uint32_t a = 0; a < pnact * pnact; a++)
+        {
+            pcmd[a] = 1.0f;
+        }
+        cacaosim_dm_step_static_plate(&pctx, pcmd, NULL, 8.0f, popd);
+        float piston_stat = pctx.act_pos_render[32u * pnact + 32u];
+        cacaosim_dm_reset(&pctx);
+        for (uint32_t k = 0; k < 1200u; k++)
+        {
+            cacaosim_dm_step_actuators(&pctx, pcmd, 0.0f, 2.0e-5f, 8.0f);
+        }
+        float piston_dc = pctx.act_pos[32u * pnact + 32u];
+
+        snprintf(buf, sizeof(buf),
+                 "5ms=%.2fnm, 18ms=%.2fnm, nb/ctr=%.3f, piston=%.5f, cg_err=%.2e, nsub=%u",
+                 peak_5ms_nm, peak_18ms_nm, nb_ratio, piston_dc, max_stat_err, pctx.plate_nsub);
+        check_cond(init_ok && peak_5ms_nm >= 2.0 && peak_5ms_nm <= 15.0 && peak_18ms_nm < 1.2 &&
+                       peak_18ms_nm < 0.30 * peak_5ms_nm && nb_ratio >= 0.25f &&
+                       nb_ratio <= 0.50f && fabsf(piston_dc - 1.0f) < 1e-3f &&
+                       fabsf(piston_stat - 1.0f) < 1e-5f && max_stat_err < 2.0e-4f,
+                   "DM plate PDE 64x64 ripples, decay & static DC", buf);
+
+        /* Verify CPU vs CUDA parity for coupled 64x64 plate PDE + 16-tap gather */
+        if (cacaosim_cuda_available())
+        {
+            cacaosim_dm_reset(&pctx);
+            cacaosim_dm_cfg_t pgcfg = pcfg;
+            pgcfg.backend           = CACAOSIM_BACKEND_CUDA;
+            cacaosim_dm_ctx_t pgctx;
+            int               g_ok = (cacaosim_dm_init(&pgctx, &pgcfg, NULL) == 0);
+            float            *g_opd = (float *) cacaosim_aligned_calloc(pnwf * pnwf, sizeof(float));
+
+            memset(pcmd, 0, pnact * pnact * sizeof(float));
+            pcmd[py * pnact + px] = 5.0f;
+            for (uint32_t fr = 0; fr < 80u; fr++)
+            {
+                cacaosim_dm_step(&pctx, pcmd, NULL, 0.0f, 2.0e-5f, 8.0f, popd);
+                cacaosim_dm_step(&pgctx, pcmd, NULL, 0.0f, 2.0e-5f, 8.0f, g_opd);
+            }
+            double max_d = 0.0;
+            for (uint32_t p = 0; p < pnwf * pnwf; p++)
+            {
+                double d = fabs((double) popd[p] - (double) g_opd[p]);
+                if (d > max_d)
+                {
+                    max_d = d;
+                }
+            }
+            snprintf(buf, sizeof(buf), "max |CPU - CUDA| = %.3e um (plate_cuda=%d)", max_d,
+                     pgctx.plate_use_cuda);
+            check_cond(g_ok && pgctx.plate_use_cuda && max_d < 1e-5,
+                       "DM plate PDE 64x64 CPU vs CUDA parity", buf);
+            cacaosim_dm_free(&pgctx);
+            free(g_opd);
+        }
+
+        /* Verify .bench parse/format round-trip for dyn_mode = "plate" */
+        static const char *const plate_ini =
+            "[bench]\n"
+            "nwf = 64\n"
+            "master_hz = 2000.0\n"
+            "out_beam = b_in\n"
+            "[dm.ao3k]\n"
+            "in = b_in\n"
+            "out = b_out\n"
+            "in_cmd = dm01disp\n"
+            "nact_x = 64\n"
+            "nact_y = 64\n"
+            "dyn_mode = \"plate\"\n"
+            "tau_us = 200\n"
+            "f0_hz = 950\n"
+            "act_pitch_mm = 1.5\n"
+            "wave_c = 22\n"
+            "bend_beta = 0.025\n"
+            "damp_g0 = 150\n"
+            "damp_g2 = 12\n"
+            "plate_drive = \"force\"\n"
+            "rim_bc = \"free\"\n";
+        cacaosim_bench_cfg_t b1, b2;
+        char                 berr[128] = "";
+        char                 bfmt[4096];
+        int                  rt_ok = 0;
+        if (cacaosim_bench_parse_str(plate_ini, &b1, berr, sizeof(berr)) == 0 &&
+            cacaosim_bench_format_str(&b1, bfmt, sizeof(bfmt)) > 0 &&
+            cacaosim_bench_parse_str(bfmt, &b2, berr, sizeof(berr)) == 0)
+        {
+            const cacaosim_dm_cfg_t *d2 = &b2.nodes[0].dm;
+            rt_ok = (d2->dyn_mode == 3 && fabsf(d2->f0_hz - 950.0f) < 1e-2f &&
+                     fabsf(d2->wave_c_ms - 22.0f) < 1e-2f &&
+                     fabsf(d2->bend_beta_m2s - 0.025f) < 1e-4f &&
+                     fabsf(d2->damp_g0 - 150.0f) < 1e-2f &&
+                     fabsf(d2->damp_g2 - 12.0f) < 1e-2f && d2->plate_drive == 1 &&
+                     d2->rim_bc == 1);
+        }
+        check_cond(rt_ok, ".bench dyn_mode=plate parse/format round-trip",
+                   rt_ok ? "plate_drive=force, rim_bc=free" : berr);
+
+        cacaosim_dm_free(&pctx);
+        free(hist);
+        free(popd);
+        free(pcmd);
+    }
+
     cacaosim_dm_free(&ctx);
     free(opd_cpu);
     free(cmd);
@@ -5399,10 +5611,17 @@ static void test_options_schema_and_tui_coverage(void)
     nd->dm.delay_sec   = 2.5e-4f;
     nd->dm.no_zoh_mean = 1;
 
+    /* 1b: DM zonal PLATE PDE (ALPAO 64x64 coupled facesheet) */
+    nd = &ecfg.nodes[ecfg.n_nodes++];
+    cacaosim_bench_node_defaults(nd, CACAOSIM_NODE_DM, "dm_plt", 0, 1);
+    snprintf(nd->in_beam, sizeof(nd->in_beam), "b_2");
+    snprintf(nd->out_beam, sizeof(nd->out_beam), "b_2p");
+    nd->dm.dyn_mode = 3;
+
     /* 2: TTM */
     nd = &ecfg.nodes[ecfg.n_nodes++];
     cacaosim_bench_node_defaults(nd, CACAOSIM_NODE_DM, "ttm0", 1, 2);
-    snprintf(nd->in_beam, sizeof(nd->in_beam), "b_2");
+    snprintf(nd->in_beam, sizeof(nd->in_beam), "b_2p");
     snprintf(nd->out_beam, sizeof(nd->out_beam), "b_3");
 
     /* 3: Splitter dichroic_bp with all per-arm reg/ncpa/pup */

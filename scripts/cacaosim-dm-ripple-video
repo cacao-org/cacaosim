@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Olivier Guyon et al
+# SPDX-License-Identifier: LGPL-3.0-or-later
+"""Render 20 kHz ALPAO 64x64 DM poke ripple MP4 & contact sheet matching LepICSaBL-E."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+
+def _ensure_sci_python() -> None:
+    try:
+        import matplotlib  # noqa: F401
+        import numpy  # noqa: F401
+        return
+    except ImportError:
+        pass
+    for p in (
+        os.environ.get("PYTHON_BIN", ""),
+        os.path.expanduser("~/miniforge3/bin/python3"),
+        os.path.expanduser("~/.local/envs/cacao/bin/python3"),
+    ):
+        if p and os.path.isfile(p) and os.path.realpath(p) != os.path.realpath(sys.executable):
+            os.execv(p, [p] + sys.argv)
+
+
+_ensure_sci_python()
+
+import matplotlib  # noqa: E402
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+
+
+def find_ffmpeg_bin() -> str | None:
+    for c in (
+        os.environ.get("FFMPEG_BIN", ""),
+        shutil.which("ffmpeg") or "",
+        os.path.expanduser("~/.local/bin/ffmpeg"),
+    ):
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    try:
+        import imageio_ffmpeg  # type: ignore[import-not-found]
+
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and os.path.isfile(exe):
+            return exe
+    except Exception:
+        pass
+    return None
+
+
+def norm_gray_u8(img: np.ndarray, vmax: float) -> np.ndarray:
+    v = max(float(vmax), 1e-12)
+    x = np.clip(0.5 + 0.5 * (img / v), 0.0, 1.0)
+    return (x * 255.0 + 0.5).astype(np.uint8)
+
+
+def resize_nn_or_bin(img: np.ndarray, size: int) -> np.ndarray:
+    """Fast area/bilinear resample of a square 2D float image to size x size."""
+    h, w = img.shape
+    if h == size and w == size:
+        return img
+    from PIL import Image
+
+    im = Image.fromarray(img.astype(np.float32), mode="F")
+    im = im.resize((size, size), resample=Image.BILINEAR)
+    return np.asarray(im, dtype=np.float32)
+
+
+def build_frame_rgb(
+    wfs_im: np.ndarray,
+    dm_im: np.ndarray,
+    wfs_lim: float,
+    dm_lim: float,
+    panel_px: int,
+    pad: int,
+) -> np.ndarray:
+    """Assemble the 2x3 panel frame matching LepICSaBL-E (top: PyWFS, bottom: DM shape)."""
+    w_r = resize_nn_or_bin(wfs_im, panel_px)
+    d_r = resize_nn_or_bin(dm_im, panel_px)
+
+    w_auto = max(float(np.max(np.abs(w_r))), 1e-12)
+    d_auto = max(float(np.max(np.abs(d_r))), 1e-12)
+
+    top_panels = [
+        norm_gray_u8(w_r, wfs_lim),
+        norm_gray_u8(w_r, wfs_lim / 50.0),
+        norm_gray_u8(w_r, w_auto),
+    ]
+    bot_panels = [
+        norm_gray_u8(d_r, dm_lim),
+        norm_gray_u8(d_r, dm_lim / 50.0),
+        norm_gray_u8(d_r, d_auto),
+    ]
+
+    H = 2 * panel_px + 3 * pad
+    W = 3 * panel_px + 4 * pad
+    # Ensure even H, W for libx264 yuv420p
+    H += H & 1
+    W += W & 1
+    canvas = np.full((H, W, 3), 255, dtype=np.uint8)
+
+    for col in range(3):
+        x0 = pad + col * (panel_px + pad)
+        y0_top = pad
+        y0_bot = 2 * pad + panel_px
+        tp = top_panels[col]
+        bp = bot_panels[col]
+        canvas[y0_top : y0_top + panel_px, x0 : x0 + panel_px] = tp[:, :, None]
+        canvas[y0_bot : y0_bot + panel_px, x0 : x0 + panel_px] = bp[:, :, None]
+
+    return canvas
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Render 20 kHz DM poke ripple comparison MP4 & contact sheet."
+    )
+    ap.add_argument("indir", help="Directory created by cacaosim-dm-poke-sim")
+    ap.add_argument(
+        "--fps",
+        type=float,
+        default=7.55,
+        help="Output MP4 framerate (default: 7.55 -> 53 s for 400 frames, matching LepICSaBL-E)",
+    )
+    ap.add_argument(
+        "--panel-px",
+        type=int,
+        default=256,
+        help="Pixel width/height of each sub-panel (default: 256)",
+    )
+    ap.add_argument(
+        "--gain-1x",
+        type=float,
+        default=0.25,
+        help="Linear 1x display limit as fraction of peak 1ms diff (default: 0.25; 50x = 1x/50)",
+    )
+    ap.add_argument(
+        "--diff-mode",
+        choices=("boxcar", "pointwise"),
+        default="boxcar",
+        help="1 ms diff operator: consecutive 1 ms exposure means (boxcar) or pointwise",
+    )
+    ap.add_argument("--no-video", action="store_true", help="Skip MP4 encoding; write PNG only")
+    ap.add_argument("--save-fits", action="store_true", help="Also save 1ms-diff FITS cubes")
+    args = ap.parse_args()
+
+    with open(os.path.join(args.indir, "meta.json"), "r", encoding="utf-8") as fh:
+        meta = json.load(fh)
+
+    n_total = int(meta["n_total"])
+    n_diff = int(meta["n_diff"])
+    nwf = int(meta["nwf"])
+    ncam = int(meta["ncam"])
+    rate_hz = float(meta["rate_hz"])
+    pre_ms = float(meta["pre_ms"])
+    poke_x = int(meta["poke_x"])
+    poke_y = int(meta["poke_y"])
+
+    opd = np.fromfile(os.path.join(args.indir, "dm_opd_20khz.f32"), dtype=np.float32).reshape(
+        (n_total, nwf, nwf)
+    )
+    wfs = np.fromfile(os.path.join(args.indir, "pyrwfs_20khz.f32"), dtype=np.float32).reshape(
+        (n_total, ncam, ncam)
+    )
+    pup = np.fromfile(os.path.join(args.indir, "pup.f32"), dtype=np.float32).reshape((nwf, nwf))
+    pup_mask = pup > 0.5
+
+    # Convert reflective OPD [um] -> mechanical surface displacement [um] (refl_scale = 2.0)
+    surf = 0.5 * opd
+    if args.diff_mode == "boxcar" and n_total >= 2 * n_diff + 1:
+        # Exact LepICSaBL-E operator: difference between two consecutive 1 ms exposure means
+        cs_w = np.concatenate(
+            [np.zeros((1, ncam, ncam), dtype=np.float64), np.cumsum(wfs, axis=0, dtype=np.float64)],
+            axis=0,
+        )
+        cs_d = np.concatenate(
+            [np.zeros((1, nwf, nwf), dtype=np.float64), np.cumsum(surf, axis=0, dtype=np.float64)],
+            axis=0,
+        )
+        k = np.arange(2 * n_diff, n_total + 1)
+        dw = (cs_w[k] - cs_w[k - n_diff]) - (cs_w[k - n_diff] - cs_w[k - 2 * n_diff])
+        dd = (cs_d[k] - cs_d[k - n_diff]) - (cs_d[k - n_diff] - cs_d[k - 2 * n_diff])
+        wfs_diff = (dw / float(n_diff)).astype(np.float32)
+        dm_diff = ((dd / float(n_diff)) * pup_mask[None, :, :]).astype(np.float32)
+        # Drop the extra trailing element if n_total == 2*n_diff + n_out
+        if dm_diff.shape[0] > n_total - 2 * n_diff:
+            wfs_diff = wfs_diff[:-1]
+            dm_diff = dm_diff[:-1]
+    else:
+        wfs_diff = wfs[n_diff:] - wfs[:-n_diff]
+        dm_diff = (surf[n_diff:] - surf[:-n_diff]) * pup_mask[None, :, :]
+    n_out = dm_diff.shape[0]
+
+    # Reference linear 1x scales (slight tip saturation at 1x so both 1x poke and 50x ripples pop)
+    wfs_peak = float(np.max(np.abs(wfs_diff)))
+    dm_peak = float(np.max(np.abs(dm_diff)))
+    wfs_lim = max(args.gain_1x, 0.05) * wfs_peak
+    dm_lim = max(args.gain_1x, 0.05) * dm_peak
+
+    # Quantitative far-ring ripple metrics (18..36 act = 72..144 px from poke center)
+    yy, xx = np.mgrid[0:nwf, 0:nwf]
+    px_wf = 1.5 + 4.0 * poke_x
+    py_wf = 1.5 + 4.0 * poke_y
+    r_poke_act = np.hypot(xx - px_wf, yy - py_wf) / 4.0
+    far_ring = pup_mask & (r_poke_act >= 18.0) & (r_poke_act <= 36.0)
+
+    sample_ms = [0.5, 1.5, 2.5, 3.5, 4.5, 6.0, 8.0, 10.0, 14.0, 18.0]
+    metrics_rows = []
+    print(
+        f"[dm-ripple-video] {n_out} diff frames @ {rate_hz:.0f} Hz | "
+        f"peak 1ms-diff DM surf = {dm_peak*1e3:.1f} nm (OPD {2*dm_peak*1e3:.1f} nm)"
+    )
+    for dt_ms in sample_ms:
+        t_vid_ms = pre_ms + dt_ms
+        idx = int(round(t_vid_ms * rate_hz * 1e-3))
+        if idx < 0 or idx >= n_out:
+            continue
+        vals_nm = dm_diff[idx][far_ring] * 1e3
+        p_max = float(np.max(np.abs(vals_nm)))
+        p_rms = float(np.std(vals_nm))
+        metrics_rows.append({"dt_post_poke_ms": dt_ms, "far_max_nm": p_max, "far_rms_nm": p_rms})
+        print(
+            f"  dt=+{dt_ms:4.1f} ms | far-ring 1ms-diff surf: "
+            f"max={p_max:6.2f} nm, rms={p_rms:5.2f} nm"
+        )
+
+    with open(os.path.join(args.indir, "ripple_metrics.json"), "w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "meta": meta,
+                "gain_1x": args.gain_1x,
+                "peak_dm_surf_1ms_diff_nm": dm_peak * 1e3,
+                "peak_wfs_1ms_diff": wfs_peak,
+                "lim_1x_dm_surf_nm": dm_lim * 1e3,
+                "lim_50x_dm_surf_nm": (dm_lim / 50.0) * 1e3,
+                "samples": metrics_rows,
+            },
+            fh,
+            indent=2,
+        )
+
+    if args.save_fits:
+        from astropy.io import fits
+
+        fits.writeto(
+            os.path.join(args.indir, "pyrwfs_diff1ms_20khz.fits"), wfs_diff, overwrite=True
+        )
+        fits.writeto(
+            os.path.join(args.indir, "dm_surf_diff1ms_20khz.fits"), dm_diff, overwrite=True
+        )
+
+    # Render high-res visual contact sheet matching LepICSaBL-E timestamps (3x3 grid of 2x3 panels)
+    sheet_dt_ms = [0.6, 1.6, 2.6, 3.6, 5.2, 7.5, 10.5, 14.0, 17.5]
+    fig, axes = plt.subplots(3, 3, figsize=(13.5, 9.2), dpi=140)
+    fig.patch.set_facecolor("white")
+    for k, dt_ms in enumerate(sheet_dt_ms):
+        t_vid_ms = pre_ms + dt_ms
+        idx = min(n_out - 1, max(0, int(round(t_vid_ms * rate_hz * 1e-3))))
+        rgb = build_frame_rgb(wfs_diff[idx], dm_diff[idx], wfs_lim, dm_lim, panel_px=160, pad=6)
+        ax = axes[k // 3, k % 3]
+        ax.imshow(rgb)
+        d_auto_nm = float(np.max(np.abs(dm_diff[idx]))) * 1e3
+        ax.set_title(
+            f"t = +{dt_ms:.1f} ms  (DM auto ±{d_auto_nm:.1f} nm)",
+            fontsize=9.5,
+            pad=3,
+        )
+        ax.axis("off")
+    fig.suptitle(
+        "Simulated 64x64 ALPAO DM (dyn_mode=plate) — 20 kHz 1 ms Diff\n"
+        "Top: NIR PyWFS | Bottom: DM Shape | Cols: Linear (1x) / Linear (50x) / Autoscale",
+        fontsize=11,
+        fontweight="bold",
+    )
+    plt.tight_layout(rect=[0.0, 0.0, 1.0, 0.94])
+    sheet_path = os.path.join(args.indir, "dm_poke_sim_contact_sheet.png")
+    plt.savefig(sheet_path)
+    plt.close(fig)
+    print(f"[dm-ripple-video] Saved contact sheet: {sheet_path}")
+
+    if args.no_video:
+        return 0
+
+    ffmpeg = find_ffmpeg_bin()
+    if not ffmpeg:
+        print("[dm-ripple-video] WARNING: ffmpeg not found; skipped MP4", file=sys.stderr)
+        return 0
+
+    mp4_path = os.path.join(args.indir, "dm_poke_sim_20khz.mp4")
+    sample_rgb = build_frame_rgb(
+        wfs_diff[0], dm_diff[0], wfs_lim, dm_lim, panel_px=args.panel_px, pad=10
+    )
+    H, W, _ = sample_rgb.shape
+
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{W}x{H}",
+        "-r",
+        f"{args.fps:.4f}",
+        "-i",
+        "-",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-crf",
+        "18",
+        "-movflags",
+        "+faststart",
+        mp4_path,
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc.stdin is not None
+    for idx in range(n_out):
+        rgb = build_frame_rgb(
+            wfs_diff[idx], dm_diff[idx], wfs_lim, dm_lim, panel_px=args.panel_px, pad=10
+        )
+        proc.stdin.write(rgb.tobytes())
+    proc.stdin.close()
+    err_b = proc.stderr.read() if proc.stderr else b""
+    rc = proc.wait()
+    if rc != 0:
+        msg = err_b.decode("utf-8", "ignore")
+        print(f"[dm-ripple-video] ffmpeg failed ({rc}): {msg}", file=sys.stderr)
+        return rc
+    dur_s = n_out / args.fps
+    print(
+        f"[dm-ripple-video] Saved MP4 ({W}x{H}, {n_out} fr @ {args.fps:.2f} fps "
+        f"= {dur_s:.1f}s): {mp4_path}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

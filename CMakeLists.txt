@@ -116,6 +116,7 @@ set(SCRIPTS
     scripts/cacaosim-ao-report
     scripts/cacaosim-gui-screenshot
     scripts/cacaosim-telemetry-video
+    scripts/cacaosim-dm-ripple-video
 )
 
 set(USE_CUDA_ACCEL OFF)
@@ -509,6 +510,22 @@ int main(int argc, char *argv[])
         INSTALL_RPATH "$ORIGIN/../lib;${CMAKE_INSTALL_RPATH}"
     )
     install(TARGETS cacaosim-benchmark DESTINATION bin)
+
+    add_executable(cacaosim-dm-poke-sim tests/cacaosim_dm_poke_sim.c)
+    target_compile_definitions(cacaosim-dm-poke-sim PRIVATE MILK_NO_CLI)
+    target_compile_options(cacaosim-dm-poke-sim PRIVATE ${CACAOSIM_C_OPT_FLAGS})
+    target_include_directories(cacaosim-dm-poke-sim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_include_directories(cacaosim-dm-poke-sim SYSTEM PRIVATE ${MILK_STANDALONE_INCLUDES})
+    target_link_libraries(cacaosim-dm-poke-sim PRIVATE
+        ${LIBNAME}
+        ${MILK_LIBRARIES}
+        ${CACAOSIM_MATH_LIBS}
+    )
+    set_target_properties(cacaosim-dm-poke-sim PROPERTIES
+        BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR};${CMAKE_INSTALL_RPATH}"
+        INSTALL_RPATH "$ORIGIN/../lib;${CMAKE_INSTALL_RPATH}"
+    )
+    install(TARGETS cacaosim-dm-poke-sim DESTINATION bin)
 endif()
 
 # ── Export and install machine-readable options schema JSON ──────────────────

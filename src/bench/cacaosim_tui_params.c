@@ -111,6 +111,13 @@ enum
     PID_DM_TAU_US,
     PID_DM_F0_HZ,
     PID_DM_ZETA,
+    PID_DM_PITCH_MM,
+    PID_DM_WAVE_C,
+    PID_DM_BEND_BETA,
+    PID_DM_DAMP_G0,
+    PID_DM_DAMP_G2,
+    PID_DM_PLATE_DRIVE,
+    PID_DM_RIM_BC,
     PID_DM_DELAY,
     PID_DM_DELAY_US,
     PID_DM_ZOH_MEAN,
@@ -639,14 +646,32 @@ int cs_params_build(
         }
         else
         {
-            add_enum_pd(out, &n, max_out, PID_DM_DYN_MODE, "dyn_mode", "Servo Dynamics", 3,
-                        "instant", "rc", "osc", NULL, "Discrete ZOH actuator temporal response");
+            add_enum_pd(out, &n, max_out, PID_DM_DYN_MODE, "dyn_mode", "Servo Dynamics", 4,
+                        "instant", "rc", "osc", "plate",
+                        "Discrete actuator temporal & coupled plate dynamics");
             add_pd(out, &n, max_out, PID_DM_TAU_US, "tau_us", "RC Time Const", "us", CS_PTYPE_FLOAT,
                    0.0, 20000.0, 20.0, "1st-order RC settling time constant [microseconds]");
             add_pd(out, &n, max_out, PID_DM_F0_HZ, "f0_hz", "Resonance f0", "Hz", CS_PTYPE_FLOAT,
-                   50.0, 50000.0, 250.0, "2nd-order natural resonance frequency [Hz]");
+                   50.0, 50000.0, 250.0, "Natural resonance frequency [Hz] (mode 2 & 3)");
             add_pd(out, &n, max_out, PID_DM_ZETA, "zeta", "Damping Ratio", "", CS_PTYPE_FLOAT, 0.05,
                    2.0, 0.05, "2nd-order damping ratio (0.7 = critically damped)");
+            if (nd->dm.dyn_mode == 3)
+            {
+                add_pd(out, &n, max_out, PID_DM_PITCH_MM, "act_pitch_mm", "Act Pitch", "mm",
+                       CS_PTYPE_FLOAT, 0.1, 20.0, 0.1, "Physical actuator spacing [mm]");
+                add_pd(out, &n, max_out, PID_DM_WAVE_C, "wave_c", "Wave Speed", "m/s",
+                       CS_PTYPE_FLOAT, 0.0, 200.0, 1.0, "Membrane wave speed c_m [m/s]");
+                add_pd(out, &n, max_out, PID_DM_BEND_BETA, "bend_beta", "Plate Beta", "m2/s",
+                       CS_PTYPE_FLOAT, 0.0, 0.5, 0.002, "Flexural dispersion beta [m^2/s]");
+                add_pd(out, &n, max_out, PID_DM_DAMP_G0, "damp_g0", "Visc Damp g0", "1/s",
+                       CS_PTYPE_FLOAT, 1.0, 5000.0, 10.0, "Viscous modal decay rate [1/s]");
+                add_pd(out, &n, max_out, PID_DM_DAMP_G2, "damp_g2", "KV Damp g2", "",
+                       CS_PTYPE_FLOAT, 0.0, 500.0, 2.0, "Kelvin-Voigt Laplacian damping");
+                add_enum_pd(out, &n, max_out, PID_DM_PLATE_DRIVE, "plate_drive", "Plate Drive", 2,
+                            "disp", "force", NULL, NULL, "Displacement-calibrated or force drive");
+                add_enum_pd(out, &n, max_out, PID_DM_RIM_BC, "rim_bc", "Rim Boundary", 2,
+                            "clamped", "free", NULL, NULL, "Circular rim boundary condition");
+            }
             add_pd(out, &n, max_out, PID_DM_DELAY, "delay_frames", "Frame Delay", "fr",
                    CS_PTYPE_FLOAT, 0.0, 7.0, 0.25, "Fractional master-clock latency [frames]");
             if (show_advanced)
@@ -1265,7 +1290,10 @@ void cs_param_format_val(
         break;
     case PID_DM_DYN_MODE:
         snprintf(buf, cap, "%s",
-                 (nd->dm.dyn_mode == 0) ? "instant" : (nd->dm.dyn_mode == 2 ? "osc" : "rc"));
+                 (nd->dm.dyn_mode == 0)
+                     ? "instant"
+                     : ((nd->dm.dyn_mode == 2) ? "osc"
+                                               : ((nd->dm.dyn_mode == 3) ? "plate" : "rc")));
         break;
     case PID_DM_TAU_US:
         snprintf(buf, cap, "%.1f", nd->dm.tau_sec * 1.0e6f);
@@ -1275,6 +1303,27 @@ void cs_param_format_val(
         break;
     case PID_DM_ZETA:
         snprintf(buf, cap, "%.2f", nd->dm.zeta);
+        break;
+    case PID_DM_PITCH_MM:
+        snprintf(buf, cap, "%.2f", nd->dm.act_pitch_mm);
+        break;
+    case PID_DM_WAVE_C:
+        snprintf(buf, cap, "%.1f", nd->dm.wave_c_ms);
+        break;
+    case PID_DM_BEND_BETA:
+        snprintf(buf, cap, "%.4f", nd->dm.bend_beta_m2s);
+        break;
+    case PID_DM_DAMP_G0:
+        snprintf(buf, cap, "%.1f", nd->dm.damp_g0);
+        break;
+    case PID_DM_DAMP_G2:
+        snprintf(buf, cap, "%.1f", nd->dm.damp_g2);
+        break;
+    case PID_DM_PLATE_DRIVE:
+        snprintf(buf, cap, "%s", (nd->dm.plate_drive == 1) ? "force" : "disp");
+        break;
+    case PID_DM_RIM_BC:
+        snprintf(buf, cap, "%s", (nd->dm.rim_bc == 1) ? "free" : "clamped");
         break;
     case PID_DM_DELAY:
         snprintf(buf, cap, "%.2f", nd->dm.delay_frames);
@@ -1987,6 +2036,27 @@ int cs_param_set_str(
         break;
     case PID_DM_ZETA:
         nd->dm.zeta = (float) dv;
+        break;
+    case PID_DM_PITCH_MM:
+        nd->dm.act_pitch_mm = (float) dv;
+        break;
+    case PID_DM_WAVE_C:
+        nd->dm.wave_c_ms = (float) dv;
+        break;
+    case PID_DM_BEND_BETA:
+        nd->dm.bend_beta_m2s = (float) dv;
+        break;
+    case PID_DM_DAMP_G0:
+        nd->dm.damp_g0 = (float) dv;
+        break;
+    case PID_DM_DAMP_G2:
+        nd->dm.damp_g2 = (float) dv;
+        break;
+    case PID_DM_PLATE_DRIVE:
+        nd->dm.plate_drive = iv ? 1 : 0;
+        break;
+    case PID_DM_RIM_BC:
+        nd->dm.rim_bc = iv ? 1 : 0;
         break;
     case PID_DM_DELAY:
         nd->dm.delay_frames = (float) dv;

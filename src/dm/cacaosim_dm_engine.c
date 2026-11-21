@@ -267,6 +267,97 @@ int MILK_COLD cacaosim_dm_init(
 
     dm_build_gather_stencil(ctx);
 
+    /* Precompute circular rim mask and CFL-safe sub-stepping for coupled 2D plate PDE (mode 3) */
+    if (ctx->cfg.dyn_mode == 3 && ctx->cfg.dm_mode == 0 && ctx->cfg.nact_x >= 4u &&
+        ctx->cfg.nact_y >= 4u)
+    {
+        ctx->act_u_filt = (float *) cacaosim_aligned_calloc(nact, sizeof(float));
+        ctx->plate_e    = (float *) cacaosim_aligned_calloc(nact, sizeof(float));
+        ctx->plate_lap  = (float *) cacaosim_aligned_calloc(nact, sizeof(float));
+        ctx->plate_lv   = (float *) cacaosim_aligned_calloc(nact, sizeof(float));
+        ctx->plate_mask = (uint8_t *) cacaosim_aligned_calloc(nact, sizeof(uint8_t));
+        if (!ctx->act_u_filt || !ctx->plate_e || !ctx->plate_lap || !ctx->plate_lv ||
+            !ctx->plate_mask)
+        {
+            cacaosim_dm_free(ctx);
+            return -1;
+        }
+
+        const uint32_t nx    = ctx->cfg.nact_x;
+        const uint32_t ny    = ctx->cfg.nact_y;
+        const float    cx    = 0.5f * (float) (nx - 1u);
+        const float    cy    = 0.5f * (float) (ny - 1u);
+        const float    r_rim = 0.5f * (float) ((nx < ny) ? nx : ny) + 0.5f;
+        const float    r2max = r_rim * r_rim;
+        for (uint32_t ay = 0; ay < ny; ay++)
+        {
+            float dy = (float) ay - cy;
+            for (uint32_t ax = 0; ax < nx; ax++)
+            {
+                float dx                     = (float) ax - cx;
+                ctx->plate_mask[ay * nx + ax] = ((dx * dx + dy * dy) <= r2max) ? 1u : 0u;
+            }
+        }
+
+        const float pitch_m = ((ctx->cfg.act_pitch_mm > 1e-4f) ? ctx->cfg.act_pitch_mm : 1.5f) *
+                              1.0e-3f;
+        const float f0_hz   = (ctx->cfg.f0_hz > 1.0f) ? ctx->cfg.f0_hz : 1000.0f;
+        float       wave_c  = ctx->cfg.wave_c_ms;
+        float       beta    = ctx->cfg.bend_beta_m2s;
+        if (wave_c <= 0.0f && beta <= 0.0f)
+        {
+            wave_c = 14.0f;
+            beta   = 0.0085f;
+        }
+        else
+        {
+            if (wave_c < 0.0f)
+            {
+                wave_c = 14.0f;
+            }
+            if (beta < 0.0f)
+            {
+                beta = 0.0085f;
+            }
+        }
+        float g0 = ctx->cfg.damp_g0;
+        float g2 = ctx->cfg.damp_g2;
+        if (g0 <= 0.0f)
+        {
+            g0 = 195.0f;
+            if (g2 == 0.0f)
+            {
+                g2 = 1.5f;
+            }
+        }
+        if (g2 < 0.0f)
+        {
+            g2 = 1.5f;
+        }
+
+        ctx->plate_w0     = CACAOSIM_TWO_PI_F * f0_hz;
+        ctx->plate_cm_p   = wave_c / pitch_m;
+        ctx->plate_beta_p = beta / (pitch_m * pitch_m);
+        ctx->plate_g0     = g0;
+        ctx->plate_g2     = g2;
+
+        /* Exact discrete spectral upper bound on 5-pt Laplacian (lambda <= 8) and biharmonic.
+         * Symplectic Verlet is stable for dt * w_max < 2.0; 1.15 gives a 1.74x safety margin. */
+        const float w_max = sqrtf(ctx->plate_w0 * ctx->plate_w0 +
+                                  8.0f * ctx->plate_cm_p * ctx->plate_cm_p +
+                                  64.0f * ctx->plate_beta_p * ctx->plate_beta_p);
+        const float g_max = ctx->plate_g0 + 8.0f * ctx->plate_g2;
+        float       r_w   = (ctx->cfg.dt_sec * w_max) / 1.15f;
+        float       r_g   = (ctx->cfg.dt_sec * g_max) / 0.45f;
+        float       r_req = (r_w > r_g) ? r_w : r_g;
+        uint32_t    nsub  = (r_req > 1.0f) ? (uint32_t) ceilf(r_req) : 1u;
+        if (nsub > 256u)
+        {
+            nsub = 256u;
+        }
+        ctx->plate_nsub = nsub;
+    }
+
     /* Probe and initialize CUDA backend when requested (gracefully falls back to CPU on failure) */
     int want_cuda = (cfg->backend == CACAOSIM_BACKEND_AUTO ||
                      cfg->backend == CACAOSIM_BACKEND_CUDA);
@@ -307,6 +398,26 @@ void MILK_COLD cacaosim_dm_reset(cacaosim_dm_ctx_t *ctx)
     __builtin_memset(ctx->act_pos_render, 0, nact * sizeof(float));
     __builtin_memset(ctx->prev_pos_render, 0, nact * sizeof(float));
     __builtin_memset(ctx->act_vel, 0, nact * sizeof(float));
+    if (ctx->act_u_filt != NULL)
+    {
+        __builtin_memset(ctx->act_u_filt, 0, nact * sizeof(float));
+    }
+    if (ctx->plate_e != NULL)
+    {
+        __builtin_memset(ctx->plate_e, 0, nact * sizeof(float));
+    }
+    if (ctx->plate_lap != NULL)
+    {
+        __builtin_memset(ctx->plate_lap, 0, nact * sizeof(float));
+    }
+    if (ctx->plate_lv != NULL)
+    {
+        __builtin_memset(ctx->plate_lv, 0, nact * sizeof(float));
+    }
+    if (ctx->plate_use_cuda)
+    {
+        cacaosim_dm_cuda_plate_reset(ctx);
+    }
     ctx->ring_head   = 0;
     ctx->ring_filled = 0;
     ctx->opd_valid   = 0;
@@ -340,10 +451,174 @@ void MILK_COLD cacaosim_dm_free(cacaosim_dm_ctx_t *ctx)
     free(ctx->act_pos_render);
     free(ctx->prev_pos_render);
     free(ctx->act_vel);
+    free(ctx->act_u_filt);
+    free(ctx->plate_e);
+    free(ctx->plate_lap);
+    free(ctx->plate_lv);
+    free(ctx->plate_mask);
     free(ctx->dead_mask);
     free(ctx->stencil_idx);
     free(ctx->stencil_w);
     __builtin_memset(ctx, 0, sizeof(*ctx));
+}
+
+/**
+ * plate_lap_sample() - Evaluate discrete 5-point Laplacian at active cell (ax, ay)
+ * @a:      Source 2D field `[nx * ny]`
+ * @mask:   Circular active rim mask `[nx * ny]` (`1` inside rim, `0` outside)
+ * @nx:     Actuator grid X count
+ * @ny:     Actuator grid Y count
+ * @ax:     Cell X index
+ * @ay:     Cell Y index
+ * @rim_bc: Boundary condition: `0` = clamped (Dirichlet `0`), `1` = free (Neumann)
+ *
+ * Return: Discrete Laplacian value `nL + nR + nU + nD - 4 * a[ax, ay]`.
+ */
+static inline float plate_lap_sample(
+    const float *__restrict   a,
+    const uint8_t *__restrict mask,
+    uint32_t                  nx,
+    uint32_t                  ny,
+    uint32_t                  ax,
+    uint32_t                  ay,
+    int32_t                   rim_bc)
+{
+    const uint32_t idx = ay * nx + ax;
+    const float    c   = a[idx];
+    const float    bc  = (rim_bc == 1) ? c : 0.0f;
+    const float    l   = (ax > 0u && mask[idx - 1u]) ? a[idx - 1u] : bc;
+    const float    r   = (ax + 1u < nx && mask[idx + 1u]) ? a[idx + 1u] : bc;
+    const float    u   = (ay > 0u && mask[idx - nx]) ? a[idx - nx] : bc;
+    const float    d   = (ay + 1u < ny && mask[idx + nx]) ? a[idx + nx] : bc;
+    return (l + r + u + d) - 4.0f * c;
+}
+
+/**
+ * dm_step_plate_cpu() - Advance coupled 2D circular-rim flexural+membrane PDE on CPU (mode 3)
+ * @ctx:     Active DM context with initialized plate buffers
+ * @tau_sec: Live 1st-order coil/driver RC pre-filter time constant [s]
+ *
+ * Role:
+ *   Integrates `w_tt + (2*g0 - 2*g2*lap)*w_t + (w0^2 - cm^2*lap + beta^2*lap^2)*e = rhs`
+ *   over `plate_nsub` CFL-safe symplectic Verlet sub-steps inside `[0, dt_sec]`, accumulating
+ *   the subframe-averaged displacement into `ctx->act_pos_render`.
+ */
+static void MILK_HOT dm_step_plate_cpu(
+    cacaosim_dm_ctx_t *ctx,
+    float              tau_sec)
+{
+    const uint32_t            nx      = ctx->cfg.nact_x;
+    const uint32_t            ny      = ctx->cfg.nact_y;
+    const uint32_t            nact    = ctx->nact_total;
+    const uint32_t            nsub    = (ctx->plate_nsub >= 1u) ? ctx->plate_nsub : 1u;
+    const float               dt_sub  = ctx->cfg.dt_sec / (float) nsub;
+    const float               inv_sub = 1.0f / (float) nsub;
+    const float               w02     = ctx->plate_w0 * ctx->plate_w0;
+    const float               cm2     = ctx->plate_cm_p * ctx->plate_cm_p;
+    const float               beta2   = ctx->plate_beta_p * ctx->plate_beta_p;
+    const float               two_g0  = 2.0f * ctx->plate_g0;
+    const float               two_g2  = 2.0f * ctx->plate_g2;
+    const int32_t             drive   = ctx->cfg.plate_drive;
+    const int32_t             rim_bc  = ctx->cfg.rim_bc;
+    const int32_t             do_mean = !ctx->cfg.no_zoh_mean;
+    const float               a_rc    = (tau_sec > 1e-7f) ? (1.0f - expf(-dt_sub / tau_sec)) : 1.0f;
+
+    const float *__restrict   del     = MILK_ASSUME_ALIGNED(ctx->act_cmd_delayed);
+    const uint8_t *__restrict mask    = MILK_ASSUME_ALIGNED(ctx->plate_mask);
+    float *__restrict         w       = MILK_ASSUME_ALIGNED(ctx->act_pos);
+    float *__restrict         v       = MILK_ASSUME_ALIGNED(ctx->act_vel);
+    float *__restrict         uf      = MILK_ASSUME_ALIGNED(ctx->act_u_filt);
+    float *__restrict         e_buf   = MILK_ASSUME_ALIGNED(ctx->plate_e);
+    float *__restrict         lap_buf = MILK_ASSUME_ALIGNED(ctx->plate_lap);
+    float *__restrict         lv_buf  = MILK_ASSUME_ALIGNED(ctx->plate_lv);
+    float *__restrict         ren     = MILK_ASSUME_ALIGNED(ctx->act_pos_render);
+
+    if (do_mean)
+    {
+        __builtin_memset(ren, 0, nact * sizeof(float));
+    }
+
+    for (uint32_t s = 0; s < nsub; s++)
+    {
+        /* Pass 1: Coil RC pre-filter and error/displacement field e masked to circular rim */
+#pragma omp simd
+        for (uint32_t a = 0; a < nact; a++)
+        {
+            float u_next = uf[a] + a_rc * (del[a] - uf[a]);
+            uf[a]        = u_next;
+            e_buf[a]     = mask[a] ? ((drive == 0) ? (w[a] - u_next) : w[a]) : 0.0f;
+        }
+
+        /* Pass 2: Discrete 5-point Laplacians of e_buf and v (Jacobi-symmetric before update) */
+        for (uint32_t ay = 0; ay < ny; ay++)
+        {
+            for (uint32_t ax = 0; ax < nx; ax++)
+            {
+                uint32_t idx = ay * nx + ax;
+                if (mask[idx])
+                {
+                    lap_buf[idx] = plate_lap_sample(e_buf, mask, nx, ny, ax, ay, rim_bc);
+                    lv_buf[idx]  = (two_g2 > 0.0f)
+                                       ? plate_lap_sample(v, mask, nx, ny, ax, ay, rim_bc)
+                                       : 0.0f;
+                }
+                else
+                {
+                    lap_buf[idx] = 0.0f;
+                    lv_buf[idx]  = 0.0f;
+                }
+            }
+        }
+
+        /* Pass 3: Biharmonic lap(lap_buf), Kelvin-Voigt damping, and symplectic Verlet update */
+        for (uint32_t ay = 0; ay < ny; ay++)
+        {
+            for (uint32_t ax = 0; ax < nx; ax++)
+            {
+                uint32_t idx = ay * nx + ax;
+                if (mask[idx])
+                {
+                    float lle = (beta2 > 0.0f)
+                                    ? plate_lap_sample(lap_buf, mask, nx, ny, ax, ay, rim_bc)
+                                    : 0.0f;
+                    float Ke  = w02 * e_buf[idx] - cm2 * lap_buf[idx] + beta2 * lle;
+                    float Cv  = two_g0 * v[idx] - two_g2 * lv_buf[idx];
+                    float rhs = (drive == 1) ? (w02 * uf[idx]) : 0.0f;
+                    float vn  = v[idx] + dt_sub * (rhs - Ke - Cv);
+                    float wn  = w[idx] + dt_sub * vn;
+                    v[idx]    = vn;
+                    w[idx]    = wn;
+                }
+                else
+                {
+                    v[idx] = 0.0f;
+                    w[idx] = (drive == 0) ? uf[idx] : 0.0f;
+                }
+            }
+        }
+
+        if (do_mean)
+        {
+#pragma omp simd
+            for (uint32_t a = 0; a < nact; a++)
+            {
+                ren[a] += w[a];
+            }
+        }
+    }
+
+    if (do_mean)
+    {
+#pragma omp simd
+        for (uint32_t a = 0; a < nact; a++)
+        {
+            ren[a] *= inv_sub;
+        }
+    }
+    else
+    {
+        __builtin_memcpy(ren, w, nact * sizeof(float));
+    }
 }
 
 /**
@@ -503,6 +778,18 @@ void MILK_HOT cacaosim_dm_step_actuators(
             float e0   = pos[a] - u;
             pos_ren[a] = u + mean_c * e0;
             pos[a]     = u + alpha * e0;
+        }
+    }
+    else if (mode == 3 && ctx->plate_mask != NULL)
+    {
+        /* Mode 3: Coupled 2D circular-rim flexural+membrane PDE (GPU shared mem or CPU L1) */
+        if (ctx->plate_use_cuda)
+        {
+            cacaosim_dm_cuda_plate_step(ctx, tau_sec);
+        }
+        else
+        {
+            dm_step_plate_cpu(ctx, tau_sec);
         }
     }
     else
@@ -677,6 +964,135 @@ void MILK_HOT cacaosim_dm_step(
     }
     else
     {
+        if (ctx->plate_use_cuda && ctx->cfg.dyn_mode == 3)
+        {
+            cacaosim_dm_cuda_plate_sync_host(ctx);
+        }
         cacaosim_dm_render_opd_cpu(ctx, flat_opd, host_opd_out);
     }
+}
+
+/**
+ * cacaosim_dm_step_static_plate() - Solve exact static plate equilibrium & render OPD
+ *
+ * Uses zero-allocation Conjugate Gradient on the SPD discrete circular-rim plate operator
+ * `A = w0^2 * I - cm^2 * L + beta^2 * L^2` (condition number ~42 on 64x64 ALPAO defaults ->
+ * converges to < 1e-6 relative residual in <= 45 iterations, ~0.2 ms in L1 cache).
+ */
+void MILK_HOT cacaosim_dm_step_static_plate(
+    cacaosim_dm_ctx_t       *ctx,
+    const float *__restrict  cmd_in,
+    const float *__restrict  flat_opd,
+    float                    max_stroke,
+    float *__restrict        host_opd_out)
+{
+    const int32_t orig_dyn   = ctx->cfg.dyn_mode;
+    const int32_t orig_nozoh = ctx->cfg.no_zoh_mean;
+
+    /* Run exact electronics pipeline (dead mask, stroke clip, DAC, nonlinearity) -> del */
+    ctx->cfg.dyn_mode    = 0;
+    ctx->cfg.no_zoh_mean = 1;
+    cacaosim_dm_step_actuators(ctx, cmd_in, 0.0f, 0.0f, max_stroke);
+
+    if (orig_dyn == 3 && ctx->cfg.plate_drive == 1 && ctx->plate_mask != NULL)
+    {
+        const uint32_t            nx     = ctx->cfg.nact_x;
+        const uint32_t            ny     = ctx->cfg.nact_y;
+        const uint32_t            nact   = ctx->nact_total;
+        const int32_t             rim_bc = ctx->cfg.rim_bc;
+        const float               w02    = ctx->plate_w0 * ctx->plate_w0;
+        const float               cm2    = ctx->plate_cm_p * ctx->plate_cm_p;
+        const float               beta2  = ctx->plate_beta_p * ctx->plate_beta_p;
+        const uint8_t *__restrict mask   = MILK_ASSUME_ALIGNED(ctx->plate_mask);
+        const float *__restrict   del    = MILK_ASSUME_ALIGNED(ctx->act_cmd_delayed);
+        float *__restrict         w      = MILK_ASSUME_ALIGNED(ctx->act_pos);
+        float *__restrict         r      = MILK_ASSUME_ALIGNED(ctx->plate_e);
+        float *__restrict         p      = MILK_ASSUME_ALIGNED(ctx->act_u_filt);
+        float *__restrict         lap    = MILK_ASSUME_ALIGNED(ctx->plate_lap);
+        float *__restrict         Ap     = MILK_ASSUME_ALIGNED(ctx->plate_lv);
+
+        double bnorm2 = 0.0;
+        for (uint32_t a = 0; a < nact; a++)
+        {
+            float ba = mask[a] ? (w02 * del[a]) : 0.0f;
+            w[a]     = 0.0f;
+            r[a]     = ba;
+            p[a]     = ba;
+            bnorm2  += (double) ba * (double) ba;
+        }
+
+        if (bnorm2 > 1.0e-24)
+        {
+            double       rr  = bnorm2;
+            const double tol = 1.0e-12 * bnorm2;
+            for (uint32_t it = 0; it < 96u && rr > tol; it++)
+            {
+                for (uint32_t ay = 0; ay < ny; ay++)
+                {
+                    for (uint32_t ax = 0; ax < nx; ax++)
+                    {
+                        uint32_t id = ay * nx + ax;
+                        lap[id]     = mask[id] ? plate_lap_sample(p, mask, nx, ny, ax, ay, rim_bc)
+                                               : 0.0f;
+                    }
+                }
+                double pAp = 0.0;
+                for (uint32_t ay = 0; ay < ny; ay++)
+                {
+                    for (uint32_t ax = 0; ax < nx; ax++)
+                    {
+                        uint32_t id = ay * nx + ax;
+                        if (mask[id])
+                        {
+                            float llp = (beta2 > 0.0f)
+                                            ? plate_lap_sample(lap, mask, nx, ny, ax, ay, rim_bc)
+                                            : 0.0f;
+                            float v   = w02 * p[id] - cm2 * lap[id] + beta2 * llp;
+                            Ap[id]    = v;
+                            pAp      += (double) p[id] * (double) v;
+                        }
+                        else
+                        {
+                            Ap[id] = 0.0f;
+                        }
+                    }
+                }
+                if (pAp <= 1.0e-30)
+                {
+                    break;
+                }
+                const float alpha  = (float) (rr / pAp);
+                double      rr_new = 0.0;
+                for (uint32_t a = 0; a < nact; a++)
+                {
+                    w[a] += alpha * p[a];
+                    r[a] -= alpha * Ap[a];
+                    rr_new += (double) r[a] * (double) r[a];
+                }
+                const float beta_cg = (float) (rr_new / rr);
+                for (uint32_t a = 0; a < nact; a++)
+                {
+                    p[a] = r[a] + beta_cg * p[a];
+                }
+                rr = rr_new;
+            }
+        }
+
+        __builtin_memcpy(ctx->act_pos_render, w, nact * sizeof(float));
+        __builtin_memcpy(ctx->act_u_filt, del, nact * sizeof(float));
+        __builtin_memset(ctx->act_vel, 0, nact * sizeof(float));
+    }
+
+    /* Render OPD with dyn_mode == 0 so CUDA uploads host act_pos_render -> d_act_pos */
+    if (ctx->use_cuda && flat_opd == NULL)
+    {
+        cacaosim_dm_cuda_render(ctx, host_opd_out);
+    }
+    else
+    {
+        cacaosim_dm_render_opd_cpu(ctx, flat_opd, host_opd_out);
+    }
+
+    ctx->cfg.dyn_mode    = orig_dyn;
+    ctx->cfg.no_zoh_mean = orig_nozoh;
 }

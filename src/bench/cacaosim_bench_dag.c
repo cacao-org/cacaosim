@@ -2325,14 +2325,23 @@ MILK_HOT void cacaosim_bench_step(
 
             if (is_static_cal)
             {
-                int32_t orig_dyn            = nd->dm_ctx.cfg.dyn_mode;
-                int32_t orig_nozoh          = nd->dm_ctx.cfg.no_zoh_mean;
-                nd->dm_ctx.cfg.dyn_mode     = 0;
-                nd->dm_ctx.cfg.no_zoh_mean  = 1;
-                cacaosim_dm_step(&nd->dm_ctx, cmd_in, flat_in, 0.0f, 0.0f, nd->cfg.dm.max_stroke,
-                                 host_opd);
-                nd->dm_ctx.cfg.dyn_mode    = orig_dyn;
-                nd->dm_ctx.cfg.no_zoh_mean = orig_nozoh;
+                if (nd->dm_ctx.cfg.dyn_mode == 3 && nd->dm_ctx.cfg.plate_drive == 1 &&
+                    nd->dm_ctx.plate_mask != NULL)
+                {
+                    cacaosim_dm_step_static_plate(&nd->dm_ctx, cmd_in, flat_in,
+                                                  nd->cfg.dm.max_stroke, host_opd);
+                }
+                else
+                {
+                    int32_t orig_dyn            = nd->dm_ctx.cfg.dyn_mode;
+                    int32_t orig_nozoh          = nd->dm_ctx.cfg.no_zoh_mean;
+                    nd->dm_ctx.cfg.dyn_mode     = 0;
+                    nd->dm_ctx.cfg.no_zoh_mean  = 1;
+                    cacaosim_dm_step(&nd->dm_ctx, cmd_in, flat_in, 0.0f, 0.0f,
+                                     nd->cfg.dm.max_stroke, host_opd);
+                    nd->dm_ctx.cfg.dyn_mode    = orig_dyn;
+                    nd->dm_ctx.cfg.no_zoh_mean = orig_nozoh;
+                }
             }
             else
             {

@@ -468,9 +468,16 @@ static void init_node_defaults(
         nd->dm.dac_bits     = 16;
         nd->dm.dyn_mode     = 1;
         nd->dm.tau_sec      = 0.00012f;
-        nd->dm.f0_hz        = 2500.0f;
-        nd->dm.zeta         = 0.70f;
-        nd->dm.delay_frames = 1.0f;
+        nd->dm.f0_hz         = 2500.0f;
+        nd->dm.zeta          = 0.70f;
+        nd->dm.act_pitch_mm  = 1.5f;
+        nd->dm.wave_c_ms     = 14.0f;
+        nd->dm.bend_beta_m2s = 0.0085f;
+        nd->dm.damp_g0       = 195.0f;
+        nd->dm.damp_g2       = 1.5f;
+        nd->dm.plate_drive   = 1;
+        nd->dm.rim_bc        = 1;
+        nd->dm.delay_frames  = 1.0f;
         nd->dm.mag_scale    = 1.0f;
     }
     else if (kind == CACAOSIM_NODE_SPLITTER)
@@ -1015,6 +1022,10 @@ static int apply_node_kv(cacaosim_node_cfg_t *nd, const char *k, const char *v)
             {
                 nd->dm.dyn_mode = 2;
             }
+            else if (strcasecmp(v, "plate") == 0)
+            {
+                nd->dm.dyn_mode = 3;
+            }
             else
             {
                 nd->dm.dyn_mode = atoi(v);
@@ -1036,6 +1047,56 @@ static int apply_node_kv(cacaosim_node_cfg_t *nd, const char *k, const char *v)
         else if (strcmp(k, "zeta") == 0)
         {
             nd->dm.zeta = strtof(v, NULL);
+        }
+        else if (strcmp(k, "act_pitch_mm") == 0)
+        {
+            nd->dm.act_pitch_mm = strtof(v, NULL);
+        }
+        else if (strcmp(k, "wave_c") == 0 || strcmp(k, "wave_c_ms") == 0)
+        {
+            nd->dm.wave_c_ms = strtof(v, NULL);
+        }
+        else if (strcmp(k, "bend_beta") == 0 || strcmp(k, "bend_beta_m2s") == 0)
+        {
+            nd->dm.bend_beta_m2s = strtof(v, NULL);
+        }
+        else if (strcmp(k, "damp_g0") == 0)
+        {
+            nd->dm.damp_g0 = strtof(v, NULL);
+        }
+        else if (strcmp(k, "damp_g2") == 0)
+        {
+            nd->dm.damp_g2 = strtof(v, NULL);
+        }
+        else if (strcmp(k, "plate_drive") == 0)
+        {
+            if (strcasecmp(v, "force") == 0)
+            {
+                nd->dm.plate_drive = 1;
+            }
+            else if (strcasecmp(v, "disp") == 0)
+            {
+                nd->dm.plate_drive = 0;
+            }
+            else
+            {
+                nd->dm.plate_drive = atoi(v) ? 1 : 0;
+            }
+        }
+        else if (strcmp(k, "rim_bc") == 0)
+        {
+            if (strcasecmp(v, "free") == 0 || strcasecmp(v, "neumann") == 0)
+            {
+                nd->dm.rim_bc = 1;
+            }
+            else if (strcasecmp(v, "clamped") == 0 || strcasecmp(v, "dirichlet") == 0)
+            {
+                nd->dm.rim_bc = 0;
+            }
+            else
+            {
+                nd->dm.rim_bc = atoi(v) ? 1 : 0;
+            }
         }
         else if (strcmp(k, "delay_frames") == 0)
         {
@@ -2061,6 +2122,8 @@ static const char *dyn_mode_str(int32_t m)
         return "rc";
     case 2:
         return "osc";
+    case 3:
+        return "plate";
     default:
         return "rc";
     }
@@ -2339,6 +2402,24 @@ int cacaosim_bench_format_str(
             {
                 cw_printf(&w, "f0_hz         = %.5g\n", nd->dm.f0_hz);
                 cw_printf(&w, "zeta          = %.4g\n", nd->dm.zeta);
+            }
+            else if (nd->dm.dyn_mode == 3)
+            {
+                cw_printf(&w, "tau_us        = %.5g\n", nd->dm.tau_sec * 1.0e6f);
+                cw_printf(&w, "f0_hz         = %.5g\n", nd->dm.f0_hz);
+                cw_printf(&w, "act_pitch_mm  = %.4g\n", nd->dm.act_pitch_mm);
+                cw_printf(&w, "wave_c        = %.5g\n", nd->dm.wave_c_ms);
+                cw_printf(&w, "bend_beta     = %.5g\n", nd->dm.bend_beta_m2s);
+                cw_printf(&w, "damp_g0       = %.5g\n", nd->dm.damp_g0);
+                cw_printf(&w, "damp_g2       = %.5g\n", nd->dm.damp_g2);
+                if (nd->dm.plate_drive != 0)
+                {
+                    cw_printf(&w, "plate_drive   = \"force\"\n");
+                }
+                if (nd->dm.rim_bc != 0)
+                {
+                    cw_printf(&w, "rim_bc        = \"free\"\n");
+                }
             }
             if (nd->dm.delay_sec > 0.0f)
             {

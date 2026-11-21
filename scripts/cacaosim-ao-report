@@ -272,6 +272,9 @@ def analyze_bench_chromaticity(bench_path):
             if kind in ("dm", "ttm"):
                 del_us = float(nd.get("delay_us", 0.0))
                 tau_us = float(nd.get("tau_us", 0.0))
+                _dm_map = {"instant": 0, "rc": 1, "osc": 2, "plate": 3}
+                _raw_dm = str(nd.get("dyn_mode", 0)).strip().strip('"').lower()
+                _dyn_m = _dm_map.get(_raw_dm, int(_raw_dm) if _raw_dm.isdigit() else 0)
                 dms.append(
                     {
                         "id": nd["id"],
@@ -281,7 +284,7 @@ def analyze_bench_chromaticity(bench_path):
                         "delay_us": del_us,
                         "delay_subticks": del_us / dt_sub_us if dt_sub_us > 0 else 0.0,
                         "tau_us": tau_us,
-                        "dyn_mode": int(nd.get("dyn_mode", 0)),
+                        "dyn_mode": _dyn_m,
                     }
                 )
             else:

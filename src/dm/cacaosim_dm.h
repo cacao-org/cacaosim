@@ -72,11 +72,18 @@ typedef struct
     float    max_stroke;   /**< Bipolar mechanical stroke rail [um] (`[-max, +max]`, <=0 = off) */
     int32_t  dac_bits;     /**< Uniform DAC resolution [4..24 bits] over 2*max_stroke (0 = off) */
     float    nonlin_quad;  /**< Electrostrictive quadratic term k_nl in `c + k_nl*c*|c|` [1/um] */
-    int32_t  dyn_mode;     /**< Temporal model: 0 = instant, 1 = 1st-order RC, 2 = 2nd-order osc */
+    int32_t  dyn_mode;     /**< Temporal model: 0=instant, 1=RC, 2=2nd-order osc, 3=plate PDE */
     float    dt_sec;       /**< Discrete physics integration step interval [s] (> 0) */
-    float    tau_sec;      /**< 1st-order exponential 1/e settling time constant [s] (mode == 1) */
-    float    f0_hz;        /**< 2nd-order undamped natural resonance frequency [Hz] (mode == 2) */
+    float    tau_sec;      /**< 1st-order RC time constant [s] (mode 1 & mode 3 coil pre-filter) */
+    float    f0_hz;        /**< Natural resonance frequency [Hz] (mode 2 & mode 3 foundation) */
     float    zeta;         /**< 2nd-order viscous damping ratio (mode == 2; <1, ==1, >1 valid) */
+    float    act_pitch_mm; /**< Physical actuator pitch [mm] for mode 3 (<=0 -> 1.5 mm) */
+    float    wave_c_ms;    /**< Membrane wave speed c_m [m/s] for mode 3 (<0 -> 14.0 m/s) */
+    float    bend_beta_m2s;/**< Flexural plate dispersion beta [m^2/s] for mode 3 (<0 -> 0.0085) */
+    float    damp_g0;      /**< Viscous modal decay rate gamma_0 [1/s] for mode 3 (<=0 -> 195) */
+    float    damp_g2;      /**< Kelvin-Voigt Laplacian damping gamma_2 [pitch^2/s] (<0 -> 1.5) */
+    int32_t  plate_drive;  /**< Mode 3 drive: 0 = displacement-calibrated, 1 = voice-coil force */
+    int32_t  rim_bc;       /**< Mode 3 circular rim BC: 0 = clamped (Dirichlet), 1 = free */
     float    delay_frames; /**< Pure transport latency [frames] in `[0, 254]`, fractional OK */
     float    delay_sec;    /**< Physical pure transport latency [s] (>0 overrides delay_frames) */
     int32_t  no_zoh_mean;  /**< 0 (default) = render analytical ZOH subframe mean; 1 = endpoint */
@@ -111,7 +118,19 @@ typedef struct
     float            *act_pos;         /**< End-of-step mechanical actuator displacement [um] */
     float            *act_pos_render;  /**< Subframe-averaged (ZOH mean) stroke rendered [um] */
     float            *prev_pos_render; /**< Last actuator stroke vector rendered to d_opd_out */
-    float            *act_vel;         /**< Instantaneous actuator velocity [um/s] (dyn_mode==2) */
+    float            *act_vel;         /**< Instantaneous actuator velocity [um/s] (mode 2 & 3) */
+    float            *act_u_filt;      /**< RC-filtered command driving plate PDE [um] (mode 3) */
+    float            *plate_e;         /**< Scratch error/displacement buffer [nact_total] */
+    float            *plate_lap;       /**< Scratch discrete Laplacian buffer [nact_total] */
+    float            *plate_lv;        /**< Scratch velocity Laplacian buffer [nact_total] */
+    uint8_t          *plate_mask;      /**< Circular active mirror aperture mask (1 inside rim) */
+    uint32_t          plate_nsub;      /**< CFL-safe inner PDE sub-steps per dt_sec (mode 3) */
+    float             plate_cm_p;      /**< Membrane speed in lattice units [pitch/s] */
+    float             plate_beta_p;    /**< Flexural dispersion in lattice units [pitch^2/s] */
+    float             plate_g0;        /**< Sanitized viscous decay rate gamma_0 [1/s] */
+    float             plate_g2;        /**< Sanitized Kelvin-Voigt damping [pitch^2/s] */
+    float             plate_w0;        /**< Sanitized foundation angular freq omega_0 [rad/s] */
+    int32_t           plate_use_cuda;  /**< Non-zero when CUDA shared-mem PDE stepper is active */
     uint8_t          *dead_mask;       /**< Per-actuator stuck-zero fault mask (`!= 0` -> 0 um) */
 
     /* 16-tap pixel-centric gather stencil [npix_wf * 16] */
@@ -120,6 +139,11 @@ typedef struct
 
     /* Optional CUDA device pointers */
     float            *d_act_pos;       /**< Device copy of `act_pos` `[nact_total]` [um] */
+    float            *d_act_cmd_del;   /**< Device copy of `act_cmd_delayed` (mode 3 CUDA) */
+    float            *d_plate_w;       /**< Device plate displacement [nact_total] (mode 3 CUDA) */
+    float            *d_plate_v;       /**< Device plate velocity [nact_total] (mode 3 CUDA) */
+    float            *d_plate_uf;      /**< Device RC-filtered cmd [nact_total] (mode 3 CUDA) */
+    uint8_t          *d_plate_mask;    /**< Device circular rim mask [nact_total] (mode 3 CUDA) */
     int32_t          *d_stencil_idx;   /**< Device copy of `stencil_idx` `[npix_wf * 16]` */
     float            *d_stencil_w;     /**< Device copy of `stencil_w` `[npix_wf * 16]` */
     float            *d_opd_out;       /**< Device synthesized 2D OPD surface `[npix_wf]` [um] */
@@ -260,6 +284,26 @@ void cacaosim_dm_step(
     float *__restrict        host_opd_out);
 
 /**
+ * cacaosim_dm_step_static_plate() - Solve exact static plate equilibrium & render OPD (calib_fast)
+ * @ctx:          Active DM context (`dyn_mode == 3`, `plate_drive == 1`)
+ * @cmd_in:       Host actuator command array `[nact_total]` in mechanical stroke `[um]`
+ * @flat_opd:     Optional host static DM flat OPD `[npix_wf]` in `[um]` (NULL -> `0`)
+ * @max_stroke:   Live mechanical stroke limit [um]
+ * @host_opd_out: Destination host OPD buffer `[npix_wf]` [um] (NULL = keep in `ctx->d_opd_out`)
+ *
+ * Role:
+ *   Zero-allocation Conjugate Gradient solver for `(w0^2 - cm^2*lap + beta^2*lap^2) w = w0^2 * u`
+ *   used during lockstep static RM calibration (`calib_fast`), matching the dynamic plate PDE's
+ *   exact `t -> inf` continuous-facesheet equilibrium without time-stepping transients.
+ */
+void cacaosim_dm_step_static_plate(
+    cacaosim_dm_ctx_t       *ctx,
+    const float *__restrict  cmd_in,
+    const float *__restrict  flat_opd,
+    float                    max_stroke,
+    float *__restrict        host_opd_out);
+
+/**
  * cacaosim_dm_cuda_alloc() - Allocate CUDA device buffers and upload static 16-tap stencil
  * @ctx:        DM context with populated host `stencil_idx` and `stencil_w` arrays
  * @ext_stream: Optional borrowed `cudaStream_t` (`void *`); NULL creates a private stream
@@ -307,6 +351,29 @@ void cacaosim_dm_cuda_free(cacaosim_dm_ctx_t *ctx);
  *   VRAM with zero PCIe round-trip.
  */
 void cacaosim_dm_cuda_render(cacaosim_dm_ctx_t *ctx, float *host_opd_out);
+
+/**
+ * cacaosim_dm_cuda_plate_step() - Advance coupled 2D plate PDE in CUDA shared memory (dyn_mode==3)
+ * @ctx:     Active CUDA-enabled DM context with `ctx->plate_use_cuda != 0`
+ * @tau_sec: Live coil/driver RC pre-filter time constant [s]
+ *
+ * Role:
+ *   Internal hot-path GPU PDE stepper invoked by `cacaosim_dm_step_actuators()` when
+ *   `dyn_mode == 3` and the circular actuator lattice fits inside SM shared memory.
+ */
+void cacaosim_dm_cuda_plate_step(cacaosim_dm_ctx_t *ctx, float tau_sec);
+
+/**
+ * cacaosim_dm_cuda_plate_reset() - Zero device plate PDE displacement, velocity, and filter state
+ * @ctx: Active CUDA-enabled DM context (no-op if `plate_use_cuda == 0`)
+ */
+void cacaosim_dm_cuda_plate_reset(cacaosim_dm_ctx_t *ctx);
+
+/**
+ * cacaosim_dm_cuda_plate_sync_host() - Copy GPU `d_act_pos` back to host `act_pos_render`
+ * @ctx: Active CUDA-enabled DM context with `plate_use_cuda != 0`
+ */
+void cacaosim_dm_cuda_plate_sync_host(cacaosim_dm_ctx_t *ctx);
 
 #ifdef __cplusplus
 }

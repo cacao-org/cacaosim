@@ -1944,6 +1944,10 @@ static void render_beam_subtree(
         {
             sb_printf(&line, "f0=%.0fHz d=%.1ffr", nd->cfg.dm.f0_hz, nd->cfg.dm.delay_frames);
         }
+        else if (nd->cfg.dm.dyn_mode == 3)
+        {
+            sb_printf(&line, "plate %.0fHz c=%.0fm/s", nd->cfg.dm.f0_hz, nd->cfg.dm.wave_c_ms);
+        }
         else
         {
             sb_printf(&line, "instant d=%.1ffr", nd->cfg.dm.delay_frames);
@@ -2943,6 +2947,10 @@ void cacaosim_bench_render(
                 else if (nd->cfg.dm.dyn_mode == 2)
                 {
                     snprintf(dyn, sizeof(dyn), "2nd %.0fHz, %s", nd->cfg.dm.f0_hz, dly_s);
+                }
+                else if (nd->cfg.dm.dyn_mode == 3)
+                {
+                    snprintf(dyn, sizeof(dyn), "plate %.0fHz, %s", nd->cfg.dm.f0_hz, dly_s);
                 }
                 else
                 {

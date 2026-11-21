@@ -115,12 +115,22 @@ static void print_stats(const char *label, const char *backend, double *lat_us, 
  * @param[in] backend  Requested compute backend (`CACAOSIM_BACKEND_CPU` or `CUDA`).
  * @param[in] niter    Number of timed iterations to record after warm-up.
  */
-static void bench_dm(uint32_t nact, uint32_t nwf, int32_t backend, int niter)
+static void bench_dm_mode(
+    uint32_t    nact,
+    uint32_t    nwf,
+    int32_t     dyn_mode,
+    float       dt_sec,
+    const char *tag,
+    int32_t     backend,
+    int         niter)
 {
     cacaosim_dm_cfg_t cfg = {
-        .nact_x = nact, .nact_y = nact, .nwf = nwf, .dm_diam = 0.9375f, .if_coupling = 0.20f,
-        .refl_scale = 2.0f, .max_stroke = 5.0f, .dac_bits = 16, .nonlin_quad = 0.0f,
-        .dyn_mode = 1, .dt_sec = 0.0005f, .tau_sec = 0.00012f, .f0_hz = 2500.0f, .zeta = 0.7f,
+        .nact_x = nact, .nact_y = nact, .nwf = nwf, .dm_diam = 0.984375f, .if_coupling = 0.20f,
+        .refl_scale = 2.0f, .max_stroke = 8.0f, .dac_bits = 16, .nonlin_quad = 0.0f,
+        .dyn_mode = dyn_mode, .dt_sec = dt_sec, .tau_sec = 0.0002f,
+        .f0_hz = (dyn_mode == 3) ? 1000.0f : 2500.0f, .zeta = 0.7f,
+        .act_pitch_mm = 1.5f, .wave_c_ms = 14.0f, .bend_beta_m2s = 0.0085f,
+        .damp_g0 = 195.0f, .damp_g2 = 1.5f, .plate_drive = 1, .rim_bc = 1,
         .delay_frames = 1.0f, .backend = backend
     };
     cacaosim_dm_ctx_t ctx;
@@ -145,23 +155,28 @@ static void bench_dm(uint32_t nact, uint32_t nwf, int32_t backend, int niter)
     /* Warm up OpenMP threads / GPU context and fill the 1-frame command delay ring */
     for (int w = 0; w < 25; w++)
     {
-        cacaosim_dm_step(&ctx, cmd, NULL, 1.0f, 0.00012f, 5.0f, opd);
+        cacaosim_dm_step(&ctx, cmd, NULL, 1.0f, 0.0002f, 8.0f, opd);
     }
     for (int k = 0; k < niter; k++)
     {
         uint64_t t0 = cacaosim_now_ns();
-        cacaosim_dm_step(&ctx, cmd, NULL, 1.0f, 0.00012f, 5.0f, opd);
+        cacaosim_dm_step(&ctx, cmd, NULL, 1.0f, 0.0002f, 8.0f, opd);
         lat[k] = (double) (cacaosim_now_ns() - t0) * 1e-3;
     }
 
     char label[64];
-    snprintf(label, sizeof(label), "DM %ux%u -> %ux%u OPD", nact, nact, nwf, nwf);
+    snprintf(label, sizeof(label), "DM %ux%u%s -> %ux%u OPD", nact, nact, tag, nwf, nwf);
     print_stats(label, ctx.use_cuda ? "CUDA" : "CPU", lat, niter);
 
     cacaosim_dm_free(&ctx);
     free(lat);
     free(opd);
     free(cmd);
+}
+
+static void bench_dm(uint32_t nact, uint32_t nwf, int32_t backend, int niter)
+{
+    bench_dm_mode(nact, nwf, 1, 0.0005f, "", backend, niter);
 }
 
 /**
@@ -952,8 +967,17 @@ static const char *const g_ao3k_scexao_bench_ini =
     "in_cmd = dm01disp\n"
     "nact_x = 64\n"
     "nact_y = 64\n"
-    "dyn_mode = 1\n"
-    "tau_us = 200.0\n"
+    "if_coupling = 0.08\n"
+    "dyn_mode = plate\n"
+    "tau_us = 20.0\n"
+    "f0_hz = 1000.0\n"
+    "act_pitch_mm = 1.5\n"
+    "wave_c = 14.0\n"
+    "bend_beta = 0.0085\n"
+    "damp_g0 = 195.0\n"
+    "damp_g2 = 1.5\n"
+    "plate_drive = force\n"
+    "rim_bc = free\n"
     "delay_us = 1000.0\n"
     "[fpcam.vis_stg1]\n"
     "in = b_post_stg1\n"
@@ -1072,6 +1096,8 @@ int main(void)
     bench_dm(20, 128, CACAOSIM_BACKEND_CUDA, 500);
     bench_dm(50, 256, CACAOSIM_BACKEND_CPU, 300);
     bench_dm(50, 256, CACAOSIM_BACKEND_CUDA, 500);
+    bench_dm_mode(64, 256, 3, 0.000125f, " plate", CACAOSIM_BACKEND_CPU, 300);
+    bench_dm_mode(64, 256, 3, 0.000125f, " plate", CACAOSIM_BACKEND_CUDA, 500);
 
     /* 2. 4-sided Pyramid WFS (unmodulated vs 16-point ring modulation, 128 & 256 grids) */
     bench_pyrwfs(128, 64, 0.0f, 1, CACAOSIM_BACKEND_CPU, 300);

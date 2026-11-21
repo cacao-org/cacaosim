@@ -62,6 +62,13 @@ static float    param_dt_sec                                 = 0.0005f;
 static float    param_tau_sec                                = 0.00015f;
 static float    param_f0_hz                                  = 3000.0f;
 static float    param_zeta                                   = 0.7f;
+static float    param_act_pitch_mm                           = 1.5f;
+static float    param_wave_c                                 = 14.0f;
+static float    param_bend_beta                              = 0.0085f;
+static float    param_damp_g0                                = 195.0f;
+static float    param_damp_g2                                = 1.5f;
+static int32_t  param_plate_drive                            = 1;
+static int32_t  param_rim_bc                                 = 1;
 static float    param_delay_fr                               = 0.0f;
 static float    param_delay_us                               = 0.0f;
 static float    param_shift_x                                = 0.0f;
@@ -136,16 +143,30 @@ static int32_t  param_backend                                = 0;
     X(".nonlin_quad", &param_nonlin_quad, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,      \
       "Quadratic voltage/stroke non-linearity coefficient")                             \
     X(".dyn_mode", &param_dyn_mode, FPTYPE_INT32, 0, FPFLAG_DEFAULT_INPUT,              \
-      "Temporal mode: 0=instant, 1=1st-order RC, 2=2nd-order oscillator")               \
+      "Temporal mode: 0=instant, 1=RC, 2=2nd-order osc, 3=coupled 2D plate PDE")        \
     X(".dt_sec", &param_dt_sec, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,                \
       "Physics time step [s] (default: 0.0005 = 2 kHz)")                                \
     X(".tau_sec", &param_tau_sec, FPTYPE_FLOAT32, 0,                                    \
       FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
-      "1st-order 1/e time constant [s] (default: 0.00015)")                             \
+      "1st-order RC time constant [s] (mode 1 & mode 3 coil pre-filter)")               \
     X(".f0_hz", &param_f0_hz, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,                  \
-      "2nd-order natural resonance frequency [Hz] (default: 3000)")                     \
+      "Natural resonance frequency [Hz] (mode 2 & mode 3 foundation)")                  \
     X(".zeta", &param_zeta, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,                    \
       "2nd-order damping ratio (default: 0.7)")                                         \
+    X(".act_pitch_mm", &param_act_pitch_mm, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,    \
+      "Physical actuator pitch [mm] for mode 3 plate PDE (default: 1.5)")               \
+    X(".wave_c", &param_wave_c, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,                \
+      "Membrane wave speed c_m [m/s] for mode 3 plate PDE (default: 14.0)")             \
+    X(".bend_beta", &param_bend_beta, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,          \
+      "Flexural plate dispersion beta [m^2/s] for mode 3 (default: 0.0085)")            \
+    X(".damp_g0", &param_damp_g0, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,              \
+      "Viscous modal decay rate gamma_0 [1/s] for mode 3 (default: 195)")               \
+    X(".damp_g2", &param_damp_g2, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,              \
+      "Kelvin-Voigt Laplacian damping gamma_2 [pitch^2/s] (default: 1.5)")              \
+    X(".plate_drive", &param_plate_drive, FPTYPE_INT32, 0, FPFLAG_DEFAULT_INPUT,        \
+      "Mode 3 drive: 0 = displacement-calibrated, 1 = voice-coil force (default: 1)")   \
+    X(".rim_bc", &param_rim_bc, FPTYPE_INT32, 0, FPFLAG_DEFAULT_INPUT,                  \
+      "Mode 3 circular rim BC: 0 = clamped, 1 = free Neumann (default: 1)")             \
     X(".delay_frames", &param_delay_fr, FPTYPE_FLOAT32, 0,                              \
       FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
       "Transport latency [frames, fractional supported]")                               \
@@ -308,9 +329,16 @@ static MILK_HOT errno_t dmsim_compute(const MILK_RUNNABLE *self)
         .dyn_mode     = param_dyn_mode,
         .dt_sec       = param_dt_sec,
         .tau_sec      = param_tau_sec,
-        .f0_hz        = param_f0_hz,
-        .zeta         = param_zeta,
-        .delay_frames = param_delay_fr,
+        .f0_hz         = param_f0_hz,
+        .zeta          = param_zeta,
+        .act_pitch_mm  = param_act_pitch_mm,
+        .wave_c_ms     = param_wave_c,
+        .bend_beta_m2s = param_bend_beta,
+        .damp_g0       = param_damp_g0,
+        .damp_g2       = param_damp_g2,
+        .plate_drive   = param_plate_drive,
+        .rim_bc        = param_rim_bc,
+        .delay_frames  = param_delay_fr,
         .dm_mode      = param_dm_mode,
         .shift_x      = param_shift_x,
         .shift_y      = param_shift_y,
