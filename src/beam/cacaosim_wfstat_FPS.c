@@ -33,6 +33,9 @@ static char     param_outdir[FUNCTION_PARAMETER_STRMAXLEN]     = ".";
 static uint64_t param_target_ticks                             = 20000;
 static float    param_dt_phys                                  = 0.0005f;
 static int64_t  param_snap_extra                               = 1;
+static uint64_t param_clip_start                               = 0;
+static uint32_t param_clip_len                                 = 0;
+static float    param_full_fps                                 = 0.0f;
 
 #define CACAOSIM_WFSTAT_PARAMS(X)                                                      \
     X(".trig_beam", param_trig_beam, FPTYPE_STREAMNAME, 1,                             \
@@ -51,7 +54,13 @@ static int64_t  param_snap_extra                               = 1;
     X(".dt_phys", &param_dt_phys, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,             \
       "Physical frame interval [s] (default: 0.0005)")                                 \
     X(".snap_extra", &param_snap_extra, FPTYPE_ONOFF, 0, FPFLAG_DEFAULT_INPUT,         \
-      "Capture synchronized WFS/DM/PSF 2D snapshot cubes")
+      "Capture synchronized WFS/DM/PSF 2D snapshot cubes")                             \
+    X(".clip_start", &param_clip_start, FPTYPE_UINT64, 0, FPFLAG_DEFAULT_INPUT,        \
+      "1-based frame start for short-timescale WF/DM video clip (0 = auto mid)")       \
+    X(".clip_len", &param_clip_len, FPTYPE_UINT32, 0, FPFLAG_DEFAULT_INPUT,            \
+      "Contiguous frame count for short-timescale WF/DM video clip (0 = off)")         \
+    X(".full_fps", &param_full_fps, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,           \
+      "Strided full-duration WF/DM capture rate [Hz] for 1x real-time video (0 = off)")
 
 MILK_PARAMS_DEFINE(cacaosim_wfstat, CACAOSIM_WFSTAT_PARAMS);
 
@@ -110,6 +119,41 @@ static MILK_HOT errno_t wfstat_compute(const MILK_RUNNABLE *self)
             imgid_free(&img_loc[k]);
         }
         return RETURN_FAILURE;
+    }
+    if (param_clip_len > 0u)
+    {
+        uint64_t cstart = param_clip_start;
+        if (cstart == 0ULL)
+        {
+            uint64_t tgt = (param_target_ticks > 10ULL) ? param_target_ticks : 20000ULL;
+            uint64_t mid = tgt / 2ULL;
+            if (mid + (uint64_t) param_clip_len > tgt)
+            {
+                cstart = (tgt > (uint64_t) param_clip_len)
+                             ? ((tgt - (uint64_t) param_clip_len) / 2ULL + 1ULL)
+                             : 1ULL;
+            }
+            else
+            {
+                cstart = (mid > 20ULL) ? (mid - 20ULL) : 1ULL;
+            }
+        }
+        (void) cacaosim_wfstat_enable_clip(&ws, cstart, param_clip_len);
+    }
+    if (param_full_fps > 0.0f && param_dt_phys > 0.0f)
+    {
+        double step_fr = 1.0 / ((double) param_full_fps * (double) param_dt_phys);
+        if (step_fr < 1.0)
+        {
+            step_fr = 1.0;
+        }
+        uint64_t tgt = (param_target_ticks > 10ULL) ? param_target_ticks : 20000ULL;
+        uint32_t cap = (uint32_t) ((double) tgt / step_fr) + 8u;
+        if (cap > 3600u)
+        {
+            cap = 3600u;
+        }
+        (void) cacaosim_wfstat_enable_full(&ws, step_fr, cap);
     }
 
     MILK_PROCINFO_INIT(self)

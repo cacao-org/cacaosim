@@ -385,12 +385,13 @@ static inline int32_t cacaosim_resolve_nlambda(
  *   an upstream polychromatic `[OPD_m, Amp_m]` cube so complex pupil phasors are linearly
  *   interpolated in wavelength without index-truncation steps or `atan2` phase-wrap artifacts.
  */
-static inline void cacaosim_poly_interp_bracket(
+static inline void cacaosim_poly_interp_bracket_ex(
     float        target_lam,
     const float *beam_lam_um,
     uint32_t     beam_nlam,
     float        def_l0,
     float        def_l1,
+    int32_t      use_invlam2,
     uint32_t    *out_m0,
     uint32_t    *out_m1,
     float       *out_alpha)
@@ -424,10 +425,38 @@ static inline void cacaosim_poly_interp_bracket(
             float l1 = beam_lam_um[m + 1u];
             if (target_lam >= l0 && target_lam <= l1)
             {
-                float dl   = l1 - l0;
-                *out_m0    = m;
-                *out_m1    = m + 1u;
-                *out_alpha = (dl > 1e-12f) ? ((target_lam - l0) / dl) : 0.0f;
+                float alpha = 0.0f;
+                if (use_invlam2 && l0 > 1e-4f && l1 > 1e-4f && target_lam > 1e-4f)
+                {
+                    float inv0 = 1.0f / (l0 * l0);
+                    float inv1 = 1.0f / (l1 * l1);
+                    float invt = 1.0f / (target_lam * target_lam);
+                    float den  = inv0 - inv1;
+                    alpha      = (den > 1e-12f) ? ((inv0 - invt) / den) : 0.0f;
+                }
+                else
+                {
+                    float dl = l1 - l0;
+                    alpha    = (dl > 1e-12f) ? ((target_lam - l0) / dl) : 0.0f;
+                }
+                if (alpha <= 1e-6f)
+                {
+                    *out_m0    = m;
+                    *out_m1    = m;
+                    *out_alpha = 0.0f;
+                }
+                else if (alpha >= 1.0f - 1e-6f)
+                {
+                    *out_m0    = m + 1u;
+                    *out_m1    = m + 1u;
+                    *out_alpha = 0.0f;
+                }
+                else
+                {
+                    *out_m0    = m;
+                    *out_m1    = m + 1u;
+                    *out_alpha = alpha;
+                }
                 return;
             }
         }
@@ -460,6 +489,20 @@ static inline void cacaosim_poly_interp_bracket(
     *out_m0    = 0u;
     *out_m1    = 0u;
     *out_alpha = 0.0f;
+}
+
+static inline void cacaosim_poly_interp_bracket(
+    float        target_lam,
+    const float *beam_lam_um,
+    uint32_t     beam_nlam,
+    float        def_l0,
+    float        def_l1,
+    uint32_t    *out_m0,
+    uint32_t    *out_m1,
+    float       *out_alpha)
+{
+    cacaosim_poly_interp_bracket_ex(target_lam, beam_lam_um, beam_nlam, def_l0, def_l1, 0, out_m0,
+                                    out_m1, out_alpha);
 }
 
 /**

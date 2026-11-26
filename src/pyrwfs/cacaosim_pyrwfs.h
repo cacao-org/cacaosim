@@ -47,6 +47,7 @@
 
 #include "cacaosim_types.h"
 #include "common/cacaosim_detector.h"
+#include "common/cacaosim_disp.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -134,6 +135,12 @@ typedef struct
     float                 chan_w[CACAOSIM_MAX_LAMBDA];         /**< Normalized channel weights */
     float                 k_rad[CACAOSIM_MAX_LAMBDA];          /**< 2*pi / lam_um[c] [rad/um] */
     float                 chan_flat_norm[CACAOSIM_MAX_LAMBDA]; /**< Per-channel flat intensity */
+    int32_t               disp_active;                         /**< 1 if chromatic disp active */
+    uint64_t              disp_gen;                            /**< Cached dispersion gen */
+    float                 disp_tel_diam;                       /**< Cached tel_diam_m [m] */
+    int32_t               in_poly_mode;                        /**< cacaosim_beam_poly_mode_t */
+    float                 disp_sx[CACAOSIM_MAX_LAMBDA];        /**< X OPD slope [um/pix] */
+    float                 disp_sy[CACAOSIM_MAX_LAMBDA];        /**< Y OPD slope [um/pix] */
     float                 cached_mod_rad; /**< Modulation radius [lambda/D] baked into masks_cplx */
     float                 flat_flux_norm; /**< Unaberrated total camera intensity for photometry */
     int32_t               use_cuda;       /**< 1 when CUDA backend is active, 0 for CPU FFTW3f */
@@ -323,6 +330,15 @@ void cacaosim_pyrwfs_set_weights(
     const float           *weights);
 
 /**
+ * cacaosim_pyrwfs_set_disp() - Update chromatic angular dispersion OPD slopes & input poly mode
+ */
+void cacaosim_pyrwfs_set_disp(
+    cacaosim_pyrwfs_ctx_t *ctx,
+    const cacaosim_disp_t *disp,
+    float                  tel_diam_m,
+    int32_t                in_poly_mode);
+
+/**
  * cacaosim_pyrwfs_readout() - Finalize accumulated WFS exposure and perform detector readout
  * @ctx:      Initialized Pyramid WFS context with `subframe_cnt >= 1` (no-op if 0)
  * @det_live: Optional live detector configuration override (NULL uses `ctx->cfg.det`)
@@ -430,6 +446,7 @@ int  cacaosim_pyrwfs_cuda_init(cacaosim_pyrwfs_ctx_t *ctx,
  */
 void cacaosim_pyrwfs_cuda_upload_masks(cacaosim_pyrwfs_ctx_t *ctx);
 void cacaosim_pyrwfs_cuda_upload_weights(cacaosim_pyrwfs_ctx_t *ctx);
+void cacaosim_pyrwfs_cuda_upload_disp(cacaosim_pyrwfs_ctx_t *ctx);
 void cacaosim_pyrwfs_cuda_accum_poly(cacaosim_pyrwfs_ctx_t *ctx,
                                      const float           *beam_opd,
                                      const float           *beam_amp,

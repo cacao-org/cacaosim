@@ -31,11 +31,13 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "milk_runnable.h"
 #include "COREMOD_memory/COREMOD_memory.h"
 #include "beam/cacaosim_beamsplit_FPS.h"
 #include "common/cacaosim_beam.h"
+#include "common/cacaosim_disp.h"
 
 /*
  * Module-static FPS parameter backing storage for cacaosim.beamsplit.
@@ -220,7 +222,7 @@ static MILK_HOT errno_t beamsplit_compute(const MILK_RUNNABLE *self)
     if (img_in.ID == -1)
     {
         uint32_t fb_nwf = (param_nwf >= 8) ? param_nwf : 128;
-        img_in          = stream_connect_create_3Df32(param_in_beam, fb_nwf, fb_nwf, 2);
+        img_in          = cacaosim_beam_shm_create(param_in_beam, fb_nwf, 2u);
         if (img_in.ID == -1)
         {
             return RETURN_FAILURE;
@@ -228,8 +230,12 @@ static MILK_HOT errno_t beamsplit_compute(const MILK_RUNNABLE *self)
         cacaosim_beam_shm_init_kw(img_in.im);
     }
 
-    uint32_t nwf  = img_in.md->size[0];
-    uint64_t npix = (uint64_t) nwf * nwf;
+    uint32_t nwf   = img_in.md->size[0];
+    uint32_t in_nz = (img_in.md->naxis == 3 && img_in.md->size[2] >= 2u &&
+                      (img_in.md->size[2] % 2u) == 0u)
+                         ? img_in.md->size[2]
+                         : 2u;
+    uint64_t npix  = (uint64_t) nwf * nwf;
 
     /* Create reflected and transmitted output beam cubes (either arm may be omitted if empty) */
     IMGID img_refl  = { 0 };
@@ -239,7 +245,7 @@ static MILK_HOT errno_t beamsplit_compute(const MILK_RUNNABLE *self)
 
     if (param_out_refl[0] != '\0')
     {
-        img_refl = stream_connect_create_3Df32(param_out_refl, nwf, nwf, 2);
+        img_refl = cacaosim_beam_shm_create(param_out_refl, nwf, in_nz);
         if (img_refl.ID != -1)
         {
             cacaosim_beam_shm_init_kw(img_refl.im);
@@ -247,7 +253,7 @@ static MILK_HOT errno_t beamsplit_compute(const MILK_RUNNABLE *self)
     }
     if (param_out_trans[0] != '\0')
     {
-        img_trans = stream_connect_create_3Df32(param_out_trans, nwf, nwf, 2);
+        img_trans = cacaosim_beam_shm_create(param_out_trans, nwf, in_nz);
         if (img_trans.ID != -1)
         {
             cacaosim_beam_shm_init_kw(img_trans.im);
@@ -323,6 +329,20 @@ static MILK_HOT errno_t beamsplit_compute(const MILK_RUNNABLE *self)
         const float *pt = (img_pt.ID != -1 && img_pt.md->size[0] == nwf) ? img_pt.im->array.F
                                                                          : NULL;
 
+        cacaosim_disp_t in_disp;
+        memset(&in_disp, 0, sizeof(in_disp));
+        cacaosim_beam_shm_read_disp(img_in.im, &in_disp);
+        float    in_diam = cacaosim_beam_shm_read_diam(img_in.im, 0.0f);
+        uint32_t nlam    = (in_nz >= 2u) ? (in_nz / 2u) : 1u;
+        uint32_t nwl_kw  = 1u;
+        float    wl0_kw  = 0.0f;
+        float    wl1_kw  = 0.0f;
+        int      has_poly = cacaosim_beam_shm_read_poly_kw(img_in.im, &nwl_kw, &wl0_kw, &wl1_kw);
+        int32_t  pmd_kw   = cacaosim_beam_shm_read_poly_mode(img_in.im, nwl_kw);
+        float    wls_kw[8];
+        int      has_wls = (has_poly && nwl_kw <= 8u &&
+                       cacaosim_beam_shm_read_poly_wls(img_in.im, nwl_kw, wls_kw));
+
         /* Relay reflected arm: 2D affine registration + reflected NCPA + reflected pupil stop */
         if (img_refl.ID != -1)
         {
@@ -332,10 +352,32 @@ static MILK_HOT errno_t beamsplit_compute(const MILK_RUNNABLE *self)
                 .rot_deg = param_refl_rot,
                 .scale   = param_refl_scale,
             };
+            cacaosim_disp_t disp_r;
+            memset(&disp_r, 0, sizeof(disp_r));
+            cacaosim_disp_apply_reg(&in_disp, &reg_r, &disp_r);
             img_refl.md->write = 1;
-            cacaosim_beam_relay_cpu(in_opd, in_amp, nr, pr, &reg_r, nwf, img_refl.im->array.F,
-                                    img_refl.im->array.F + npix);
+            for (uint32_t c = 0; c < nlam; c++)
+            {
+                uint64_t off = (uint64_t) c * 2u * npix;
+                cacaosim_beam_relay_cpu(in_opd + off, (in_amp != NULL) ? (in_opd + off + npix) : NULL,
+                                        nr, pr, &reg_r, nwf, img_refl.im->array.F + off,
+                                        img_refl.im->array.F + off + npix);
+            }
             cacaosim_beam_shm_write_spec(img_refl.im, &spec_r);
+            cacaosim_beam_shm_write_disp(img_refl.im, &disp_r);
+            if (in_diam > 0.0f)
+            {
+                cacaosim_beam_shm_write_diam(img_refl.im, in_diam);
+            }
+            if (has_poly)
+            {
+                cacaosim_beam_shm_write_poly_kw(img_refl.im, nwl_kw, wl0_kw, wl1_kw);
+                cacaosim_beam_shm_write_poly_mode(img_refl.im, pmd_kw);
+                if (has_wls)
+                {
+                    cacaosim_beam_shm_write_poly_wls(img_refl.im, wls_kw, nwl_kw);
+                }
+            }
             processinfo_update_output_stream(processinfo, img_refl.im, img_in.im);
         }
 
@@ -348,10 +390,32 @@ static MILK_HOT errno_t beamsplit_compute(const MILK_RUNNABLE *self)
                 .rot_deg = param_tran_rot,
                 .scale   = param_tran_scale,
             };
+            cacaosim_disp_t disp_t;
+            memset(&disp_t, 0, sizeof(disp_t));
+            cacaosim_disp_apply_reg(&in_disp, &reg_t, &disp_t);
             img_trans.md->write = 1;
-            cacaosim_beam_relay_cpu(in_opd, in_amp, nt, pt, &reg_t, nwf, img_trans.im->array.F,
-                                    img_trans.im->array.F + npix);
+            for (uint32_t c = 0; c < nlam; c++)
+            {
+                uint64_t off = (uint64_t) c * 2u * npix;
+                cacaosim_beam_relay_cpu(in_opd + off, (in_amp != NULL) ? (in_opd + off + npix) : NULL,
+                                        nt, pt, &reg_t, nwf, img_trans.im->array.F + off,
+                                        img_trans.im->array.F + off + npix);
+            }
             cacaosim_beam_shm_write_spec(img_trans.im, &spec_t);
+            cacaosim_beam_shm_write_disp(img_trans.im, &disp_t);
+            if (in_diam > 0.0f)
+            {
+                cacaosim_beam_shm_write_diam(img_trans.im, in_diam);
+            }
+            if (has_poly)
+            {
+                cacaosim_beam_shm_write_poly_kw(img_trans.im, nwl_kw, wl0_kw, wl1_kw);
+                cacaosim_beam_shm_write_poly_mode(img_trans.im, pmd_kw);
+                if (has_wls)
+                {
+                    cacaosim_beam_shm_write_poly_wls(img_trans.im, wls_kw, nwl_kw);
+                }
+            }
             processinfo_update_output_stream(processinfo, img_trans.im, img_in.im);
         }
     }

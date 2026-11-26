@@ -65,6 +65,8 @@ typedef struct
     float         *d_dm_opd;
     float         *d_k_rad;
     float         *d_chan_w;
+    float         *d_disp_sx;
+    float         *d_disp_sy;
     float         *d_poly_opd;
     float         *d_poly_amp;
 
@@ -90,7 +92,10 @@ __global__ static void k_zwfs_build_epup(
     const float *__restrict__ dm_opd,
     const float *__restrict__ ncpa_opd,
     const float *__restrict__ k_rad,
+    const float *__restrict__ disp_sx,
+    const float *__restrict__ disp_sy,
     float                     wf_to_opd,
+    uint32_t                  nwf,
     uint64_t                  npix_wf,
     int32_t                   nlam,
     cuComplex *__restrict__   epup)
@@ -129,9 +134,13 @@ __global__ static void k_zwfs_build_epup(
         opd += ncpa_opd[p];
     }
 
+    float p0_xy = 0.5f * (float) (nwf - 1u);
+    float dx    = (float) (p % nwf) - p0_xy;
+    float dy    = (float) (p / nwf) - p0_xy;
+
     for (int32_t c = 0; c < nlam; c++)
     {
-        float phi = opd * k_rad[c];
+        float phi = (opd + disp_sx[c] * dx + disp_sy[c] * dy) * k_rad[c];
         float s   = 0.0f;
         float co  = 1.0f;
         __sincosf(phi, &s, &co);
@@ -144,10 +153,14 @@ __global__ static void k_zwfs_build_epup_poly(
     const float *__restrict__ beam_amp,
     const float *__restrict__ ncpa_opd,
     const float *__restrict__ k_rad,
+    const float *__restrict__ disp_sx,
+    const float *__restrict__ disp_sy,
     zwfs_poly_map_t           map,
     uint64_t                  chan_stride,
+    uint32_t                  nwf,
     uint64_t                  npix_wf,
     int32_t                   nlam,
+    int32_t                   poly_mode,
     cuComplex *__restrict__   epup)
 {
     uint64_t p = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -156,7 +169,10 @@ __global__ static void k_zwfs_build_epup_poly(
         return;
     }
 
-    float nc = (ncpa_opd != NULL) ? ncpa_opd[p] : 0.0f;
+    float nc    = (ncpa_opd != NULL) ? ncpa_opd[p] : 0.0f;
+    float p0_xy = 0.5f * (float) (nwf - 1u);
+    float dx    = (float) (p % nwf) - p0_xy;
+    float dy    = (float) (p / nwf) - p0_xy;
     for (int32_t c = 0; c < nlam; c++)
     {
         uint32_t m0   = map.m0[c];
@@ -168,12 +184,24 @@ __global__ static void k_zwfs_build_epup_poly(
         uint64_t off1 = (uint64_t) m1 * chan_stride + p;
         float    amp0 = (beam_amp != NULL) ? beam_amp[off0] : 1.0f;
         float    amp1 = (beam_amp != NULL) ? beam_amp[off1] : 1.0f;
-        if (amp0 <= 0.0f && amp1 <= 0.0f)
+        if (amp0 <= 0.0f && (m1 == m0 || amp1 <= 0.0f))
         {
             epup[(uint64_t) c * npix_wf + p] = make_cuComplex(0.0f, 0.0f);
             continue;
         }
-        float p0  = (((beam_opd != NULL) ? beam_opd[off0] : 0.0f) + nc) * kc;
+        float nc_c = nc + disp_sx[c] * dx + disp_sy[c] * dy;
+        if (poly_mode == CACAOSIM_POLY_UNWRAPPED_OPD && m1 != m0 && w1 > 0.0f)
+        {
+            float amp = w0 * amp0 + w1 * amp1;
+            float opd = w0 * ((beam_opd != NULL) ? beam_opd[off0] : 0.0f) +
+                        w1 * ((beam_opd != NULL) ? beam_opd[off1] : 0.0f) + nc_c;
+            float s   = 0.0f;
+            float co  = 1.0f;
+            __sincosf(opd * kc, &s, &co);
+            epup[(uint64_t) c * npix_wf + p] = make_cuComplex(amp * co, amp * s);
+            continue;
+        }
+        float p0  = (((beam_opd != NULL) ? beam_opd[off0] : 0.0f) + nc_c) * kc;
         float s0  = 0.0f;
         float co0 = 1.0f;
         __sincosf(p0, &s0, &co0);
@@ -181,7 +209,7 @@ __global__ static void k_zwfs_build_epup_poly(
         float im = w0 * amp0 * s0;
         if (m1 != m0 && w1 > 0.0f)
         {
-            float p1  = (((beam_opd != NULL) ? beam_opd[off1] : 0.0f) + nc) * kc;
+            float p1  = (((beam_opd != NULL) ? beam_opd[off1] : 0.0f) + nc_c) * kc;
             float s1  = 0.0f;
             float co1 = 1.0f;
             __sincosf(p1, &s1, &co1);
@@ -477,6 +505,8 @@ extern "C" int cacaosim_zwfs_cuda_init(
         cudaMalloc((void **) &cs->d_dm_opd, wf_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_k_rad, lam_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_chan_w, lam_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_disp_sx, lam_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_disp_sy, lam_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_poly_opd, poly_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_poly_amp, poly_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_fwd_U, uv_bytes) != cudaSuccess ||
@@ -509,6 +539,8 @@ extern "C" int cacaosim_zwfs_cuda_init(
     cudaMemcpyAsync(cs->d_pup_amp, pup_amp, wf_bytes, cudaMemcpyHostToDevice, cs->stream);
     cudaMemcpyAsync(cs->d_k_rad, ctx->k_rad, lam_bytes, cudaMemcpyHostToDevice, cs->stream);
     cudaMemcpyAsync(cs->d_chan_w, ctx->chan_w, lam_bytes, cudaMemcpyHostToDevice, cs->stream);
+    cudaMemcpyAsync(cs->d_disp_sx, ctx->disp_sx, lam_bytes, cudaMemcpyHostToDevice, cs->stream);
+    cudaMemcpyAsync(cs->d_disp_sy, ctx->disp_sy, lam_bytes, cudaMemcpyHostToDevice, cs->stream);
     cudaMemcpyAsync(cs->d_fwd_U, ctx->fwd_U_cplx, uv_bytes, cudaMemcpyHostToDevice, cs->stream);
     cudaMemcpyAsync(cs->d_fwd_V, ctx->fwd_V_cplx, uv_bytes, cudaMemcpyHostToDevice, cs->stream);
     cudaMemcpyAsync(cs->d_inv_U, ctx->inv_U_cplx, uv_bytes, cudaMemcpyHostToDevice, cs->stream);
@@ -539,6 +571,8 @@ extern "C" void cacaosim_zwfs_cuda_free(cacaosim_zwfs_ctx_t *ctx)
     cudaFree(cs->d_dm_opd);
     cudaFree(cs->d_k_rad);
     cudaFree(cs->d_chan_w);
+    cudaFree(cs->d_disp_sx);
+    cudaFree(cs->d_disp_sy);
     cudaFree(cs->d_poly_opd);
     cudaFree(cs->d_poly_amp);
     cudaFree(cs->d_fwd_U);
@@ -570,6 +604,18 @@ extern "C" void cacaosim_zwfs_cuda_upload_weights(cacaosim_zwfs_ctx_t *ctx)
     }
     cudaMemcpyAsync(cs->d_chan_w, ctx->chan_w, (size_t) ctx->eff_nlam * sizeof(float),
                     cudaMemcpyHostToDevice, cs->stream);
+}
+
+extern "C" void cacaosim_zwfs_cuda_upload_disp(cacaosim_zwfs_ctx_t *ctx)
+{
+    zwfs_cuda_state_t *cs = (zwfs_cuda_state_t *) ctx->cuda_priv;
+    if (cs == NULL || ctx->eff_nlam < 1)
+    {
+        return;
+    }
+    size_t lam_bytes = (size_t) ctx->eff_nlam * sizeof(float);
+    cudaMemcpyAsync(cs->d_disp_sx, ctx->disp_sx, lam_bytes, cudaMemcpyHostToDevice, cs->stream);
+    cudaMemcpyAsync(cs->d_disp_sy, ctx->disp_sy, lam_bytes, cudaMemcpyHostToDevice, cs->stream);
 }
 
 extern "C" void cacaosim_zwfs_cuda_accum(
@@ -635,8 +681,8 @@ extern "C" void cacaosim_zwfs_cuda_accum(
 
     uint32_t bl_wf = (uint32_t) ((ctx->npix_wf + 255ULL) / 256ULL);
     k_zwfs_build_epup<<<bl_wf, 256, 0, cs->stream>>>(
-        d_pup, d_amp, d_wf, d_dm, cs->d_ncpa_opd, cs->d_k_rad, wf_to_opd, ctx->npix_wf, nlam,
-        cs->d_epup);
+        d_pup, d_amp, d_wf, d_dm, cs->d_ncpa_opd, cs->d_k_rad, cs->d_disp_sx, cs->d_disp_sy,
+        wf_to_opd, ctx->cfg.nwf, ctx->npix_wf, nlam, cs->d_epup);
 
     zwfs_cuda_run_babinet_batched(ctx, cs, nlam);
 }
@@ -665,13 +711,14 @@ extern "C" void cacaosim_zwfs_cuda_accum_poly(
     const float    *d_amp_use  = d_beam_amp;
     uint64_t        stride_use = chan_stride;
 
+    int32_t unwrapped = (ctx->in_poly_mode == CACAOSIM_POLY_UNWRAPPED_OPD) ? 1 : 0;
     for (int32_t c = 0; c < nlam; c++)
     {
         uint32_t m0 = 0u;
         uint32_t m1 = 0u;
         float    al = 0.0f;
-        cacaosim_poly_interp_bracket(ctx->lam_um[c], beam_lam_um, beam_nlam, def_l0, def_l1, &m0,
-                                     &m1, &al);
+        cacaosim_poly_interp_bracket_ex(ctx->lam_um[c], beam_lam_um, beam_nlam, def_l0, def_l1,
+                                        unwrapped, &m0, &m1, &al);
         if (d_beam_opd == NULL && beam_opd != NULL)
         {
             uint32_t s0 = (uint32_t) (2 * c);
@@ -720,8 +767,8 @@ extern "C" void cacaosim_zwfs_cuda_accum_poly(
 
     uint32_t bl_wf = (uint32_t) ((ctx->npix_wf + 255ULL) / 256ULL);
     k_zwfs_build_epup_poly<<<bl_wf, 256, 0, cs->stream>>>(
-        d_opd_use, d_amp_use, cs->d_ncpa_opd, cs->d_k_rad, map, stride_use, ctx->npix_wf, nlam,
-        cs->d_epup);
+        d_opd_use, d_amp_use, cs->d_ncpa_opd, cs->d_k_rad, cs->d_disp_sx, cs->d_disp_sy, map,
+        stride_use, ctx->cfg.nwf, ctx->npix_wf, nlam, ctx->in_poly_mode, cs->d_epup);
 
     zwfs_cuda_run_babinet_batched(ctx, cs, nlam);
 }

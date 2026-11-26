@@ -40,9 +40,13 @@ set(SOURCEFILES
     src/common/cacaosim_rng.c
     src/common/cacaosim_detector.c
     src/common/cacaosim_beam.c
+    src/common/cacaosim_disp.c
     src/common/cacaosim_mask.c
     src/common/cacaosim_wfstat_core.c
+    src/common/cacaosim_perturb.c
     src/common/cacaosim_cuda_stub.c
+    src/adc/cacaosim_adc.c
+    src/adc/cacaosim_adc_FPS.c
     src/pupil/cacaosim_pupil.c
     src/pupil/cacaosim_mkpupil_FPS.c
     src/beam/cacaosim_mkbeam_FPS.c
@@ -83,9 +87,13 @@ set(INCLUDEFILES
     src/common/cacaosim_rng.h
     src/common/cacaosim_detector.h
     src/common/cacaosim_beam.h
+    src/common/cacaosim_disp.h
     src/common/cacaosim_mask.h
     src/common/cacaosim_wfstat_core.h
+    src/common/cacaosim_perturb.h
     src/common/cacaosim_cuda.h
+    src/adc/cacaosim_adc.h
+    src/adc/cacaosim_adc_FPS.h
     src/pupil/cacaosim_pupil.h
     src/pupil/cacaosim_mkpupil_FPS.h
     src/beam/cacaosim_mkbeam_FPS.h
@@ -350,6 +358,16 @@ else()
     )
     if(USE_CUDA_ACCEL)
         target_link_libraries(${LIBNAME} PRIVATE CUDA::cudart CUDA::cufft CUDA::cublas)
+    endif()
+
+    find_library(MILK_OPTICSMATERIALS_LIB NAMES milkOpticsMaterials HINTS ${MILK_SEARCH_HINTS})
+    find_path(MILK_OPTICSMATERIALS_INC NAMES OpticsMaterials/OpticsMaterials.h
+              HINTS ${MILK_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/.. /usr/local/milk/include)
+    if(MILK_OPTICSMATERIALS_LIB AND MILK_OPTICSMATERIALS_INC)
+        target_compile_definitions(${LIBNAME} PRIVATE HAVE_OPTICSMATERIALS)
+        target_include_directories(${LIBNAME} SYSTEM PRIVATE ${MILK_OPTICSMATERIALS_INC})
+        target_link_libraries(${LIBNAME} PRIVATE ${MILK_OPTICSMATERIALS_LIB})
+        message(STATUS "milkcacaosim: linking milkOpticsMaterials (${MILK_OPTICSMATERIALS_LIB})")
     endif()
 
     install(TARGETS ${LIBNAME} DESTINATION lib)

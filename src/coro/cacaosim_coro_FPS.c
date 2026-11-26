@@ -294,7 +294,7 @@ static MILK_HOT errno_t coro_compute(const MILK_RUNNABLE *self)
     {
         imgid_free(&img_in);
         uint32_t fb_nwf = (param_nwf >= 8) ? param_nwf : 128;
-        img_in          = stream_connect_create_3Df32(param_in_beam, fb_nwf, fb_nwf, 2);
+        img_in          = cacaosim_beam_shm_create(param_in_beam, fb_nwf, 2);
         if (img_in.ID == -1)
         {
             return RETURN_FAILURE;
@@ -357,7 +357,7 @@ static MILK_HOT errno_t coro_compute(const MILK_RUNNABLE *self)
 
     /* Publish 2 * eff_nlam slices: [OPD_0, Amp_0, OPD_1, Amp_1, ...] */
     uint32_t out_nz  = (uint32_t) (2 * coro_ctx.eff_nlam);
-    IMGID    img_out = stream_connect_create_3Df32(param_out_beam, nwf, nwf, out_nz);
+    IMGID    img_out = cacaosim_beam_shm_create(param_out_beam, nwf, out_nz);
     if (img_out.ID == -1)
     {
         cacaosim_coro_free(&coro_ctx);
@@ -372,7 +372,7 @@ static MILK_HOT errno_t coro_compute(const MILK_RUNNABLE *self)
     img_lowfs.ID    = -1;
     if (param_out_lowfs[0] != '\0')
     {
-        img_lowfs = stream_connect_create_3Df32(param_out_lowfs, nwf, nwf, out_nz);
+        img_lowfs = cacaosim_beam_shm_create(param_out_lowfs, nwf, out_nz);
         if (img_lowfs.ID != -1)
         {
             cacaosim_beam_shm_init_kw(img_lowfs.im);
@@ -405,6 +405,8 @@ static MILK_HOT errno_t coro_compute(const MILK_RUNNABLE *self)
 
     cacaosim_spec_t fallback_spec;
     cacaosim_spec_star(&fallback_spec, 8.2f, 0.30f, 8.0f, 5778.0f, 0.75f);
+    cacaosim_disp_t b_disp    = { 0 };
+    cacaosim_disp_t zero_disp = { 0 };
 
     MILK_PROCINFO_INIT(self)
     MILK_PROCINFO_LOOPSTART(self)
@@ -428,6 +430,46 @@ static MILK_HOT errno_t coro_compute(const MILK_RUNNABLE *self)
                                 (img_in.md->size[2] % 2u) == 0u)
                                    ? (img_in.md->size[2] / 2u)
                                    : 1u;
+
+        if (in_nlam > 1u)
+        {
+            float    in_wls[CACAOSIM_CORO_MAX_LAMBDA];
+            uint32_t cnt = (in_nlam <= CACAOSIM_CORO_MAX_LAMBDA) ? in_nlam
+                                                                 : CACAOSIM_CORO_MAX_LAMBDA;
+            if (!cacaosim_beam_shm_read_poly_wls(img_in.im, cnt, in_wls))
+            {
+                uint32_t kw_n = 1u;
+                float    wl0  = 0.0f;
+                float    wl1  = 0.0f;
+                if (cacaosim_beam_shm_read_poly_kw(img_in.im, &kw_n, &wl0, &wl1) && wl0 > 0.05f &&
+                    wl1 > 0.05f)
+                {
+                    for (uint32_t i = 0u; i < cnt; i++)
+                    {
+                        float t   = (cnt > 1u) ? ((float) i / (float) (cnt - 1u)) : 0.0f;
+                        in_wls[i] = wl0 + (wl1 - wl0) * t;
+                    }
+                    cacaosim_coro_set_in_lambdas(&coro_ctx, in_wls, cnt);
+                }
+                else
+                {
+                    cacaosim_coro_set_in_lambdas(&coro_ctx, NULL, 1u);
+                }
+            }
+            else
+            {
+                cacaosim_coro_set_in_lambdas(&coro_ctx, in_wls, cnt);
+            }
+        }
+        else
+        {
+            cacaosim_coro_set_in_lambdas(&coro_ctx, NULL, 1u);
+        }
+
+        cacaosim_beam_shm_read_disp(img_in.im, &b_disp);
+        float   b_diam  = cacaosim_beam_shm_read_diam(img_in.im, 8.0f);
+        int32_t b_pmode = cacaosim_beam_shm_read_poly_mode(img_in.im, in_nlam);
+        cacaosim_coro_set_disp(&coro_ctx, &b_disp, b_diam, b_pmode);
 
         cacaosim_spec_t in_spec;
         if (!cacaosim_beam_shm_read_spec(img_in.im, &in_spec))
@@ -456,10 +498,21 @@ static MILK_HOT errno_t coro_compute(const MILK_RUNNABLE *self)
             (img_lowfs.ID != -1) ? (img_lowfs.im->array.F + npix) : NULL, NULL, NULL, NULL, NULL,
             NULL, NULL);
 
+        int32_t out_pmode = (coro_ctx.eff_nlam > 1) ? CACAOSIM_POLY_COMPLEX_FIELD
+                                                    : CACAOSIM_POLY_NONE;
         cacaosim_beam_shm_write_spec(img_out.im, &out_spec);
         cacaosim_beam_shm_write_poly_kw(img_out.im, (uint32_t) coro_ctx.eff_nlam,
                                         coro_ctx.lam_um[0],
                                         coro_ctx.lam_um[coro_ctx.eff_nlam - 1]);
+        /* Dispersion was already baked into complex focal/Lyot fields: clear on outputs */
+        cacaosim_beam_shm_write_disp(img_out.im, &zero_disp);
+        cacaosim_beam_shm_write_poly_mode(img_out.im, out_pmode);
+        cacaosim_beam_shm_write_diam(img_out.im, b_diam);
+        if (coro_ctx.eff_nlam <= 8)
+        {
+            cacaosim_beam_shm_write_poly_wls(img_out.im, coro_ctx.lam_um,
+                                             (uint32_t) coro_ctx.eff_nlam);
+        }
         processinfo_update_output_stream(processinfo, img_out.im, img_in.im);
 
         if (img_lowfs.ID != -1)
@@ -468,6 +521,14 @@ static MILK_HOT errno_t coro_compute(const MILK_RUNNABLE *self)
             cacaosim_beam_shm_write_poly_kw(img_lowfs.im, (uint32_t) coro_ctx.eff_nlam,
                                             coro_ctx.lam_um[0],
                                             coro_ctx.lam_um[coro_ctx.eff_nlam - 1]);
+            cacaosim_beam_shm_write_disp(img_lowfs.im, &zero_disp);
+            cacaosim_beam_shm_write_poly_mode(img_lowfs.im, out_pmode);
+            cacaosim_beam_shm_write_diam(img_lowfs.im, b_diam);
+            if (coro_ctx.eff_nlam <= 8)
+            {
+                cacaosim_beam_shm_write_poly_wls(img_lowfs.im, coro_ctx.lam_um,
+                                                 (uint32_t) coro_ctx.eff_nlam);
+            }
             processinfo_update_output_stream(processinfo, img_lowfs.im, img_in.im);
         }
 

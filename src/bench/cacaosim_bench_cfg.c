@@ -527,6 +527,12 @@ static void init_node_defaults(
         nd->wfe_gain   = 1.0f;
         nd->wfe_seed   = seed_base;
     }
+    else if (kind == CACAOSIM_NODE_ADC)
+    {
+        /* Subaru AO188 calibrated doublet-prism ADC (Egner 2009 Table 11, H-band LUT) */
+        cacaosim_adc_cfg_defaults(&nd->adc);
+        nd->tput = nd->adc.tput_base;
+    }
     else if (kind == CACAOSIM_NODE_PYRWFS)
     {
         /* Visible (0.75 um) 4-sided Pyramid WFS with 3 lambda/D 16-point circular modulation */
@@ -662,6 +668,15 @@ void cacaosim_bench_cfg_defaults(cacaosim_bench_cfg_t *cfg)
     cfg->wf_unit    = 1;
     cfg->ref_lambda = 0.50f;
     cfg->turb_gain  = 1.0f;
+    cacaosim_perturb_cfg_defaults(&cfg->perturb);
+    cacaosim_atm_disp_cfg_defaults(&cfg->atm_disp);
+    cfg->atm_disp.zenith_deg = 0.0f;
+    cfg->atm_disp.enable     = 1;
+    cfg->imr_mode            = 0;
+    cfg->parallactic_rate_dps = 0.0f;
+    cfg->site_alt_m          = 4205.0f;
+    cfg->chrom_turb          = 0;
+    copy_str(cfg->chrom_lambdas, sizeof(cfg->chrom_lambdas), "0.75,1.22,1.65");
     cfg->backend    = CACAOSIM_BACKEND_AUTO;
 }
 
@@ -878,6 +893,95 @@ static int apply_bench_kv(cacaosim_bench_cfg_t *cfg, const char *k, const char *
     else if (strcmp(k, "turb_gain") == 0)
     {
         cfg->turb_gain = strtof(v, NULL);
+    }
+    else if (strcmp(k, "vib_enable") == 0)
+    {
+        cfg->perturb.vib_enable = parse_bool(v);
+    }
+    else if (strcmp(k, "vib_rms_nm") == 0)
+    {
+        cfg->perturb.vib_rms_nm = strtof(v, NULL);
+    }
+    else if (strcmp(k, "vib_seed") == 0)
+    {
+        cfg->perturb.vib_seed = (uint64_t) strtoull(v, NULL, 10);
+    }
+    else if (strcmp(k, "petal_enable") == 0)
+    {
+        cfg->perturb.petal_enable = parse_bool(v);
+    }
+    else if (strcmp(k, "petal_rms_nm") == 0)
+    {
+        cfg->perturb.petal_rms_nm = strtof(v, NULL);
+    }
+    else if (strcmp(k, "petal_tau_s") == 0)
+    {
+        cfg->perturb.petal_tau_s = strtof(v, NULL);
+    }
+    else if (strcmp(k, "petal_seed") == 0)
+    {
+        cfg->perturb.petal_seed = (uint64_t) strtoull(v, NULL, 10);
+    }
+    else if (strcmp(k, "zenith_deg") == 0)
+    {
+        cfg->atm_disp.zenith_deg = strtof(v, NULL);
+    }
+    else if (strcmp(k, "disp_pa_deg") == 0)
+    {
+        cfg->atm_disp.disp_pa_deg = strtof(v, NULL);
+    }
+    else if (strcmp(k, "imr_mode") == 0)
+    {
+        if (strcasecmp(v, "pupil_track") == 0 || strcasecmp(v, "adi") == 0 ||
+            strcmp(v, "0") == 0)
+        {
+            cfg->imr_mode = 0;
+        }
+        else if (strcasecmp(v, "field_track") == 0 || strcasecmp(v, "sidereal") == 0 ||
+                 strcmp(v, "1") == 0)
+        {
+            cfg->imr_mode = 1;
+        }
+        else
+        {
+            return -1;
+        }
+    }
+    else if (strcmp(k, "parallactic_rate_dps") == 0)
+    {
+        cfg->parallactic_rate_dps = strtof(v, NULL);
+    }
+    else if (strcmp(k, "site_alt_m") == 0)
+    {
+        cfg->site_alt_m = strtof(v, NULL);
+    }
+    else if (strcmp(k, "atm_pressure_hpa") == 0)
+    {
+        cfg->atm_disp.pressure_hpa = strtof(v, NULL);
+    }
+    else if (strcmp(k, "atm_temp_c") == 0)
+    {
+        cfg->atm_disp.temp_c = strtof(v, NULL);
+    }
+    else if (strcmp(k, "atm_rh_pct") == 0)
+    {
+        cfg->atm_disp.rh_pct = strtof(v, NULL);
+    }
+    else if (strcmp(k, "atm_disp_ref_um") == 0)
+    {
+        cfg->atm_disp.ref_lam_um = strtof(v, NULL);
+    }
+    else if (strcmp(k, "atm_disp_enable") == 0)
+    {
+        cfg->atm_disp.enable = parse_bool(v);
+    }
+    else if (strcmp(k, "chrom_turb") == 0)
+    {
+        cfg->chrom_turb = parse_bool(v);
+    }
+    else if (strcmp(k, "chrom_lambdas") == 0)
+    {
+        copy_str(cfg->chrom_lambdas, sizeof(cfg->chrom_lambdas), v);
     }
     else if (strcmp(k, "backend") == 0)
     {
@@ -1409,6 +1513,159 @@ static int apply_node_kv(cacaosim_node_cfg_t *nd, const char *k, const char *v)
         return 0;
     }
 
+    if (nd->kind == CACAOSIM_NODE_ADC)
+    {
+        if (strcmp(k, "preset") == 0)
+        {
+            int32_t p = cacaosim_adc_parse_preset(v);
+            if (p < 0)
+            {
+                return -1;
+            }
+            nd->adc.preset = p;
+        }
+        else if (strcmp(k, "mode") == 0)
+        {
+            int32_t m = cacaosim_adc_parse_mode(v);
+            if (m < 0)
+            {
+                return -1;
+            }
+            nd->adc.mode = m;
+        }
+        else if (strcmp(k, "opt_band") == 0)
+        {
+            int32_t b = cacaosim_adc_parse_opt_band(v);
+            if (b < 0)
+            {
+                return -1;
+            }
+            nd->adc.opt_band = b;
+        }
+        else if (strcmp(k, "opt_lam1_um") == 0)
+        {
+            nd->adc.opt_lam1_um = strtof(v, NULL);
+        }
+        else if (strcmp(k, "opt_lam2_um") == 0)
+        {
+            nd->adc.opt_lam2_um = strtof(v, NULL);
+        }
+        else if (strcmp(k, "angle1_deg") == 0)
+        {
+            nd->adc.angle1_deg = strtof(v, NULL);
+        }
+        else if (strcmp(k, "angle2_deg") == 0)
+        {
+            nd->adc.angle2_deg = strtof(v, NULL);
+        }
+        else if (strcmp(k, "manual_use_psi") == 0)
+        {
+            nd->adc.manual_use_psi = parse_bool(v);
+        }
+        else if (strcmp(k, "manual_psi_deg") == 0)
+        {
+            nd->adc.manual_psi_deg = strtof(v, NULL);
+        }
+        else if (strcmp(k, "glass1") == 0)
+        {
+            copy_str(nd->adc.glass1, sizeof(nd->adc.glass1), v);
+        }
+        else if (strcmp(k, "glass2") == 0)
+        {
+            copy_str(nd->adc.glass2, sizeof(nd->adc.glass2), v);
+        }
+        else if (strcmp(k, "alpha1_deg") == 0)
+        {
+            nd->adc.alpha1_deg = strtof(v, NULL);
+        }
+        else if (strcmp(k, "alpha2_deg") == 0)
+        {
+            nd->adc.alpha2_deg = strtof(v, NULL);
+        }
+        else if (strcmp(k, "beam_mag") == 0)
+        {
+            nd->adc.beam_mag = strtof(v, NULL);
+        }
+        else if (strcmp(k, "thick1_mm") == 0)
+        {
+            nd->adc.thick1_mm = strtof(v, NULL);
+        }
+        else if (strcmp(k, "thick2_mm") == 0)
+        {
+            nd->adc.thick2_mm = strtof(v, NULL);
+        }
+        else if (strcmp(k, "gap_mm") == 0)
+        {
+            nd->adc.gap_mm = strtof(v, NULL);
+        }
+        else if (strcmp(k, "lut_scale_err") == 0)
+        {
+            nd->adc.lut_scale_err = strtof(v, NULL);
+        }
+        else if (strcmp(k, "lut_pa_err_deg") == 0)
+        {
+            nd->adc.lut_pa_err_deg = strtof(v, NULL);
+        }
+        else if (strcmp(k, "lut_p_err_hpa") == 0)
+        {
+            nd->adc.lut_p_err_hpa = strtof(v, NULL);
+        }
+        else if (strcmp(k, "lut_t_err_c") == 0)
+        {
+            nd->adc.lut_t_err_c = strtof(v, NULL);
+        }
+        else if (strcmp(k, "lut_use_nominal") == 0)
+        {
+            nd->adc.lut_use_nominal = parse_bool(v);
+        }
+        else if (strcmp(k, "ideal_mech") == 0)
+        {
+            nd->adc.ideal_mech = parse_bool(v);
+        }
+        else if (strcmp(k, "enc_step_deg") == 0)
+        {
+            nd->adc.enc_step_deg = strtof(v, NULL);
+        }
+        else if (strcmp(k, "max_slew_dps") == 0)
+        {
+            nd->adc.max_slew_dps = strtof(v, NULL);
+        }
+        else if (strcmp(k, "backlash_deg") == 0)
+        {
+            nd->adc.backlash_deg = strtof(v, NULL);
+        }
+        else if (strcmp(k, "prism_offset_deg") == 0)
+        {
+            nd->adc.prism_offset_deg = strtof(v, NULL);
+        }
+        else if (strcmp(k, "unit_rot_err_deg") == 0)
+        {
+            nd->adc.unit_rot_err_deg = strtof(v, NULL);
+        }
+        else if (strcmp(k, "tput_enable") == 0)
+        {
+            nd->adc.tput_enable = parse_bool(v);
+        }
+        else if (strcmp(k, "tput_base") == 0)
+        {
+            nd->adc.tput_base = strtof(v, NULL);
+            nd->tput          = nd->adc.tput_base;
+        }
+        else if (strcmp(k, "in_cmd") == 0)
+        {
+            copy_str(nd->in_cmd, sizeof(nd->in_cmd), v);
+        }
+        else if (strcmp(k, "out_state") == 0)
+        {
+            copy_str(nd->out_state, sizeof(nd->out_state), v);
+        }
+        else
+        {
+            return -1;
+        }
+        return 0;
+    }
+
     /* Sensor common parameters (shared by pyrwfs, shwfs, zwfs, and fpcam) */
     if (strcmp(k, "out_cam") == 0)
     {
@@ -1847,6 +2104,10 @@ int cacaosim_bench_parse_str(
             else if (strcasecmp(type_str, "wfe") == 0 || strcasecmp(type_str, "static_wfe") == 0)
             {
                 kind = CACAOSIM_NODE_WFE;
+            }
+            else if (strcasecmp(type_str, "adc") == 0)
+            {
+                kind = CACAOSIM_NODE_ADC;
             }
             else
             {
@@ -2343,6 +2604,82 @@ int cacaosim_bench_format_str(
     {
         cw_printf(&w, "turb_gain  = %.4g\n", cfg->turb_gain);
     }
+    if (cfg->perturb.vib_enable)
+    {
+        cw_printf(&w, "vib_enable   = 1\n");
+    }
+    if (fabsf(cfg->perturb.vib_rms_nm - 45.0f) > 1e-3f)
+    {
+        cw_printf(&w, "vib_rms_nm   = %.4g\n", cfg->perturb.vib_rms_nm);
+    }
+    if (cfg->perturb.vib_seed != 101ULL)
+    {
+        cw_printf(&w, "vib_seed     = %llu\n", (unsigned long long) cfg->perturb.vib_seed);
+    }
+    if (cfg->perturb.petal_enable)
+    {
+        cw_printf(&w, "petal_enable = 1\n");
+    }
+    if (fabsf(cfg->perturb.petal_rms_nm - 1000.0f) > 1e-3f)
+    {
+        cw_printf(&w, "petal_rms_nm = %.4g\n", cfg->perturb.petal_rms_nm);
+    }
+    if (fabsf(cfg->perturb.petal_tau_s - 3.0f) > 1e-3f)
+    {
+        cw_printf(&w, "petal_tau_s  = %.4g\n", cfg->perturb.petal_tau_s);
+    }
+    if (cfg->perturb.petal_seed != 202ULL)
+    {
+        cw_printf(&w, "petal_seed   = %llu\n", (unsigned long long) cfg->perturb.petal_seed);
+    }
+    if (cfg->atm_disp.zenith_deg > 1e-5f)
+    {
+        cw_printf(&w, "zenith_deg       = %.4g\n", cfg->atm_disp.zenith_deg);
+    }
+    if (fabsf(cfg->atm_disp.disp_pa_deg) > 1e-5f)
+    {
+        cw_printf(&w, "disp_pa_deg      = %.4g\n", cfg->atm_disp.disp_pa_deg);
+    }
+    if (cfg->imr_mode != 0)
+    {
+        cw_printf(&w, "imr_mode         = \"field_track\"\n");
+    }
+    if (fabsf(cfg->parallactic_rate_dps) > 1e-7f)
+    {
+        cw_printf(&w, "parallactic_rate_dps = %.6g\n", cfg->parallactic_rate_dps);
+    }
+    if (fabsf(cfg->site_alt_m - 4205.0f) > 0.5f)
+    {
+        cw_printf(&w, "site_alt_m       = %.6g\n", cfg->site_alt_m);
+    }
+    if (fabsf(cfg->atm_disp.pressure_hpa - 615.0f) > 0.1f)
+    {
+        cw_printf(&w, "atm_pressure_hpa = %.5g\n", cfg->atm_disp.pressure_hpa);
+    }
+    if (fabsf(cfg->atm_disp.temp_c - 2.0f) > 1e-3f)
+    {
+        cw_printf(&w, "atm_temp_c       = %.4g\n", cfg->atm_disp.temp_c);
+    }
+    if (fabsf(cfg->atm_disp.rh_pct - 20.0f) > 0.1f)
+    {
+        cw_printf(&w, "atm_rh_pct       = %.4g\n", cfg->atm_disp.rh_pct);
+    }
+    if (fabsf(cfg->atm_disp.ref_lam_um - 1.65f) > 1e-4f)
+    {
+        cw_printf(&w, "atm_disp_ref_um  = %.4g\n", cfg->atm_disp.ref_lam_um);
+    }
+    if (!cfg->atm_disp.enable)
+    {
+        cw_printf(&w, "atm_disp_enable  = 0\n");
+    }
+    if (cfg->chrom_turb)
+    {
+        cw_printf(&w, "chrom_turb       = 1\n");
+        if (cfg->chrom_lambdas[0] != '\0')
+        {
+            cw_printf(&w, "chrom_lambdas    = \"%s\"\n", cfg->chrom_lambdas);
+        }
+    }
     if (cfg->backend == CACAOSIM_BACKEND_CPU)
     {
         cw_printf(&w, "backend    = \"cpu\"\n");
@@ -2646,6 +2983,93 @@ int cacaosim_bench_format_str(
             cw_printf(&w, "wfe_seed      = %llu\n", (unsigned long long) nd->wfe_seed);
             cw_printf(&w, "tput          = %.4g\n", nd->tput);
             cw_write_reg(&w, &nd->reg);
+        }
+        else if (nd->kind == CACAOSIM_NODE_ADC)
+        {
+            cw_printf(&w, "[adc.%s]\n", nd->id);
+            cw_printf(&w, "in            = \"%s\"\n", nd->in_beam);
+            cw_printf(&w, "out           = \"%s\"\n", nd->out_beam);
+            cw_printf(&w, "preset        = \"%s\"\n", cacaosim_adc_preset_name(nd->adc.preset));
+            cw_printf(&w, "mode          = \"%s\"\n", cacaosim_adc_mode_name(nd->adc.mode));
+            cw_printf(&w, "opt_band      = \"%s\"\n",
+                      cacaosim_adc_opt_band_name(nd->adc.opt_band));
+            if (nd->adc.opt_band == CACAOSIM_ADC_OPT_CUSTOM)
+            {
+                cw_printf(&w, "opt_lam1_um   = %.4g\n", nd->adc.opt_lam1_um);
+                cw_printf(&w, "opt_lam2_um   = %.4g\n", nd->adc.opt_lam2_um);
+            }
+            if (nd->adc.mode == CACAOSIM_ADC_MODE_MANUAL)
+            {
+                if (nd->adc.manual_use_psi)
+                {
+                    cw_printf(&w, "manual_use_psi = 1\n");
+                    cw_printf(&w, "manual_psi_deg = %.4g\n", nd->adc.manual_psi_deg);
+                }
+                else
+                {
+                    cw_printf(&w, "angle1_deg    = %.4g\n", nd->adc.angle1_deg);
+                    cw_printf(&w, "angle2_deg    = %.4g\n", nd->adc.angle2_deg);
+                }
+            }
+            if (nd->adc.preset == CACAOSIM_ADC_PRESET_SNELL_DOUBLET)
+            {
+                cw_printf(&w, "glass1        = \"%s\"\n", nd->adc.glass1);
+                cw_printf(&w, "glass2        = \"%s\"\n", nd->adc.glass2);
+                cw_printf(&w, "alpha1_deg    = %.5g\n", nd->adc.alpha1_deg);
+                cw_printf(&w, "alpha2_deg    = %.5g\n", nd->adc.alpha2_deg);
+                cw_printf(&w, "beam_mag      = %.5g\n", nd->adc.beam_mag);
+            }
+            if (fabsf(nd->adc.lut_scale_err) > 1e-6f)
+            {
+                cw_printf(&w, "lut_scale_err = %.4g\n", nd->adc.lut_scale_err);
+            }
+            if (fabsf(nd->adc.lut_pa_err_deg) > 1e-6f)
+            {
+                cw_printf(&w, "lut_pa_err_deg = %.4g\n", nd->adc.lut_pa_err_deg);
+            }
+            if (fabsf(nd->adc.lut_p_err_hpa) > 1e-5f)
+            {
+                cw_printf(&w, "lut_p_err_hpa = %.4g\n", nd->adc.lut_p_err_hpa);
+            }
+            if (fabsf(nd->adc.lut_t_err_c) > 1e-5f)
+            {
+                cw_printf(&w, "lut_t_err_c   = %.4g\n", nd->adc.lut_t_err_c);
+            }
+            if (nd->adc.lut_use_nominal)
+            {
+                cw_printf(&w, "lut_use_nominal = 1\n");
+            }
+            if (!nd->adc.ideal_mech)
+            {
+                cw_printf(&w, "ideal_mech    = 0\n");
+                cw_printf(&w, "enc_step_deg  = %.4g\n", nd->adc.enc_step_deg);
+                cw_printf(&w, "max_slew_dps  = %.4g\n", nd->adc.max_slew_dps);
+                cw_printf(&w, "backlash_deg  = %.4g\n", nd->adc.backlash_deg);
+            }
+            if (fabsf(nd->adc.prism_offset_deg) > 1e-6f)
+            {
+                cw_printf(&w, "prism_offset_deg = %.4g\n", nd->adc.prism_offset_deg);
+            }
+            if (fabsf(nd->adc.unit_rot_err_deg) > 1e-6f)
+            {
+                cw_printf(&w, "unit_rot_err_deg = %.4g\n", nd->adc.unit_rot_err_deg);
+            }
+            if (!nd->adc.tput_enable)
+            {
+                cw_printf(&w, "tput_enable   = 0\n");
+            }
+            if (fabsf(nd->adc.tput_base - 0.96f) > 1e-4f)
+            {
+                cw_printf(&w, "tput_base     = %.4g\n", nd->adc.tput_base);
+            }
+            if (nd->in_cmd[0] != '\0')
+            {
+                cw_printf(&w, "in_cmd        = \"%s\"\n", nd->in_cmd);
+            }
+            if (nd->out_state[0] != '\0')
+            {
+                cw_printf(&w, "out_state     = \"%s\"\n", nd->out_state);
+            }
         }
         else if (nd->kind == CACAOSIM_NODE_PYRWFS)
         {

@@ -92,13 +92,40 @@ def find_ffmpeg_bin() -> str | None:
     return None
 
 
-def parse_bench_timing(bench_path: str | None) -> dict[str, float]:
-    """Extract master_hz, oversample, and tel_diam_m from an optical .bench file."""
-    info = {"master_hz": 2000.0, "oversample": 4.0, "tel_diam_m": TEL_DIAM_M}
+def parse_bench_config(bench_path: str | None) -> dict[str, object]:
+    """Extract timing, pupil, star, and DM physics parameters from an optical .bench file."""
+    cfg: dict[str, object] = {
+        "master_hz": 2000.0,
+        "oversample": 4.0,
+        "tel_diam_m": TEL_DIAM_M,
+        "nwf": 256,
+        "pup_diam": 0.9375,
+        "cobs": 0.307,
+        "star_mag": 6.0,
+        "wf_unit": 1,
+        "ref_lambda": 0.50,
+        "dms": [],
+    }
     if not bench_path or not os.path.isfile(bench_path):
-        return info
+        return cfg
+
     sec = ""
     explicit_diam = False
+    dm_map: dict[str, dict[str, object]] = {}
+    dm_order: list[str] = []
+
+    def _to_float(val: str, default: float) -> float:
+        try:
+            return float(val)
+        except ValueError:
+            return default
+
+    def _to_int(val: str, default: int) -> int:
+        try:
+            return int(round(float(val)))
+        except ValueError:
+            return default
+
     with open(bench_path, "r", encoding="utf-8", errors="replace") as fh:
         for raw in fh:
             line = raw.split("#", 1)[0].strip()
@@ -106,29 +133,86 @@ def parse_bench_timing(bench_path: str | None) -> dict[str, float]:
                 continue
             if line.startswith("[") and line.endswith("]"):
                 sec = line
+                if sec.startswith("[dm."):
+                    dmid = sec[4:-1].strip()
+                    if dmid not in dm_map:
+                        dm_map[dmid] = {
+                            "id": dmid,
+                            "in_cmd": "",
+                            "out_opd": "",
+                            "nact_x": 64,
+                            "nact_y": 64,
+                            "dm_diam": 0.9375,
+                            "if_coupling": 0.15,
+                            "dyn_mode": "1",
+                            "plate_drive": "disp",
+                            "rim_bc": "clamped",
+                            "f0_hz": 1000.0,
+                            "act_pitch_mm": 1.5,
+                            "wave_c": 14.0,
+                            "bend_beta": 0.0085,
+                            "delay_us": 0.0,
+                            "refl_scale": 2.0,
+                        }
+                        dm_order.append(dmid)
                 continue
-            if sec == "[bench]" and "=" in line:
-                k, v = [x.strip() for x in line.split("=", 1)]
-                v = v.strip('"').strip("'")
+            if "=" not in line:
+                continue
+            k, v = [x.strip() for x in line.split("=", 1)]
+            v = v.strip('"').strip("'")
+            if sec == "[bench]":
                 if k == "master_hz":
-                    try:
-                        info["master_hz"] = float(v)
-                    except ValueError:
-                        pass
+                    cfg["master_hz"] = _to_float(v, 2000.0)
                 elif k == "oversample":
-                    try:
-                        info["oversample"] = max(1.0, float(v))
-                    except ValueError:
-                        pass
+                    cfg["oversample"] = max(1.0, _to_float(v, 4.0))
                 elif k == "tel_diam_m":
-                    try:
-                        info["tel_diam_m"] = float(v)
-                        explicit_diam = True
-                    except ValueError:
-                        pass
+                    cfg["tel_diam_m"] = _to_float(v, TEL_DIAM_M)
+                    explicit_diam = True
                 elif k == "pupil_geom" and v.lower() == "subaru" and not explicit_diam:
-                    info["tel_diam_m"] = 7.95
-    return info
+                    cfg["tel_diam_m"] = 7.95
+                elif k == "nwf":
+                    cfg["nwf"] = max(16, _to_int(v, 256))
+                elif k == "pup_diam":
+                    cfg["pup_diam"] = _to_float(v, 0.9375)
+                elif k == "cobs":
+                    cfg["cobs"] = _to_float(v, 0.307)
+                elif k == "star_mag":
+                    cfg["star_mag"] = _to_float(v, 6.0)
+                elif k == "wf_unit":
+                    cfg["wf_unit"] = _to_int(v, 1)
+                elif k == "ref_lambda":
+                    cfg["ref_lambda"] = _to_float(v, 0.50)
+            elif sec.startswith("[dm."):
+                dmid = sec[4:-1].strip()
+                dm = dm_map[dmid]
+                if k in ("in_cmd", "out_opd", "dyn_mode", "plate_drive", "rim_bc"):
+                    dm[k] = v.lower() if k in ("dyn_mode", "plate_drive", "rim_bc") else v
+                elif k in ("nact_x", "nact_y"):
+                    dm[k] = max(1, _to_int(v, int(dm[k])))
+                elif k in (
+                    "dm_diam",
+                    "if_coupling",
+                    "f0_hz",
+                    "act_pitch_mm",
+                    "wave_c",
+                    "bend_beta",
+                    "delay_us",
+                    "refl_scale",
+                ):
+                    dm[k] = _to_float(v, float(dm[k]))
+
+    cfg["dms"] = [dm_map[d] for d in dm_order]
+    return cfg
+
+
+def parse_bench_timing(bench_path: str | None) -> dict[str, float]:
+    """Extract master_hz, oversample, and tel_diam_m from an optical .bench file."""
+    cfg = parse_bench_config(bench_path)
+    return {
+        "master_hz": float(cfg["master_hz"]),
+        "oversample": float(cfg["oversample"]),
+        "tel_diam_m": float(cfg["tel_diam_m"]),
+    }
 
 
 def discover_stream_cubes(telem_dir: str, stream_name: str) -> list[tuple[str, str | None]]:
@@ -298,6 +382,39 @@ class TelemetryStreamIndex:
             out[ov0 - idx_start : ov1 - idx_start] = chunk
         return out
 
+    def load_indices(self, indices):
+        """Memory-map and extract specific frame indices (sparse-friendly) -> float32 cube."""
+        import numpy as np
+        from astropy.io import fits
+
+        idx_arr = np.clip(np.asarray(indices, dtype=np.int64), 0, max(self.n_frames - 1, 0))
+        n_out = int(idx_arr.size)
+        out = np.zeros((n_out, *self.frame_shape), dtype=np.float32)
+        if n_out == 0 or self.n_frames == 0:
+            return out
+
+        uniq, inv = np.unique(idx_arr, return_inverse=True)
+        s0, s1 = int(uniq[0]), int(uniq[-1]) + 1
+        if (s1 - s0) <= max(64, 2 * int(uniq.size)):
+            return self.load_slice(s0, s1)[idx_arr - s0]
+
+        u_buf = np.zeros((int(uniq.size), *self.frame_shape), dtype=np.float32)
+        for fp, seg0, seg_len, _ in self.segments:
+            seg1 = seg0 + seg_len
+            m = (uniq >= seg0) & (uniq < seg1)
+            if not np.any(m):
+                continue
+            loc = uniq[m] - seg0
+            dst_pos = np.flatnonzero(m)
+            with fits.open(fp, memmap=True) as hdul:
+                hdu = hdul[0] if hdul[0].data is not None else hdul[1]
+                if hdu.data.ndim == 3:
+                    for di, li in zip(dst_pos, loc):
+                        u_buf[int(di)] = np.asarray(hdu.data[int(li)], dtype=np.float32)
+                else:
+                    u_buf[dst_pos] = np.asarray(hdu.data, dtype=np.float32)[None, :, :]
+        return u_buf[inv]
+
 
 def compute_wfs_refsub(raw_cube, calib_dir: str, norm_floor: float = 1.0):
     """Compute exact CACAO acquireWFSim reference-subtracted signal imWFS2 from raw WFS frames."""
@@ -328,6 +445,890 @@ def compute_wfs_refsub(raw_cube, calib_dir: str, norm_floor: float = 1.0):
 
     mean_ref = np.mean(im1, axis=0, keepdims=True)
     return (im1 - mean_ref).astype(np.float32)
+
+
+def _scale_wfs_refsub(sig_cube, pct: float = 99.0):
+    """Auto-scale ref-sub WFS cube to a clean power-of-10 symmetric range for visualization."""
+    import numpy as np
+
+    abs_c = np.abs(sig_cube)
+    nz = abs_c[abs_c > 0.0]
+    raw_lim = float(np.percentile(nz, pct)) if nz.size > 0 else float(np.percentile(abs_c, pct))
+    if not math.isfinite(raw_lim) or raw_lim <= 1.0e-12:
+        raw_lim = 1.0e-6
+    exp10 = int(math.floor(math.log10(raw_lim)))
+    scale = 10.0 ** (-exp10)
+    disp = (sig_cube * scale).astype(np.float32)
+    lim = max(0.1, raw_lim * scale)
+    sup = str.maketrans("-0123456789", "⁻⁰¹²³⁴⁵⁶⁷⁸⁹")
+    exp_lbl = f"×10{str(exp10).translate(sup)}"
+    return disp, lim, exp_lbl
+
+
+def _fmt_sci(val: float) -> str:
+    """Compact 2-decimal scientific string (e.g. 1.41e-6)."""
+    return f"{val:.2e}".replace("e-0", "e-").replace("e+0", "e+")
+
+
+def _fmt_rate_hz(rate_hz: float) -> str:
+    """Compact frequency label (e.g. '2.0 kHz' or '100 Hz')."""
+    return f"{rate_hz / 1e3:.1f} kHz" if rate_hz >= 500.0 else f"{rate_hz:.0f} Hz"
+
+
+def load_pupil_mask(telem_dir: str, report_dir: str, bcfg: dict[str, object]):
+    """Load pupil amplitude mask and return (pup, pmask, weights, ext_m)."""
+    import numpy as np
+    from astropy.io import fits
+
+    pup = None
+    for cand in (
+        os.path.join(telem_dir, "csim_pup.fits"),
+        os.path.join(report_dir, "csim_pup.fits"),
+        os.path.join(report_dir, "wf_pupil_mask.fits"),
+    ):
+        if os.path.isfile(cand):
+            arr = np.asarray(fits.getdata(cand), dtype=np.float64)
+            if arr.ndim == 2 and arr.shape[0] == arr.shape[1]:
+                pup = arr
+                break
+
+    if pup is None:
+        nwf = int(bcfg.get("nwf", 256))
+        pdiam = float(bcfg.get("pup_diam", 0.9375))
+        cobs = float(bcfg.get("cobs", 0.307))
+        yy, xx = np.indices((nwf, nwf), dtype=np.float64)
+        ctr = 0.5 * (nwf - 1.0)
+        rr = np.hypot(xx - ctr, yy - ctr)
+        r_out = 0.5 * pdiam * nwf
+        r_in = cobs * r_out
+        pup = ((rr <= r_out) & (rr >= r_in)).astype(np.float64)
+
+    pmask = pup > 0.5
+    if not np.any(pmask):
+        pmask = np.ones_like(pup, dtype=bool)
+        pup = np.ones_like(pup, dtype=np.float64)
+    w = np.where(pmask, pup * pup, 0.0)
+    w_sum = float(np.sum(w))
+    weights = w / max(w_sum, 1.0e-12)
+
+    nwf = int(pup.shape[0])
+    tel_diam_m = float(bcfg.get("tel_diam_m", TEL_DIAM_M))
+    pup_pix = max(1.0, float(bcfg.get("pup_diam", 0.9375)) * nwf)
+    half_m = 0.5 * nwf * (tel_diam_m / pup_pix)
+    ext_m = [-half_m, half_m, -half_m, half_m]
+    return pup, pmask, weights, ext_m
+
+
+def _build_dm_stencil(
+    nwf: int,
+    nact_x: int,
+    nact_y: int,
+    dm_diam: float,
+    if_coupling: float,
+    refl_scale: float = 2.0,
+):
+    """Build exact 16-tap 4x4 Gaussian DM gather stencil matching cacaosim_dm_engine.c."""
+    import numpy as np
+
+    diam = dm_diam if (0.05 < dm_diam <= 1.2) else 0.9375
+    span = diam * float(nwf)
+    ctr = 0.5 * float(nwf - 1)
+    px = span / float(nact_x - 1) if nact_x > 1 else span
+    py = span / float(nact_y - 1) if nact_y > 1 else span
+    x0 = ctr - 0.5 * float(nact_x - 1) * px
+    y0 = ctr - 0.5 * float(nact_y - 1) * py
+    coupl = min(max(float(if_coupling), 0.005), 0.45)
+    alpha = -math.log(coupl)
+
+    yy, xx = np.indices((nwf, nwf), dtype=np.float64)
+    fx = (xx - x0) / px
+    fy = (yy - y0) / py
+    ax0 = np.floor(fx).astype(np.int32) - 1
+    ay0 = np.floor(fy).astype(np.int32) - 1
+
+    lat_sum = np.zeros((nwf, nwf), dtype=np.float64)
+    for dy in range(4):
+        ry = fy - (ay0 + dy)
+        for dx in range(4):
+            rx = fx - (ax0 + dx)
+            lat_sum += np.exp(-alpha * (rx * rx + ry * ry))
+    w_scale = np.where(lat_sum > 1.0e-8, refl_scale / lat_sum, refl_scale)
+
+    idxs = []
+    ws = []
+    for dy in range(4):
+        ay = ay0 + dy
+        for dx in range(4):
+            ax = ax0 + dx
+            valid = (ax >= 0) & (ax < nact_x) & (ay >= 0) & (ay < nact_y)
+            rx = fx - ax
+            ry = fy - ay
+            w = np.where(valid, w_scale * np.exp(-alpha * (rx * rx + ry * ry)), 0.0)
+            idx = np.where(valid, ay * nact_x + ax, 0)
+            idxs.append(idx.ravel().astype(np.int32))
+            ws.append(w.ravel().astype(np.float32))
+    idxs_arr = np.stack(idxs, axis=0)
+    ws_arr = np.stack(ws, axis=0)
+    try:
+        from scipy import sparse  # type: ignore[import-not-found]
+
+        npix = nwf * nwf
+        rows = np.repeat(np.arange(npix, dtype=np.int32), 16)
+        cols = idxs_arr.T.ravel()
+        vals = ws_arr.T.ravel()
+        nz = vals != 0.0
+        smat = sparse.csr_matrix(
+            (vals[nz], (rows[nz], cols[nz])),
+            shape=(npix, nact_x * nact_y),
+            dtype=np.float32,
+        )
+        return smat, None
+    except Exception:
+        return idxs_arr, ws_arr
+
+
+def _apply_dm_stencil(cmd_cube, stencil_a, stencil_b, nwf: int):
+    """Apply precomputed 16-tap DM gather stencil to (N, ny, nx) cube -> (N, nwf, nwf)."""
+    import numpy as np
+
+    nfr = int(cmd_cube.shape[0])
+    flat = np.asarray(cmd_cube, dtype=np.float32).reshape(nfr, -1)
+    if stencil_b is None:
+        return np.asarray((stencil_a @ flat.T).T, dtype=np.float32).reshape(nfr, nwf, nwf)
+    out = np.zeros((nfr, nwf * nwf), dtype=np.float32)
+    for t in range(16):
+        out += flat[:, stencil_a[t]] * stencil_b[t][None, :]
+    return out.reshape(nfr, nwf, nwf)
+
+
+def _build_plate_solver(dm_cfg: dict[str, object]):
+    """Build exact static circular-rim coupled-plate solver matching cacaosim_dm_engine.c."""
+    import numpy as np
+
+    dyn = str(dm_cfg.get("dyn_mode", "1")).strip().lower()
+    drive = str(dm_cfg.get("plate_drive", "disp")).strip().lower()
+    if dyn not in ("plate", "3") or drive not in ("force", "1"):
+        return None
+
+    nx = int(dm_cfg.get("nact_x", 64))
+    ny = int(dm_cfg.get("nact_y", 64))
+    if nx < 4 or ny < 4:
+        return None
+
+    cx = 0.5 * float(nx - 1)
+    cy = 0.5 * float(ny - 1)
+    r_rim = 0.5 * float(min(nx, ny)) + 0.5
+    yy, xx = np.indices((ny, nx), dtype=np.float64)
+    pm = ((xx - cx) ** 2 + (yy - cy) ** 2) <= (r_rim * r_rim)
+    act_idx = np.flatnonzero(pm.ravel())
+    n_act = int(act_idx.size)
+    idx_map = np.full(nx * ny, -1, dtype=np.int32)
+    idx_map[act_idx] = np.arange(n_act, dtype=np.int32)
+
+    rim_free = str(dm_cfg.get("rim_bc", "clamped")).strip().lower() in ("free", "1")
+    lap = np.zeros((n_act, n_act), dtype=np.float64)
+    for k, flat_i in enumerate(act_idx):
+        ay, ax = divmod(int(flat_i), nx)
+        diag = 0.0
+        for dy, dx in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+            ny_, nx_ = ay + dy, ax + dx
+            if 0 <= nx_ < nx and 0 <= ny_ < ny and pm[ny_, nx_]:
+                lap[k, idx_map[ny_ * nx + nx_]] += 1.0
+                diag -= 1.0
+            elif not rim_free:
+                diag -= 1.0
+        lap[k, k] = diag
+
+    pitch_m = max(float(dm_cfg.get("act_pitch_mm", 1.5)), 1.0e-4) * 1.0e-3
+    f0_hz = max(float(dm_cfg.get("f0_hz", 1000.0)), 1.0)
+    wave_c = float(dm_cfg.get("wave_c", 14.0))
+    beta = float(dm_cfg.get("bend_beta", 0.0085))
+    w0 = 2.0 * math.pi * f0_hz
+    cm_p = wave_c / pitch_m
+    beta_p = beta / (pitch_m * pitch_m)
+    stiff = (w0 * w0) * np.eye(n_act) - (cm_p * cm_p) * lap + (beta_p * beta_p) * (lap @ lap)
+
+    try:
+        from scipy.linalg import cho_factor, cho_solve  # type: ignore[import-not-found]
+
+        cf = cho_factor(stiff, lower=True)
+
+        def _solve(cmd_cube):
+            nfr = int(cmd_cube.shape[0])
+            rhs = (w0 * w0) * np.asarray(cmd_cube, dtype=np.float64).reshape(nfr, -1)[:, act_idx].T
+            sol = cho_solve(cf, rhs)
+            out = np.zeros((nfr, ny * nx), dtype=np.float32)
+            out[:, act_idx] = sol.T.astype(np.float32)
+            return out.reshape(nfr, ny, nx)
+
+        return _solve
+    except Exception:
+        chol = np.linalg.cholesky(stiff)
+
+        def _solve_np(cmd_cube):
+            nfr = int(cmd_cube.shape[0])
+            rhs = (w0 * w0) * np.asarray(cmd_cube, dtype=np.float64).reshape(nfr, -1)[:, act_idx].T
+            y = np.linalg.solve(chol, rhs)
+            sol = np.linalg.solve(chol.T, y)
+            out = np.zeros((nfr, ny * nx), dtype=np.float32)
+            out[:, act_idx] = sol.T.astype(np.float32)
+            return out.reshape(nfr, ny, nx)
+
+        return _solve_np
+
+
+def _finalize_opd_cube(cube_nm, pmask, weights):
+    """Piston-remove OPD cube [nm], mask outside pupil to NaN, and return (disp, rms, ptv)."""
+    import numpy as np
+
+    c64 = np.asarray(cube_nm, dtype=np.float64)
+    nfr = int(c64.shape[0])
+    w_flat = weights.ravel()
+    m_flat = pmask.ravel()
+    c_flat = c64.reshape(nfr, -1)
+    pist = c_flat @ w_flat
+    sub = c_flat - pist[:, None]
+    w_act = w_flat[m_flat]
+    sub_act = sub[:, m_flat]
+    rms = np.sqrt(np.maximum((sub_act * sub_act) @ w_act, 0.0))
+    ptv = np.max(sub_act, axis=1) - np.min(sub_act, axis=1)
+    disp = sub.reshape(c64.shape).astype(np.float32)
+    disp[:, ~pmask] = np.nan
+    return disp, rms, ptv
+
+
+def _nice_opd_vlim(disp_cube, pmask, min_lim: float = 10.0) -> float:
+    """Compute a clean symmetric ±vlim [nm] across a pupil OPD clip (prevents flicker)."""
+    import numpy as np
+
+    vals = np.abs(disp_cube[:, pmask])
+    vals = vals[np.isfinite(vals)]
+    lim = float(np.percentile(vals, 99.3)) if vals.size > 0 else min_lim
+    if not math.isfinite(lim) or lim < min_lim:
+        lim = min_lim
+    step = 100.0 if lim > 800.0 else (25.0 if lim > 200.0 else 10.0)
+    return float(max(min_lim, step, math.ceil(lim / step) * step))
+
+
+def _find_wfstat_meta(telem_dir: str, report_dir: str, prefix: str):
+    """Locate <prefix>_meta.json + <prefix>_raw.fits in telem_dir or report_dir."""
+    for d in (telem_dir, report_dir):
+        mp = os.path.join(d, f"{prefix}_meta.json")
+        rp = os.path.join(d, f"{prefix}_raw.fits")
+        if os.path.isfile(mp) and os.path.isfile(rp):
+            return d, mp
+    return None, None
+
+
+def _load_wfstat_clip(
+    telem_dir: str,
+    report_dir: str,
+    t_grid,
+    wfs2_cnt0_clip,
+    realtime: bool = False,
+):
+    """Load exact ground-truth wf_clip_* or wf_full_* cubes if they cover t_grid."""
+    import numpy as np
+    from astropy.io import fits
+
+    order = (
+        (("wf_full", "dm_full"), ("wf_clip", "dm_clip"))
+        if realtime
+        else (("wf_clip", "dm_clip"),)
+    )
+    for wf_pfx, dm_pfx in order:
+        clip_dir, meta_p = _find_wfstat_meta(telem_dir, report_dir, wf_pfx)
+        if clip_dir is None or meta_p is None:
+            continue
+
+        try:
+            with open(meta_p, "r", encoding="utf-8") as fh:
+                meta = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        n_clip_src = int(meta.get("n_frames", 0))
+        if n_clip_src < 2:
+            continue
+
+        dt_s = float(meta.get("dt_phys_s", 0.0005))
+        rate_hz = 1.0 / max(dt_s, 1.0e-6)
+        c0_arr = np.asarray(meta.get("wfs2_cnt0", []), dtype=np.int64)
+        fr_arr = np.asarray(meta.get("frames", []), dtype=np.int64)
+        step_tol = (
+            max(4, int(math.ceil(float(meta.get("full_step_frames", 67.0)))))
+            if wf_pfx == "wf_full"
+            else 4
+        )
+
+        pos = None
+        if (
+            c0_arr.size == n_clip_src
+            and wfs2_cnt0_clip.size > 0
+            and np.all(c0_arr > 0)
+            and int(c0_arr[0]) <= int(wfs2_cnt0_clip[0]) + step_tol
+            and int(c0_arr[-1]) >= int(wfs2_cnt0_clip[-1]) - step_tol
+        ):
+            pos = np.searchsorted(c0_arr, wfs2_cnt0_clip, side="left")
+            pos = np.clip(pos, 0, n_clip_src - 1)
+            prev = np.clip(pos - 1, 0, n_clip_src - 1)
+            use_prev = np.abs(c0_arr[prev] - wfs2_cnt0_clip) < np.abs(
+                c0_arr[pos] - wfs2_cnt0_clip
+            )
+            pos = np.where(use_prev, prev, pos)
+            if int(np.max(np.abs(c0_arr[pos] - wfs2_cnt0_clip))) > step_tol:
+                pos = None
+        elif fr_arr.size == n_clip_src:
+            t_clip = fr_arr.astype(np.float64) * dt_s
+            t_tol = max(0.005, float(step_tol) * dt_s)
+            if t_clip[0] <= float(t_grid[0]) + t_tol and t_clip[-1] >= float(t_grid[-1]) - t_tol:
+                pos = np.searchsorted(t_clip, t_grid, side="left")
+                pos = np.clip(pos, 0, n_clip_src - 1)
+                prev = np.clip(pos - 1, 0, n_clip_src - 1)
+                use_prev = np.abs(t_clip[prev] - t_grid) < np.abs(t_clip[pos] - t_grid)
+                pos = np.where(use_prev, prev, pos)
+
+        if pos is None:
+            continue
+
+        uniq, inv = np.unique(pos, return_inverse=True)
+        s0, s1 = int(uniq[0]), int(uniq[-1]) + 1
+        use_dense = (s1 - s0) <= max(64, 2 * int(uniq.size))
+        out: dict[str, object] = {
+            "map_idx": (pos - s0) if use_dense else inv,
+            "rate_hz": rate_hz,
+            "wf_src": wf_pfx,
+            "dm_src": dm_pfx,
+        }
+        for key, fname in (
+            ("wf_raw", f"{wf_pfx}_raw.fits"),
+            ("wf_final", f"{wf_pfx}_final.fits"),
+            ("dm1_opd", f"{dm_pfx}_opd_stg1.fits"),
+            ("dm2_opd", f"{dm_pfx}_opd_stg2.fits"),
+        ):
+            fp = os.path.join(clip_dir, fname)
+            if os.path.isfile(fp):
+                with fits.open(fp, memmap=True) as hdul:
+                    hdu = hdul[0] if hdul[0].data is not None else hdul[1]
+                    if hdu.data.ndim == 3 and int(hdu.data.shape[0]) >= s1:
+                        if use_dense:
+                            out[key] = np.asarray(hdu.data[s0:s1], dtype=np.float32)
+                        else:
+                            buf = np.empty(
+                                (int(uniq.size), int(hdu.data.shape[1]), int(hdu.data.shape[2])),
+                                dtype=np.float32,
+                            )
+                            for di, li in enumerate(uniq):
+                                buf[di] = np.asarray(hdu.data[int(li)], dtype=np.float32)
+                            out[key] = buf
+        if "wf_raw" in out:
+            return out
+    return None
+
+
+def _slice_stream_at_times(
+    telem_dir: str,
+    stream_name: str,
+    phys_time_s: float,
+    nominal_rate_hz: float,
+    t_query,
+):
+    """Discover and slice stream_name at query times t_query -> (cube, map_idx, rate_hz) or None."""
+    import numpy as np
+
+    pairs = discover_stream_cubes(telem_dir, stream_name)
+    if not pairs:
+        return None
+    idx = TelemetryStreamIndex(stream_name, pairs, phys_time_s, nominal_rate_hz=nominal_rate_hz)
+    if idx.n_frames == 0:
+        return None
+    pos = np.searchsorted(idx.t_phys_s, t_query + 1.0e-7, side="right") - 1
+    pos = np.clip(pos, 0, idx.n_frames - 1)
+    uniq, inv = np.unique(pos, return_inverse=True)
+    s0 = int(uniq[0])
+    s1 = int(uniq[-1]) + 1
+    if (s1 - s0) <= max(64, 2 * int(uniq.size)):
+        return idx.load_slice(s0, s1), (pos - s0), float(idx.rate_hz)
+    return idx.load_indices(uniq), inv, float(idx.rate_hz)
+
+
+def _load_wf_and_dm_panels(
+    telem_dir: str,
+    report_dir: str,
+    bcfg: dict[str, object],
+    phys_time_s: float,
+    fs_stg1: float,
+    fs_stg2: float,
+    t_grid,
+    wfs2_cnt0_clip,
+    realtime: bool = False,
+):
+    """Load/reconstruct synchronized Incoming WF, DM1/DM2 shapes, and optional Residual WF."""
+    import numpy as np
+    from astropy.io import fits
+
+    _, pmask, weights, ext_m = load_pupil_mask(telem_dir, report_dir, bcfg)
+    nwf = int(pmask.shape[0])
+    dms = list(bcfg.get("dms", []))
+    dm1_cfg = (
+        dms[0]
+        if len(dms) >= 1
+        else {
+            "in_cmd": "dm01disp",
+            "nact_x": 64,
+            "nact_y": 64,
+            "dm_diam": 0.984375,
+            "if_coupling": 0.08,
+            "dyn_mode": "plate",
+            "plate_drive": "force",
+            "rim_bc": "free",
+            "f0_hz": 1000.0,
+            "act_pitch_mm": 1.5,
+            "wave_c": 14.0,
+            "bend_beta": 0.0085,
+            "delay_us": 1000.0,
+            "refl_scale": 2.0,
+        }
+    )
+    dm2_cfg = (
+        dms[1]
+        if len(dms) >= 2
+        else {
+            "in_cmd": "dm02disp",
+            "nact_x": 50,
+            "nact_y": 50,
+            "dm_diam": 0.9986413,
+            "if_coupling": 0.15,
+            "dyn_mode": "1",
+            "plate_drive": "disp",
+            "delay_us": 500.0,
+            "refl_scale": 2.0,
+        }
+    )
+
+    clip_exact = _load_wfstat_clip(
+        telem_dir, report_dir, t_grid, wfs2_cnt0_clip, realtime=realtime
+    )
+
+    # Lazy physics builders for DM1/DM2 fallback reconstruction
+    stencil_cache: dict[int, tuple[object, object]] = {}
+    plate_cache: dict[int, object] = {}
+
+    def _get_dm_ops(stage: int, dcfg: dict[str, object], shape_yx: tuple[int, int]):
+        if stage not in stencil_cache:
+            ny_a, nx_a = shape_yx
+            stencil_cache[stage] = _build_dm_stencil(
+                nwf,
+                nx_a,
+                ny_a,
+                float(dcfg.get("dm_diam", 0.9375)),
+                float(dcfg.get("if_coupling", 0.15)),
+                float(dcfg.get("refl_scale", 2.0)),
+            )
+            dcfg_eff = dict(dcfg)
+            dcfg_eff["nact_x"] = nx_a
+            dcfg_eff["nact_y"] = ny_a
+            plate_cache[stage] = _build_plate_solver(dcfg_eff)
+        return stencil_cache[stage], plate_cache[stage]
+
+    # 1. Stage-1 DM1 Shape [nm]
+    dm1_disp = None
+    dm1_rms = None
+    dm1_ptv = None
+    dm1_midx = None
+    dm1_src = "none"
+    dm1_title = ""
+    dm1_nx = int(dm1_cfg.get("nact_x", 64))
+    dm1_ny = int(dm1_cfg.get("nact_y", 64))
+
+    if clip_exact is not None and "dm1_opd" in clip_exact:
+        dm1_disp, dm1_rms, dm1_ptv = _finalize_opd_cube(clip_exact["dm1_opd"], pmask, weights)
+        dm1_midx = clip_exact["map_idx"]
+        dm1_src = str(clip_exact.get("dm_src", "dm_clip"))
+        dm1_title = (
+            f"Stg 1 AO3k DM1 Shape ({dm1_nx}×{dm1_ny})\n"
+            f"(csim_dm01_opd, {_fmt_rate_hz(float(clip_exact['rate_hz']))})"
+        )
+    else:
+        res_opd1 = _slice_stream_at_times(telem_dir, "csim_dm01_opd", phys_time_s, fs_stg2, t_grid)
+        if res_opd1 is not None:
+            cube1, dm1_midx, r1 = res_opd1
+            dm1_disp, dm1_rms, dm1_ptv = _finalize_opd_cube(cube1 * 1000.0, pmask, weights)
+            dm1_src = "csim_dm01_opd"
+            dm1_title = (
+                f"Stg 1 AO3k DM1 Shape ({dm1_nx}×{dm1_ny})\n"
+                f"(csim_dm01_opd, {_fmt_rate_hz(r1)})"
+            )
+        else:
+            delay1_s = float(dm1_cfg.get("delay_us", 1000.0)) * 1.0e-6
+            t_dm1_q = np.maximum(t_grid - delay1_s, 0.0)
+            in_cmd1 = str(dm1_cfg.get("in_cmd", "dm01disp"))
+            cands1 = (
+                [("dm01shaped", fs_stg2), ("dm01disp", fs_stg1), ("aol1_dmC", fs_stg1)]
+                if in_cmd1 == "dm01shaped"
+                else [("dm01disp", fs_stg1), ("dm01shaped", fs_stg2), ("aol1_dmC", fs_stg1)]
+            )
+            for sname1, nom1 in cands1:
+                res1 = _slice_stream_at_times(telem_dir, sname1, phys_time_s, nom1, t_dm1_q)
+                if res1 is not None:
+                    cmd1, dm1_midx, r1 = res1
+                    dm1_ny, dm1_nx = int(cmd1.shape[1]), int(cmd1.shape[2])
+                    (idxs1, ws1), psolve1 = _get_dm_ops(1, dm1_cfg, (dm1_ny, dm1_nx))
+                    surf1 = psolve1(cmd1) if psolve1 is not None else cmd1
+                    opd1_nm = _apply_dm_stencil(surf1, idxs1, ws1, nwf) * 1000.0
+                    dm1_disp, dm1_rms, dm1_ptv = _finalize_opd_cube(opd1_nm, pmask, weights)
+                    dm1_src = f"{sname1}_{'plate' if psolve1 is not None else 'stencil'}"
+                    dm1_title = (
+                        f"Stg 1 AO3k DM1 Shape ({dm1_nx}×{dm1_ny})\n"
+                        f"({sname1} → Pupil OPD, {_fmt_rate_hz(r1)})"
+                    )
+                    break
+
+    # 2. Stage-2 DM2 Shape [nm]
+    dm2_disp = None
+    dm2_rms = None
+    dm2_ptv = None
+    dm2_midx = None
+    dm2_src = "open"
+    dm2_is_open = False
+    dm2_nx = int(dm2_cfg.get("nact_x", 50))
+    dm2_ny = int(dm2_cfg.get("nact_y", 50))
+    dm2_title = f"Stg 2 SCExAO DM2 Shape ({dm2_nx}×{dm2_ny})\n(Stage-2 Loop Open)"
+
+    if clip_exact is not None and "dm2_opd" in clip_exact:
+        dm2_disp, dm2_rms, dm2_ptv = _finalize_opd_cube(clip_exact["dm2_opd"], pmask, weights)
+        dm2_midx = clip_exact["map_idx"]
+        dm2_src = str(clip_exact.get("dm_src", "dm_clip"))
+        dm2_is_open = float(np.max(dm2_rms)) < 1.0e-3
+        dm2_title = (
+            f"Stg 2 SCExAO DM2 Shape ({dm2_nx}×{dm2_ny})\n"
+            + (
+                "(csim_dm02_opd, Loop Open)"
+                if dm2_is_open
+                else f"(csim_dm02_opd, {_fmt_rate_hz(float(clip_exact['rate_hz']))})"
+            )
+        )
+    else:
+        res_opd2 = _slice_stream_at_times(telem_dir, "csim_dm02_opd", phys_time_s, fs_stg2, t_grid)
+        if res_opd2 is not None:
+            cube2, dm2_midx, r2 = res_opd2
+            dm2_disp, dm2_rms, dm2_ptv = _finalize_opd_cube(cube2 * 1000.0, pmask, weights)
+            dm2_src = "csim_dm02_opd"
+            dm2_is_open = float(np.max(dm2_rms)) < 1.0e-3
+            dm2_title = (
+                f"Stg 2 SCExAO DM2 Shape ({dm2_nx}×{dm2_ny})\n"
+                f"(csim_dm02_opd, {_fmt_rate_hz(r2)})"
+            )
+        else:
+            delay2_s = float(dm2_cfg.get("delay_us", 500.0)) * 1.0e-6
+            t_dm2_q = np.maximum(t_grid - delay2_s, 0.0)
+            for sname2, nom2 in (("dm02disp", fs_stg2), ("aol2_dmC", fs_stg2)):
+                res2 = _slice_stream_at_times(telem_dir, sname2, phys_time_s, nom2, t_dm2_q)
+                if res2 is not None:
+                    cmd2, dm2_midx, r2 = res2
+                    dm2_ny, dm2_nx = int(cmd2.shape[1]), int(cmd2.shape[2])
+                    (idxs2, ws2), psolve2 = _get_dm_ops(2, dm2_cfg, (dm2_ny, dm2_nx))
+                    surf2 = psolve2(cmd2) if psolve2 is not None else cmd2
+                    opd2_nm = _apply_dm_stencil(surf2, idxs2, ws2, nwf) * 1000.0
+                    dm2_disp, dm2_rms, dm2_ptv = _finalize_opd_cube(opd2_nm, pmask, weights)
+                    dm2_src = f"{sname2}_stencil"
+                    dm2_is_open = float(np.max(dm2_rms)) < 1.0e-3
+                    dm2_title = (
+                        f"Stg 2 SCExAO DM2 Shape ({dm2_nx}×{dm2_ny})\n"
+                        f"({sname2} → Pupil OPD, {_fmt_rate_hz(r2)})"
+                    )
+                    break
+
+    if dm2_disp is None:
+        z_map = np.zeros((1, nwf, nwf), dtype=np.float32)
+        z_map[:, ~pmask] = np.nan
+        dm2_disp = z_map
+        dm2_rms = np.zeros(1, dtype=np.float64)
+        dm2_ptv = np.zeros(1, dtype=np.float64)
+        dm2_midx = np.zeros(int(t_grid.size), dtype=np.int64)
+        dm2_is_open = True
+
+    # 3. True Incoming Pupil WF [nm] (b_pup / wf_clip_raw / outarraypha)
+    wf_in_disp = None
+    wf_in_rms = None
+    wf_in_ptv = None
+    wf_in_midx = None
+    wf_in_src = "none"
+    wf_in_title = ""
+    wf_in_rate_hz = fs_stg2
+
+    if clip_exact is not None and "wf_raw" in clip_exact:
+        wf_in_disp, wf_in_rms, wf_in_ptv = _finalize_opd_cube(clip_exact["wf_raw"], pmask, weights)
+        wf_in_midx = clip_exact["map_idx"]
+        wf_in_src = str(clip_exact.get("wf_src", "wf_clip"))
+        wf_in_rate_hz = float(clip_exact["rate_hz"])
+        wf_in_title = (
+            f"Incoming Pupil WF\n(b_pup, {_fmt_rate_hz(wf_in_rate_hz)}, {nwf}×{nwf})"
+        )
+    else:
+        res_bpup = _slice_stream_at_times(telem_dir, "b_pup", phys_time_s, fs_stg2, t_grid)
+        if res_bpup is not None:
+            bp_c, wf_in_midx, r_bp = res_bpup
+            wf_in_disp, wf_in_rms, wf_in_ptv = _finalize_opd_cube(bp_c * 1000.0, pmask, weights)
+            wf_in_src = "b_pup"
+            wf_in_rate_hz = r_bp
+            wf_in_title = f"Incoming Pupil WF\n(b_pup, {_fmt_rate_hz(r_bp)}, {nwf}×{nwf})"
+        else:
+            res_pha = _slice_stream_at_times(telem_dir, "outarraypha", phys_time_s, fs_stg2, t_grid)
+            if res_pha is not None:
+                pha_c, wf_in_midx, r_ph = res_pha
+                wf_unit = int(bcfg.get("wf_unit", 1))
+                ref_lam = float(bcfg.get("ref_lambda", 0.50))
+                scale_nm = (ref_lam * 1000.0 / (2.0 * math.pi)) if wf_unit == 1 else 1000.0
+                wf_in_disp, wf_in_rms, wf_in_ptv = _finalize_opd_cube(
+                    pha_c * scale_nm, pmask, weights
+                )
+                wf_in_src = "outarraypha"
+                wf_in_rate_hz = r_ph
+                wf_in_title = f"Incoming Atm WF\n(outarraypha, {_fmt_rate_hz(r_ph)}, {nwf}×{nwf})"
+
+    # 4. PSOL Reconstructed Pupil WF [nm] (aol1_modevalOL + Stage-1 CMmodesDM -> DM1 pupil OPD)
+    psol_disp = None
+    psol_rms = None
+    psol_ptv = None
+    psol_midx = None
+    psol_src = "none"
+    psol_title = ""
+
+    cm1_p = os.path.join(telem_dir, "calib_stg1", "CMmodesDM.fits")
+    res_ol = _slice_stream_at_times(telem_dir, "aol1_modevalOL", phys_time_s, fs_stg1, t_grid)
+    if res_ol is not None and os.path.isfile(cm1_p):
+        ol_c, psol_midx, r_ol = res_ol
+        cm1 = np.asarray(fits.getdata(cm1_p), dtype=np.float32)
+        if cm1.ndim == 3:
+            ol_2d = ol_c.reshape(ol_c.shape[0], -1)
+            nmode = min(int(ol_2d.shape[1]), int(cm1.shape[0]))
+            psol_cmd = -np.tensordot(ol_2d[:, :nmode], cm1[:nmode], axes=(1, 0))
+            ny_c, nx_c = int(cm1.shape[1]), int(cm1.shape[2])
+            (idxs1, ws1), psolve1 = _get_dm_ops(1, dm1_cfg, (ny_c, nx_c))
+            psol_surf = psolve1(psol_cmd) if psolve1 is not None else psol_cmd
+            psol_opd = _apply_dm_stencil(psol_surf, idxs1, ws1, nwf) * 1000.0
+            psol_disp, psol_rms, psol_ptv = _finalize_opd_cube(psol_opd, pmask, weights)
+            psol_src = "aol1_modevalOL"
+            psol_title = f"PSOL Recon. WF\n(aol1_modevalOL, {_fmt_rate_hz(r_ol)})"
+
+    # 5. Optional Exact Final Residual Pupil WF [nm] (b_post_stg2 / wf_clip_final)
+    wf_res_disp = None
+    wf_res_rms = None
+    wf_res_ptv = None
+    wf_res_midx = None
+    wf_res_src = "none"
+    wf_res_title = ""
+
+    if clip_exact is not None and "wf_final" in clip_exact:
+        wf_res_disp, wf_res_rms, wf_res_ptv = _finalize_opd_cube(
+            clip_exact["wf_final"], pmask, weights
+        )
+        wf_res_midx = clip_exact["map_idx"]
+        wf_res_src = str(clip_exact.get("wf_src", "wf_clip"))
+        wf_res_title = (
+            f"Final Residual Pupil WF\n"
+            f"(b_post_stg2, {_fmt_rate_hz(float(clip_exact['rate_hz']))}, {nwf}×{nwf})"
+        )
+    else:
+        res_bfin = _slice_stream_at_times(telem_dir, "b_post_stg2", phys_time_s, fs_stg2, t_grid)
+        if res_bfin is not None:
+            bf_c, wf_res_midx, r_bf = res_bfin
+            wf_res_disp, wf_res_rms, wf_res_ptv = _finalize_opd_cube(bf_c * 1000.0, pmask, weights)
+            wf_res_src = "b_post_stg2"
+            wf_res_title = (
+                f"Final Residual Pupil WF\n(b_post_stg2, {_fmt_rate_hz(r_bf)}, {nwf}×{nwf})"
+            )
+
+    panels: list[dict[str, object]] = []
+    if wf_in_disp is not None and psol_disp is not None and dm1_disp is not None:
+        # Both true Incoming WF and PSOL reconstruction available:
+        # 5-panel Row 0: Incoming WF | PSOL Recon. WF | Diff (Incoming - PSOL) | DM1 | DM2
+        in_at_t = np.nan_to_num(wf_in_disp[wf_in_midx], nan=0.0)
+        ps_at_t = np.nan_to_num(psol_disp[psol_midx], nan=0.0)
+        diff_disp, diff_rms, diff_ptv = _finalize_opd_cube(in_at_t - ps_at_t, pmask, weights)
+        diff_midx = np.arange(int(t_grid.size), dtype=np.int64)
+        diff_src_lbl = "b_pup" if wf_in_src in ("wf_clip", "wf_full", "b_pup") else wf_in_src
+        diff_title = (
+            f"Diff: Incoming − PSOL\n({diff_src_lbl} − PSOL, {_fmt_rate_hz(wf_in_rate_hz)})"
+        )
+
+        vlim_in = _nice_opd_vlim(wf_in_disp, pmask, min_lim=25.0)
+        vlim_psol = _nice_opd_vlim(psol_disp, pmask, min_lim=25.0)
+        vlim_dm1 = _nice_opd_vlim(dm1_disp, pmask, min_lim=25.0)
+        vlim_shared = max(vlim_in, vlim_psol, vlim_dm1)
+        vlim_diff = _nice_opd_vlim(diff_disp, pmask, min_lim=25.0)
+
+        dm1_t5 = dm1_title.replace("DM1 Shape ", "DM1 ")
+        dm2_t5 = dm2_title.replace("DM2 Shape ", "DM2 ")
+        panels.extend(
+            [
+                {
+                    "key": "wf_in",
+                    "title": wf_in_title,
+                    "cube": wf_in_disp,
+                    "rms": wf_in_rms,
+                    "ptv": wf_in_ptv,
+                    "map_idx": wf_in_midx,
+                    "vlim": vlim_shared,
+                    "source": wf_in_src,
+                    "is_open": False,
+                },
+                {
+                    "key": "wf_psol",
+                    "title": psol_title,
+                    "cube": psol_disp,
+                    "rms": psol_rms,
+                    "ptv": psol_ptv,
+                    "map_idx": psol_midx,
+                    "vlim": vlim_shared,
+                    "source": psol_src,
+                    "is_open": False,
+                },
+                {
+                    "key": "wf_diff",
+                    "title": diff_title,
+                    "cube": diff_disp,
+                    "rms": diff_rms,
+                    "ptv": diff_ptv,
+                    "map_idx": diff_midx,
+                    "vlim": vlim_diff,
+                    "source": f"{wf_in_src}-psol",
+                    "is_open": False,
+                },
+                {
+                    "key": "dm1",
+                    "title": dm1_t5,
+                    "cube": dm1_disp,
+                    "rms": dm1_rms,
+                    "ptv": dm1_ptv,
+                    "map_idx": dm1_midx,
+                    "vlim": vlim_shared,
+                    "source": dm1_src,
+                    "is_open": False,
+                },
+                {
+                    "key": "dm2",
+                    "title": dm2_t5,
+                    "cube": dm2_disp,
+                    "rms": dm2_rms,
+                    "ptv": dm2_ptv,
+                    "map_idx": dm2_midx,
+                    "vlim": _nice_opd_vlim(dm2_disp, pmask, min_lim=10.0),
+                    "source": dm2_src,
+                    "is_open": dm2_is_open,
+                },
+            ]
+        )
+    elif wf_in_disp is not None and dm1_disp is not None:
+        # True Incoming WF without PSOL stream: 3 or 4 panels (with optional Final Residual WF)
+        vlim_in = _nice_opd_vlim(wf_in_disp, pmask, min_lim=25.0)
+        vlim_dm1 = _nice_opd_vlim(dm1_disp, pmask, min_lim=25.0)
+        vlim_shared = max(vlim_in, vlim_dm1)
+        panels.extend(
+            [
+                {
+                    "key": "wf_in",
+                    "title": wf_in_title,
+                    "cube": wf_in_disp,
+                    "rms": wf_in_rms,
+                    "ptv": wf_in_ptv,
+                    "map_idx": wf_in_midx,
+                    "vlim": vlim_shared,
+                    "source": wf_in_src,
+                    "is_open": False,
+                },
+                {
+                    "key": "dm1",
+                    "title": dm1_title,
+                    "cube": dm1_disp,
+                    "rms": dm1_rms,
+                    "ptv": dm1_ptv,
+                    "map_idx": dm1_midx,
+                    "vlim": vlim_shared,
+                    "source": dm1_src,
+                    "is_open": False,
+                },
+                {
+                    "key": "dm2",
+                    "title": dm2_title,
+                    "cube": dm2_disp,
+                    "rms": dm2_rms,
+                    "ptv": dm2_ptv,
+                    "map_idx": dm2_midx,
+                    "vlim": _nice_opd_vlim(dm2_disp, pmask, min_lim=10.0),
+                    "source": dm2_src,
+                    "is_open": dm2_is_open,
+                },
+            ]
+        )
+        if wf_res_disp is not None:
+            panels.append(
+                {
+                    "key": "wf_res",
+                    "title": wf_res_title,
+                    "cube": wf_res_disp,
+                    "rms": wf_res_rms,
+                    "ptv": wf_res_ptv,
+                    "map_idx": wf_res_midx,
+                    "vlim": _nice_opd_vlim(wf_res_disp, pmask, min_lim=25.0),
+                    "source": wf_res_src,
+                    "is_open": False,
+                }
+            )
+    elif psol_disp is not None and dm1_disp is not None:
+        # Legacy telemetry without true incoming WF cube: 3 centered panels clearly labeled PSOL
+        wf_in_src = "psol"
+        vlim_psol = _nice_opd_vlim(psol_disp, pmask, min_lim=25.0)
+        vlim_dm1 = _nice_opd_vlim(dm1_disp, pmask, min_lim=25.0)
+        vlim_shared = max(vlim_psol, vlim_dm1)
+        panels.extend(
+            [
+                {
+                    "key": "wf_psol",
+                    "title": psol_title,
+                    "cube": psol_disp,
+                    "rms": psol_rms,
+                    "ptv": psol_ptv,
+                    "map_idx": psol_midx,
+                    "vlim": vlim_shared,
+                    "source": psol_src,
+                    "is_open": False,
+                },
+                {
+                    "key": "dm1",
+                    "title": dm1_title,
+                    "cube": dm1_disp,
+                    "rms": dm1_rms,
+                    "ptv": dm1_ptv,
+                    "map_idx": dm1_midx,
+                    "vlim": vlim_shared,
+                    "source": dm1_src,
+                    "is_open": False,
+                },
+                {
+                    "key": "dm2",
+                    "title": dm2_title,
+                    "cube": dm2_disp,
+                    "rms": dm2_rms,
+                    "ptv": dm2_ptv,
+                    "map_idx": dm2_midx,
+                    "vlim": _nice_opd_vlim(dm2_disp, pmask, min_lim=10.0),
+                    "source": dm2_src,
+                    "is_open": dm2_is_open,
+                },
+            ]
+        )
+
+    return {
+        "panels": panels,
+        "ext_m": ext_m,
+        "wf_in_source": wf_in_src,
+        "psol_source": psol_src,
+        "dm1_source": dm1_src,
+        "dm2_source": dm2_src,
+        "wf_res_source": wf_res_src,
+    }
 
 
 def normalize_psf_to_strehl(
@@ -389,6 +1390,7 @@ def render_telemetry_video(
     t_start_req: float = 5.0,
     duration_ms: float = 200.0,
     fps: int = 30,
+    realtime: bool = False,
 ) -> dict[str, object]:
     """Slice telemetry cubes around [t_start, t_start + duration] and encode H.264 MP4 + poster."""
     import matplotlib
@@ -424,10 +1426,12 @@ def render_telemetry_video(
         os.path.join(os.path.dirname(report_dir), "ao3k_scexao.bench"),
     ]
     bench_p = next((p for p in bench_cands if os.path.isfile(p)), None)
-    btiming = parse_bench_timing(bench_p)
-    tel_diam_m = float(manifest.get("tel_diam_m", btiming.get("tel_diam_m", TEL_DIAM_M)))
-    outer_hz = float(btiming.get("master_hz", fs_stg2))
-    oversample = int(round(btiming.get("oversample", 4.0)))
+    bcfg = parse_bench_config(bench_p)
+    tel_diam_m = float(manifest.get("tel_diam_m", bcfg.get("tel_diam_m", TEL_DIAM_M)))
+    bcfg["tel_diam_m"] = tel_diam_m
+    star_mag = float(bcfg.get("star_mag", 6.0))
+    outer_hz = float(bcfg.get("master_hz", fs_stg2))
+    oversample = int(round(float(bcfg.get("oversample", 4.0))))
     internal_hz = outer_hz * oversample
     internal_dt_us = 1.0e6 / max(internal_hz, 1.0)
 
@@ -451,39 +1455,107 @@ def render_telemetry_video(
 
     t_max_avail = min(float(idx.t_phys_s[-1]) for idx in indices.values())
     t_min_avail = max(float(idx.t_phys_s[0]) for idx in indices.values())
-    dur_s = min(max(duration_ms * 1.0e-3, 0.010), max(t_max_avail - t_min_avail, 0.010))
-
-    t_start = float(t_start_req)
-    if t_start + dur_s > t_max_avail - 1.0e-6:
-        t_start = max(t_min_avail, 0.5 * (t_min_avail + t_max_avail - dur_s))
-    t_start = max(t_start, t_min_avail)
-    t_end = min(t_max_avail, t_start + dur_s)
-
-    # Step on Stage-2 WFS outer grid (0.50 ms @ 2.0 kHz)
     wfs2_t = indices["wfs2"].t_phys_s
-    i2_0 = int(np.searchsorted(wfs2_t, t_start - 1.0e-7, side="left"))
-    i2_1 = int(np.searchsorted(wfs2_t, t_end + 1.0e-7, side="right"))
-    i2_1 = max(i2_0 + 2, min(i2_1, indices["wfs2"].n_frames))
-    t_grid = wfs2_t[i2_0:i2_1]
-    n_clip = int(t_grid.size)
-    t0_actual = float(t_grid[0])
-    t1_actual = float(t_grid[-1])
-    dt_step_ms = 1000.0 / max(indices["wfs2"].rate_hz, 1.0)
-    actual_dur_ms = max((t1_actual - t0_actual) * 1000.0, dt_step_ms)
-    slowdown = (1000.0 / dt_step_ms) / float(max(fps, 1))
+    wfs2_c0 = indices["wfs2"].cnt0
 
-    # Slice only the [s0:s1] range needed from each stream via memmap
+    if realtime:
+        phys_span_s = max(t_max_avail - t_min_avail, 1.0 / max(indices["wfs2"].rate_hz, 1.0))
+        n_vid = max(2, int(round(phys_span_s * float(max(fps, 1)))))
+        i2_sel = None
+        _, full_mp = _find_wfstat_meta(telem_dir, report_dir, "wf_full")
+        if full_mp is not None:
+            try:
+                with open(full_mp, "r", encoding="utf-8") as fh:
+                    fmeta = json.load(fh)
+                fc0 = np.asarray(fmeta.get("wfs2_cnt0", []), dtype=np.int64)
+                if (
+                    fc0.size >= 2
+                    and np.all(fc0 > 0)
+                    and abs(int(fc0.size) - n_vid) <= max(3, int(round(0.10 * n_vid)))
+                ):
+                    p = np.clip(np.searchsorted(wfs2_c0, fc0, side="left"), 0, wfs2_c0.size - 1)
+                    prev = np.clip(p - 1, 0, wfs2_c0.size - 1)
+                    p = np.where(np.abs(wfs2_c0[prev] - fc0) < np.abs(wfs2_c0[p] - fc0), prev, p)
+                    # Keep samples strictly within [t_min_avail, t_max_avail]
+                    valid_t = (wfs2_t[p] >= t_min_avail - 1.0e-5) & (
+                        wfs2_t[p] <= t_max_avail + 1.0e-5
+                    )
+                    if int(np.sum(valid_t)) >= 2:
+                        i2_sel = p[valid_t]
+            except (OSError, json.JSONDecodeError):
+                i2_sel = None
+        if i2_sel is None:
+            t_targets = np.linspace(t_min_avail, t_max_avail, n_vid)
+            p = np.clip(np.searchsorted(wfs2_t, t_targets, side="left"), 0, wfs2_t.size - 1)
+            prev = np.clip(p - 1, 0, wfs2_t.size - 1)
+            i2_sel = np.where(
+                np.abs(wfs2_t[prev] - t_targets) < np.abs(wfs2_t[p] - t_targets), prev, p
+            )
+        t_grid = wfs2_t[i2_sel]
+        wfs2_cnt0_clip = wfs2_c0[i2_sel]
+        n_clip = int(t_grid.size)
+        t0_actual = float(t_grid[0])
+        t1_actual = float(t_grid[-1])
+        actual_dur_ms = max(
+            (t1_actual - t0_actual) * 1000.0,
+            1000.0 / max(indices["wfs2"].rate_hz, 1.0),
+        )
+        dt_step_ms = actual_dur_ms / float(max(n_clip - 1, 1))
+        slowdown = (n_clip / float(max(fps, 1))) / max(actual_dur_ms * 1.0e-3, 1.0e-6)
+    else:
+        dur_s = min(max(duration_ms * 1.0e-3, 0.010), max(t_max_avail - t_min_avail, 0.010))
+        t_start = float(t_start_req)
+        if t_start + dur_s > t_max_avail - 1.0e-6:
+            t_start = max(t_min_avail, 0.5 * (t_min_avail + t_max_avail - dur_s))
+        t_start = max(t_start, t_min_avail)
+        t_end = min(t_max_avail, t_start + dur_s)
+
+        # Step on Stage-2 WFS outer grid (0.50 ms @ 2.0 kHz)
+        i2_0 = int(np.searchsorted(wfs2_t, t_start - 1.0e-7, side="left"))
+        i2_1 = int(np.searchsorted(wfs2_t, t_end + 1.0e-7, side="right"))
+        i2_1 = max(i2_0 + 2, min(i2_1, indices["wfs2"].n_frames))
+        t_grid = wfs2_t[i2_0:i2_1]
+        wfs2_cnt0_clip = wfs2_c0[i2_0:i2_1]
+        n_clip = int(t_grid.size)
+        t0_actual = float(t_grid[0])
+        t1_actual = float(t_grid[-1])
+        dt_step_ms = 1000.0 / max(indices["wfs2"].rate_hz, 1.0)
+        actual_dur_ms = max((t1_actual - t0_actual) * 1000.0, dt_step_ms)
+        slowdown = (1000.0 / dt_step_ms) / float(max(fps, 1))
+
+    # Extract only the needed frames from each stream via memmap (sparse-safe for 10s realtime)
     sliced_cubes: dict[str, np.ndarray] = {}
     map_idx: dict[str, np.ndarray] = {}
     abs_idx: dict[str, np.ndarray] = {}
     for key, idx in indices.items():
         pos = np.searchsorted(idx.t_phys_s, t_grid + 1.0e-7, side="right") - 1
         pos = np.clip(pos, 0, idx.n_frames - 1)
-        s0 = int(np.min(pos))
-        s1 = int(np.max(pos)) + 1
-        sliced_cubes[key] = idx.load_slice(s0, s1)
-        map_idx[key] = pos - s0
+        uniq, inv = np.unique(pos, return_inverse=True)
+        s0 = int(uniq[0])
+        s1 = int(uniq[-1]) + 1
+        if (s1 - s0) <= max(64, 2 * int(uniq.size)):
+            sliced_cubes[key] = idx.load_slice(s0, s1)
+            map_idx[key] = pos - s0
+        else:
+            sliced_cubes[key] = idx.load_indices(uniq)
+            map_idx[key] = inv
         abs_idx[key] = pos + 1  # 1-based exposure index
+
+    # Load synchronized Incoming Pupil WF, Stage-1/Stage-2 DM shapes, and optional Residual WF
+    wf_dm_info = _load_wf_and_dm_panels(
+        telem_dir=telem_dir,
+        report_dir=report_dir,
+        bcfg=bcfg,
+        phys_time_s=phys_time_s,
+        fs_stg1=fs_stg1,
+        fs_stg2=fs_stg2,
+        t_grid=t_grid,
+        wfs2_cnt0_clip=wfs2_cnt0_clip,
+        realtime=realtime,
+    )
+    wf_dm_panels = list(wf_dm_info["panels"])
+    has_wf_dm_row = len(wf_dm_panels) > 0
+    ext_m = wf_dm_info["ext_m"]
 
     # Reference-subtracted WFS signals (exact acquireWFSim formula using calib_stg{1,2})
     wfs1_raw = sliced_cubes["wfs1"]
@@ -554,13 +1626,13 @@ def render_telemetry_video(
                     0,
                     midx.n_frames - 1,
                 )
-                ms0, ms1 = int(np.min(mpos)), int(np.max(mpos)) + 1
-                mcube = midx.load_slice(ms0, ms1).reshape(ms1 - ms0, -1)
+                m_uniq, m_inv = np.unique(mpos, return_inverse=True)
+                mcube = midx.load_indices(m_uniq).reshape(int(m_uniq.size), -1)
                 mrms = np.sqrt(np.sum(mcube.astype(np.float64) ** 2, axis=1)) * 1000.0
                 if tag == "stg1":
-                    wfe_stg1_nm = mrms[mpos - ms0]
+                    wfe_stg1_nm = mrms[m_inv]
                 else:
-                    wfe_final_nm = mrms[mpos - ms0]
+                    wfe_final_nm = mrms[m_inv]
         if wfe_stg1_nm is None:
             wfe_stg1_nm = np.zeros_like(t_rel_ms)
         if wfe_final_nm is None:
@@ -569,38 +1641,87 @@ def render_telemetry_video(
     # Fixed color-scale limits across entire clip (prevents flicker)
     w1_vmin, w1_vmax = 95.0, max(150.0, float(np.percentile(wfs1_raw, 99.7)))
     w2_vmin, w2_vmax = 95.0, max(150.0, float(np.percentile(wfs2_raw, 99.7)))
-    s1_disp = wfs1_sig * 1.0e4
-    s2_disp = wfs2_sig * 1.0e4
-    s1_lim = max(0.5, float(np.percentile(np.abs(s1_disp), 99.5)))
-    s2_lim = max(0.5, float(np.percentile(np.abs(s2_disp), 99.5)))
+    s1_disp, s1_lim, s1_exp_lbl = _scale_wfs_refsub(wfs1_sig, pct=99.0)
+    s2_disp, s2_lim, s2_exp_lbl = _scale_wfs_refsub(wfs2_sig, pct=99.0)
 
     w1_sum_kadu = np.sum(wfs1_raw.astype(np.float64), axis=(1, 2)) * 1.0e-3
     w1_max_adu = np.max(wfs1_raw, axis=(1, 2))
     w2_sum_kadu = np.sum(wfs2_raw.astype(np.float64), axis=(1, 2)) * 1.0e-3
     w2_max_adu = np.max(wfs2_raw, axis=(1, 2))
-    s1_rms_e4 = np.sqrt(np.mean(wfs1_sig.astype(np.float64) ** 2, axis=(1, 2))) * 1.0e4
-    s2_rms_e4 = np.sqrt(np.mean(wfs2_sig.astype(np.float64) ** 2, axis=(1, 2))) * 1.0e4
+    s1_rms = np.sqrt(np.mean(wfs1_sig.astype(np.float64) ** 2, axis=(1, 2)))
+    s2_rms = np.sqrt(np.mean(wfs2_sig.astype(np.float64) ** 2, axis=(1, 2)))
 
-    # Build Matplotlib figure once (1480 x 1000 px @ 100 dpi, even dimensions for H.264 yuv420p)
-    fig = plt.figure(figsize=(14.8, 10.0), dpi=100, facecolor="#ffffff")
-    gs = GridSpec(
-        3,
-        4,
-        figure=fig,
-        height_ratios=[1.02, 1.06, 0.72],
-        left=0.052,
-        right=0.946,
-        bottom=0.058,
-        top=0.858,
-        hspace=0.37,
-        wspace=0.28,
-    )
+    # Build Matplotlib figure once (even dimensions for H.264 yuv420p)
+    n_wfdm = len(wf_dm_panels)
+    if has_wf_dm_row:
+        if n_wfdm == 5:
+            fig = plt.figure(figsize=(17.6, 12.4), dpi=100, facecolor="#ffffff")
+            gs = GridSpec(
+                4,
+                4,
+                figure=fig,
+                height_ratios=[1.00, 1.02, 1.06, 0.72],
+                left=0.095,
+                right=0.905,
+                bottom=0.046,
+                top=0.892,
+                hspace=0.36,
+                wspace=0.28,
+            )
+        else:
+            fig = plt.figure(figsize=(14.8, 12.8), dpi=100, facecolor="#ffffff")
+            gs = GridSpec(
+                4,
+                4,
+                figure=fig,
+                height_ratios=[1.02, 1.02, 1.06, 0.72],
+                left=0.052,
+                right=0.946,
+                bottom=0.046,
+                top=0.892,
+                hspace=0.36,
+                wspace=0.28,
+            )
+        title_y = 0.986
+        hud_rect = [0.04, 0.926, 0.92, 0.036]
+        row_wfs = 1
+        row_psf = 2
+        row_ts = 3
+        title_tag = "Full-Duration Real-Time" if realtime else "Short-Timescale"
+        fig_title = (
+            f"Subaru {tel_diam_m:.2f} m AO3k + SCExAO — "
+            f"{title_tag} WF, DM, WFS & PSF Evolution "
+            f"(Seeing = {seeing_arcsec:.2f}\", mV = mH = {star_mag:.1f})"
+        )
+    else:
+        fig = plt.figure(figsize=(14.8, 10.0), dpi=100, facecolor="#ffffff")
+        gs = GridSpec(
+            3,
+            4,
+            figure=fig,
+            height_ratios=[1.02, 1.06, 0.72],
+            left=0.052,
+            right=0.946,
+            bottom=0.058,
+            top=0.858,
+            hspace=0.37,
+            wspace=0.28,
+        )
+        title_y = 0.978
+        hud_rect = [0.04, 0.902, 0.92, 0.044]
+        row_wfs = 0
+        row_psf = 1
+        row_ts = 2
+        title_tag = "Full-Duration Real-Time" if realtime else "Short-Timescale"
+        fig_title = (
+            f"Subaru {tel_diam_m:.2f} m AO3k + SCExAO — {title_tag} WFS & PSF Evolution "
+            f"(Seeing = {seeing_arcsec:.2f}\", mV = mH = {star_mag:.1f})"
+        )
 
     fig.text(
         0.5,
-        0.978,
-        f"Subaru {tel_diam_m:.2f} m AO3k + SCExAO — Short-Timescale WFS & PSF Evolution "
-        f"(Seeing = {seeing_arcsec:.2f}\", mV = mH = 6.0)",
+        title_y,
+        fig_title,
         ha="center",
         va="top",
         fontsize=13.2,
@@ -608,7 +1729,7 @@ def render_telemetry_video(
         color="#0f172a",
     )
     # Dedicated thin top axis for clean HUD blitting without touching subplot titles
-    ax_hud = fig.add_axes([0.04, 0.902, 0.92, 0.044])
+    ax_hud = fig.add_axes(hud_rect)
     ax_hud.set_axis_off()
     hud_text = ax_hud.text(
         0.5,
@@ -624,7 +1745,82 @@ def render_telemetry_video(
         bbox=dict(boxstyle="round,pad=0.30", fc="#f1f5f9", ec="#cbd5e1", lw=1.0),
     )
 
-    # Row 0: 4 Pyramid WFS panels
+    # Row 0 (optional): Incoming Pupil WF, PSOL, Diff, DM1/DM2 Shapes & optional Residual WF
+    wf_dm_ims = []
+    wf_dm_badges = []
+    if has_wf_dm_row:
+        cmap_opd = matplotlib.colormaps["RdBu_r"].copy()
+        cmap_opd.set_bad("#141820")
+        if n_wfdm == 5:
+            r0_box = gs[0, 0].get_position(fig)
+            gs_r0 = GridSpec(
+                1,
+                5,
+                figure=fig,
+                left=0.042,
+                right=0.956,
+                bottom=float(r0_box.y0),
+                top=float(r0_box.y1),
+                wspace=0.34,
+            )
+            r0_slots = [gs_r0[0, c] for c in range(5)]
+        elif n_wfdm == 3:
+            r0_box = gs[0, 0].get_position(fig)
+            gs_r0 = GridSpec(
+                1,
+                3,
+                figure=fig,
+                left=0.165,
+                right=0.835,
+                bottom=float(r0_box.y0),
+                top=float(r0_box.y1),
+                wspace=0.28,
+            )
+            r0_slots = [gs_r0[0, c] for c in range(3)]
+        else:
+            r0_slots = [gs[0, c] for c in range(n_wfdm)]
+
+        r0_title_fs = 9.2 if n_wfdm == 5 else 9.8
+        for col_i, pinfo in enumerate(wf_dm_panels):
+            ax = fig.add_subplot(r0_slots[col_i])
+            cube = pinfo["cube"]
+            midx_arr = pinfo["map_idx"]
+            vlim = float(pinfo["vlim"])
+            im = ax.imshow(
+                cube[midx_arr[0]],
+                origin="lower",
+                extent=ext_m,
+                cmap=cmap_opd,
+                vmin=-vlim,
+                vmax=vlim,
+                interpolation="nearest",
+            )
+            ax.set_title(str(pinfo["title"]), fontsize=r0_title_fs, fontweight="bold", pad=5)
+            ax.set_xlabel("x [m]", fontsize=8.3, labelpad=2)
+            ax.set_ylabel("y [m]" if col_i == 0 else "", fontsize=8.5, labelpad=2)
+            ax.xaxis.set_major_locator(MaxNLocator(5))
+            ax.yaxis.set_major_locator(MaxNLocator(5))
+            ax.tick_params(labelsize=7.8)
+            cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+            cb.ax.tick_params(labelsize=7.4)
+            cb.ax.yaxis.set_major_locator(MaxNLocator(4))
+            cb.set_label("OPD [nm]", fontsize=7.6)
+            bd = ax.text(
+                0.03,
+                0.04,
+                "",
+                transform=ax.transAxes,
+                fontsize=7.7 if n_wfdm == 5 else 7.9,
+                family="monospace",
+                color="white",
+                bbox=dict(boxstyle="round,pad=0.22", fc="black", ec="none", alpha=0.72),
+            )
+            wf_dm_ims.append(
+                (ax, im, cube, midx_arr, pinfo["rms"], pinfo["ptv"], bool(pinfo["is_open"]))
+            )
+            wf_dm_badges.append((ax, bd))
+
+    # Row 1 (or 0): 4 Pyramid WFS panels
     wfs_specs = [
         (
             0,
@@ -645,7 +1841,7 @@ def render_telemetry_video(
             "RdBu_r",
             -s1_lim,
             s1_lim,
-            "Signal [×10⁻⁴ norm]",
+            f"Signal [{s1_exp_lbl} norm]",
             "sig",
         ),
         (
@@ -667,14 +1863,14 @@ def render_telemetry_video(
             "RdBu_r",
             -s2_lim,
             s2_lim,
-            "Signal [×10⁻⁴ norm]",
+            f"Signal [{s2_exp_lbl} norm]",
             "sig",
         ),
     ]
     wfs_ims = []
     wfs_badges = []
     for col, title, cube, midx_arr, cmap_n, vmin, vmax, cblab, kind in wfs_specs:
-        ax = fig.add_subplot(gs[0, col])
+        ax = fig.add_subplot(gs[row_wfs, col])
         im = ax.imshow(
             cube[midx_arr[0]],
             origin="lower",
@@ -748,7 +1944,7 @@ def render_telemetry_video(
     psf_badges = []
     log_norm = Normalize(vmin=-4.0, vmax=0.0)
     for col, bkey, skey, title in psf_specs:
-        ax = fig.add_subplot(gs[1, col])
+        ax = fig.add_subplot(gs[row_psf, col])
         pk = f"psf_{bkey}_{skey}"
         cube_log = psf_sr[(bkey, skey)]
         midx_arr = map_idx[pk]
@@ -813,11 +2009,20 @@ def render_telemetry_video(
         psf_ims.append((ax, im, c30, c23, leg_p, cube_log, midx_arr, bkey, skey, pk))
         psf_badges.append((ax, bd))
 
-    # Row 2 Left: Residual WFE strip chart
-    ax_wfe = fig.add_subplot(gs[2, 0:2])
-    ax_wfe.plot(t_rel_ms, wfe_stg1_nm, color="#ff7f0e", lw=1.6, label="Post-AO3k (Stg 1)")
+    # Row 3 Left: Residual WFE strip chart
+    x_is_sec = bool(realtime or actual_dur_ms > 1000.0)
+    x_ts = t_grid if x_is_sec else t_rel_ms
+    x_lim0 = float(x_ts[0]) if x_is_sec else 0.0
+    x_lim1 = max(float(x_ts[-1]), x_lim0 + (0.01 if x_is_sec else 1.0))
+    x_lbl = (
+        "Physical Simulation Time t [s]"
+        if x_is_sec
+        else f"Window Time Offset Δt [ms]  (t₀ = {t0_actual:.3f} s)"
+    )
+    ax_wfe = fig.add_subplot(gs[row_ts, 0:2])
+    ax_wfe.plot(x_ts, wfe_stg1_nm, color="#ff7f0e", lw=1.6, label="Post-AO3k (Stg 1)")
     ax_wfe.plot(
-        t_rel_ms, wfe_final_nm, color="#1f77b4", lw=1.8, label="Post-SCExAO (Final Stg 1+2)"
+        x_ts, wfe_final_nm, color="#1f77b4", lw=1.8, label="Post-SCExAO (Final Stg 1+2)"
     )
     if wfe_label_mode == "pupil":
         ax_wfe.axhline(
@@ -842,15 +2047,15 @@ def render_telemetry_video(
             fontweight="bold",
         )
     wfe_top = max(145.0, float(np.max(np.concatenate([wfe_stg1_nm, wfe_final_nm]))) * 1.25)
-    ax_wfe.set_xlim(0.0, max(float(t_rel_ms[-1]), 1.0))
+    ax_wfe.set_xlim(x_lim0, x_lim1)
     ax_wfe.set_ylim(0.0, wfe_top)
-    ax_wfe.set_xlabel(f"Window Time Offset Δt [ms]  (t₀ = {t0_actual:.3f} s)", fontsize=8.8)
+    ax_wfe.set_xlabel(x_lbl, fontsize=8.8)
     ax_wfe.tick_params(labelsize=8.2)
     ax_wfe.grid(True, alpha=0.28)
     leg_wfe = ax_wfe.legend(loc="upper right", fontsize=7.8, ncol=3, framealpha=0.90)
-    cur_wfe = ax_wfe.axvline(0.0, color="#7c3aed", lw=1.9, zorder=5, animated=True)
+    cur_wfe = ax_wfe.axvline(x_lim0, color="#7c3aed", lw=1.9, zorder=5, animated=True)
     (dot_w1,) = ax_wfe.plot(
-        [0.0],
+        [x_lim0],
         [wfe_stg1_nm[0]],
         "o",
         color="#ff7f0e",
@@ -860,7 +2065,7 @@ def render_telemetry_video(
         animated=True,
     )
     (dot_w2,) = ax_wfe.plot(
-        [0.0],
+        [x_lim0],
         [wfe_final_nm[0]],
         "o",
         color="#1f77b4",
@@ -870,23 +2075,23 @@ def render_telemetry_video(
         animated=True,
     )
 
-    # Row 2 Right: Short-Exposure Strehl strip chart
-    ax_sr = fig.add_subplot(gs[2, 2:4])
+    # Row 3 Right: Short-Exposure Strehl strip chart
+    ax_sr = fig.add_subplot(gs[row_ts, 2:4])
     sr_v1 = psf_peak_sr[("vis", "stg1")]
     sr_vf = psf_peak_sr[("vis", "final")]
     sr_n1 = psf_peak_sr[("nir", "stg1")]
     sr_nf = psf_peak_sr[("nir", "final")]
-    ax_sr.plot(t_rel_ms, sr_v1, color="#0284c7", ls="--", lw=1.35, alpha=0.85, label="Vis Stg 1")
-    ax_sr.plot(t_rel_ms, sr_vf, color="#1d4ed8", lw=1.8, label="Vis Final")
-    ax_sr.plot(t_rel_ms, sr_n1, color="#f59e0b", ls="--", lw=1.35, alpha=0.85, label="H Stg 1")
-    ax_sr.plot(t_rel_ms, sr_nf, color="#dc2626", lw=1.8, label="H Final")
+    ax_sr.plot(x_ts, sr_v1, color="#0284c7", ls="--", lw=1.35, alpha=0.85, label="Vis Stg 1")
+    ax_sr.plot(x_ts, sr_vf, color="#1d4ed8", lw=1.8, label="Vis Final")
+    ax_sr.plot(x_ts, sr_n1, color="#f59e0b", ls="--", lw=1.35, alpha=0.85, label="H Stg 1")
+    ax_sr.plot(x_ts, sr_nf, color="#dc2626", lw=1.8, label="H Final")
     sr_max = max(50.0, float(np.max(np.concatenate([sr_v1, sr_vf, sr_n1, sr_nf]))) * 1.18)
-    ax_sr.set_xlim(0.0, max(float(t_rel_ms[-1]), 1.0))
+    ax_sr.set_xlim(x_lim0, x_lim1)
     ax_sr.set_ylim(0.0, min(112.0, sr_max))
     if sr_max > 95.0:
         ax_sr.set_yticks([0, 20, 40, 60, 80, 100])
     ax_sr.set_ylabel("Short-Exp Strehl [%]", fontsize=9.0)
-    ax_sr.set_xlabel(f"Window Time Offset Δt [ms]  (t₀ = {t0_actual:.3f} s)", fontsize=8.8)
+    ax_sr.set_xlabel(x_lbl, fontsize=8.8)
     ax_sr.set_title(
         "Instantaneous Peak Strehl Ratio (Vis 0.75 µm & H-Band 1.65 µm)",
         fontsize=10.0,
@@ -897,15 +2102,19 @@ def render_telemetry_video(
     sr_all = np.concatenate([sr_v1, sr_vf, sr_n1, sr_nf])
     sr_leg_loc = "lower right" if float(np.min(sr_all)) > 35.0 else "upper right"
     leg_sr = ax_sr.legend(loc=sr_leg_loc, fontsize=7.8, ncol=4, framealpha=0.90)
-    cur_sr = ax_sr.axvline(0.0, color="#7c3aed", lw=1.9, zorder=5, animated=True)
+    cur_sr = ax_sr.axvline(x_lim0, color="#7c3aed", lw=1.9, zorder=5, animated=True)
     (dot_sv,) = ax_sr.plot(
-        [0.0], [sr_vf[0]], "o", color="#1d4ed8", mec="#0f172a", ms=6.0, zorder=6, animated=True
+        [x_lim0], [sr_vf[0]], "o", color="#1d4ed8", mec="#0f172a", ms=6.0, zorder=6, animated=True
     )
     (dot_sn,) = ax_sr.plot(
-        [0.0], [sr_nf[0]], "o", color="#dc2626", mec="#0f172a", ms=6.0, zorder=6, animated=True
+        [x_lim0], [sr_nf[0]], "o", color="#dc2626", mec="#0f172a", ms=6.0, zorder=6, animated=True
     )
 
     hud_text.set_animated(True)
+    for _, im, _, _, _, _, _ in wf_dm_ims:
+        im.set_animated(True)
+    for _, bd in wf_dm_badges:
+        bd.set_animated(True)
     for _, im, _, _ in wfs_ims:
         im.set_animated(True)
     for _, bd in wfs_badges:
@@ -971,17 +2180,41 @@ def render_telemetry_video(
     def _draw_frame(k: int):
         fig.canvas.restore_region(bg_cache)
         t_cur = float(t_grid[k])
+        x_cur = float(x_ts[k])
         dt_ms = float(t_rel_ms[k])
         outer_tick = int(round(t_cur * outer_hz))
         sub_tick = outer_tick * oversample
-        hud_text.set_text(
-            f"t = {t_cur:7.4f} s (+{dt_ms:5.1f} / {actual_dur_ms:5.1f} ms)  |  "
-            f"Outer {outer_hz/1e3:.1f} kHz Tick: {outer_tick:6,d}  |  "
-            f"Internal {internal_hz/1e3:.1f} kHz Sub-Tick "
-            f"({internal_dt_us:.0f} µs): {sub_tick:7,d}  |  "
-            f"{slowdown:.1f}× Slow-Motion ({fps} fps)"
-        )
+        if realtime:
+            hud_text.set_text(
+                f"t = {t_cur:6.3f} / {t1_actual:6.3f} s  |  "
+                f"Outer {outer_hz/1e3:.1f} kHz Tick: {outer_tick:6,d}  |  "
+                f"Internal {internal_hz/1e3:.1f} kHz Sub-Tick "
+                f"({internal_dt_us:.0f} µs): {sub_tick:7,d}  |  "
+                f"1.0× Real-Time ({fps} fps)"
+            )
+        else:
+            hud_text.set_text(
+                f"t = {t_cur:7.4f} s (+{dt_ms:5.1f} / {actual_dur_ms:5.1f} ms)  |  "
+                f"Outer {outer_hz/1e3:.1f} kHz Tick: {outer_tick:6,d}  |  "
+                f"Internal {internal_hz/1e3:.1f} kHz Sub-Tick "
+                f"({internal_dt_us:.0f} µs): {sub_tick:7,d}  |  "
+                f"{slowdown:.1f}× Slow-Motion ({fps} fps)"
+            )
         ax_hud.draw_artist(hud_text)
+
+        for d_i, (ax_d, im, cube, midx_arr, rms_a, ptv_a, is_open) in enumerate(wf_dm_ims):
+            j_d = int(midx_arr[k])
+            im.set_data(cube[j_d])
+            if is_open:
+                wf_dm_badges[d_i][1].set_text("RMS =   0.0 nm\nPTV =   0 nm (Open)")
+            else:
+                wf_dm_badges[d_i][1].set_text(
+                    f"RMS = {float(rms_a[j_d]):6.1f} nm\nPTV = {float(ptv_a[j_d]):6.0f} nm"
+                )
+            ax_d.draw_artist(im)
+            for sp in ax_d.spines.values():
+                ax_d.draw_artist(sp)
+            ax_d.draw_artist(wf_dm_badges[d_i][1])
 
         i1 = int(map_idx["wfs1"][k])
         i2 = int(map_idx["wfs2"][k])
@@ -989,12 +2222,12 @@ def render_telemetry_video(
             f"Max = {w1_max_adu[i1]:5.0f} ADU\n"
             f"Sum = {w1_sum_kadu[i1]:4.0f} kADU (#{int(abs_idx['wfs1'][k])})"
         )
-        wfs_badges[1][1].set_text(f"RMS = {s1_rms_e4[i1]:5.2f}e-4")
+        wfs_badges[1][1].set_text(f"RMS = {_fmt_sci(float(s1_rms[i1]))}")
         wfs_badges[2][1].set_text(
             f"Max = {w2_max_adu[i2]:5.0f} ADU\n"
             f"Sum = {w2_sum_kadu[i2]:4.0f} kADU (#{int(abs_idx['wfs2'][k])})"
         )
-        wfs_badges[3][1].set_text(f"RMS = {s2_rms_e4[i2]:5.2f}e-4")
+        wfs_badges[3][1].set_text(f"RMS = {_fmt_sci(float(s2_rms[i2]))}")
 
         for w_i, (ax_w, im, cube, midx_arr) in enumerate(wfs_ims):
             im.set_data(cube[midx_arr[k]])
@@ -1019,17 +2252,17 @@ def render_telemetry_video(
                 ax_p.draw_artist(leg_p)
             ax_p.draw_artist(psf_badges[p_i][1])
 
-        cur_wfe.set_xdata([dt_ms, dt_ms])
-        dot_w1.set_data([dt_ms], [float(wfe_stg1_nm[k])])
-        dot_w2.set_data([dt_ms], [float(wfe_final_nm[k])])
+        cur_wfe.set_xdata([x_cur, x_cur])
+        dot_w1.set_data([x_cur], [float(wfe_stg1_nm[k])])
+        dot_w2.set_data([x_cur], [float(wfe_final_nm[k])])
         ax_wfe.draw_artist(cur_wfe)
         ax_wfe.draw_artist(dot_w1)
         ax_wfe.draw_artist(dot_w2)
         ax_wfe.draw_artist(leg_wfe)
 
-        cur_sr.set_xdata([dt_ms, dt_ms])
-        dot_sv.set_data([dt_ms], [float(sr_vf[k])])
-        dot_sn.set_data([dt_ms], [float(sr_nf[k])])
+        cur_sr.set_xdata([x_cur, x_cur])
+        dot_sv.set_data([x_cur], [float(sr_vf[k])])
+        dot_sn.set_data([x_cur], [float(sr_nf[k])])
         ax_sr.draw_artist(cur_sr)
         ax_sr.draw_artist(dot_sv)
         ax_sr.draw_artist(dot_sn)
@@ -1153,6 +2386,7 @@ def render_telemetry_video(
     meta = {
         "video_file": os.path.basename(out_mp4),
         "poster_file": poster_base,
+        "playback_mode": "realtime" if realtime else "short_slowmo",
         "telemetry_mode": str(manifest.get("mode", "custom")),
         "t_start_s": round(t0_actual, 6),
         "t_end_s": round(t1_actual, 6),
@@ -1179,8 +2413,31 @@ def render_telemetry_video(
         "nir_final_sr_min_pct": round(float(np.min(sr_nf)), 2),
         "nir_final_sr_max_pct": round(float(np.max(sr_nf)), 2),
         "wfe_final_mean_nm": round(float(np.mean(wfe_final_nm)), 2),
+        "wf_in_source": str(wf_dm_info["wf_in_source"]),
+        "psol_source": str(wf_dm_info["psol_source"]),
+        "dm1_source": str(wf_dm_info["dm1_source"]),
+        "dm2_source": str(wf_dm_info["dm2_source"]),
+        "wf_res_source": str(wf_dm_info["wf_res_source"]),
+        "has_wf_dm_row": bool(has_wf_dm_row),
+        "wf_dm_panel_count": int(n_wfdm),
+        "has_psol_wf": any(str(p["key"]) == "wf_psol" for p in wf_dm_panels),
+        "has_wf_psol_diff": any(str(p["key"]) == "wf_diff" for p in wf_dm_panels),
+        "has_residual_wf": any(str(p["key"]) == "wf_res" for p in wf_dm_panels),
         "render_wall_s": round(wall_render_s, 2),
     }
+    for pinfo in wf_dm_panels:
+        pk = str(pinfo["key"])
+        r_vals = pinfo["rms"][pinfo["map_idx"]]
+        if pk == "wf_in":
+            meta["wf_in_rms_mean_nm"] = round(float(np.mean(r_vals)), 1)
+        elif pk == "wf_psol":
+            meta["psol_rms_mean_nm"] = round(float(np.mean(r_vals)), 1)
+        elif pk == "wf_diff":
+            meta["wf_psol_diff_rms_mean_nm"] = round(float(np.mean(r_vals)), 1)
+        elif pk == "dm1":
+            meta["dm1_opd_rms_mean_nm"] = round(float(np.mean(r_vals)), 1)
+        elif pk == "dm2":
+            meta["dm2_opd_rms_mean_nm"] = round(float(np.mean(r_vals)), 1)
     if meta_json:
         with open(meta_json, "w", encoding="utf-8") as fh:
             json.dump(meta, fh, indent=2)
@@ -1191,12 +2448,12 @@ def render_telemetry_video(
 def main(argv: list[str] | None = None) -> int:
     args_raw = sys.argv[1:] if argv is None else argv
     if any(a in ("-h1", "--help-oneline") for a in args_raw):
-        print("render short-timescale WFS & PSF evolution MP4 video from AO telemetry cubes")
+        print("render short-timescale WF, DM, WFS & PSF evolution MP4 video from AO telemetry")
         return 0
     if any(a in ("-h2", "--help-description") for a in args_raw):
         print(
-            "Memory-map streamFITSlog AO telemetry cubes (csim_wfs_*, psf_*) and render a\n"
-            "synchronized slow-motion H.264 MP4 movie + poster frame for AO web reports."
+            "Memory-map streamFITSlog AO telemetry cubes (b_pup/wf_clip, dm01/dm02, csim_wfs_*,\n"
+            "psf_*) and render a synchronized slow-motion H.264 MP4 movie + poster frame."
         )
         return 0
 
@@ -1249,14 +2506,20 @@ def main(argv: list[str] | None = None) -> int:
         default=30,
         help="Video playback frame rate [fps] (default: 30)",
     )
+    parser.add_argument(
+        "--realtime",
+        action="store_true",
+        help="Render full simulation duration at 1.0x physical time (e.g. 10 s -> 10 s video)",
+    )
     args = parser.parse_args(args_raw)
 
     telem_dir = os.path.abspath(args.telemetry_dir)
     report_dir = os.path.abspath(args.report_dir) if args.report_dir else os.path.dirname(telem_dir)
+    def_mp4_name = "wfs_psf_full_evolution.mp4" if args.realtime else "wfs_psf_short_evolution.mp4"
     out_mp4 = (
         os.path.abspath(args.out)
         if args.out
-        else os.path.join(report_dir, "wfs_psf_short_evolution.mp4")
+        else os.path.join(report_dir, def_mp4_name)
     )
     meta = render_telemetry_video(
         telem_dir=telem_dir,
@@ -1267,13 +2530,18 @@ def main(argv: list[str] | None = None) -> int:
         t_start_req=args.t_start,
         duration_ms=args.duration_ms,
         fps=args.fps,
+        realtime=bool(args.realtime),
     )
     sz_mb = float(meta["size_bytes"]) / (1024.0 * 1024.0)
+    rate_desc = (
+        f"1.0x real-time @ {meta['fps']} fps"
+        if args.realtime
+        else f"{meta['slowdown_factor']}x slow-motion @ {meta['fps']} fps"
+    )
     print(
         f"[telemetry-video] Rendered {meta['n_frames']} frames "
         f"(t = {meta['t_start_s']:.3f}..{meta['t_end_s']:.3f} s, "
-        f"{meta['slowdown_factor']}x slow-motion @ {meta['fps']} fps) -> "
-        f"{out_mp4} ({sz_mb:.2f} MiB in {meta['render_wall_s']:.1f} s)"
+        f"{rate_desc}) -> {out_mp4} ({sz_mb:.2f} MiB in {meta['render_wall_s']:.1f} s)"
     )
     return 0
 

@@ -2064,6 +2064,75 @@ static void render_beam_subtree(
         return;
     }
 
+    /* Case 1c: Single inline Atmospheric Dispersion Compensator (ADC) -> keep vertical axis */
+    if (n_cons == 1 && ctx->nodes[consumers[0]].cfg.kind == CACAOSIM_NODE_ADC)
+    {
+        const cacaosim_bench_node_t *nd  = &ctx->nodes[consumers[0]];
+        const char                  *sep = ev->ascii ? " | " : " │ ";
+
+        sbuf_t c1;
+        sb_init(&c1);
+        sb_fg(&c1, ev->lvl, ev->pal->fg_conn);
+        sb_puts(&c1, prefix);
+        sb_puts(&c1, vbar);
+        panel_row(ev, ev->pal->fg_conn, c1.data);
+
+        sbuf_t line;
+        sb_init(&line);
+        sb_fg(&line, ev->lvl, ev->pal->fg_conn);
+        sb_puts(&line, prefix);
+        sb_puts(&line, darr);
+        sb_puts(&line, " ");
+        sb_soft_pill(&line, ev->lvl, ev->pal->bg_panel, ev->pal->fg_stream, "ADC");
+        sb_puts(&line, " ");
+        sb_bold(&line, ev->lvl);
+        sb_fg(&line, ev->lvl, ev->pal->fg_bright);
+        sb_printf(&line, "%-11s", nd->cfg.id);
+        sb_rst(&line, ev->lvl);
+
+        sb_fg(&line, ev->lvl, ev->pal->fg_text);
+        sb_printf(&line, " %s (%s/%s)", cacaosim_adc_preset_str(nd->cfg.adc.preset),
+                  cacaosim_adc_mode_str(nd->cfg.adc.mode),
+                  cacaosim_adc_opt_band_str(nd->cfg.adc.opt_band));
+        sb_fg(&line, ev->lvl, ev->pal->fg_dim);
+        sb_puts(&line, sep);
+        sb_fg(&line, ev->lvl, ev->pal->fg_muted);
+        sb_printf(&line, "z=%.1fdeg psi=%.1fdeg res(H)=%.1fmas",
+                  ctx->cfg.atm_disp.zenith_deg, nd->adc_ctx.last_state[2],
+                  nd->adc_ctx.last_state[8]);
+        if (nd->cfg.out_state[0] != '\0')
+        {
+            sb_puts(&line, "  ");
+            sb_fg(&line, ev->lvl, ev->pal->fg_conn);
+            sb_puts(&line, rarr);
+            sb_stream_tag(&line, ev, nd->cfg.out_state);
+        }
+        panel_row(ev, ev->pal->fg_conn, line.data);
+
+        if (nd->out_idx >= 0)
+        {
+            float bt = cacaosim_spec_total(&ctx->beams[nd->out_idx].spec);
+            float pc = (src_tot > 0.0f) ? (100.0f * bt / src_tot) : 0.0f;
+
+            sbuf_t bl;
+            sb_init(&bl);
+            sb_fg(&bl, ev->lvl, ev->pal->fg_conn);
+            sb_puts(&bl, prefix);
+            sb_puts(&bl, vbar);
+            sb_fg(&bl, ev->lvl, ev->pal->fg_dim);
+            sb_printf(&bl, "   beam ");
+            sb_fg(&bl, ev->lvl, ev->pal->fg_accent);
+            sb_puts(&bl, ctx->beams[nd->out_idx].name);
+            sb_fg(&bl, ev->lvl, ev->pal->fg_dim);
+            sb_printf(&bl, " (%.1f%%, %.2e ph/s)", pc, bt);
+            panel_row(ev, ev->pal->fg_conn, bl.data);
+
+            render_beam_subtree(ev, ctx, nd->out_idx, prefix, src_tot, src_peak, visited_beam,
+                                depth + 1);
+        }
+        return;
+    }
+
     /* Case 2: Single Dichroic or Gray Beamsplitter -> branch into refl and trans arms */
     if (n_cons == 1 && ctx->nodes[consumers[0]].cfg.kind == CACAOSIM_NODE_SPLITTER)
     {
@@ -2391,6 +2460,19 @@ static void count_shm_streams(
         {
             total++;
             live += shm_stream_exists(ev, nd->cfg.in_wfe);
+        }
+        else if (nd->cfg.kind == CACAOSIM_NODE_ADC)
+        {
+            if (nd->cfg.in_cmd[0] != '\0')
+            {
+                total++;
+                live += shm_stream_exists(ev, nd->cfg.in_cmd);
+            }
+            if (nd->cfg.out_state[0] != '\0')
+            {
+                total++;
+                live += shm_stream_exists(ev, nd->cfg.out_state);
+            }
         }
         else if (nd->cfg.kind == CACAOSIM_NODE_CORO)
         {
@@ -3108,14 +3190,15 @@ void cacaosim_bench_render(
         for (uint32_t i = 0; i < ctx->n_nodes; i++)
         {
             cacaosim_node_kind_t k = ctx->nodes[i].cfg.kind;
-            if (k == CACAOSIM_NODE_SPLITTER || k == CACAOSIM_NODE_CORO || k == CACAOSIM_NODE_WFE)
+            if (k == CACAOSIM_NODE_SPLITTER || k == CACAOSIM_NODE_CORO || k == CACAOSIM_NODE_WFE ||
+                k == CACAOSIM_NODE_ADC)
             {
                 n_aux++;
             }
         }
         if (n_aux > 0)
         {
-            panel_top(&ev, "BEAMSPLITTERS, CORONAGRAPHS & STATIC WFE", ev.pal->fg_conn,
+            panel_top(&ev, "ADC, BEAMSPLITTERS, CORONAGRAPHS & STATIC WFE", ev.pal->fg_conn,
                       ev.pal->fg_proc);
 
             sbuf_t th;
@@ -3133,7 +3216,8 @@ void cacaosim_bench_render(
             {
                 const cacaosim_bench_node_t *nd = &ctx->nodes[i];
                 if (nd->cfg.kind != CACAOSIM_NODE_SPLITTER &&
-                    nd->cfg.kind != CACAOSIM_NODE_CORO && nd->cfg.kind != CACAOSIM_NODE_WFE)
+                    nd->cfg.kind != CACAOSIM_NODE_CORO && nd->cfg.kind != CACAOSIM_NODE_WFE &&
+                    nd->cfg.kind != CACAOSIM_NODE_ADC)
                 {
                     continue;
                 }
@@ -3221,6 +3305,27 @@ void cacaosim_bench_render(
                     {
                         sb_fg(&rline, ev.lvl, ev.pal->fg_stream);
                         sb_printf(&rline, " +%dM", n_m);
+                    }
+                }
+                else if (nd->cfg.kind == CACAOSIM_NODE_ADC)
+                {
+                    sb_fg(&rline, ev.lvl, ev.pal->fg_stream);
+                    sb_pad_col(&rline, "ADC", 9);
+                    snprintf(mspec, sizeof(mspec), "%s %s(%s)",
+                             cacaosim_adc_preset_str(nd->cfg.adc.preset),
+                             cacaosim_adc_mode_str(nd->cfg.adc.mode),
+                             cacaosim_adc_opt_band_str(nd->cfg.adc.opt_band));
+                    sb_fg(&rline, ev.lvl, ev.pal->fg_text);
+                    sb_pad_col(&rline, mspec, 26);
+                    sb_fg(&rline, ev.lvl, ev.pal->fg_accent);
+                    sb_pad_col(&rline, nd->cfg.in_beam, 13);
+                    sb_fg(&rline, ev.lvl, ev.pal->fg_muted);
+                    sb_printf(&rline, "Out:%s  res(H)=%.1fmas", nd->cfg.out_beam,
+                              nd->adc_ctx.last_state[8]);
+                    if (nd->cfg.out_state[0] != '\0')
+                    {
+                        sb_puts(&rline, "  SHM:");
+                        sb_stream_tag(&rline, &ev, nd->cfg.out_state);
                     }
                 }
                 else

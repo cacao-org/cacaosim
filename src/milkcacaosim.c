@@ -62,6 +62,7 @@ MODULE_DEPS("milkCOREMODmemory", "milkCOREMODarith", "milkCOREMODiofits", "milkC
 static const MILK_RUNNABLE *const runnables[] = {
     &runnable_cacaosim_mkpupil,
     &runnable_cacaosim_mkbeam,
+    &runnable_cacaosim_adc,
     &runnable_cacaosim_wfe,
     &runnable_cacaosim_dmsim,
     &runnable_cacaosim_beamsplit,

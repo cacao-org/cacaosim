@@ -1046,7 +1046,7 @@ int main(int argc, char **argv)
     int         inter_mode    = 0;
     int         do_deploy     = 0;
     int         with_atmturb  = 0;
-    float       seeing        = 0.7f;
+    float       seeing        = 0.8f;
 
     /* Parse CLI options; first non-option positional token is treated as the .bench target */
     for (int i = 1; i < argc; i++)

@@ -1025,6 +1025,62 @@ extern "C" void cacaosim_cuda_beam_init_lerp(
         d_out_opd, d_out_amp);
 }
 
+typedef struct
+{
+    float c[32];
+} cacaosim_mode_coeff32_t;
+
+__global__ void kernel_beam_add_modes(
+    float                  *d_opd,
+    const float            *d_basis,
+    cacaosim_mode_coeff32_t coeffs,
+    uint32_t                n_modes,
+    uint64_t                npix)
+{
+    uint64_t idx = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= npix)
+    {
+        return;
+    }
+    float acc = 0.0f;
+    for (uint32_t m = 0u; m < n_modes; m++)
+    {
+        float cm = coeffs.c[m];
+        if (cm != 0.0f)
+        {
+            acc += cm * d_basis[(uint64_t) m * npix + idx];
+        }
+    }
+    d_opd[idx] += acc;
+}
+
+extern "C" void cacaosim_cuda_beam_add_modes(
+    float       *d_opd,
+    const float *d_basis,
+    const float *h_coeffs,
+    uint32_t     n_modes,
+    uint64_t     npix,
+    void        *cuda_stream)
+{
+    if (d_opd == NULL || d_basis == NULL || h_coeffs == NULL || n_modes == 0u || npix == 0ULL)
+    {
+        return;
+    }
+    if (n_modes > 32u)
+    {
+        n_modes = 32u;
+    }
+    cacaosim_mode_coeff32_t coeffs;
+    for (uint32_t m = 0u; m < 32u; m++)
+    {
+        coeffs.c[m] = (m < n_modes) ? h_coeffs[m] : 0.0f;
+    }
+    uint32_t     threads = 256u;
+    uint32_t     blocks  = (uint32_t) ((npix + threads - 1ULL) / threads);
+    cudaStream_t st      = (cudaStream_t) cuda_stream;
+    kernel_beam_add_modes<<<blocks, threads, 0, st>>>(d_opd, d_basis, coeffs, n_modes, npix);
+}
+
 /**
  * cacaosim_cuda_beam_apply_dm() - Host launcher for `kernel_beam_apply_dm`
  * @d_in_opd:    Device input OPD `[nwf * nwf]` in `[um]`

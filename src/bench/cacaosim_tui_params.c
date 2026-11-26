@@ -71,6 +71,13 @@ enum
     PID_B_WF_UNIT,
     PID_B_REF_LAMBDA,
     PID_B_TURB_GAIN,
+    PID_B_VIB_ENABLE,
+    PID_B_VIB_RMS,
+    PID_B_VIB_SEED,
+    PID_B_PETAL_ENABLE,
+    PID_B_PETAL_RMS,
+    PID_B_PETAL_TAU,
+    PID_B_PETAL_SEED,
     PID_B_BACKEND,
     PID_B_OUT_BEAM,
     PID_B_IN_WF,
@@ -473,6 +480,23 @@ int cs_params_build(
                    CS_PTYPE_FLOAT, 0.01, 1.0, 0.05, "Entrance telescope + relay transmission");
             add_pd(out, &n, max_out, PID_B_TURB_GAIN, "turb_gain", "Turbulence Gain", "x",
                    CS_PTYPE_FLOAT, 0.0, 10.0, 0.1, "Atmospheric phase amplitude multiplier");
+            if (show_advanced)
+            {
+                add_pd(out, &n, max_out, PID_B_VIB_ENABLE, "vib_enable", "Vibrations", "",
+                       CS_PTYPE_BOOL, 0, 1, 1, "Enable stochastic telescope/bench vibrations");
+                add_pd(out, &n, max_out, PID_B_VIB_RMS, "vib_rms_nm", "Vib OPD RMS", "nm",
+                       CS_PTYPE_FLOAT, 0.0, 500.0, 5.0, "Total vibration OPD RMS [nm]");
+                add_pd(out, &n, max_out, PID_B_VIB_SEED, "vib_seed", "Vib RNG Seed", "",
+                       CS_PTYPE_UINT, 1, 999999, 1, "Deterministic vibration PRNG seed");
+                add_pd(out, &n, max_out, PID_B_PETAL_ENABLE, "petal_enable", "Thermal Petaling", "",
+                       CS_PTYPE_BOOL, 0, 1, 1, "Enable slow thermally induced island petaling");
+                add_pd(out, &n, max_out, PID_B_PETAL_RMS, "petal_rms_nm", "Petal OPD RMS", "nm",
+                       CS_PTYPE_FLOAT, 0.0, 2000.0, 10.0, "Total thermal petaling OPD RMS [nm]");
+                add_pd(out, &n, max_out, PID_B_PETAL_TAU, "petal_tau_s", "Petal Tau", "s",
+                       CS_PTYPE_FLOAT, 0.05, 60.0, 0.5, "Thermal petaling timescale [s]");
+                add_pd(out, &n, max_out, PID_B_PETAL_SEED, "petal_seed", "Petal RNG Seed", "",
+                       CS_PTYPE_UINT, 1, 999999, 1, "Deterministic petaling PRNG seed");
+            }
             add_enum_pd(out, &n, max_out, PID_B_WF_UNIT, "wf_unit", "Input WF Unit", 2, "um",
                         "rad", NULL, NULL, "Units of input atmosphere stream (OPD um or rad)");
             add_pd(out, &n, max_out, PID_B_REF_LAMBDA, "ref_lambda", "Phase Ref Lam", "um",
@@ -1179,6 +1203,27 @@ void cs_param_format_val(
         case PID_B_TURB_GAIN:
             snprintf(buf, cap, "%.2f", cfg->turb_gain);
             break;
+        case PID_B_VIB_ENABLE:
+            snprintf(buf, cap, "%s", cfg->perturb.vib_enable ? "ON" : "OFF");
+            break;
+        case PID_B_VIB_RMS:
+            snprintf(buf, cap, "%.1f", cfg->perturb.vib_rms_nm);
+            break;
+        case PID_B_VIB_SEED:
+            snprintf(buf, cap, "%llu", (unsigned long long) cfg->perturb.vib_seed);
+            break;
+        case PID_B_PETAL_ENABLE:
+            snprintf(buf, cap, "%s", cfg->perturb.petal_enable ? "ON" : "OFF");
+            break;
+        case PID_B_PETAL_RMS:
+            snprintf(buf, cap, "%.1f", cfg->perturb.petal_rms_nm);
+            break;
+        case PID_B_PETAL_TAU:
+            snprintf(buf, cap, "%.2f", cfg->perturb.petal_tau_s);
+            break;
+        case PID_B_PETAL_SEED:
+            snprintf(buf, cap, "%llu", (unsigned long long) cfg->perturb.petal_seed);
+            break;
         case PID_B_BACKEND:
             snprintf(buf, cap, "%s",
                      (cfg->backend == 1) ? "cpu" : (cfg->backend == 2 ? "cuda" : "auto"));
@@ -1871,6 +1916,27 @@ int cs_param_set_str(
             break;
         case PID_B_TURB_GAIN:
             cfg->turb_gain = (float) dv;
+            break;
+        case PID_B_VIB_ENABLE:
+            cfg->perturb.vib_enable = iv ? 1 : 0;
+            break;
+        case PID_B_VIB_RMS:
+            cfg->perturb.vib_rms_nm = (float) dv;
+            break;
+        case PID_B_VIB_SEED:
+            cfg->perturb.vib_seed = (iv > 0) ? (uint64_t) iv : 101ULL;
+            break;
+        case PID_B_PETAL_ENABLE:
+            cfg->perturb.petal_enable = iv ? 1 : 0;
+            break;
+        case PID_B_PETAL_RMS:
+            cfg->perturb.petal_rms_nm = (float) dv;
+            break;
+        case PID_B_PETAL_TAU:
+            cfg->perturb.petal_tau_s = (float) dv;
+            break;
+        case PID_B_PETAL_SEED:
+            cfg->perturb.petal_seed = (iv > 0) ? (uint64_t) iv : 202ULL;
             break;
         case PID_B_BACKEND:
             cfg->backend = iv;

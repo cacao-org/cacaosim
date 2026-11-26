@@ -79,6 +79,8 @@ typedef struct
     float           *d_dm_opd;       /**< Staging buffer for host DM OPD `[npix_wf]` [um] */
     float           *d_k_rad;        /**< Per-channel 2*pi/lam_c wavenumbers `[eff_nlam]` */
     float           *d_chan_w;       /**< Per-channel photon weights `[eff_nlam]` */
+    float           *d_disp_sx;      /**< Per-channel X dispersion OPD slope `[eff_nlam]` */
+    float           *d_disp_sy;      /**< Per-channel Y dispersion OPD slope `[eff_nlam]` */
     float           *d_poly_opd;     /**< Host-cube staging OPD `[2 * eff_nlam * npix_wf]` */
     float           *d_poly_amp;     /**< Host-cube staging Amp `[2 * eff_nlam * npix_wf]` */
     cuFloatComplex  *d_masks;        /**< Shifted pyramid masks `[n_slices*nlam*pps*npix_fft]` */
@@ -119,6 +121,7 @@ typedef struct
     const float      *poly_opd_ptr;
     const float      *poly_amp_ptr;
     uint64_t          poly_stride;
+    int32_t           poly_mode;
     pyrwfs_poly_map_t poly_map;
 } pyrwfs_cuda_state_t;
 
@@ -147,6 +150,8 @@ __global__ void kernel_pyrwfs_build_pupil_batch(
     const float *__restrict__ ncpa_opd,
     float                     wf_to_opd,
     const float *__restrict__ k_rad,
+    const float *__restrict__ disp_sx,
+    const float *__restrict__ disp_sy,
     uint32_t                  nwf,
     uint32_t                  nfft,
     uint32_t                  pad_off,
@@ -171,7 +176,9 @@ __global__ void kernel_pyrwfs_build_pupil_batch(
         return;
     }
 
-    uint32_t pix = (oy - pad_off) * nwf + (ox - pad_off);
+    uint32_t px  = ox - pad_off;
+    uint32_t py  = oy - pad_off;
+    uint32_t pix = py * nwf + px;
     float    amp = pup_amp[pix];
     if (amp == 0.0f)
     {
@@ -200,10 +207,15 @@ __global__ void kernel_pyrwfs_build_pupil_batch(
         opd += ncpa_opd[pix];
     }
 
+    float p0_xy = 0.5f * (float) (nwf - 1u);
+    float dx    = (float) px - p0_xy;
+    float dy    = (float) py - p0_xy;
+
     for (int32_t c = 0; c < nlam; c++)
     {
+        float opd_c = opd + disp_sx[c] * dx + disp_sy[c] * dy;
         float s, co;
-        __sincosf(opd * k_rad[c], &s, &co);
+        __sincosf(opd_c * k_rad[c], &s, &co);
         out_cplx[(uint64_t) c * npix_fft + idx] = make_cuFloatComplex(amp * co, amp * s);
     }
 }
@@ -214,11 +226,14 @@ __global__ void kernel_pyrwfs_build_pupil_poly(
     uint64_t                  chan_stride,
     const float *__restrict__ ncpa_opd,
     const float *__restrict__ k_rad,
+    const float *__restrict__ disp_sx,
+    const float *__restrict__ disp_sy,
     pyrwfs_poly_map_t         pmap,
     uint32_t                  nwf,
     uint32_t                  nfft,
     uint32_t                  pad_off,
     int32_t                   nlam,
+    int32_t                   poly_mode,
     cuFloatComplex *__restrict__ out_cplx)
 {
     uint32_t idx      = blockIdx.x * blockDim.x + threadIdx.x;
@@ -239,8 +254,13 @@ __global__ void kernel_pyrwfs_build_pupil_poly(
         return;
     }
 
-    uint32_t pix = (oy - pad_off) * nwf + (ox - pad_off);
-    float    nc  = (ncpa_opd != NULL) ? ncpa_opd[pix] : 0.0f;
+    uint32_t px    = ox - pad_off;
+    uint32_t py    = oy - pad_off;
+    uint32_t pix   = py * nwf + px;
+    float    nc    = (ncpa_opd != NULL) ? ncpa_opd[pix] : 0.0f;
+    float    p0_xy = 0.5f * (float) (nwf - 1u);
+    float    dx    = (float) px - p0_xy;
+    float    dy    = (float) py - p0_xy;
 
     for (int32_t c = 0; c < nlam; c++)
     {
@@ -254,13 +274,25 @@ __global__ void kernel_pyrwfs_build_pupil_poly(
 
         float a0 = (beam_amp != NULL) ? beam_amp[off0] : 1.0f;
         float a1 = (beam_amp != NULL) ? beam_amp[off1] : 1.0f;
-        if (a0 == 0.0f && a1 == 0.0f)
+        if (a0 == 0.0f && (m1 == m0 || a1 == 0.0f))
         {
             out_cplx[(uint64_t) c * npix_fft + idx] = make_cuFloatComplex(0.0f, 0.0f);
             continue;
         }
 
-        float o0 = ((beam_opd != NULL) ? beam_opd[off0] : 0.0f) + nc;
+        float nc_c = nc + disp_sx[c] * dx + disp_sy[c] * dy;
+        if (poly_mode == CACAOSIM_POLY_UNWRAPPED_OPD && m1 != m0 && w1 > 0.0f)
+        {
+            float amp = w0 * a0 + w1 * a1;
+            float opd = w0 * ((beam_opd != NULL) ? beam_opd[off0] : 0.0f) +
+                        w1 * ((beam_opd != NULL) ? beam_opd[off1] : 0.0f) + nc_c;
+            float s, co;
+            __sincosf(opd * kc, &s, &co);
+            out_cplx[(uint64_t) c * npix_fft + idx] = make_cuFloatComplex(amp * co, amp * s);
+            continue;
+        }
+
+        float o0 = ((beam_opd != NULL) ? beam_opd[off0] : 0.0f) + nc_c;
         float s0, c0;
         __sincosf(o0 * kc, &s0, &c0);
         float re = w0 * a0 * c0;
@@ -268,7 +300,7 @@ __global__ void kernel_pyrwfs_build_pupil_poly(
 
         if (m1 != m0 && w1 > 0.0f)
         {
-            float o1 = ((beam_opd != NULL) ? beam_opd[off1] : 0.0f) + nc;
+            float o1 = ((beam_opd != NULL) ? beam_opd[off1] : 0.0f) + nc_c;
             float s1, c1;
             __sincosf(o1 * kc, &s1, &c1);
             re += w1 * a1 * c1;
@@ -794,7 +826,7 @@ static void pyrwfs_cuda_launch_optics(
 
     kernel_pyrwfs_build_pupil_batch<<<bl_fft, th_fft, 0, cs->stream>>>(
         d_pup_ptr, d_atm_amp_ptr, d_wf_ptr, d_dm_ptr, cs->d_ncpa_opd, wf_to_opd, cs->d_k_rad,
-        nwf, nfft, pad_off, nlam, cs->d_pup_cplx);
+        cs->d_disp_sx, cs->d_disp_sy, nwf, nfft, pad_off, nlam, cs->d_pup_cplx);
 
     if (slice_idx < 0 && cs->has_inv_full)
     {
@@ -823,8 +855,8 @@ static void pyrwfs_cuda_launch_optics_poly(
     uint32_t bl_fft  = (uint32_t) ((ctx->npix_fft + th_fft - 1ULL) / th_fft);
 
     kernel_pyrwfs_build_pupil_poly<<<bl_fft, th_fft, 0, cs->stream>>>(
-        d_opd_src, d_amp_src, eff_stride, cs->d_ncpa_opd, cs->d_k_rad, pmap, nwf, nfft, pad_off,
-        nlam, cs->d_pup_cplx);
+        d_opd_src, d_amp_src, eff_stride, cs->d_ncpa_opd, cs->d_k_rad, cs->d_disp_sx, cs->d_disp_sy,
+        pmap, nwf, nfft, pad_off, nlam, ctx->in_poly_mode, cs->d_pup_cplx);
 
     if (slice_idx < 0 && cs->has_inv_full)
     {
@@ -901,6 +933,8 @@ extern "C" int cacaosim_pyrwfs_cuda_init(
         cudaMalloc((void **) &cs->d_dm_opd, wf_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_k_rad, lam_f_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_chan_w, lam_f_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_disp_sx, lam_f_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_disp_sy, lam_f_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_poly_opd, poly_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_poly_amp, poly_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_masks, mask_c_bytes) != cudaSuccess ||
@@ -929,6 +963,8 @@ extern "C" int cacaosim_pyrwfs_cuda_init(
     cudaMemcpyAsync(cs->d_pup_amp, pup_amp, wf_bytes, cudaMemcpyHostToDevice, cs->stream);
     cudaMemcpyAsync(cs->d_k_rad, ctx->k_rad, lam_f_bytes, cudaMemcpyHostToDevice, cs->stream);
     cudaMemcpyAsync(cs->d_chan_w, ctx->chan_w, lam_f_bytes, cudaMemcpyHostToDevice, cs->stream);
+    cudaMemcpyAsync(cs->d_disp_sx, ctx->disp_sx, lam_f_bytes, cudaMemcpyHostToDevice, cs->stream);
+    cudaMemcpyAsync(cs->d_disp_sy, ctx->disp_sy, lam_f_bytes, cudaMemcpyHostToDevice, cs->stream);
     cudaMemcpyAsync(cs->d_masks, ctx->masks_cplx, mask_c_bytes, cudaMemcpyHostToDevice,
                     cs->stream);
     cudaMemsetAsync(cs->d_wf_in, 0, wf_bytes, cs->stream);
@@ -1007,6 +1043,19 @@ extern "C" void cacaosim_pyrwfs_cuda_upload_weights(cacaosim_pyrwfs_ctx_t *ctx)
                     cudaMemcpyHostToDevice, cs->stream);
 }
 
+extern "C" void cacaosim_pyrwfs_cuda_upload_disp(cacaosim_pyrwfs_ctx_t *ctx)
+{
+    pyrwfs_cuda_state_t *cs = (pyrwfs_cuda_state_t *) ctx->cuda_priv;
+    if (cs == NULL || cs->d_disp_sx == NULL)
+    {
+        return;
+    }
+    int32_t nlam      = (ctx->eff_nlam >= 1) ? ctx->eff_nlam : 1;
+    size_t  lam_bytes = (size_t) nlam * sizeof(float);
+    cudaMemcpyAsync(cs->d_disp_sx, ctx->disp_sx, lam_bytes, cudaMemcpyHostToDevice, cs->stream);
+    cudaMemcpyAsync(cs->d_disp_sy, ctx->disp_sy, lam_bytes, cudaMemcpyHostToDevice, cs->stream);
+}
+
 extern "C" void cacaosim_pyrwfs_cuda_free(cacaosim_pyrwfs_ctx_t *ctx)
 {
     pyrwfs_cuda_state_t *cs = (pyrwfs_cuda_state_t *) ctx->cuda_priv;
@@ -1036,6 +1085,8 @@ extern "C" void cacaosim_pyrwfs_cuda_free(cacaosim_pyrwfs_ctx_t *ctx)
     cudaFree(cs->d_dm_opd);
     cudaFree(cs->d_k_rad);
     cudaFree(cs->d_chan_w);
+    cudaFree(cs->d_disp_sx);
+    cudaFree(cs->d_disp_sy);
     cudaFree(cs->d_poly_opd);
     cudaFree(cs->d_poly_amp);
     cudaFree(cs->d_masks);
@@ -1372,11 +1423,12 @@ static void pyrwfs_cuda_accum_poly_impl(
     float                def_l0   = lam0 * (1.0f - 0.5f * bw);
     float                def_l1   = lam0 * (1.0f + 0.5f * bw);
 
-    pyrwfs_poly_map_t pmap = { { 0 }, { 0 }, { 0.0f } };
+    pyrwfs_poly_map_t pmap      = { { 0 }, { 0 }, { 0.0f } };
+    int32_t           unwrapped = (ctx->in_poly_mode == CACAOSIM_POLY_UNWRAPPED_OPD) ? 1 : 0;
     for (int32_t c = 0; c < nlam; c++)
     {
-        cacaosim_poly_interp_bracket(ctx->lam_um[c], beam_lam_um, beam_nlam, def_l0, def_l1,
-                                     &pmap.m0[c], &pmap.m1[c], &pmap.alpha[c]);
+        cacaosim_poly_interp_bracket_ex(ctx->lam_um[c], beam_lam_um, beam_nlam, def_l0, def_l1,
+                                        unwrapped, &pmap.m0[c], &pmap.m1[c], &pmap.alpha[c]);
     }
 
     const float *d_opd_src  = d_beam_opd;
@@ -1439,7 +1491,8 @@ static void pyrwfs_cuda_accum_poly_impl(
 
     if (cs->has_poly_sig &&
         (cs->poly_opd_ptr != d_opd_src || cs->poly_amp_ptr != d_amp_src ||
-         cs->poly_stride != eff_stride || memcmp(&cs->poly_map, &pmap, sizeof(pmap)) != 0))
+         cs->poly_stride != eff_stride || cs->poly_mode != ctx->in_poly_mode ||
+         memcmp(&cs->poly_map, &pmap, sizeof(pmap)) != 0))
     {
         pyrwfs_cuda_invalidate_poly_graph(cs);
     }
@@ -1465,6 +1518,7 @@ static void pyrwfs_cuda_accum_poly_impl(
                         cs->poly_opd_ptr          = d_opd_src;
                         cs->poly_amp_ptr          = d_amp_src;
                         cs->poly_stride           = eff_stride;
+                        cs->poly_mode             = ctx->in_poly_mode;
                         cs->poly_map              = pmap;
                     }
                     else
@@ -1518,6 +1572,7 @@ static void pyrwfs_cuda_accum_poly_impl(
                         cs->poly_opd_ptr        = d_opd_src;
                         cs->poly_amp_ptr        = d_amp_src;
                         cs->poly_stride         = eff_stride;
+                        cs->poly_mode           = ctx->in_poly_mode;
                         cs->poly_map            = pmap;
                     }
                     else

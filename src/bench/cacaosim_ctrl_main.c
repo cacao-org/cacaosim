@@ -144,7 +144,7 @@ static void print_help_full(const char *prog, int color)
     print_opt_line(color, "--atmturb", NULL,
                    "Enable milk-fpsexec-atmturb-mkwfs launch on deploy");
     print_opt_line(color, "--seeing", "<arcsec>",
-                   "Atmospheric seeing [arcsec] when --atmturb is active (default: 0.7)");
+                   "Atmospheric seeing [arcsec] when --atmturb is active (default: 0.8)");
     printf("\n");
 
     milk_help_section("Display & Theme Options", color);

@@ -450,6 +450,11 @@ static void emit_atmturb_plan(
     float       seeing,
     uint32_t    master_sz,
     const char *out_pha,
+    float       zenith_deg,
+    float       disp_pa_deg,
+    float       site_alt_m,
+    int         chrom_turb,
+    const char *chrom_lambdas,
     char        units[][CACAOSIM_BENCH_NAME_LEN],
     int        *n_units,
     char        streams[][CACAOSIM_BENCH_NAME_LEN],
@@ -459,6 +464,8 @@ static void emit_atmturb_plan(
     float denom     = (float) nwf * pup_diam;
     float pup_scale = (denom > 0.0f) ? (tel_diam / denom) : 0.04f;
     const char *pha = (out_pha != NULL && out_pha[0] != '\0') ? out_pha : "outarraypha";
+    float z_rad     = zenith_deg * (3.14159265358979323846f / 180.0f);
+    float pa_rad    = disp_pa_deg * (3.14159265358979323846f / 180.0f);
 
     fprintf(f_man, "csim_atmturb milk-fpsexec-atmturb-mkwfs\n");
 
@@ -467,6 +474,14 @@ static void emit_atmturb_plan(
     fprintf(f_bat, "csim_atmturb.wfsize = %u\n", nwf);
     fprintf(f_bat, "csim_atmturb.pupil_scale = %.6f\n", pup_scale);
     fprintf(f_bat, "csim_atmturb.seeing = %.6g\n", seeing);
+    fprintf(f_bat, "csim_atmturb.zenith_angle = %.6f\n", z_rad);
+    fprintf(f_bat, "csim_atmturb.parallactic_angle = %.6f\n", pa_rad);
+    fprintf(f_bat, "csim_atmturb.site_alt = %.6g\n", site_alt_m);
+    if (chrom_turb && chrom_lambdas != NULL && chrom_lambdas[0] != '\0')
+    {
+        fprintf(f_bat, "csim_atmturb.chrom_lambdas = %s\n", chrom_lambdas);
+        fprintf(f_bat, "csim_atmturb.chrom_opd_um = 1\n");
+    }
     fprintf(f_bat, "csim_atmturb.time_step = %.7f\n", dt_s);
     fprintf(f_bat, "csim_atmturb.master_size = %u\n", master_sz);
     fprintf(f_bat, "csim_atmturb.stream_mode = 1\n");
@@ -477,7 +492,14 @@ static void emit_atmturb_plan(
     fprintf(f_bat, "csim_atmturb.procinfo.loopcntMax = -1\n");
 
     fprintf(f_wav, "RUNSTART\tcsim_atmturb\n");
-    fprintf(f_wav, "WAIT\t%s:%ux%u+1\n", pha, nwf, nwf);
+    if (chrom_turb && chrom_lambdas != NULL && chrom_lambdas[0] != '\0')
+    {
+        fprintf(f_wav, "WAIT\t%s+1\n", pha);
+    }
+    else
+    {
+        fprintf(f_wav, "WAIT\t%s:%ux%u+1\n", pha, nwf, nwf);
+    }
 
     add_unique_item(units, n_units, PLAN_MAX_UNITS, "csim_atmturb");
     add_unique_item(streams, n_streams, PLAN_MAX_STREAMS, pha);
@@ -493,7 +515,7 @@ void cacaosim_plan_opts_defaults(cacaosim_plan_opts_t *opts)
     opts->modular_mode    = 0;
     opts->flat_mode       = 0;
     opts->with_atmturb    = 0;
-    opts->seeing_arcsec   = 0.7f;
+    opts->seeing_arcsec   = 0.8f;
     opts->atm_master_size = 0u;
     opts->rate_override   = 0.0f;
     opts->backend         = -1;
@@ -648,8 +670,8 @@ int cacaosim_bench_emit_plan(
         if (inc_atmturb)
         {
             emit_atmturb_plan(f_man, f_bat, f_wav, nwf, eff_rate, 0.9375f, 8.2f, 0.50f,
-                              opts.seeing_arcsec, atm_master, "outarraypha", units, &n_units,
-                              streams, &n_streams);
+                              opts.seeing_arcsec, atm_master, "outarraypha", 0.0f, 0.0f, 4205.0f,
+                              0, "", units, &n_units, streams, &n_streams);
         }
 
         if (!opts.modular_mode)
@@ -909,8 +931,10 @@ int cacaosim_bench_emit_plan(
         if (inc_atmturb)
         {
             emit_atmturb_plan(f_man, f_bat, f_wav, cfg.nwf, atm_rate, cfg.pup_diam, cfg.tel_diam_m,
-                              cfg.ref_lambda, opts.seeing_arcsec, atm_master, cfg.in_wf, units,
-                              &n_units, streams, &n_streams);
+                              cfg.ref_lambda, opts.seeing_arcsec, atm_master, cfg.in_wf,
+                              cfg.atm_disp.zenith_deg, cfg.atm_disp.disp_pa_deg, cfg.site_alt_m,
+                              cfg.chrom_turb, cfg.chrom_lambdas, units, &n_units, streams,
+                              &n_streams);
         }
 
         if (!opts.modular_mode)
@@ -924,6 +948,18 @@ int cacaosim_bench_emit_plan(
             fprintf(f_bat, "csim_htsim.bench_file = %s\n", b_arg);
             fprintf(f_bat, "csim_htsim.frame_rate = %.6g\n", eff_rate);
             fprintf(f_bat, "csim_htsim.turb_gain = %.6g\n", cfg.turb_gain);
+            fprintf(f_bat, "csim_htsim.vib_enable = %s\n", cfg.perturb.vib_enable ? "ON" : "OFF");
+            fprintf(f_bat, "csim_htsim.vib_rms_nm = %.6g\n", cfg.perturb.vib_rms_nm);
+            fprintf(f_bat, "csim_htsim.petal_enable = %s\n",
+                    cfg.perturb.petal_enable ? "ON" : "OFF");
+            fprintf(f_bat, "csim_htsim.petal_rms_nm = %.6g\n", cfg.perturb.petal_rms_nm);
+            fprintf(f_bat, "csim_htsim.petal_tau_s = %.6g\n", cfg.perturb.petal_tau_s);
+            fprintf(f_bat, "csim_htsim.atm_disp_enable = %s\n",
+                    cfg.atm_disp.enable ? "ON" : "OFF");
+            fprintf(f_bat, "csim_htsim.zenith_deg = %.6g\n", cfg.atm_disp.zenith_deg);
+            fprintf(f_bat, "csim_htsim.disp_pa_deg = %.6g\n", cfg.atm_disp.disp_pa_deg);
+            fprintf(f_bat, "csim_htsim.adc_mode = -1\n");
+            fprintf(f_bat, "csim_htsim.adc_opt_band = -1\n");
             fprintf(f_bat, "csim_htsim.backend = %d\n", cfg.backend);
             fprintf(f_bat, "csim_htsim.procinfo.triggermode = 0\n");
             fprintf(f_bat, "csim_htsim.procinfo.loopcntMax = -1\n");
@@ -959,6 +995,22 @@ int cacaosim_bench_emit_plan(
                     first_w = 0;
                     add_unique_item(streams, &n_streams, PLAN_MAX_STREAMS, nd->cfg.in_wfe);
                 }
+                else if (nd->cfg.kind == CACAOSIM_NODE_ADC)
+                {
+                    if (nd->cfg.in_cmd[0] != '\0')
+                    {
+                        fprintf(f_wav, "%s%s:2x1", first_w ? "" : " ", nd->cfg.in_cmd);
+                        first_w = 0;
+                        add_unique_item(streams, &n_streams, PLAN_MAX_STREAMS, nd->cfg.in_cmd);
+                    }
+                    if (nd->cfg.out_state[0] != '\0')
+                    {
+                        fprintf(f_wav, "%s%s:%ux1+1", first_w ? "" : " ", nd->cfg.out_state,
+                                (unsigned) CACAOSIM_ADC_STATE_LEN);
+                        first_w = 0;
+                        add_unique_item(streams, &n_streams, PLAN_MAX_STREAMS, nd->cfg.out_state);
+                    }
+                }
                 else if (nd->cfg.kind >= CACAOSIM_NODE_PYRWFS &&
                          nd->cfg.kind <= CACAOSIM_NODE_FPCAM)
                 {
@@ -989,6 +1041,10 @@ int cacaosim_bench_emit_plan(
             int beam_poly[CACAOSIM_BENCH_MAX_BEAMS]  = { 0 };
             int node_depth[CACAOSIM_BENCH_MAX_NODES] = { 0 };
             int max_depth                            = 0;
+            if (cfg.chrom_turb && cfg.chrom_lambdas[0] != '\0')
+            {
+                beam_poly[0] = 1;
+            }
 
             for (uint32_t i = 0; i < ctx.n_nodes; i++)
             {
@@ -1065,12 +1121,33 @@ int cacaosim_bench_emit_plan(
             fprintf(f_bat, "csim_mkbeam.wf_unit = %d\n", cfg.wf_unit);
             fprintf(f_bat, "csim_mkbeam.ref_lambda = %.8g\n", cfg.ref_lambda);
             fprintf(f_bat, "csim_mkbeam.turb_gain = %.8g\n", cfg.turb_gain);
+            fprintf(f_bat, "csim_mkbeam.vib_enable = %s\n", cfg.perturb.vib_enable ? "ON" : "OFF");
+            fprintf(f_bat, "csim_mkbeam.vib_rms_nm = %.6g\n", cfg.perturb.vib_rms_nm);
+            fprintf(f_bat, "csim_mkbeam.petal_enable = %s\n",
+                    cfg.perturb.petal_enable ? "ON" : "OFF");
+            fprintf(f_bat, "csim_mkbeam.petal_rms_nm = %.6g\n", cfg.perturb.petal_rms_nm);
+            fprintf(f_bat, "csim_mkbeam.petal_tau_s = %.6g\n", cfg.perturb.petal_tau_s);
+            fprintf(f_bat, "csim_mkbeam.atm_disp_enable = %s\n",
+                    cfg.atm_disp.enable ? "ON" : "OFF");
+            fprintf(f_bat, "csim_mkbeam.zenith_deg = %.8g\n", cfg.atm_disp.zenith_deg);
+            fprintf(f_bat, "csim_mkbeam.disp_pa_deg = %.8g\n", cfg.atm_disp.disp_pa_deg);
+            fprintf(f_bat, "csim_mkbeam.atm_pressure_hpa = %.8g\n", cfg.atm_disp.pressure_hpa);
+            fprintf(f_bat, "csim_mkbeam.atm_temp_c = %.8g\n", cfg.atm_disp.temp_c);
+            fprintf(f_bat, "csim_mkbeam.atm_rh_pct = %.8g\n", cfg.atm_disp.rh_pct);
+            fprintf(f_bat, "csim_mkbeam.atm_disp_ref_um = %.8g\n", cfg.atm_disp.ref_lam_um);
             fprintf(f_bat, "csim_mkbeam.frame_rate = %.8g\n", eff_rate);
             fprintf(f_bat, "csim_mkbeam.procinfo.triggermode = 0\n");
             fprintf(f_bat, "csim_mkbeam.procinfo.loopcntMax = -1\n");
 
             fprintf(f_wav, "RUNSTART\tcsim_mkbeam\n");
-            fprintf(f_wav, "WAIT\t%s:%ux%ux2+1\n", root_beam, cfg.nwf, cfg.nwf);
+            if (beam_poly[0])
+            {
+                fprintf(f_wav, "WAIT\t%s+1\n", root_beam);
+            }
+            else
+            {
+                fprintf(f_wav, "WAIT\t%s:%ux%ux2+1\n", root_beam, cfg.nwf, cfg.nwf);
+            }
             add_unique_item(units, &n_units, PLAN_MAX_UNITS, "csim_mkbeam");
             add_unique_item(streams, &n_streams, PLAN_MAX_STREAMS, root_beam);
 
@@ -1267,6 +1344,58 @@ int cacaosim_bench_emit_plan(
 
                     add_unique_item(streams, &n_streams, PLAN_MAX_STREAMS, wfe_s);
                     add_unique_item(streams, &n_streams, PLAN_MAX_STREAMS, nd->cfg.out_beam);
+                }
+                else if (nd->cfg.kind == CACAOSIM_NODE_ADC)
+                {
+                    fprintf(f_man, "%s milk-fpsexec-cacaosim-adc .in_cmd= .out_state=\n", fps);
+                    fprintf(f_bat, "%s.in_beam = %s\n", fps, inb);
+                    fprintf(f_bat, "%s.out_beam = %s\n", fps, nd->cfg.out_beam);
+                    emit_str_if_set(f_bat, fps, ".in_cmd", nd->cfg.in_cmd);
+                    emit_str_if_set(f_bat, fps, ".out_state", nd->cfg.out_state);
+                    fprintf(f_bat, "%s.nwf = %u\n", fps, cfg.nwf);
+                    fprintf(f_bat, "%s.preset = %s\n", fps,
+                            cacaosim_adc_preset_name(nd->cfg.adc.preset));
+                    fprintf(f_bat, "%s.mode = %s\n", fps,
+                            cacaosim_adc_mode_name(nd->cfg.adc.mode));
+                    fprintf(f_bat, "%s.opt_band = %s\n", fps,
+                            cacaosim_adc_opt_band_name(nd->cfg.adc.opt_band));
+                    fprintf(f_bat, "%s.opt_lam1_um = %.8g\n", fps, nd->cfg.adc.opt_lam1_um);
+                    fprintf(f_bat, "%s.opt_lam2_um = %.8g\n", fps, nd->cfg.adc.opt_lam2_um);
+                    fprintf(f_bat, "%s.angle1_deg = %.8g\n", fps, nd->cfg.adc.angle1_deg);
+                    fprintf(f_bat, "%s.angle2_deg = %.8g\n", fps, nd->cfg.adc.angle2_deg);
+                    fprintf(f_bat, "%s.manual_use_psi = %d\n", fps, nd->cfg.adc.manual_use_psi);
+                    fprintf(f_bat, "%s.manual_psi_deg = %.8g\n", fps, nd->cfg.adc.manual_psi_deg);
+                    emit_str_if_set(f_bat, fps, ".glass1", nd->cfg.adc.glass1);
+                    emit_str_if_set(f_bat, fps, ".glass2", nd->cfg.adc.glass2);
+                    fprintf(f_bat, "%s.alpha1_deg = %.8g\n", fps, nd->cfg.adc.alpha1_deg);
+                    fprintf(f_bat, "%s.alpha2_deg = %.8g\n", fps, nd->cfg.adc.alpha2_deg);
+                    fprintf(f_bat, "%s.beam_mag = %.8g\n", fps, nd->cfg.adc.beam_mag);
+                    fprintf(f_bat, "%s.zenith_deg = %.8g\n", fps, cfg.atm_disp.zenith_deg);
+                    fprintf(f_bat, "%s.disp_pa_deg = %.8g\n", fps, cfg.atm_disp.disp_pa_deg);
+                    fprintf(f_bat, "%s.atm_pressure_hpa = %.8g\n", fps, cfg.atm_disp.pressure_hpa);
+                    fprintf(f_bat, "%s.atm_temp_c = %.8g\n", fps, cfg.atm_disp.temp_c);
+                    fprintf(f_bat, "%s.atm_rh_pct = %.8g\n", fps, cfg.atm_disp.rh_pct);
+                    fprintf(f_bat, "%s.atm_disp_ref_um = %.8g\n", fps, cfg.atm_disp.ref_lam_um);
+                    fprintf(f_bat, "%s.lut_scale_err = %.8g\n", fps, nd->cfg.adc.lut_scale_err);
+                    fprintf(f_bat, "%s.lut_pa_err_deg = %.8g\n", fps, nd->cfg.adc.lut_pa_err_deg);
+                    fprintf(f_bat, "%s.lut_p_err_hpa = %.8g\n", fps, nd->cfg.adc.lut_p_err_hpa);
+                    fprintf(f_bat, "%s.lut_t_err_c = %.8g\n", fps, nd->cfg.adc.lut_t_err_c);
+                    fprintf(f_bat, "%s.lut_use_nominal = %d\n", fps, nd->cfg.adc.lut_use_nominal);
+                    fprintf(f_bat, "%s.ideal_mech = %d\n", fps, nd->cfg.adc.ideal_mech);
+                    fprintf(f_bat, "%s.enc_step_deg = %.8g\n", fps, nd->cfg.adc.enc_step_deg);
+                    fprintf(f_bat, "%s.max_slew_dps = %.8g\n", fps, nd->cfg.adc.max_slew_dps);
+                    fprintf(f_bat, "%s.backlash_deg = %.8g\n", fps, nd->cfg.adc.backlash_deg);
+                    fprintf(f_bat, "%s.prism_offset_deg = %.8g\n", fps,
+                            nd->cfg.adc.prism_offset_deg);
+                    fprintf(f_bat, "%s.unit_rot_err_deg = %.8g\n", fps,
+                            nd->cfg.adc.unit_rot_err_deg);
+                    fprintf(f_bat, "%s.tput_enable = %d\n", fps, nd->cfg.adc.tput_enable);
+                    fprintf(f_bat, "%s.tput_base = %.8g\n", fps, nd->cfg.adc.tput_base);
+                    fprintf(f_bat, "%s.dt_sec = %.7f\n", fps, dt_s);
+
+                    add_unique_item(streams, &n_streams, PLAN_MAX_STREAMS, nd->cfg.out_beam);
+                    add_unique_item(streams, &n_streams, PLAN_MAX_STREAMS, nd->cfg.in_cmd);
+                    add_unique_item(streams, &n_streams, PLAN_MAX_STREAMS, nd->cfg.out_state);
                 }
                 else if (nd->cfg.kind == CACAOSIM_NODE_PYRWFS)
                 {
@@ -1541,6 +1670,16 @@ int cacaosim_bench_emit_plan(
                         }
                         EMIT_W_SEP();
                         fprintf(f_wav, "%s:%ux%u", wfe_s, cfg.nwf, cfg.nwf);
+                        EMIT_BEAM_WAIT(nd->out_idx);
+                    }
+                    else if (nd->cfg.kind == CACAOSIM_NODE_ADC)
+                    {
+                        if (nd->cfg.out_state[0] != '\0')
+                        {
+                            EMIT_W_SEP();
+                            fprintf(f_wav, "%s:%ux1+1", nd->cfg.out_state,
+                                    (unsigned) CACAOSIM_ADC_STATE_LEN);
+                        }
                         EMIT_BEAM_WAIT(nd->out_idx);
                     }
                     else if (nd->cfg.kind >= CACAOSIM_NODE_PYRWFS &&

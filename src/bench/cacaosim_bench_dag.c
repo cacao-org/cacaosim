@@ -51,6 +51,7 @@
 #include "COREMOD_memory/COREMOD_memory.h"
 #include "bench/cacaosim_bench.h"
 #include "common/cacaosim_cuda.h"
+#include "common/cacaosim_disp.h"
 #include "common/cacaosim_mask.h"
 #include "pupil/cacaosim_pupil.h"
 
@@ -167,20 +168,167 @@ static int register_beam_name(
  */
 static void init_node_imgids(cacaosim_bench_node_t *nd)
 {
-    nd->img_cmd.ID        = -1;
-    nd->img_opd.ID        = -1;
-    nd->img_flat.ID       = -1;
-    nd->img_wfe.ID        = -1;
-    nd->img_cam.ID        = -1;
-    nd->img_long.ID       = -1;
+    nd->img_cmd.ID           = -1;
+    nd->img_opd.ID           = -1;
+    nd->img_state.ID         = -1;
+    nd->img_flat.ID          = -1;
+    nd->img_wfe.ID           = -1;
+    nd->img_cam.ID           = -1;
+    nd->img_long.ID          = -1;
     nd->img_ncpa.ID          = -1;
     nd->img_lyot.ID          = -1;
     nd->img_pre_lyot.ID      = -1;
     nd->img_pre_lyot_long.ID = -1;
     nd->img_ncpa_refl.ID     = -1;
-    nd->img_ncpa_trans.ID = -1;
-    nd->img_pup_refl.ID   = -1;
-    nd->img_pup_trans.ID  = -1;
+    nd->img_ncpa_trans.ID    = -1;
+    nd->img_pup_refl.ID      = -1;
+    nd->img_pup_trans.ID     = -1;
+}
+
+/* Parse comma/space-separated chromatic anchor wavelengths [um] (returns 0..max_n) */
+static uint32_t parse_chrom_lambdas_csv(const char *csv, float *out_um, uint32_t max_n)
+{
+    if (csv == NULL || out_um == NULL || max_n == 0u)
+    {
+        return 0u;
+    }
+    uint32_t    cnt = 0u;
+    const char *p   = csv;
+    while (*p != '\0' && cnt < max_n)
+    {
+        while (*p == ' ' || *p == '\t' || *p == ',' || *p == ';')
+        {
+            p++;
+        }
+        if (*p == '\0')
+        {
+            break;
+        }
+        char  *end = NULL;
+        double v   = strtod(p, &end);
+        if (end == p)
+        {
+            break;
+        }
+        p = end;
+        if (v > 20.0)
+        {
+            v *= 1.0e-3;
+        }
+        if (v >= 0.2 && v <= 20.0)
+        {
+            out_um[cnt++] = (float) v;
+        }
+    }
+    return cnt;
+}
+
+/* Propagate dispersion descriptor through a static 2D registration preserving gen when steady */
+static void bench_prop_disp(
+    const cacaosim_disp_t *in,
+    const cacaosim_reg_t  *reg,
+    cacaosim_disp_t       *out)
+{
+    if (out == NULL)
+    {
+        return;
+    }
+    if (in == NULL || !in->active)
+    {
+        uint64_t g = (in != NULL) ? in->gen : 0ULL;
+        if (out->active || out->gen != g)
+        {
+            memset(out, 0, sizeof(*out));
+            out->active = 0;
+            out->gen    = g;
+        }
+        return;
+    }
+    if (cacaosim_reg_is_identity(reg))
+    {
+        *out = *in;
+        return;
+    }
+    if (!out->active || out->gen != in->gen)
+    {
+        cacaosim_disp_apply_reg(in, reg, out);
+        out->gen = in->gen;
+    }
+}
+
+/* Update cached atmospheric dispersion Chebyshev fit only when parameters actually change */
+static void bench_update_atm_disp(cacaosim_bench_ctx_t *ctx)
+{
+    cacaosim_atm_disp_cfg_t cur = ctx->cfg.atm_disp;
+    cur.disp_pa_deg             = (float) ctx->atm_disp_pa_curr_deg;
+    if (ctx->cached_atm_valid && cur.enable == ctx->cached_atm_cfg.enable &&
+        fabsf(cur.zenith_deg - ctx->cached_atm_cfg.zenith_deg) <= 1e-6f &&
+        fabsf(cur.disp_pa_deg - ctx->cached_atm_cfg.disp_pa_deg) <= 1e-6f &&
+        fabsf(cur.pressure_hpa - ctx->cached_atm_cfg.pressure_hpa) <= 1e-4f &&
+        fabsf(cur.temp_c - ctx->cached_atm_cfg.temp_c) <= 1e-4f &&
+        fabsf(cur.rh_pct - ctx->cached_atm_cfg.rh_pct) <= 1e-3f &&
+        fabsf(cur.ref_lam_um - ctx->cached_atm_cfg.ref_lam_um) <= 1e-5f)
+    {
+        return;
+    }
+    cacaosim_disp_set_atm(&ctx->cached_atm_disp, &cur);
+    ctx->cached_atm_cfg   = cur;
+    ctx->cached_atm_valid = 1;
+}
+
+/* Warn once at init if any broadband sensor has per-channel dispersion step > 0.5 lambda/D */
+static void bench_warn_chromatic_sampling(const cacaosim_bench_ctx_t *ctx)
+{
+    if (ctx == NULL || !ctx->cfg.atm_disp.enable || ctx->cfg.atm_disp.zenith_deg <= 1.0f)
+    {
+        return;
+    }
+    const double d_tel = (ctx->cfg.tel_diam_m > 0.01f) ? (double) ctx->cfg.tel_diam_m : 8.0;
+    for (uint32_t i = 0; i < ctx->n_nodes; i++)
+    {
+        const cacaosim_bench_node_t *nd  = &ctx->nodes[i];
+        const cacaosim_beam_slot_t  *bin = &ctx->beams[nd->in_idx];
+        if (!bin->disp.active)
+        {
+            continue;
+        }
+        double lam = 0.0, bw = 0.0;
+        int    nch = 1;
+        if (nd->cfg.kind == CACAOSIM_NODE_CORO)
+        {
+            lam = nd->cfg.coro.lambda_um;
+            bw  = nd->cfg.coro.bw_frac;
+            nch = (nd->coro_ctx.eff_nlam >= 1) ? nd->coro_ctx.eff_nlam : 1;
+        }
+        else if (nd->cfg.kind >= CACAOSIM_NODE_PYRWFS && nd->cfg.kind <= CACAOSIM_NODE_FPCAM)
+        {
+            lam = (nd->eff_lambda_um > 0.1f) ? (double) nd->eff_lambda_um : 1.0;
+            bw  = (double) nd->cfg.bw_frac;
+            nch = (nd->eff_nlam >= 1) ? nd->eff_nlam : 1;
+        }
+        else
+        {
+            continue;
+        }
+        if (bw <= 1e-4)
+        {
+            continue;
+        }
+        double l0       = lam * (1.0 - 0.5 * bw);
+        double l1       = lam * (1.0 + 0.5 * bw);
+        double span_mas = cacaosim_disp_band_span_mas(&bin->disp, l0, l1);
+        double ld_mas   = (lam * 1.0e-6 / d_tel) * 206264806.24709636;
+        double step_mas = (nch > 1) ? (span_mas / (double) (nch - 1)) : span_mas;
+        if (step_mas > 0.5 * ld_mas)
+        {
+            int rec = (int) ceil(span_mas / (0.5 * ld_mas)) + 1;
+            fprintf(stderr,
+                    "[cacaosim] WARNING: node '%s' (%.2fum, BW=%.0f%%, nlambda=%d) has "
+                    "dispersion span %.1f mas (%.2f l/D per step > 0.5 l/D); recommend "
+                    "nlambda >= %d\n",
+                    nd->cfg.id, lam, bw * 100.0, nch, span_mas, step_mas / ld_mas, rec);
+        }
+    }
 }
 
 /**
@@ -424,7 +572,7 @@ static int topo_sort_and_wire_beams(
         }
 
         if (nc->kind == CACAOSIM_NODE_DM || nc->kind == CACAOSIM_NODE_CORO ||
-            nc->kind == CACAOSIM_NODE_WFE)
+            nc->kind == CACAOSIM_NODE_WFE || nc->kind == CACAOSIM_NODE_ADC)
         {
             if (nc->out_beam[0] == '\0')
             {
@@ -568,29 +716,50 @@ static void propagate_spectra(cacaosim_bench_ctx_t *ctx)
 {
     cacaosim_spec_star(&ctx->beams[0].spec, ctx->cfg.tel_diam_m, ctx->cfg.cobs, ctx->cfg.star_mag,
                        ctx->cfg.star_teff, ctx->cfg.tput_tel);
+    cacaosim_disp_set_atm(&ctx->beams[0].disp, &ctx->cfg.atm_disp);
 
     for (uint32_t i = 0; i < ctx->n_nodes; i++)
     {
         cacaosim_bench_node_t *nd      = &ctx->nodes[i];
         const cacaosim_spec_t *in_spec = &ctx->beams[nd->in_idx].spec;
+        const cacaosim_disp_t *in_disp = &ctx->beams[nd->in_idx].disp;
 
         if (nd->cfg.kind == CACAOSIM_NODE_DM || nd->cfg.kind == CACAOSIM_NODE_WFE)
         {
             cacaosim_spec_scale(in_spec, nd->cfg.tput, &ctx->beams[nd->out_idx].spec);
+            bench_prop_disp(in_disp, &nd->cfg.reg, &ctx->beams[nd->out_idx].disp);
+        }
+        else if (nd->cfg.kind == CACAOSIM_NODE_ADC)
+        {
+            cacaosim_adc_ctx_t tmp_adc;
+            cacaosim_adc_init(&tmp_adc, &nd->cfg.adc, &ctx->cfg.atm_disp);
+            cacaosim_adc_step(&tmp_adc, 0.0, &ctx->cfg.atm_disp, NULL, in_disp, in_spec,
+                              &ctx->beams[nd->out_idx].disp, &ctx->beams[nd->out_idx].spec);
+            nd->adc_ctx = tmp_adc;
         }
         else if (nd->cfg.kind == CACAOSIM_NODE_SPLITTER)
         {
             cacaosim_spec_t *r_sp = (nd->refl_idx >= 0) ? &ctx->beams[nd->refl_idx].spec : NULL;
             cacaosim_spec_t *t_sp = (nd->trans_idx >= 0) ? &ctx->beams[nd->trans_idx].spec : NULL;
             cacaosim_spec_split(in_spec, &nd->cfg.split, r_sp, t_sp);
+            if (nd->refl_idx >= 0)
+            {
+                bench_prop_disp(in_disp, &nd->cfg.reg_refl, &ctx->beams[nd->refl_idx].disp);
+            }
+            if (nd->trans_idx >= 0)
+            {
+                bench_prop_disp(in_disp, &nd->cfg.reg_trans, &ctx->beams[nd->trans_idx].disp);
+            }
         }
         else if (nd->cfg.kind == CACAOSIM_NODE_CORO)
         {
             cacaosim_spec_scale(in_spec, nd->cfg.tput, &ctx->beams[nd->out_idx].spec);
+            cacaosim_disp_zero(&ctx->beams[nd->out_idx].disp);
             if (nd->lowfs_idx >= 0)
             {
                 /* lowfs_refl amplitude weight is applied directly inside coro lo_amp */
                 cacaosim_spec_scale(in_spec, nd->cfg.tput, &ctx->beams[nd->lowfs_idx].spec);
+                cacaosim_disp_zero(&ctx->beams[nd->lowfs_idx].disp);
             }
         }
         else
@@ -963,15 +1132,43 @@ int cacaosim_bench_init(
         }
     }
 
+    /* Detect multi-wavelength chromatic turbulence cube (3D SHM or [bench] chrom_turb=1) */
+    ctx->wf_chrom_nwl  = 1u;
+    ctx->wf_chrom_unit = cfg->wf_unit;
+    if (connect_shm && ctx->img_wf.ID != -1)
+    {
+        uint32_t cnwl  = 1u;
+        int32_t  cunit = 1;
+        float    cwls[8];
+        if (cacaosim_wf_shm_read_chrom(ctx->img_wf.im, &cnwl, &cunit, cwls))
+        {
+            ctx->wf_chrom_nwl  = cnwl;
+            ctx->wf_chrom_unit = cunit;
+            memcpy(ctx->wf_chrom_wls, cwls, sizeof(cwls));
+        }
+    }
+    if (ctx->wf_chrom_nwl < 2u && cfg->chrom_turb)
+    {
+        float    cwls[8];
+        uint32_t cnwl = parse_chrom_lambdas_csv(cfg->chrom_lambdas, cwls, 8u);
+        if (cnwl >= 2u)
+        {
+            ctx->wf_chrom_nwl  = cnwl;
+            ctx->wf_chrom_unit = 0; /* Default milkatmturb chrom_opd_um = 1 -> OPD [um] */
+            memcpy(ctx->wf_chrom_wls, cwls, sizeof(cwls));
+        }
+    }
+
+    size_t wf_tot_pix = (size_t) ctx->wf_chrom_nwl * ctx->npix_wf;
     if (ctx->use_cuda)
     {
         ctx->d_pup_amp = cacaosim_cuda_alloc_f32(ctx->npix_wf);
-        ctx->d_wf_in   = cacaosim_cuda_alloc_f32(ctx->npix_wf);
-        ctx->d_atm_amp = cacaosim_cuda_alloc_f32(ctx->npix_wf);
+        ctx->d_wf_in   = cacaosim_cuda_alloc_f32(wf_tot_pix);
+        ctx->d_atm_amp = cacaosim_cuda_alloc_f32(wf_tot_pix);
         if (cfg->atm_interp && ctx->eff_oversample > 1u)
         {
-            ctx->d_wf_prev = cacaosim_cuda_alloc_f32(ctx->npix_wf);
-            ctx->d_wf_curr = cacaosim_cuda_alloc_f32(ctx->npix_wf);
+            ctx->d_wf_prev = cacaosim_cuda_alloc_f32(wf_tot_pix);
+            ctx->d_wf_curr = cacaosim_cuda_alloc_f32(wf_tot_pix);
         }
         if (!ctx->d_pup_amp || !ctx->d_wf_in || !ctx->d_atm_amp ||
             (cfg->atm_interp && ctx->eff_oversample > 1u &&
@@ -990,8 +1187,8 @@ int cacaosim_bench_init(
     }
     else if (cfg->atm_interp && ctx->eff_oversample > 1u)
     {
-        ctx->h_wf_prev = (float *) cacaosim_aligned_calloc(ctx->npix_wf, sizeof(float));
-        ctx->h_wf_curr = (float *) cacaosim_aligned_calloc(ctx->npix_wf, sizeof(float));
+        ctx->h_wf_prev = (float *) cacaosim_aligned_calloc(wf_tot_pix, sizeof(float));
+        ctx->h_wf_curr = (float *) cacaosim_aligned_calloc(wf_tot_pix, sizeof(float));
         if (!ctx->h_wf_prev || !ctx->h_wf_curr)
         {
             cacaosim_bench_free(ctx);
@@ -1003,10 +1200,11 @@ int cacaosim_bench_init(
     /* Allocate named optical beam buffers (initially monochromatic nlam = 1) */
     for (uint32_t b = 0; b < ctx->n_beams; b++)
     {
-        ctx->beams[b].nlam     = 1u;
-        ctx->beams[b].owns_buf = 1;
-        ctx->beams[b].opd      = (float *) cacaosim_aligned_calloc(ctx->npix_wf, sizeof(float));
-        ctx->beams[b].amp      = (float *) cacaosim_aligned_calloc(ctx->npix_wf, sizeof(float));
+        ctx->beams[b].nlam      = 1u;
+        ctx->beams[b].poly_mode = (int32_t) CACAOSIM_POLY_NONE;
+        ctx->beams[b].owns_buf  = 1;
+        ctx->beams[b].opd       = (float *) cacaosim_aligned_calloc(ctx->npix_wf, sizeof(float));
+        ctx->beams[b].amp       = (float *) cacaosim_aligned_calloc(ctx->npix_wf, sizeof(float));
         if (!ctx->beams[b].opd || !ctx->beams[b].amp)
         {
             cacaosim_bench_free(ctx);
@@ -1026,8 +1224,33 @@ int cacaosim_bench_init(
         }
     }
 
-    /* Precompute steady-state spectral photometry across resolved sensor cadences */
+    /* Promote root entrance beam to multi-wavelength unwrapped OPD cube when chrom_turb active */
+    if (ctx->wf_chrom_nwl >= 2u)
+    {
+        if (upgrade_beam_poly(ctx, &ctx->beams[0], ctx->wf_chrom_nwl, ctx->wf_chrom_wls, err_buf,
+                              err_cap) != 0)
+        {
+            cacaosim_bench_free(ctx);
+            return -1;
+        }
+        ctx->beams[0].poly_mode = (int32_t) CACAOSIM_POLY_UNWRAPPED_OPD;
+    }
+
+    /* Initialize cached atmospheric dispersion state & IMR parallactic tracking */
+    ctx->atm_disp_pa_curr_deg = (double) cfg->atm_disp.disp_pa_deg;
+    bench_update_atm_disp(ctx);
+
+    /* Precompute steady-state spectral photometry & dispersion across resolved sensor cadences */
     propagate_spectra(ctx);
+    ctx->beams[0].disp = ctx->cached_atm_disp;
+
+    if (cacaosim_perturb_init(&ctx->perturb, ctx->nwf, cfg->pup_diam, ctx->pup_ptr, &cfg->perturb,
+                              ctx->use_cuda, ctx->cuda_stream) != 0)
+    {
+        cacaosim_bench_free(ctx);
+        dag_err(err_buf, err_cap, "Failed to initialize entrance-pupil perturbation engine");
+        return -1;
+    }
 
     /* Initialize each compute unit in topological order */
     for (uint32_t i = 0; i < ctx->n_nodes; i++)
@@ -1104,6 +1327,42 @@ int cacaosim_bench_init(
                 cacaosim_bench_free(ctx);
                 return -1;
             }
+            ctx->beams[nd->out_idx].poly_mode = bin_dm->poly_mode;
+        }
+        else if (nd->cfg.kind == CACAOSIM_NODE_ADC)
+        {
+            cacaosim_adc_init(&nd->adc_ctx, &nd->cfg.adc, &cfg->atm_disp);
+            if (connect_shm)
+            {
+                if (nd->cfg.in_cmd[0] != '\0')
+                {
+                    nd->img_cmd = stream_connect_create_2Df32(nd->cfg.in_cmd, 2u, 1u);
+                }
+                if (nd->cfg.out_state[0] != '\0')
+                {
+                    nd->img_state =
+                        stream_connect_create_2Df32(nd->cfg.out_state, CACAOSIM_ADC_STATE_LEN, 1u);
+                }
+            }
+            const cacaosim_beam_slot_t *bin_adc = &ctx->beams[nd->in_idx];
+            if (bin_adc->nlam > 1u &&
+                upgrade_beam_poly(ctx, &ctx->beams[nd->out_idx], bin_adc->nlam, bin_adc->lam_um,
+                                  err_buf, err_cap) != 0)
+            {
+                cacaosim_bench_free(ctx);
+                return -1;
+            }
+            ctx->beams[nd->out_idx].poly_mode = bin_adc->poly_mode;
+            cacaosim_adc_step(&nd->adc_ctx, 0.0, &cfg->atm_disp, NULL, &bin_adc->disp,
+                              &bin_adc->spec, &ctx->beams[nd->out_idx].disp,
+                              &ctx->beams[nd->out_idx].spec);
+            if (connect_shm && nd->img_state.ID != -1)
+            {
+                nd->img_state.md->write = 1;
+                memcpy(nd->img_state.im->array.F, nd->adc_ctx.state_vec,
+                       sizeof(nd->adc_ctx.state_vec));
+                ImageStreamIO_UpdateIm(nd->img_state.im);
+            }
         }
         else if (nd->cfg.kind == CACAOSIM_NODE_SPLITTER)
         {
@@ -1162,15 +1421,25 @@ int cacaosim_bench_init(
                     return -1;
                 }
             }
+            if (nd->refl_idx >= 0)
+            {
+                ctx->beams[nd->refl_idx].poly_mode = bin_sp->poly_mode;
+            }
+            if (nd->trans_idx >= 0)
+            {
+                ctx->beams[nd->trans_idx].poly_mode = bin_sp->poly_mode;
+            }
         }
         else if (nd->cfg.kind == CACAOSIM_NODE_CORO)
         {
-            nd->cfg.coro.nwf      = ctx->nwf;
-            nd->cfg.coro.pup_diam = cfg->pup_diam;
-            nd->cfg.coro.backend  = eff_backend;
-            if (ctx->beams[nd->in_idx].nlam > 1u && nd->cfg.coro.nlambda <= 1)
+            const cacaosim_beam_slot_t *bin_co = &ctx->beams[nd->in_idx];
+            nd->cfg.coro.nwf                   = ctx->nwf;
+            nd->cfg.coro.pup_diam              = cfg->pup_diam;
+            nd->cfg.coro.backend               = eff_backend;
+            if (bin_co->nlam > 1u && bin_co->poly_mode != CACAOSIM_POLY_UNWRAPPED_OPD &&
+                nd->cfg.coro.nlambda <= 1)
             {
-                nd->cfg.coro.nlambda = (int32_t) ctx->beams[nd->in_idx].nlam;
+                nd->cfg.coro.nlambda = (int32_t) bin_co->nlam;
             }
 
             cacaosim_coro_masks_t masks = { 0 };
@@ -1225,6 +1494,11 @@ int cacaosim_bench_init(
                 }
                 return -1;
             }
+            /* Bind input beam wavelengths so unwrapped chromatic cubes interpolate cleanly */
+            if (bin_co->nlam > 1u)
+            {
+                cacaosim_coro_set_in_lambdas(&nd->coro_ctx, bin_co->lam_um, bin_co->nlam);
+            }
             /* Widen output science and LOWFS beams to [eff_nlam, nwf, nwf] when broadband */
             if (nd->coro_ctx.eff_nlam > 1 &&
                 upgrade_beam_poly(ctx, &ctx->beams[nd->out_idx], (uint32_t) nd->coro_ctx.eff_nlam,
@@ -1233,12 +1507,24 @@ int cacaosim_bench_init(
                 cacaosim_bench_free(ctx);
                 return -1;
             }
-            if (nd->lowfs_idx >= 0 && nd->coro_ctx.eff_nlam > 1 &&
-                upgrade_beam_poly(ctx, &ctx->beams[nd->lowfs_idx], (uint32_t) nd->coro_ctx.eff_nlam,
-                                  nd->coro_ctx.lam_um, err_buf, err_cap) != 0)
+            ctx->beams[nd->out_idx].poly_mode =
+                (nd->coro_ctx.eff_nlam > 1) ? (int32_t) CACAOSIM_POLY_COMPLEX_FIELD
+                                            : (int32_t) CACAOSIM_POLY_NONE;
+            cacaosim_disp_zero(&ctx->beams[nd->out_idx].disp);
+            if (nd->lowfs_idx >= 0)
             {
-                cacaosim_bench_free(ctx);
-                return -1;
+                if (nd->coro_ctx.eff_nlam > 1 &&
+                    upgrade_beam_poly(ctx, &ctx->beams[nd->lowfs_idx],
+                                      (uint32_t) nd->coro_ctx.eff_nlam, nd->coro_ctx.lam_um,
+                                      err_buf, err_cap) != 0)
+                {
+                    cacaosim_bench_free(ctx);
+                    return -1;
+                }
+                ctx->beams[nd->lowfs_idx].poly_mode =
+                    (nd->coro_ctx.eff_nlam > 1) ? (int32_t) CACAOSIM_POLY_COMPLEX_FIELD
+                                                : (int32_t) CACAOSIM_POLY_NONE;
+                cacaosim_disp_zero(&ctx->beams[nd->lowfs_idx].disp);
             }
             if (connect_shm)
             {
@@ -1719,6 +2005,7 @@ void cacaosim_bench_free(cacaosim_bench_ctx_t *ctx)
         free_imgid_if_valid(&ctx->beams[b].img_shm);
     }
 
+    cacaosim_perturb_free(&ctx->perturb);
     cacaosim_cuda_free_f32(ctx->d_pup_amp);
     cacaosim_cuda_free_f32(ctx->d_ncpa_opd);
     cacaosim_cuda_free_f32(ctx->d_wf_in);
@@ -2241,6 +2528,14 @@ MILK_HOT void cacaosim_bench_step(
             cacaosim_beam_init_cpu(ctx->pup_ptr, amp_ptr, wf_ptr, ctx->ncpa_ptr, wf_scale,
                                    ctx->nwf, b0->opd, b0->amp);
         }
+    }
+
+    if (beam_needed[0] && !ctx->calib_fast &&
+        (ctx->cfg.perturb.vib_enable || ctx->cfg.perturb.petal_enable))
+    {
+        cacaosim_perturb_step_apply(
+            &ctx->perturb, &ctx->cfg.perturb, (double) ctx->dt_master_s, turb_gain, b0->opd,
+            ctx->use_cuda ? b0->d_opd : NULL, ctx->cuda_stream);
     }
 
     /* Use primary DM command stream as lineage trigger reference for sensor SHM updates */

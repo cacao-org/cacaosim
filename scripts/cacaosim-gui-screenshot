@@ -140,6 +140,7 @@ def probe_bench_layout(bench_path: Path, ctrl_bin: str) -> dict[str, int]:
     dag_w = 152
     dag_h = 26
     n_beams = max(4, n_misc * 2 + n_dm + 1)
+    measured_deck_h = 0
 
     lib_path = find_libmilkcacaosim(ctrl_bin)
     if lib_path:
@@ -167,10 +168,10 @@ def probe_bench_layout(bench_path: Path, ctrl_bin: str) -> dict[str, int]:
                     ctypes.c_size_t,
                 ]
                 lib.cacaosim_tui_render_headless.restype = ctypes.c_int
-                probe_cols, probe_rows = 240, 84
-                out_buf = ctypes.create_string_buffer(655360)
+                probe_cols, probe_rows = 280, 100
+                out_buf = ctypes.create_string_buffer(1048576)
                 n = lib.cacaosim_tui_render_headless(
-                    cfg_buf, 1, probe_cols, probe_rows, 0, out_buf, 655360
+                    cfg_buf, 1, probe_cols, probe_rows, 0, out_buf, 1048576
                 )
                 if n > 0:
                     rows_txt = out_buf.value.decode("utf-8", errors="replace").splitlines()
@@ -191,12 +192,26 @@ def probe_bench_layout(bench_path: Path, ctrl_bin: str) -> dict[str, int]:
                             max_c = max(max_c, len(inner) + 2)
                     dag_w = max_c
                     dag_h = max_r
+                    deck_end = next(
+                        (
+                            ri
+                            for ri in range(box_end + 2, len(rows_txt))
+                            if rows_txt[ri].startswith("╰")
+                        ),
+                        -1,
+                    )
+                    if deck_end > box_end:
+                        measured_deck_h = deck_end - box_end
         except OSError:
             pass
 
-    deck_h = min(16, max(11, n_beams + 3))
-    schem_cols = max(136, min(210, dag_w + 4))
-    schem_rows = max(30, min(68, dag_h + deck_h + 7))
+    deck_h = (
+        measured_deck_h
+        if measured_deck_h > 0
+        else min(16, max(11, n_beams + 3))
+    )
+    schem_cols = max(136, min(280, dag_w + 4))
+    schem_rows = max(30, min(100, dag_h + deck_h + 7))
 
     bldr_cols = max(154, min(206, max(dag_w + 38, 168)))
     bldr_rows = max(38, min(48, max(node_idx + 22, 42)))

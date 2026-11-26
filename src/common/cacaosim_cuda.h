@@ -305,6 +305,23 @@ void cacaosim_cuda_beam_init_lerp(
     void        *cuda_stream);
 
 /**
+ * cacaosim_cuda_beam_add_modes() - Add a weighted linear combination of static pupil modes on GPU
+ * @d_opd:       In/out device beam OPD `[npix]` in `[um]`
+ * @d_basis:     Device static modal basis stack `[n_modes * npix]`
+ * @h_coeffs:    Host modal coefficients `[n_modes]` in `[um]` (passed by value, <= 32 modes)
+ * @n_modes:     Number of basis modes (<= 32)
+ * @npix:        Total pupil pixels (`nwf * nwf`)
+ * @cuda_stream: Optional `cudaStream_t` handle
+ */
+void cacaosim_cuda_beam_add_modes(
+    float       *d_opd,
+    const float *d_basis,
+    const float *h_coeffs,
+    uint32_t     n_modes,
+    uint64_t     npix,
+    void        *cuda_stream);
+
+/**
  * cacaosim_cuda_beam_apply_dm() - Subtract reflective DM OPD surface from a beam on GPU
  * @d_in_opd:    Device input beam OPD `[nwf * nwf]` in `[um]` (`NULL` -> `0.0f`)
  * @d_in_amp:    Device input beam amplitude `[nwf * nwf]` (`NULL` -> `1.0f`)

@@ -356,46 +356,56 @@ static void MILK_HOT zwfs_propagate_cpu(
     const uint64_t npix_wf = ctx->npix_wf;
     const int32_t  nlam    = (ctx->eff_nlam >= 1) ? ctx->eff_nlam : 1;
     const int      nth     = (npix_wf >= 16384ULL) ? omp_get_max_threads() : 1;
+    const float    p0_xy   = 0.5f * (float) (nwf - 1u);
 
     float *__restrict epup = MILK_ASSUME_ALIGNED(ctx->cpu_epup_cplx);
 
     for (int32_t c = 0; c < nlam; c++)
     {
         const float opd_to_rad = ctx->k_rad[c];
+        const float sx_c       = ctx->disp_sx[c];
+        const float sy_c       = ctx->disp_sy[c];
+        const int   has_disp   = (sx_c != 0.0f || sy_c != 0.0f) ? 1 : 0;
 
 #pragma omp parallel for num_threads(nth) if (nth > 1) schedule(static)
-        for (uint64_t p = 0; p < npix_wf; p++)
+        for (uint32_t iy = 0; iy < nwf; iy++)
         {
-            float amp = (pup_amp != NULL) ? pup_amp[p] : 1.0f;
-            if (atm_amp != NULL)
+            const float    dy    = has_disp ? (sy_c * ((float) iy - p0_xy)) : 0.0f;
+            const uint64_t pbase = (uint64_t) iy * nwf;
+            for (uint32_t ix = 0; ix < nwf; ix++)
             {
-                amp *= atm_amp[p];
+                uint64_t p   = pbase + ix;
+                float    amp = (pup_amp != NULL) ? pup_amp[p] : 1.0f;
+                if (atm_amp != NULL)
+                {
+                    amp *= atm_amp[p];
+                }
+                if (amp <= 0.0f)
+                {
+                    epup[2u * p]      = 0.0f;
+                    epup[2u * p + 1u] = 0.0f;
+                    continue;
+                }
+                float opd = has_disp ? (sx_c * ((float) ix - p0_xy) + dy) : 0.0f;
+                if (wf_in != NULL)
+                {
+                    opd += wf_to_opd * wf_in[p];
+                }
+                if (dm_opd != NULL)
+                {
+                    opd -= dm_opd[p];
+                }
+                if (ncpa_opd != NULL)
+                {
+                    opd += ncpa_opd[p];
+                }
+                float phi = opd * opd_to_rad;
+                float s   = 0.0f;
+                float co  = 1.0f;
+                sincosf(phi, &s, &co);
+                epup[2u * p]      = amp * co;
+                epup[2u * p + 1u] = amp * s;
             }
-            if (amp <= 0.0f)
-            {
-                epup[2u * p]      = 0.0f;
-                epup[2u * p + 1u] = 0.0f;
-                continue;
-            }
-            float opd = 0.0f;
-            if (wf_in != NULL)
-            {
-                opd += wf_to_opd * wf_in[p];
-            }
-            if (dm_opd != NULL)
-            {
-                opd -= dm_opd[p];
-            }
-            if (ncpa_opd != NULL)
-            {
-                opd += ncpa_opd[p];
-            }
-            float phi = opd * opd_to_rad;
-            float s   = 0.0f;
-            float co  = 1.0f;
-            sincosf(phi, &s, &co);
-            epup[2u * p]      = amp * co;
-            epup[2u * p + 1u] = amp * s;
         }
 
         zwfs_eval_babinet_chan_cpu(ctx, c);
@@ -413,14 +423,16 @@ static void MILK_HOT zwfs_propagate_poly_cpu(
     uint64_t             chan_stride,
     const float         *ncpa_opd)
 {
-    const uint32_t nwf     = ctx->cfg.nwf;
-    const uint64_t npix_wf = ctx->npix_wf;
-    const int32_t  nlam    = (ctx->eff_nlam >= 1) ? ctx->eff_nlam : 1;
-    const int      nth     = (npix_wf >= 16384ULL) ? omp_get_max_threads() : 1;
-    const float    lam0    = (ctx->cfg.lambda_um > 0.05f) ? ctx->cfg.lambda_um : 0.75f;
-    const float    bw      = (ctx->cfg.bw_frac > 0.0f) ? ctx->cfg.bw_frac : 0.20f;
-    const float    def_l0  = lam0 * (1.0f - 0.5f * bw);
-    const float    def_l1  = lam0 * (1.0f + 0.5f * bw);
+    const uint32_t nwf       = ctx->cfg.nwf;
+    const uint64_t npix_wf   = ctx->npix_wf;
+    const int32_t  nlam      = (ctx->eff_nlam >= 1) ? ctx->eff_nlam : 1;
+    const int      nth       = (npix_wf >= 16384ULL) ? omp_get_max_threads() : 1;
+    const float    lam0      = (ctx->cfg.lambda_um > 0.05f) ? ctx->cfg.lambda_um : 0.75f;
+    const float    bw        = (ctx->cfg.bw_frac > 0.0f) ? ctx->cfg.bw_frac : 0.20f;
+    const float    def_l0    = lam0 * (1.0f - 0.5f * bw);
+    const float    def_l1    = lam0 * (1.0f + 0.5f * bw);
+    const float    p0_xy     = 0.5f * (float) (nwf - 1u);
+    const int32_t  unwrapped = (ctx->in_poly_mode == CACAOSIM_POLY_UNWRAPPED_OPD) ? 1 : 0;
 
     float *__restrict epup = MILK_ASSUME_ALIGNED(ctx->cpu_epup_cplx);
 
@@ -429,45 +441,69 @@ static void MILK_HOT zwfs_propagate_poly_cpu(
         uint32_t m0 = 0u;
         uint32_t m1 = 0u;
         float    w1 = 0.0f;
-        cacaosim_poly_interp_bracket(ctx->lam_um[c], beam_lam_um, beam_nlam, def_l0, def_l1, &m0,
-                                     &m1, &w1);
-        float        w0 = 1.0f - w1;
-        float        kc = ctx->k_rad[c];
-        const float *o0 = (beam_opd != NULL) ? (beam_opd + (uint64_t) m0 * chan_stride) : NULL;
-        const float *a0 = (beam_amp != NULL) ? (beam_amp + (uint64_t) m0 * chan_stride) : NULL;
-        const float *o1 = (beam_opd != NULL) ? (beam_opd + (uint64_t) m1 * chan_stride) : NULL;
-        const float *a1 = (beam_amp != NULL) ? (beam_amp + (uint64_t) m1 * chan_stride) : NULL;
+        cacaosim_poly_interp_bracket_ex(ctx->lam_um[c], beam_lam_um, beam_nlam, def_l0, def_l1,
+                                        unwrapped, &m0, &m1, &w1);
+        float        w0       = 1.0f - w1;
+        float        kc       = ctx->k_rad[c];
+        float        sx_c     = ctx->disp_sx[c];
+        float        sy_c     = ctx->disp_sy[c];
+        int          has_disp = (sx_c != 0.0f || sy_c != 0.0f) ? 1 : 0;
+        const float *o0       = (beam_opd != NULL) ? (beam_opd + (uint64_t) m0 * chan_stride) : NULL;
+        const float *a0       = (beam_amp != NULL) ? (beam_amp + (uint64_t) m0 * chan_stride) : NULL;
+        const float *o1       = (beam_opd != NULL) ? (beam_opd + (uint64_t) m1 * chan_stride) : NULL;
+        const float *a1       = (beam_amp != NULL) ? (beam_amp + (uint64_t) m1 * chan_stride) : NULL;
 
 #pragma omp parallel for num_threads(nth) if (nth > 1) schedule(static)
-        for (uint64_t p = 0; p < npix_wf; p++)
+        for (uint32_t iy = 0; iy < nwf; iy++)
         {
-            float amp0 = (a0 != NULL) ? a0[p] : 1.0f;
-            float amp1 = (a1 != NULL) ? a1[p] : 1.0f;
-            if (amp0 <= 0.0f && amp1 <= 0.0f)
+            const float    dy    = has_disp ? (sy_c * ((float) iy - p0_xy)) : 0.0f;
+            const uint64_t pbase = (uint64_t) iy * nwf;
+            for (uint32_t ix = 0; ix < nwf; ix++)
             {
-                epup[2u * p]      = 0.0f;
-                epup[2u * p + 1u] = 0.0f;
-                continue;
-            }
-            float nc  = (ncpa_opd != NULL) ? ncpa_opd[p] : 0.0f;
-            float p0  = (((o0 != NULL) ? o0[p] : 0.0f) + nc) * kc;
-            float s0  = 0.0f;
-            float co0 = 1.0f;
-            sincosf(p0, &s0, &co0);
-            float re = w0 * amp0 * co0;
-            float im = w0 * amp0 * s0;
+                uint64_t p    = pbase + ix;
+                float    amp0 = (a0 != NULL) ? a0[p] : 1.0f;
+                float    amp1 = (a1 != NULL) ? a1[p] : 1.0f;
+                if (amp0 <= 0.0f && amp1 <= 0.0f)
+                {
+                    epup[2u * p]      = 0.0f;
+                    epup[2u * p + 1u] = 0.0f;
+                    continue;
+                }
+                float disp_opd = has_disp ? (sx_c * ((float) ix - p0_xy) + dy) : 0.0f;
+                float nc       = ((ncpa_opd != NULL) ? ncpa_opd[p] : 0.0f) + disp_opd;
+                if (unwrapped && m1 != m0 && w1 > 0.0f)
+                {
+                    float amp = w0 * amp0 + w1 * amp1;
+                    float opd = w0 * ((o0 != NULL) ? o0[p] : 0.0f) +
+                                w1 * ((o1 != NULL) ? o1[p] : 0.0f) + nc;
+                    float s  = 0.0f;
+                    float co = 1.0f;
+                    sincosf(opd * kc, &s, &co);
+                    epup[2u * p]      = amp * co;
+                    epup[2u * p + 1u] = amp * s;
+                }
+                else
+                {
+                    float p0  = (((o0 != NULL) ? o0[p] : 0.0f) + nc) * kc;
+                    float s0  = 0.0f;
+                    float co0 = 1.0f;
+                    sincosf(p0, &s0, &co0);
+                    float re = w0 * amp0 * co0;
+                    float im = w0 * amp0 * s0;
 
-            if (m1 != m0 && w1 > 0.0f)
-            {
-                float p1  = (((o1 != NULL) ? o1[p] : 0.0f) + nc) * kc;
-                float s1  = 0.0f;
-                float co1 = 1.0f;
-                sincosf(p1, &s1, &co1);
-                re += w1 * amp1 * co1;
-                im += w1 * amp1 * s1;
+                    if (m1 != m0 && w1 > 0.0f)
+                    {
+                        float p1  = (((o1 != NULL) ? o1[p] : 0.0f) + nc) * kc;
+                        float s1  = 0.0f;
+                        float co1 = 1.0f;
+                        sincosf(p1, &s1, &co1);
+                        re += w1 * amp1 * co1;
+                        im += w1 * amp1 * s1;
+                    }
+                    epup[2u * p]      = re;
+                    epup[2u * p + 1u] = im;
+                }
             }
-            epup[2u * p]      = re;
-            epup[2u * p + 1u] = im;
         }
 
         zwfs_eval_babinet_chan_cpu(ctx, c);
@@ -817,6 +853,50 @@ void cacaosim_zwfs_set_weights(
     if (changed && ctx->use_cuda)
     {
         cacaosim_zwfs_cuda_upload_weights(ctx);
+    }
+}
+
+void cacaosim_zwfs_set_disp(
+    cacaosim_zwfs_ctx_t   *ctx,
+    const cacaosim_disp_t *disp,
+    float                  tel_diam_m,
+    int32_t                in_poly_mode)
+{
+    if (ctx == NULL || ctx->eff_nlam < 1)
+    {
+        return;
+    }
+    ctx->in_poly_mode = in_poly_mode;
+
+    if (disp == NULL || !disp->active)
+    {
+        if (ctx->disp_active)
+        {
+            memset(ctx->disp_sx, 0, sizeof(ctx->disp_sx));
+            memset(ctx->disp_sy, 0, sizeof(ctx->disp_sy));
+            ctx->disp_active = 0;
+            ctx->disp_gen    = 0ULL;
+            if (ctx->use_cuda)
+            {
+                cacaosim_zwfs_cuda_upload_disp(ctx);
+            }
+        }
+        return;
+    }
+
+    float diam = (tel_diam_m > 0.01f) ? tel_diam_m : 8.0f;
+    if (!ctx->disp_active || disp->gen != ctx->disp_gen ||
+        fabsf(diam - ctx->disp_tel_diam) > 1e-4f)
+    {
+        cacaosim_disp_eval_slopes(disp, ctx->lam_um, (uint32_t) ctx->eff_nlam, diam, ctx->cfg.nwf,
+                                  ctx->cfg.pup_diam, ctx->disp_sx, ctx->disp_sy);
+        ctx->disp_active   = 1;
+        ctx->disp_gen      = disp->gen;
+        ctx->disp_tel_diam = diam;
+        if (ctx->use_cuda)
+        {
+            cacaosim_zwfs_cuda_upload_disp(ctx);
+        }
     }
 }
 

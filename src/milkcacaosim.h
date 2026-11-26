@@ -34,7 +34,9 @@
 /* Core leaf constants, enums, detector config, and aligned memory helpers */
 #include "cacaosim_types.h"
 
-/* Optical beam source, inline static WFE, and dichroic beamsplitter FPS runnables */
+/* Optical beam source, inline static WFE, ADC, and dichroic beamsplitter FPS runnables */
+#include "adc/cacaosim_adc.h"
+#include "adc/cacaosim_adc_FPS.h"
 #include "beam/cacaosim_beamsplit_FPS.h"
 #include "beam/cacaosim_mkbeam_FPS.h"
 #include "beam/cacaosim_wfe_FPS.h"
@@ -50,6 +52,7 @@
 #include "common/cacaosim_beam.h"
 #include "common/cacaosim_cuda.h"
 #include "common/cacaosim_detector.h"
+#include "common/cacaosim_disp.h"
 #include "common/cacaosim_mask.h"
 #include "common/cacaosim_rng.h"
 #include "common/cacaosim_time.h"

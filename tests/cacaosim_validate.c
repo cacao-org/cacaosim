@@ -3524,6 +3524,26 @@ static void test_wfstat_cpu_gpu_parity(void)
     cacaosim_wfstat_t wc, wg;
     int rc_c = cacaosim_wfstat_init(&wc, nwf, pup, nframes, 0, 0, NULL);
     int rc_g = cacaosim_wfstat_init(&wg, nwf, pup, nframes, 0, 1, stream);
+    const uint64_t clip_s0  = 95ULL;
+    const uint32_t clip_len = 16u;
+    const double   full_stp = 10.0;
+    const uint32_t full_cap = 32u;
+    if (rc_c == 0)
+    {
+        rc_c = cacaosim_wfstat_enable_clip(&wc, clip_s0, clip_len);
+    }
+    if (rc_c == 0)
+    {
+        rc_c = cacaosim_wfstat_enable_full(&wc, full_stp, full_cap);
+    }
+    if (rc_g == 0)
+    {
+        rc_g = cacaosim_wfstat_enable_clip(&wg, clip_s0, clip_len);
+    }
+    if (rc_g == 0)
+    {
+        rc_g = cacaosim_wfstat_enable_full(&wg, full_stp, full_cap);
+    }
     check_cond(rc_c == 0 && rc_g == 0 && d_fr[2] != NULL, "wfstat CPU + CUDA engines initialize",
                rc_g == 0 ? "ok" : "gpu init failed");
     if (rc_c != 0 || rc_g != 0)
@@ -3607,6 +3627,49 @@ static void test_wfstat_cpu_gpu_parity(void)
              max_rel_ptv);
     check_cond(max_abs_samp < 1e-3 && max_rel_ptv < 1e-9, "wfstat sample maps + PTV parity", det);
 
+    double max_abs_clip = 0.0;
+    if (wc.clip_n == clip_len && wg.clip_n == clip_len)
+    {
+        for (uint32_t ci = 0; ci < clip_len; ci++)
+        {
+            for (uint64_t i = 0; i < npix; i++)
+            {
+                double dr = fabs((double) wg.clip_wf_raw[ci * npix + i] -
+                                 (double) wc.clip_wf_raw[ci * npix + i]);
+                double df = fabs((double) wg.clip_wf_final[ci * npix + i] -
+                                 (double) wc.clip_wf_final[ci * npix + i]);
+                max_abs_clip = fmax(max_abs_clip, fmax(dr, df));
+            }
+        }
+    }
+    snprintf(det, sizeof(det), "clip_n=%u/%u (expect %u), max |dclip| = %.2e nm", wg.clip_n,
+             wc.clip_n, clip_len, max_abs_clip);
+    check_cond(wc.clip_n == clip_len && wg.clip_n == clip_len && max_abs_clip < 1e-3 &&
+                   wg.clip_frame[0] == clip_s0 && wg.clip_frame[clip_len - 1] == clip_s0 + clip_len - 1,
+               "wfstat contiguous short-timescale clip GPU/CPU parity", det);
+
+    double max_abs_full = 0.0;
+    if (wc.full_n > 0u && wc.full_n == wg.full_n)
+    {
+        for (uint32_t fi = 0; fi < wg.full_n; fi++)
+        {
+            for (uint64_t i = 0; i < npix; i++)
+            {
+                double dr = fabs((double) wg.full_wf_raw[fi * npix + i] -
+                                 (double) wc.full_wf_raw[fi * npix + i]);
+                double df = fabs((double) wg.full_wf_final[fi * npix + i] -
+                                 (double) wc.full_wf_final[fi * npix + i]);
+                max_abs_full = fmax(max_abs_full, fmax(dr, df));
+            }
+        }
+    }
+    snprintf(det, sizeof(det), "full_n=%u/%u, first=%llu, max |dfull| = %.2e nm", wg.full_n,
+             wc.full_n, (unsigned long long) ((wg.full_n > 0u) ? wg.full_frame[0] : 0ULL),
+             max_abs_full);
+    check_cond(wc.full_n >= 10u && wg.full_n == wc.full_n && max_abs_full < 1e-3 &&
+                   wg.full_frame[0] == 1ULL,
+               "wfstat strided full-duration capture GPU/CPU parity", det);
+
     char tmpd[128], pbuf[256];
     snprintf(tmpd, sizeof(tmpd), "/tmp/cacaosim_wfstat_ut_%ld", (long) getpid());
     int rc_w = cacaosim_wfstat_write(&wg, tmpd, 0.0005);
@@ -3629,15 +3692,32 @@ static void test_wfstat_cpu_gpu_parity(void)
     {
         fclose(jfp);
     }
-    snprintf(det, sizeof(det), "write rc=%d, csv lines=%u (expect %u)", rc_w, lines, nframes + 1);
-    check_cond(rc_w == 0 && j_ok && lines == nframes + 1,
-               "wfstat writes wf_stats.json + wf_timeseries.csv", det);
+    snprintf(pbuf, sizeof(pbuf), "%s/wf_clip_meta.json", tmpd);
+    FILE *cmfp  = fopen(pbuf, "r");
+    int   cm_ok = (cmfp != NULL);
+    if (cmfp != NULL)
+    {
+        fclose(cmfp);
+    }
+    snprintf(pbuf, sizeof(pbuf), "%s/wf_full_meta.json", tmpd);
+    FILE *fmfp  = fopen(pbuf, "r");
+    int   fm_ok = (fmfp != NULL);
+    if (fmfp != NULL)
+    {
+        fclose(fmfp);
+    }
+    snprintf(det, sizeof(det), "write rc=%d, csv lines=%u (expect %u), clip=%d, full=%d", rc_w,
+             lines, nframes + 1, cm_ok, fm_ok);
+    check_cond(rc_w == 0 && j_ok && cm_ok && fm_ok && lines == nframes + 1,
+               "wfstat writes wf_stats.json + csv + wf_clip_meta + wf_full_meta", det);
 
     static const char *const ut_files[] = {
         "wf_pupil_mask.fits", "wf_stats.json",     "wf_timeseries.csv",
         "wf_mean_raw.fits",   "wf_std_raw.fits",   "wf_samples_raw.fits",
         "wf_mean_stg1.fits",  "wf_std_stg1.fits",  "wf_samples_stg1.fits",
         "wf_mean_final.fits", "wf_std_final.fits", "wf_samples_final.fits",
+        "wf_clip_raw.fits",   "wf_clip_final.fits", "wf_clip_meta.json",
+        "wf_full_raw.fits",   "wf_full_final.fits", "wf_full_meta.json",
     };
     for (size_t i = 0; i < sizeof(ut_files) / sizeof(ut_files[0]); i++)
     {
@@ -3648,6 +3728,111 @@ static void test_wfstat_cpu_gpu_parity(void)
 
     cacaosim_wfstat_free(&wc);
     cacaosim_wfstat_free(&wg);
+
+    /* Control-mode orthogonal projection parity (CPU vs CUDA + Parseval identity) */
+    cacaosim_wfstat_t wcc, wcg;
+    int rc_cc = cacaosim_wfstat_init(&wcc, nwf, pup, nframes, 0, 0, NULL);
+    int rc_cg = cacaosim_wfstat_init(&wcg, nwf, pup, nframes, 0, 1, stream);
+    if (rc_cc == 0 && rc_cg == 0 && wcc.act_pix > 16)
+    {
+        uint64_t ap   = wcc.act_pix;
+        uint32_t n1   = 4;
+        uint32_t ntot = 8;
+        float   *Q    = (float *) calloc((size_t) ap * ntot, sizeof(float));
+        /* Build 8 orthonormal columns on active pixels via modified Gram-Schmidt */
+        for (uint32_t m = 0; m < ntot; m++)
+        {
+            double mean = 0.0;
+            for (uint64_t p = 0; p < ap; p++)
+            {
+                uint32_t pix = wcc.act_idx[p];
+                double   x   = ((double) (pix % nwf) / (double) nwf) - 0.5;
+                double   y   = ((double) (pix / nwf) / (double) nwf) - 0.5;
+                double   v   = cos((double) (m + 1) * 3.14159 * x + 0.7 * (double) m * y);
+                Q[m * ap + p] = (float) v;
+                mean += wcc.weights[pix] * v;
+            }
+            for (uint64_t p = 0; p < ap; p++)
+            {
+                Q[m * ap + p] = (float) (((double) Q[m * ap + p] - mean) * (double) wcc.act_sw[p]);
+            }
+            for (uint32_t prev = 0; prev < m; prev++)
+            {
+                double dot = 0.0;
+                for (uint64_t p = 0; p < ap; p++)
+                {
+                    dot += (double) Q[prev * ap + p] * (double) Q[m * ap + p];
+                }
+                for (uint64_t p = 0; p < ap; p++)
+                {
+                    Q[m * ap + p] -= (float) (dot * (double) Q[prev * ap + p]);
+                }
+            }
+            double nrm2 = 0.0;
+            for (uint64_t p = 0; p < ap; p++)
+            {
+                nrm2 += (double) Q[m * ap + p] * (double) Q[m * ap + p];
+            }
+            double invn = 1.0 / sqrt(fmax(nrm2, 1e-24));
+            for (uint64_t p = 0; p < ap; p++)
+            {
+                Q[m * ap + p] = (float) ((double) Q[m * ap + p] * invn);
+            }
+        }
+        int rb_c = cacaosim_wfstat_set_ctrl_basis(&wcc, Q, n1, ntot, n1, ntot);
+        int rb_g = cacaosim_wfstat_set_ctrl_basis(&wcg, Q, n1, ntot, n1, ntot);
+        for (uint32_t f = 0; f < nframes && rb_c == 0 && rb_g == 0; f++)
+        {
+            for (int k = 0; k < 3; k++)
+            {
+                for (uint64_t i = 0; i < npix; i++)
+                {
+                    seed               = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+                    float u            = (float) ((seed >> 40) & 0xFFFFFF) / 16777216.0f - 0.5f;
+                    h_fr[k * npix + i] = (0.5f / (float) (k + 1)) * u;
+                }
+                /* Inject known in-space mode 0 (within Stg1) and mode 6 (only in Stg2) */
+                for (uint64_t p = 0; p < ap; p++)
+                {
+                    uint32_t pix = wcc.act_idx[p];
+                    double   inv = 1.0 / fmax((double) wcc.act_sw[p], 1e-12);
+                    h_fr[k * npix + pix] += (float) (0.04 * (double) Q[0 * ap + p] * inv +
+                                                     0.03 * (double) Q[6 * ap + p] * inv);
+                }
+                cacaosim_cuda_h2d_f32(d_fr[k], h_fr + k * npix, npix, stream);
+            }
+            const float *hc[3] = { h_fr, h_fr + npix, h_fr + 2 * npix };
+            const float *dg[3] = { d_fr[0], d_fr[1], d_fr[2] };
+            cacaosim_wfstat_frame(&wcc, hc);
+            cacaosim_wfstat_frame(&wcg, dg);
+            cacaosim_cuda_stream_sync(stream);
+        }
+        cacaosim_wfstat_sync_gpu(&wcg);
+        double max_rel_ctrl = 0.0, max_parseval = 0.0;
+        for (int k = 0; k < 3; k++)
+        {
+            for (uint32_t f = 0; f < nframes; f++)
+            {
+                double di = fabs((double) wcg.ts_in[k][f] - (double) wcc.ts_in[k][f]) /
+                            fmax((double) wcc.ts_in[k][f], 1e-6);
+                double do_ = fabs((double) wcg.ts_out[k][f] - (double) wcc.ts_out[k][f]) /
+                             fmax((double) wcc.ts_out[k][f], 1e-6);
+                max_rel_ctrl = fmax(max_rel_ctrl, fmax(di, do_));
+                double tot2  = (double) wcc.ts_rms[k][f] * (double) wcc.ts_rms[k][f];
+                double sum2  = (double) wcc.ts_in[k][f] * (double) wcc.ts_in[k][f] +
+                               (double) wcc.ts_out[k][f] * (double) wcc.ts_out[k][f];
+                max_parseval = fmax(max_parseval, fabs(sum2 - tot2) / fmax(tot2, 1e-9));
+            }
+        }
+        snprintf(det, sizeof(det), "max rel CPU/GPU = %.2e, Parseval = %.2e, stg1_in=%.1f < fin_in=%.1f",
+                 max_rel_ctrl, max_parseval, wcc.sum_in_rms[1] / nframes,
+                 wcc.sum_in_rms[2] / nframes);
+        check_cond(rb_c == 0 && rb_g == 0 && max_rel_ctrl < 1e-4 && max_parseval < 1e-4,
+                   "wfstat control-mode in/out projection CPU/GPU parity & Parseval", det);
+        free(Q);
+    }
+    cacaosim_wfstat_free(&wcc);
+    cacaosim_wfstat_free(&wcg);
     for (int k = 0; k < 3; k++)
     {
         cacaosim_cuda_free_f32(d_fr[k]);
@@ -5581,10 +5766,17 @@ static void test_options_schema_and_tui_coverage(void)
     ecfg.telemetry_stride = 2u;
     snprintf(ecfg.in_amp, sizeof(ecfg.in_amp), "atm_amp");
     snprintf(ecfg.in_ncpa, sizeof(ecfg.in_ncpa), "ent_ncpa");
-    ecfg.wf_unit    = CACAOSIM_WFUNIT_OPD_UM;
-    ecfg.ref_lambda = 0.65f;
-    ecfg.turb_gain  = 0.8f;
-    ecfg.backend    = CACAOSIM_BACKEND_CPU;
+    ecfg.wf_unit              = CACAOSIM_WFUNIT_OPD_UM;
+    ecfg.ref_lambda           = 0.65f;
+    ecfg.turb_gain            = 0.8f;
+    ecfg.perturb.vib_enable   = 1;
+    ecfg.perturb.vib_rms_nm   = 35.0f;
+    ecfg.perturb.vib_seed     = 111ULL;
+    ecfg.perturb.petal_enable = 1;
+    ecfg.perturb.petal_rms_nm = 180.0f;
+    ecfg.perturb.petal_tau_s  = 2.5f;
+    ecfg.perturb.petal_seed   = 222ULL;
+    ecfg.backend              = CACAOSIM_BACKEND_CPU;
 
     cacaosim_node_cfg_t *nd;
     /* 0: DM zonal RC + delay_frames + reg */
@@ -5901,6 +6093,123 @@ static void test_options_schema_and_tui_coverage(void)
                "12 MILK_RUNNABLE FPS units introspected & JSON/MD/Table exported", det);
 }
 
+static void test_entrance_perturbations(void)
+{
+    printf("\n[19] Entrance-Pupil Vibrations & Thermally Induced Petaling (LWE)\n");
+
+    const uint32_t       nwf  = 128u;
+    const uint64_t       npix = (uint64_t) nwf * nwf;
+    float               *pup  = (float *) calloc(npix, sizeof(float));
+    float               *opd  = (float *) calloc(npix, sizeof(float));
+    cacaosim_pupil_cfg_t pcfg = {
+        .nwf           = nwf,
+        .pup_diam      = 0.9375f,
+        .cobs          = 0.307f,
+        .nspider       = 4,
+        .spider_w      = 0.02314f,
+        .spider_deg    = 51.75f,
+        .spider_offset = 0.08289f,
+    };
+    cacaosim_make_pupil(&pcfg, pup);
+
+    cacaosim_perturb_cfg_t cfg;
+    cacaosim_perturb_cfg_defaults(&cfg);
+    cfg.vib_enable   = 1;
+    cfg.vib_rms_nm   = 45.0f;
+    cfg.petal_enable = 1;
+    cfg.petal_rms_nm = 250.0f;
+    cfg.petal_tau_s  = 2.0f;
+
+    cacaosim_perturb_ctx_t ctx;
+    int                    irc = cacaosim_perturb_init(&ctx, nwf, pcfg.pup_diam, pup, &cfg, 0,
+                                                       NULL);
+    char                   det[256];
+    snprintf(det, sizeof(det), "irc=%d, n_petals=%d, n_modes=%d", irc, ctx.n_petals, ctx.n_modes);
+    check_cond(irc == 0 && ctx.n_petals == 4 && ctx.n_modes == 17,
+               "Subaru 4-V-spider pupil segmented into 4 petals (17 modes)", det);
+
+    /* Scale == 0 must leave OPD identically zero (flat calibration safety) */
+    memset(opd, 0, npix * sizeof(float));
+    cacaosim_perturb_step_apply(&ctx, &cfg, 0.0005, 0.0f, opd, NULL, NULL);
+    double zmax = 0.0;
+    for (uint64_t i = 0; i < npix; i++)
+    {
+        if (fabs((double) opd[i]) > zmax)
+        {
+            zmax = fabs((double) opd[i]);
+        }
+    }
+    snprintf(det, sizeof(det), "max |opd| = %.2e um", zmax);
+    check_cond(zmax == 0.0, "Zero perturbation injected when turb_gain == 0", det);
+
+    /* Measure vibration RMS & 49.5 Hz resonant tone over 4.0 s @ 2 kHz */
+    cfg.petal_enable = 0;
+    const int nstep  = 8000;
+    double    dt_s   = 0.0005;
+    double    sum_v2 = 0.0;
+    double    re49 = 0.0, im49 = 0.0, re200 = 0.0, im200 = 0.0;
+    for (int t = 0; t < nstep; t++)
+    {
+        memset(opd, 0, npix * sizeof(float));
+        cacaosim_perturb_step_apply(&ctx, &cfg, dt_s, 1.0f, opd, NULL, NULL);
+        sum_v2 += (double) ctx.tlm.vib_rms_nm * (double) ctx.tlm.vib_rms_nm;
+        double ang49  = 2.0 * 3.14159265358979323846 * 49.5 * (double) t * dt_s;
+        double ang200 = 2.0 * 3.14159265358979323846 * 200.0 * (double) t * dt_s;
+        re49 += (double) ctx.tlm.vib_tip_nm * cos(ang49);
+        im49 += (double) ctx.tlm.vib_tip_nm * sin(ang49);
+        re200 += (double) ctx.tlm.vib_tip_nm * cos(ang200);
+        im200 += (double) ctx.tlm.vib_tip_nm * sin(ang200);
+    }
+    double vib_rms = sqrt(sum_v2 / (double) nstep);
+    double p49     = re49 * re49 + im49 * im49;
+    double p200    = re200 * re200 + im200 * im200;
+    snprintf(det, sizeof(det), "rms=%.1f nm (target 45), P(49.5Hz)/P(200Hz)=%.1fx", vib_rms,
+             (p200 > 1e-12) ? (p49 / p200) : 9999.0);
+    check_cond(vib_rms > 32.0 && vib_rms < 58.0 && p49 > 10.0 * p200,
+               "Stochastic vibrations match target RMS and 49.5 Hz resonant PSD peak", det);
+
+    /* Measure thermal petaling: zero global mean, slow temporal evolution, realistic RMS */
+    cfg.vib_enable   = 0;
+    cfg.petal_enable = 1;
+    double prev_p0 = 0.0, sum_dp2 = 0.0, sum_p02 = 0.0, mean_abs = 0.0;
+    for (int t = 0; t < 2000; t++)
+    {
+        memset(opd, 0, npix * sizeof(float));
+        cacaosim_perturb_step_apply(&ctx, &cfg, dt_s, 1.0f, opd, NULL, NULL);
+        if (t == 0)
+        {
+            double s = 0.0, cnt = 0.0;
+            for (uint64_t i = 0; i < npix; i++)
+            {
+                if (pup[i] > 0.5f)
+                {
+                    s += (double) opd[i];
+                    cnt += 1.0;
+                }
+            }
+            mean_abs = (cnt > 0.0) ? fabs(s / cnt) : 0.0;
+        }
+        else
+        {
+            double d = (double) ctx.tlm.petal_p_nm[0] - prev_p0;
+            sum_dp2 += d * d;
+        }
+        prev_p0 = (double) ctx.tlm.petal_p_nm[0];
+        sum_p02 += prev_p0 * prev_p0;
+    }
+    double step_rms = sqrt(sum_dp2 / 1999.0);
+    double p0_rms   = sqrt(sum_p02 / 2000.0);
+    snprintf(det, sizeof(det), "|mean|=%.2e um, step_rms=%.3f nm vs p0_rms=%.1f nm", mean_abs,
+             step_rms, p0_rms);
+    check_cond(mean_abs < 1.0e-3 && step_rms < 0.02 * (p0_rms + 1.0) &&
+                   ctx.tlm.petal_rms_nm > 10.0f,
+               "Thermal petaling has zero global piston & smooth slow temporal evolution", det);
+
+    cacaosim_perturb_free(&ctx);
+    free(pup);
+    free(opd);
+}
+
 int main(void)
 {
     printf("======================================================================\n");
@@ -5926,6 +6235,7 @@ int main(void)
     test_chromaticity_and_poly_wfs();
     test_subaru_lyot_coro_and_llowfs();
     test_options_schema_and_tui_coverage();
+    test_entrance_perturbations();
 
     printf("\n======================================================================\n");
     printf("  Summary: %d passed, %d failed\n", g_pass, g_fail);

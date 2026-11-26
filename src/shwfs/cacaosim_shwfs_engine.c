@@ -198,6 +198,10 @@ static void MILK_HOT shwfs_propagate_cpu(
             for (int32_t c = 0; c < nlam; c++)
             {
                 const float opd_to_rad = ctx->k_rad[c];
+                const float sx_c       = ctx->disp_sx[c];
+                const float sy_c       = ctx->disp_sy[c];
+                const float p0_xy      = 0.5f * (float) (nwf - 1u);
+                const int   has_disp   = (sx_c != 0.0f || sy_c != 0.0f) ? 1 : 0;
                 __builtin_memset(work, 0, (size_t) npix_sfft * 2u * sizeof(float));
 
                 for (uint32_t ly = 0; ly < ny; ly++)
@@ -206,6 +210,7 @@ static void MILK_HOT shwfs_propagate_cpu(
                     float    sy_im = sh1d[2u * ly + 1u];
                     uint64_t p_row = (uint64_t) (y0 + ly) * nwf + x0;
                     float   *w_row = &work[(size_t) ly * nfft * 2u];
+                    float    dy    = has_disp ? (sy_c * ((float) (y0 + ly) - p0_xy)) : 0.0f;
 
                     for (uint32_t lx = 0; lx < nx; lx++)
                     {
@@ -220,7 +225,7 @@ static void MILK_HOT shwfs_propagate_cpu(
                             continue;
                         }
 
-                        float opd = 0.0f;
+                        float opd = has_disp ? (sx_c * ((float) (x0 + lx) - p0_xy) + dy) : 0.0f;
                         if (wf_in != NULL)
                         {
                             opd += wf_to_opd * wf_in[p];
@@ -279,14 +284,16 @@ static void MILK_HOT shwfs_propagate_poly_cpu(
     const float    bw        = (ctx->cfg.bw_frac > 0.0f) ? ctx->cfg.bw_frac : 0.20f;
     const float    def_l0    = lam0 * (1.0f - 0.5f * bw);
     const float    def_l1    = lam0 * (1.0f + 0.5f * bw);
+    const float    p0_xy     = 0.5f * (float) (nwf - 1u);
+    const int32_t  unwrapped = (ctx->in_poly_mode == CACAOSIM_POLY_UNWRAPPED_OPD) ? 1 : 0;
 
     uint32_t m0_arr[CACAOSIM_MAX_LAMBDA];
     uint32_t m1_arr[CACAOSIM_MAX_LAMBDA];
     float    al_arr[CACAOSIM_MAX_LAMBDA];
     for (int32_t c = 0; c < nlam; c++)
     {
-        cacaosim_poly_interp_bracket(ctx->lam_um[c], beam_lam_um, beam_nlam, def_l0, def_l1,
-                                     &m0_arr[c], &m1_arr[c], &al_arr[c]);
+        cacaosim_poly_interp_bracket_ex(ctx->lam_um[c], beam_lam_um, beam_nlam, def_l0, def_l1,
+                                        unwrapped, &m0_arr[c], &m1_arr[c], &al_arr[c]);
     }
 
     const float *__restrict sh1d = ctx->shift_1d_cplx;
@@ -312,11 +319,14 @@ static void MILK_HOT shwfs_propagate_poly_cpu(
 
             for (int32_t c = 0; c < nlam; c++)
             {
-                uint32_t m0 = m0_arr[c];
-                uint32_t m1 = m1_arr[c];
-                float    w1 = al_arr[c];
-                float    w0 = 1.0f - w1;
-                float    kc = ctx->k_rad[c];
+                uint32_t m0       = m0_arr[c];
+                uint32_t m1       = m1_arr[c];
+                float    w1       = al_arr[c];
+                float    w0       = 1.0f - w1;
+                float    kc       = ctx->k_rad[c];
+                float    sx_c     = ctx->disp_sx[c];
+                float    sy_c     = ctx->disp_sy[c];
+                int      has_disp = (sx_c != 0.0f || sy_c != 0.0f) ? 1 : 0;
 
                 const float *o0 =
                     (beam_opd != NULL) ? (beam_opd + (uint64_t) m0 * chan_stride) : NULL;
@@ -336,6 +346,7 @@ static void MILK_HOT shwfs_propagate_poly_cpu(
                     float    sy_im = sh1d[2u * ly + 1u];
                     uint64_t p_row = (uint64_t) (y0 + ly) * nwf + x0;
                     float   *w_row = &work[(size_t) ly * nfft * 2u];
+                    float    dy    = has_disp ? (sy_c * ((float) (y0 + ly) - p0_xy)) : 0.0f;
 
                     for (uint32_t lx = 0; lx < nx; lx++)
                     {
@@ -346,16 +357,31 @@ static void MILK_HOT shwfs_propagate_poly_cpu(
                         {
                             continue;
                         }
-                        has_c    = 1;
-                        float nc = (ncpa_opd != NULL) ? ncpa_opd[p] : 0.0f;
-                        float p0 = (((o0 != NULL) ? o0[p] : 0.0f) + nc) * kc;
-                        float pr = w0 * amp0 * cosf(p0);
-                        float pi = w0 * amp0 * sinf(p0);
-                        if (m1 != m0 && w1 > 0.0f)
+                        has_c          = 1;
+                        float disp_opd = has_disp ? (sx_c * ((float) (x0 + lx) - p0_xy) + dy) : 0.0f;
+                        float nc       = ((ncpa_opd != NULL) ? ncpa_opd[p] : 0.0f) + disp_opd;
+                        float pr       = 0.0f;
+                        float pi       = 0.0f;
+                        if (unwrapped && m1 != m0 && w1 > 0.0f)
                         {
-                            float p1 = (((o1 != NULL) ? o1[p] : 0.0f) + nc) * kc;
-                            pr += w1 * amp1 * cosf(p1);
-                            pi += w1 * amp1 * sinf(p1);
+                            float amp = w0 * amp0 + w1 * amp1;
+                            float opd = w0 * ((o0 != NULL) ? o0[p] : 0.0f) +
+                                        w1 * ((o1 != NULL) ? o1[p] : 0.0f) + nc;
+                            float phi = opd * kc;
+                            pr        = amp * cosf(phi);
+                            pi        = amp * sinf(phi);
+                        }
+                        else
+                        {
+                            float p0 = (((o0 != NULL) ? o0[p] : 0.0f) + nc) * kc;
+                            pr       = w0 * amp0 * cosf(p0);
+                            pi       = w0 * amp0 * sinf(p0);
+                            if (m1 != m0 && w1 > 0.0f)
+                            {
+                                float p1 = (((o1 != NULL) ? o1[p] : 0.0f) + nc) * kc;
+                                pr += w1 * amp1 * cosf(p1);
+                                pi += w1 * amp1 * sinf(p1);
+                            }
                         }
 
                         float sx_re = sh1d[2u * lx];
@@ -824,6 +850,50 @@ void cacaosim_shwfs_set_weights(
     if (changed && ctx->use_cuda)
     {
         cacaosim_shwfs_cuda_upload_weights(ctx);
+    }
+}
+
+void cacaosim_shwfs_set_disp(
+    cacaosim_shwfs_ctx_t  *ctx,
+    const cacaosim_disp_t *disp,
+    float                  tel_diam_m,
+    int32_t                in_poly_mode)
+{
+    if (ctx == NULL || ctx->eff_nlam < 1)
+    {
+        return;
+    }
+    ctx->in_poly_mode = in_poly_mode;
+
+    if (disp == NULL || !disp->active)
+    {
+        if (ctx->disp_active)
+        {
+            memset(ctx->disp_sx, 0, sizeof(ctx->disp_sx));
+            memset(ctx->disp_sy, 0, sizeof(ctx->disp_sy));
+            ctx->disp_active = 0;
+            ctx->disp_gen    = 0ULL;
+            if (ctx->use_cuda)
+            {
+                cacaosim_shwfs_cuda_upload_disp(ctx);
+            }
+        }
+        return;
+    }
+
+    float diam = (tel_diam_m > 0.01f) ? tel_diam_m : 8.0f;
+    if (!ctx->disp_active || disp->gen != ctx->disp_gen ||
+        fabsf(diam - ctx->disp_tel_diam) > 1e-4f)
+    {
+        cacaosim_disp_eval_slopes(disp, ctx->lam_um, (uint32_t) ctx->eff_nlam, diam, ctx->cfg.nwf,
+                                  ctx->cfg.pup_diam, ctx->disp_sx, ctx->disp_sy);
+        ctx->disp_active   = 1;
+        ctx->disp_gen      = disp->gen;
+        ctx->disp_tel_diam = diam;
+        if (ctx->use_cuda)
+        {
+            cacaosim_shwfs_cuda_upload_disp(ctx);
+        }
     }
 }
 

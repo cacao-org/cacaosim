@@ -45,6 +45,7 @@
 
 #include "cacaosim_types.h"
 #include "common/cacaosim_detector.h"
+#include "common/cacaosim_disp.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -103,6 +104,12 @@ typedef struct
     float                scale_c[CACAOSIM_MAX_LAMBDA];       /**< Focal scale lam0 / lam_um[c] */
     float                chan_w_jac[CACAOSIM_MAX_LAMBDA];    /**< chan_w[c] * scale_c[c]^2 */
     float                chan_flat_norm[CACAOSIM_MAX_LAMBDA];/**< Per-channel flat intensity */
+    int32_t              disp_active;                         /**< 1 if chromatic disp active */
+    uint64_t             disp_gen;                            /**< Cached dispersion gen */
+    float                disp_tel_diam;                       /**< Cached tel_diam_m [m] */
+    int32_t              in_poly_mode;                        /**< cacaosim_beam_poly_mode_t */
+    float                disp_sx[CACAOSIM_MAX_LAMBDA];        /**< X OPD slope [um/pix] */
+    float                disp_sy[CACAOSIM_MAX_LAMBDA];        /**< Y OPD slope [um/pix] */
     float                flat_flux_norm;/**< Unaberrated total camera intensity for photometry */
     int32_t              use_cuda;      /**< 1 when batched cuFFT GPU backend is active, else 0 */
     uint32_t             subframe_cnt;  /**< Optical subframes accumulated in current exposure */
@@ -256,6 +263,15 @@ void cacaosim_shwfs_set_weights(
     const float          *weights);
 
 /**
+ * cacaosim_shwfs_set_disp() - Update chromatic angular dispersion OPD slopes & input poly mode
+ */
+void cacaosim_shwfs_set_disp(
+    cacaosim_shwfs_ctx_t  *ctx,
+    const cacaosim_disp_t *disp,
+    float                  tel_diam_m,
+    int32_t                in_poly_mode);
+
+/**
  * cacaosim_shwfs_readout() - Finalize accumulated SHWFS exposure and run detector readout
  * @ctx:      Initialized Shack-Hartmann WFS context with `subframe_cnt >= 1` (no-op if 0)
  * @det_live: Optional live detector configuration override (NULL uses `ctx->cfg.det`)
@@ -350,6 +366,7 @@ int  cacaosim_shwfs_cuda_init(cacaosim_shwfs_ctx_t *ctx,
  */
 void cacaosim_shwfs_cuda_free(cacaosim_shwfs_ctx_t *ctx);
 void cacaosim_shwfs_cuda_upload_weights(cacaosim_shwfs_ctx_t *ctx);
+void cacaosim_shwfs_cuda_upload_disp(cacaosim_shwfs_ctx_t *ctx);
 void cacaosim_shwfs_cuda_accum_poly(cacaosim_shwfs_ctx_t *ctx,
                                     const float          *beam_opd,
                                     const float          *beam_amp,

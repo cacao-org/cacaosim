@@ -85,7 +85,7 @@ void cacaosim_tui_opts_defaults(cacaosim_tui_opts_t *opts)
     opts->initial_view  = CACAOSIM_TUI_VIEW_BUILDER;
     opts->deploy_mode   = 0;
     opts->with_atmturb  = 0;
-    opts->seeing_arcsec = 0.7f;
+    opts->seeing_arcsec = 0.8f;
 }
 
 /**

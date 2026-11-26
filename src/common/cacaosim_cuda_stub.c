@@ -352,6 +352,22 @@ void cacaosim_cuda_beam_init_lerp(
     (void) cuda_stream;
 }
 
+void cacaosim_cuda_beam_add_modes(
+    float       *d_opd,
+    const float *d_basis,
+    const float *h_coeffs,
+    uint32_t     n_modes,
+    uint64_t     npix,
+    void        *cuda_stream)
+{
+    (void) d_opd;
+    (void) d_basis;
+    (void) h_coeffs;
+    (void) n_modes;
+    (void) npix;
+    (void) cuda_stream;
+}
+
 /**
  * cacaosim_cuda_beam_apply_dm() - No-op GPU DM subtraction stub for CPU-only builds
  * @d_in_opd:    Unused device input OPD pointer
@@ -1366,6 +1382,38 @@ int cacaosim_wfstat_gpu_fetch_sums(
     (void) h_acc;
     (void) h_ts_rms;
     (void) out_ts_len;
+    return -1;
+}
+
+int cacaosim_wfstat_gpu_set_ctrl_basis(
+    void           *gpu,
+    const uint32_t *h_act_idx,
+    const float    *h_act_sw,
+    uint64_t        act_pix,
+    const float    *h_q_act,
+    uint32_t        n_stg1,
+    uint32_t        n_tot)
+{
+    (void) gpu;
+    (void) h_act_idx;
+    (void) h_act_sw;
+    (void) act_pix;
+    (void) h_q_act;
+    (void) n_stg1;
+    (void) n_tot;
+    return -1;
+}
+
+int cacaosim_wfstat_gpu_fetch_ctrl(
+    void         *gpu,
+    double       *h_acc_ctrl,
+    float *const  h_ts_in[],
+    float *const  h_ts_out[])
+{
+    (void) gpu;
+    (void) h_acc_ctrl;
+    (void) h_ts_in;
+    (void) h_ts_out;
     return -1;
 }
 

@@ -346,7 +346,7 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
         if (img_beam.ID == -1)
         {
             imgid_free(&img_beam);
-            img_beam = stream_connect_create_3Df32(param_in_beam, nwf, nwf, 2);
+            img_beam = cacaosim_beam_shm_create(param_in_beam, nwf, 2);
             if (img_beam.ID != -1)
             {
                 cacaosim_beam_shm_init_kw(img_beam.im);
@@ -436,12 +436,15 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
                 b_nwl = CACAOSIM_FPCAM_MAX_LAMBDA;
             }
             cfg.has_in_lam = 1;
-            for (uint32_t c = 0; c < b_nwl; c++)
+            if (!cacaosim_beam_shm_read_poly_wls(img_beam.im, b_nwl, cfg.in_lam_um))
             {
-                float t           = (b_nwl > 1u) ? ((float) c / (float) (b_nwl - 1u)) : 0.0f;
-                cfg.in_lam_um[c]  = (b_wl0 > 0.05f && b_wl1 > 0.05f)
-                                        ? (b_wl0 + (b_wl1 - b_wl0) * t)
-                                        : param_lambda_um;
+                for (uint32_t c = 0; c < b_nwl; c++)
+                {
+                    float t          = (b_nwl > 1u) ? ((float) c / (float) (b_nwl - 1u)) : 0.0f;
+                    cfg.in_lam_um[c] = (b_wl0 > 0.05f && b_wl1 > 0.05f)
+                                           ? (b_wl0 + (b_wl1 - b_wl0) * t)
+                                           : param_lambda_um;
+                }
             }
             if (cfg.nlambda <= 0)
             {
@@ -499,6 +502,10 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
             (size_t) CACAOSIM_FPCAM_MAX_LAMBDA * npix * 2u, sizeof(float));
     }
 
+    cacaosim_disp_t b_disp     = { 0 };
+    cacaosim_disp_t b_disp_reg = { 0 };
+    uint64_t        reg_dgen   = 0ULL;
+
     struct timespec deadline;
     clock_gettime(CLOCK_MONOTONIC, &deadline);
 
@@ -548,6 +555,37 @@ static MILK_HOT errno_t fpcam_compute(const MILK_RUNNABLE *self)
             {
                 b_nwl = CACAOSIM_FPCAM_MAX_LAMBDA;
             }
+            if (b_nwl > 1u)
+            {
+                float live_wls[CACAOSIM_FPCAM_MAX_LAMBDA];
+                if (cacaosim_beam_shm_read_poly_wls(img_beam.im, b_nwl, live_wls))
+                {
+                    cacaosim_fpcam_set_in_lambdas(&fp_ctx, live_wls, b_nwl);
+                }
+            }
+            cacaosim_beam_shm_read_disp(img_beam.im, &b_disp);
+            const cacaosim_disp_t *eff_disp = &b_disp;
+            if (reg_buf != NULL)
+            {
+                if (b_disp.active)
+                {
+                    if (b_disp.gen != reg_dgen || !b_disp_reg.active)
+                    {
+                        cacaosim_disp_apply_reg(&b_disp, &reg, &b_disp_reg);
+                        b_disp_reg.gen = b_disp.gen;
+                        reg_dgen       = b_disp.gen;
+                    }
+                    eff_disp = &b_disp_reg;
+                }
+                else
+                {
+                    b_disp_reg.active = 0;
+                }
+            }
+            float   b_diam  = cacaosim_beam_shm_read_diam(img_beam.im, 8.0f);
+            int32_t b_pmode = cacaosim_beam_shm_read_poly_mode(img_beam.im, b_nwl);
+            cacaosim_fpcam_set_disp(&fp_ctx, eff_disp, b_diam, b_pmode);
+
             const float *b_opd    = img_beam.im->array.F;
             const float *b_amp    = img_beam.im->array.F + npix;
             uint64_t     b_stride = npix * 2u;

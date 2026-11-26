@@ -75,6 +75,11 @@ static char     param_wfstat_outdir[FUNCTION_PARAMETER_STRMAXLEN] = ".";
 static uint64_t param_wfstat_ticks                                = 20000;
 static uint32_t param_wfstat_stride                               = 0;
 static int64_t  param_wfstat_extra                                = 1;
+static char     param_wfstat_cm1[FUNCTION_PARAMETER_STRMAXLEN]    = "";
+static char     param_wfstat_cm2[FUNCTION_PARAMETER_STRMAXLEN]    = "";
+static uint64_t param_wfstat_clip_start                           = 0;
+static uint32_t param_wfstat_clip_len                             = 0;
+static float    param_wfstat_full_fps                             = 0.0f;
 static uint64_t param_wfstat_frames                               = 0;
 static int64_t  param_calib_fast                                  = 0;
 static int64_t  param_calib_temporal                              = 0;
@@ -130,6 +135,11 @@ static int32_t  param_out_dtype                                = 0;
 static int32_t  param_wf_unit                                  = 1;
 static float    param_ref_lambda                               = 0.50f;
 static float    param_turb_gain                                = 1.0f;
+static int64_t  param_vib_enable                               = 0;
+static float    param_vib_rms_nm                               = 45.0f;
+static int64_t  param_petal_enable                             = 0;
+static float    param_petal_rms_nm                             = 1000.0f;
+static float    param_petal_tau_s                              = 3.0f;
 static float    param_frame_rate                               = 2000.0f;
 static uint64_t param_rng_seed                                 = 98765;
 static int32_t  param_backend                                  = 0;
@@ -171,6 +181,21 @@ static float    param_strehl_ave                               = 0.0f;
     X(".wfstat_extra", &param_wfstat_extra, FPTYPE_ONOFF, 0,                            \
       FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
       "Snapshot WFS/DM/PSF diagnostic streams at the 5 sample instants")                \
+    X(".wfstat_cm1", param_wfstat_cm1, FPTYPE_STRING, 0,                                \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Optional Stage-1 CMmodesDM SHM stream for within/outside control WFE split")     \
+    X(".wfstat_cm2", param_wfstat_cm2, FPTYPE_STRING, 0,                                \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Optional Stage-2 CMmodesDM SHM stream for within/outside control WFE split")     \
+    X(".wfstat_clip_start", &param_wfstat_clip_start, FPTYPE_UINT64, 0,                 \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "1-based outer frame start for short-timescale WF/DM video clip (0 = auto mid)")  \
+    X(".wfstat_clip_len", &param_wfstat_clip_len, FPTYPE_UINT32, 0,                     \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Number of contiguous outer frames to capture for WF/DM video clip (0 = off)")    \
+    X(".wfstat_full_fps", &param_wfstat_full_fps, FPTYPE_FLOAT32, 0,                    \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Strided full-duration WF/DM capture rate [Hz] for 1x real-time video (0 = off)") \
     X(".wfstat_frames", &param_wfstat_frames, FPTYPE_UINT64, 0, FPFLAG_DEFAULT_OUTPUT,  \
       "Frames accumulated by the current/last in-DAG wavefront stats run")              \
     X(".calib_fast", &param_calib_fast, FPTYPE_ONOFF, 0,                                \
@@ -286,6 +311,21 @@ static float    param_strehl_ave                               = 0.0f;
     X(".turb_gain", &param_turb_gain, FPTYPE_FLOAT32, 0,                                \
       FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
       "Live turbulence multiplier (0 = off for calibration, 1 = nominal)")              \
+    X(".vib_enable", &param_vib_enable, FPTYPE_ONOFF, 0,                                \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Enable stochastic telescope/bench vibrations (14.5..138 Hz)")                    \
+    X(".vib_rms_nm", &param_vib_rms_nm, FPTYPE_FLOAT32, 0,                              \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Total telescope/bench vibration OPD RMS [nm] (default: 45.0)")                   \
+    X(".petal_enable", &param_petal_enable, FPTYPE_ONOFF, 0,                            \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Enable thermally induced slow-varying pupil petaling (LWE)")                     \
+    X(".petal_rms_nm", &param_petal_rms_nm, FPTYPE_FLOAT32, 0,                          \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Total thermal petaling (LWE) OPD RMS [nm] (default: 1000.0)")                    \
+    X(".petal_tau_s", &param_petal_tau_s, FPTYPE_FLOAT32, 0,                            \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Thermal petaling correlation timescale [s] (default: 3.0)")                      \
     X(".frame_rate", &param_frame_rate, FPTYPE_FLOAT32, 0,                              \
       FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
       "Wall-clock pacing [Hz] (0 = procinfo trigger; .bench master_hz sets physics)")    \
@@ -326,8 +366,11 @@ static MILK_COLD errno_t htsim_confcheck(void)
             ".wfs_flux",      ".wfs_ron",      ".wfs_shutter", ".fp_navg",    ".fp_flux",
             ".fp_ron",        ".reset_long",   ".photon_noise", ".turb_gain", ".frame_rate",
             ".wfstat_enable", ".wfstat_outdir", ".wfstat_ticks", ".wfstat_stride",
-            ".wfstat_extra",  ".calib_fast",    ".calib_temporal", ".calib_poke_offset",
-            ".calib_trig",    ".calib_wfs"
+            ".wfstat_extra",  ".wfstat_cm1",    ".wfstat_cm2",   ".wfstat_clip_start",
+            ".wfstat_clip_len", ".wfstat_full_fps", ".calib_fast",
+            ".calib_temporal", ".calib_poke_offset",
+            ".calib_trig",    ".calib_wfs",     ".vib_enable",     ".vib_rms_nm",
+            ".petal_enable",  ".petal_rms_nm",  ".petal_tau_s"
         };
         for (size_t i = 0; i < sizeof(live_keys) / sizeof(live_keys[0]); i++)
         {
@@ -409,7 +452,7 @@ static void resolve_bench_path(const char *spec, char *out, size_t cap)
  * Return: 0 on success, -1 on unknown beam name or allocation failure.
  */
 static int htsim_wfstat_start(cacaosim_wfstat_t *ws, const cacaosim_bench_ctx_t *bctx,
-                              int *bidx)
+                              int *bidx, double dt_phys)
 {
     char  copy[FUNCTION_PARAMETER_STRMAXLEN];
     char *save = NULL;
@@ -433,7 +476,81 @@ static int htsim_wfstat_start(cacaosim_wfstat_t *ws, const cacaosim_bench_ctx_t 
         fprintf(stderr, "[cacaosim.htsim] in-DAG wavefront stats init failed\n");
         return -1;
     }
+    if (param_wfstat_cm1[0] != '\0' || param_wfstat_cm2[0] != '\0')
+    {
+        const cacaosim_dm_ctx_t *dm1 =
+            (bctx->n_dms >= 1) ? &bctx->nodes[bctx->dm_node_idx[0]].dm_ctx : NULL;
+        const cacaosim_dm_ctx_t *dm2 =
+            (bctx->n_dms >= 2) ? &bctx->nodes[bctx->dm_node_idx[1]].dm_ctx : NULL;
+        if (cacaosim_wfstat_load_ctrl_modes(
+                ws, param_wfstat_cm1, dm1 ? dm1->stencil_idx : NULL, dm1 ? dm1->stencil_w : NULL,
+                dm1 ? dm1->nact_total : 0u, param_wfstat_cm2, dm2 ? dm2->stencil_idx : NULL,
+                dm2 ? dm2->stencil_w : NULL, dm2 ? dm2->nact_total : 0u) != 0)
+        {
+            fprintf(stderr, "[cacaosim.htsim] warning: wfstat control-mode basis setup failed\n");
+        }
+    }
+    if (param_wfstat_clip_len > 0u)
+    {
+        uint64_t cstart = param_wfstat_clip_start;
+        if (cstart == 0ULL)
+        {
+            uint64_t tgt = (param_wfstat_ticks > 10ULL) ? param_wfstat_ticks : 20000ULL;
+            uint64_t mid = tgt / 2ULL;
+            uint64_t pre = 20ULL;
+            if (mid + (uint64_t) param_wfstat_clip_len > tgt)
+            {
+                cstart = (tgt > (uint64_t) param_wfstat_clip_len)
+                             ? ((tgt - (uint64_t) param_wfstat_clip_len) / 2ULL + 1ULL)
+                             : 1ULL;
+            }
+            else
+            {
+                cstart = (mid > pre) ? (mid - pre) : 1ULL;
+            }
+        }
+        if (cacaosim_wfstat_enable_clip(ws, cstart, param_wfstat_clip_len) != 0)
+        {
+            fprintf(stderr, "[cacaosim.htsim] warning: wfstat clip capture alloc failed\n");
+        }
+    }
+    if (param_wfstat_full_fps > 0.0f && dt_phys > 0.0)
+    {
+        double step_fr = 1.0 / ((double) param_wfstat_full_fps * dt_phys);
+        if (step_fr < 1.0)
+        {
+            step_fr = 1.0;
+        }
+        uint64_t tgt = (param_wfstat_ticks > 10ULL) ? param_wfstat_ticks : 20000ULL;
+        uint32_t cap = (uint32_t) ((double) tgt / step_fr) + 8u;
+        if (cap > 3600u)
+        {
+            cap = 3600u;
+        }
+        if (cacaosim_wfstat_enable_full(ws, step_fr, cap) != 0)
+        {
+            fprintf(stderr, "[cacaosim.htsim] warning: wfstat full-video capture alloc failed\n");
+        }
+    }
     return 0;
+}
+
+/* Read float/double SHM keyword from an optional IMAGE, returning def_val if absent */
+static float htsim_read_img_kw(const IMAGE *im, const char *name, float def_val)
+{
+    if (im == NULL || im->kw == NULL || im->md == NULL)
+    {
+        return def_val;
+    }
+    uint32_t nb = im->md->NBkw;
+    for (uint32_t i = 0; i < nb; i++)
+    {
+        if (strcmp(im->kw[i].name, name) == 0 && im->kw[i].type == 'D')
+        {
+            return (float) im->kw[i].value.numf;
+        }
+    }
+    return def_val;
 }
 
 /* Accumulate plane 0 of the three selected beams (device or host buffers) */
@@ -447,6 +564,25 @@ static void htsim_wfstat_frame(cacaosim_wfstat_t *ws, const cacaosim_bench_ctx_t
         opd[k]                        = bctx->use_cuda ? b->d_opd : b->opd;
     }
     cacaosim_wfstat_frame(ws, opd);
+
+    cacaosim_wfstat_perturb_sample_t ps;
+    memset(&ps, 0, sizeof(ps));
+    const IMAGE *wf_im = (bctx->connect_shm && bctx->img_wf.ID != -1) ? bctx->img_wf.im : NULL;
+    ps.wind_scale      = htsim_read_img_kw(wf_im, "WND_SCL", 1.0f);
+    ps.wind_deg        = htsim_read_img_kw(wf_im, "WND_DEG", 0.0f);
+    ps.burst_env       = htsim_read_img_kw(wf_im, "WND_BST", 0.0f);
+    ps.cn2_scale       = htsim_read_img_kw(wf_im, "WND_CN2", 1.0f);
+    ps.vib_rms_nm      = bctx->perturb.tlm.vib_rms_nm;
+    ps.vib_tip_nm      = bctx->perturb.tlm.vib_tip_nm;
+    ps.vib_tilt_nm     = bctx->perturb.tlm.vib_tilt_nm;
+    ps.vib_foc_nm      = bctx->perturb.tlm.vib_foc_nm;
+    ps.petal_rms_nm    = bctx->perturb.tlm.petal_rms_nm;
+    ps.petal_ptv_nm    = bctx->perturb.tlm.petal_ptv_nm;
+    for (int p = 0; p < 4; p++)
+    {
+        ps.petal_p_nm[p] = bctx->perturb.tlm.petal_p_nm[p];
+    }
+    cacaosim_wfstat_record_perturb(ws, &ps);
 }
 
 /**
@@ -559,7 +695,12 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
     }
     if (dcfpsptr != NULL)
     {
-        bcfg.turb_gain = param_turb_gain;
+        bcfg.turb_gain            = param_turb_gain;
+        bcfg.perturb.vib_enable   = param_vib_enable ? 1 : 0;
+        bcfg.perturb.vib_rms_nm   = param_vib_rms_nm;
+        bcfg.perturb.petal_enable = param_petal_enable ? 1 : 0;
+        bcfg.perturb.petal_rms_nm = param_petal_rms_nm;
+        bcfg.perturb.petal_tau_s  = param_petal_tau_s;
     }
     else
     {
@@ -841,7 +982,8 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
                         wfstat_bg_running = 0;
                     }
                     param_wfstat_frames = 0;
-                    if (htsim_wfstat_start(&wfs, &bctx, wfs_bidx) == 0)
+                    double dt_ws        = (double) bctx.dt_master_s * (double) eff_ws_st;
+                    if (htsim_wfstat_start(&wfs, &bctx, wfs_bidx, dt_ws) == 0)
                     {
                         wfs_active = 1;
                     }
@@ -857,14 +999,31 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
                                  (wfs.n_frames + 1ULL) >= wfs.samp_ticks[wfs.nsamp])
                                     ? 1
                                     : 0;
+                int clip_ws   = (sample_ws && wfs.clip_len > 0u &&
+                                 (wfs.n_frames + 1ULL) >= wfs.clip_start &&
+                                 wfs.clip_n < wfs.clip_len)
+                                    ? 1
+                                    : 0;
+                int full_ws   = (sample_ws && wfs.full_cap > 0u && wfs.full_n < wfs.full_cap &&
+                                 (wfs.n_frames + 1ULL) >= wfs.full_next_frame)
+                                    ? 1
+                                    : 0;
                 bctx.wfstat_step_active = sample_ws;
-                bctx.wfstat_snap_active = snap_ws;
+                bctx.wfstat_snap_active = (snap_ws || clip_ws || full_ws) ? 1 : 0;
                 for (int k = 0; k < CACAOSIM_WFSTAT_NB_LOC; k++)
                 {
                     bctx.wfstat_beam_idx[k] = wfs_bidx[k];
                 }
 
                 /* Advance entire multi-rate bench by one master tick and publish Strehl */
+                if (dcfpsptr != NULL)
+                {
+                    bctx.cfg.perturb.vib_enable   = param_vib_enable ? 1 : 0;
+                    bctx.cfg.perturb.vib_rms_nm   = param_vib_rms_nm;
+                    bctx.cfg.perturb.petal_enable = param_petal_enable ? 1 : 0;
+                    bctx.cfg.perturb.petal_rms_nm = param_petal_rms_nm;
+                    bctx.cfg.perturb.petal_tau_s  = param_petal_tau_s;
+                }
                 bctx.export_beams_active =
                     (param_export_beams[0] != '\0' && param_export_enable != 0) ? 1 : 0;
                 cacaosim_bench_step(&bctx, NULL, NULL, param_turb_gain, processinfo);

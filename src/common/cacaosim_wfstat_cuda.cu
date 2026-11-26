@@ -14,6 +14,7 @@
  * transfers happen only on sample ticks (maps + per-frame scalars) and at finalization.
  */
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <math.h>
 #include <stdint.h>
@@ -29,19 +30,33 @@ typedef struct
     double      *sum2[WFG_MAX_LOC];
     float       *tmp[WFG_MAX_LOC];
     float       *ts[WFG_MAX_LOC];
+    float       *ts_in[WFG_MAX_LOC];
+    float       *ts_out[WFG_MAX_LOC];
 } wfg_ptrs_t;
 
 typedef struct
 {
-    uint64_t     npix;
-    uint32_t     nloc;
-    uint64_t     ts_cap;
-    uint64_t     ts_len;
-    cudaStream_t stream;
-    double      *d_w;
-    double      *d_frame; /* [nloc * 4]: pist, svar, min, max of the latest frame */
-    double      *d_acc;   /* [nloc * 2]: sum srms, sum svar */
-    wfg_ptrs_t   p;
+    uint64_t       npix;
+    uint32_t       nloc;
+    uint64_t       ts_cap;
+    uint64_t       ts_len;
+    cudaStream_t   stream;
+    double        *d_w;
+    double        *d_frame; /* [nloc * 4]: pist, svar, min, max of the latest frame */
+    double        *d_acc;   /* [nloc * 2]: sum srms, sum svar */
+    wfg_ptrs_t     p;
+
+    int            ctrl_active;
+    uint64_t       act_pix;
+    uint32_t       ctrl_n_stg1;
+    uint32_t       ctrl_n_tot;
+    cublasHandle_t cublas;
+    uint32_t      *d_act_idx;
+    float         *d_act_sw;
+    float         *d_ctrl_q;   /* [act_pix * ctrl_n_tot] col-major */
+    float         *d_ctrl_v;   /* [act_pix * nloc] col-major */
+    float         *d_ctrl_c;   /* [ctrl_n_tot * nloc] col-major */
+    double        *d_acc_ctrl; /* [nloc * 4]: sum_in_rms, sum_in_var, sum_out_rms, sum_out_var */
 } wfg_ctx_t;
 
 __device__ static double block_reduce_sum(double v, double *sh)
@@ -163,8 +178,98 @@ __global__ void k_wfg_stat(const double *w, wfg_ptrs_t P, uint64_t npix, double 
     }
 }
 
+__global__ void k_wfg_pack_ctrl(wfg_ptrs_t P, const uint32_t *act_idx, const float *act_sw,
+                                uint64_t act_pix, float *d_v)
+{
+    uint32_t k = blockIdx.y;
+    uint64_t p = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= act_pix)
+    {
+        return;
+    }
+    uint32_t idx         = act_idx[p];
+    d_v[k * act_pix + p] = act_sw[p] * P.tmp[k][idx];
+}
+
+__global__ void k_wfg_ctrl_stat(const float *d_c, uint32_t n_stg1, uint32_t n_tot,
+                                const double *frame, double *acc_ctrl, wfg_ptrs_t P,
+                                uint64_t ts_slot, uint64_t ts_cap)
+{
+    __shared__ double sh[WFG_RED_THREADS];
+    uint32_t          k     = blockIdx.x;
+    uint32_t          m_lim = (k == 1 && n_stg1 > 0) ? n_stg1 : n_tot;
+    const float      *ck    = d_c + (uint64_t) k * n_tot;
+    double            s     = 0.0;
+    for (uint32_t m = threadIdx.x; m < m_lim; m += blockDim.x)
+    {
+        double v = (double) ck[m];
+        s += v * v;
+    }
+    double in_var = block_reduce_sum(s, sh);
+    if (threadIdx.x == 0)
+    {
+        double tot_var = frame[4 * k + 1];
+        if (tot_var < 0.0)
+        {
+            tot_var = 0.0;
+        }
+        if (in_var > tot_var)
+        {
+            in_var = tot_var;
+        }
+        double out_var = tot_var - in_var;
+        double in_rms  = sqrt(in_var > 0.0 ? in_var : 0.0);
+        double out_rms = sqrt(out_var > 0.0 ? out_var : 0.0);
+        acc_ctrl[4 * k + 0] += in_rms;
+        acc_ctrl[4 * k + 1] += in_var;
+        acc_ctrl[4 * k + 2] += out_rms;
+        acc_ctrl[4 * k + 3] += out_var;
+        if (ts_slot < ts_cap)
+        {
+            if (P.ts_in[k] != NULL)
+            {
+                P.ts_in[k][ts_slot] = (float) in_rms;
+            }
+            if (P.ts_out[k] != NULL)
+            {
+                P.ts_out[k][ts_slot] = (float) out_rms;
+            }
+        }
+    }
+}
+
+static void wfg_release_ctrl(wfg_ctx_t *g)
+{
+    if (g->cublas != NULL)
+    {
+        cublasDestroy(g->cublas);
+        g->cublas = NULL;
+    }
+    cudaFree(g->d_act_idx);
+    cudaFree(g->d_act_sw);
+    cudaFree(g->d_ctrl_q);
+    cudaFree(g->d_ctrl_v);
+    cudaFree(g->d_ctrl_c);
+    cudaFree(g->d_acc_ctrl);
+    g->d_act_idx  = NULL;
+    g->d_act_sw   = NULL;
+    g->d_ctrl_q   = NULL;
+    g->d_ctrl_v   = NULL;
+    g->d_ctrl_c   = NULL;
+    g->d_acc_ctrl = NULL;
+    for (uint32_t k = 0; k < WFG_MAX_LOC; k++)
+    {
+        cudaFree(g->p.ts_in[k]);
+        cudaFree(g->p.ts_out[k]);
+        g->p.ts_in[k]  = NULL;
+        g->p.ts_out[k] = NULL;
+    }
+    g->ctrl_active = 0;
+}
+
 static void wfg_release(wfg_ctx_t *g)
 {
+    wfg_release_ctrl(g);
     cudaFree(g->d_w);
     cudaFree(g->d_frame);
     cudaFree(g->d_acc);
@@ -261,10 +366,118 @@ extern "C" void cacaosim_wfstat_gpu_accum(void *gpu, const float *const d_opd[])
     k_wfg_pix<<<grid_pix, 256, 0, g->stream>>>(g->d_w, g->p, g->npix, g->d_frame);
     k_wfg_stat<<<g->nloc, WFG_RED_THREADS, 0, g->stream>>>(
         g->d_w, g->p, g->npix, g->d_frame, g->d_acc, g->ts_len, g->ts_cap);
+    if (g->ctrl_active)
+    {
+        dim3        grid_pack((unsigned) ((g->act_pix + 255) / 256), g->nloc);
+        const float one  = 1.0f;
+        const float zero = 0.0f;
+        k_wfg_pack_ctrl<<<grid_pack, 256, 0, g->stream>>>(
+            g->p, g->d_act_idx, g->d_act_sw, g->act_pix, g->d_ctrl_v);
+        cublasSgemm(g->cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int) g->ctrl_n_tot, (int) g->nloc,
+                    (int) g->act_pix, &one, g->d_ctrl_q, (int) g->act_pix, g->d_ctrl_v,
+                    (int) g->act_pix, &zero, g->d_ctrl_c, (int) g->ctrl_n_tot);
+        k_wfg_ctrl_stat<<<g->nloc, WFG_RED_THREADS, 0, g->stream>>>(
+            g->d_ctrl_c, g->ctrl_n_stg1, g->ctrl_n_tot, g->d_frame, g->d_acc_ctrl, g->p,
+            g->ts_len, g->ts_cap);
+    }
     if (g->ts_len < g->ts_cap)
     {
         g->ts_len++;
     }
+}
+
+extern "C" int cacaosim_wfstat_gpu_set_ctrl_basis(
+    void           *gpu,
+    const uint32_t *h_act_idx,
+    const float    *h_act_sw,
+    uint64_t        act_pix,
+    const float    *h_q_act,
+    uint32_t        n_stg1,
+    uint32_t        n_tot)
+{
+    if (gpu == NULL || h_act_idx == NULL || h_act_sw == NULL || h_q_act == NULL ||
+        act_pix == 0 || n_tot == 0 || n_stg1 > n_tot)
+    {
+        return -1;
+    }
+    wfg_ctx_t *g = (wfg_ctx_t *) gpu;
+    wfg_release_ctrl(g);
+    g->act_pix     = act_pix;
+    g->ctrl_n_stg1 = n_stg1;
+    g->ctrl_n_tot  = n_tot;
+
+    int ok = (cublasCreate(&g->cublas) == CUBLAS_STATUS_SUCCESS &&
+              cublasSetStream(g->cublas, g->stream) == CUBLAS_STATUS_SUCCESS &&
+              cudaMalloc((void **) &g->d_act_idx, act_pix * sizeof(uint32_t)) == cudaSuccess &&
+              cudaMalloc((void **) &g->d_act_sw, act_pix * sizeof(float)) == cudaSuccess &&
+              cudaMalloc((void **) &g->d_ctrl_q, act_pix * n_tot * sizeof(float)) == cudaSuccess &&
+              cudaMalloc((void **) &g->d_ctrl_v, act_pix * g->nloc * sizeof(float)) == cudaSuccess &&
+              cudaMalloc((void **) &g->d_ctrl_c, (uint64_t) n_tot * g->nloc * sizeof(float)) ==
+                  cudaSuccess &&
+              cudaMalloc((void **) &g->d_acc_ctrl, 4 * g->nloc * sizeof(double)) == cudaSuccess);
+    for (uint32_t k = 0; ok && k < g->nloc; k++)
+    {
+        if (g->ts_cap > 0)
+        {
+            ok = (cudaMalloc((void **) &g->p.ts_in[k], g->ts_cap * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc((void **) &g->p.ts_out[k], g->ts_cap * sizeof(float)) == cudaSuccess);
+        }
+    }
+    if (ok)
+    {
+        ok = (cudaMemcpyAsync(g->d_act_idx, h_act_idx, act_pix * sizeof(uint32_t),
+                              cudaMemcpyHostToDevice, g->stream) == cudaSuccess &&
+              cudaMemcpyAsync(g->d_act_sw, h_act_sw, act_pix * sizeof(float),
+                              cudaMemcpyHostToDevice, g->stream) == cudaSuccess &&
+              cudaMemcpyAsync(g->d_ctrl_q, h_q_act, act_pix * n_tot * sizeof(float),
+                              cudaMemcpyHostToDevice, g->stream) == cudaSuccess &&
+              cudaMemsetAsync(g->d_acc_ctrl, 0, 4 * g->nloc * sizeof(double), g->stream) ==
+                  cudaSuccess &&
+              cudaStreamSynchronize(g->stream) == cudaSuccess);
+    }
+    if (!ok)
+    {
+        wfg_release_ctrl(g);
+        return -1;
+    }
+    g->ctrl_active = 1;
+    return 0;
+}
+
+extern "C" int cacaosim_wfstat_gpu_fetch_ctrl(
+    void         *gpu,
+    double       *h_acc_ctrl,
+    float *const  h_ts_in[],
+    float *const  h_ts_out[])
+{
+    if (gpu == NULL)
+    {
+        return -1;
+    }
+    wfg_ctx_t *g = (wfg_ctx_t *) gpu;
+    if (!g->ctrl_active)
+    {
+        return 0;
+    }
+    if (h_acc_ctrl != NULL)
+    {
+        cudaMemcpyAsync(h_acc_ctrl, g->d_acc_ctrl, 4 * g->nloc * sizeof(double),
+                        cudaMemcpyDeviceToHost, g->stream);
+    }
+    for (uint32_t k = 0; k < g->nloc; k++)
+    {
+        if (h_ts_in != NULL && h_ts_in[k] != NULL && g->p.ts_in[k] != NULL && g->ts_len > 0)
+        {
+            cudaMemcpyAsync(h_ts_in[k], g->p.ts_in[k], g->ts_len * sizeof(float),
+                            cudaMemcpyDeviceToHost, g->stream);
+        }
+        if (h_ts_out != NULL && h_ts_out[k] != NULL && g->p.ts_out[k] != NULL && g->ts_len > 0)
+        {
+            cudaMemcpyAsync(h_ts_out[k], g->p.ts_out[k], g->ts_len * sizeof(float),
+                            cudaMemcpyDeviceToHost, g->stream);
+        }
+    }
+    return (cudaStreamSynchronize(g->stream) == cudaSuccess) ? 0 : -1;
 }
 
 extern "C" int cacaosim_wfstat_gpu_fetch_sample(void *gpu, float *const h_maps[],
@@ -275,13 +488,22 @@ extern "C" int cacaosim_wfstat_gpu_fetch_sample(void *gpu, float *const h_maps[]
         return -1;
     }
     wfg_ctx_t *g = (wfg_ctx_t *) gpu;
-    for (uint32_t k = 0; k < g->nloc; k++)
+    if (h_maps != NULL)
     {
-        cudaMemcpyAsync(h_maps[k], g->p.tmp[k], g->npix * sizeof(float), cudaMemcpyDeviceToHost,
+        for (uint32_t k = 0; k < g->nloc; k++)
+        {
+            if (h_maps[k] != NULL)
+            {
+                cudaMemcpyAsync(h_maps[k], g->p.tmp[k], g->npix * sizeof(float),
+                                cudaMemcpyDeviceToHost, g->stream);
+            }
+        }
+    }
+    if (h_frame != NULL)
+    {
+        cudaMemcpyAsync(h_frame, g->d_frame, 4 * g->nloc * sizeof(double), cudaMemcpyDeviceToHost,
                         g->stream);
     }
-    cudaMemcpyAsync(h_frame, g->d_frame, 4 * g->nloc * sizeof(double), cudaMemcpyDeviceToHost,
-                    g->stream);
     return (cudaStreamSynchronize(g->stream) == cudaSuccess) ? 0 : -1;
 }
 

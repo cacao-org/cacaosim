@@ -71,6 +71,8 @@ typedef struct
     float          *d_k_rad;      /**< Per-channel optical wavenumbers `2*pi/lam_c` `[eff_nlam]` */
     float          *d_scale_c;    /**< Per-channel focal scales `lam0/lam_c` `[eff_nlam]` */
     float          *d_chan_w_jac; /**< Per-channel `chan_w * scale_c^2` weights `[eff_nlam]` */
+    float          *d_disp_sx;    /**< Per-channel X dispersion OPD slope `[eff_nlam]` */
+    float          *d_disp_sy;    /**< Per-channel Y dispersion OPD slope `[eff_nlam]` */
     float          *d_poly_opd;   /**< Host-cube staging OPD `[2 * eff_nlam * npix_wf]` */
     float          *d_poly_amp;   /**< Host-cube staging Amp `[2 * eff_nlam * npix_wf]` */
     uint32_t       *d_sub_off;    /**< Uploaded subaperture start indices `[n_sub]` */
@@ -112,6 +114,8 @@ __global__ static void k_shwfs_build_patches(
     const uint32_t *__restrict__       sub_len,
     const cuFloatComplex *__restrict__ shift_1d,
     const float *__restrict__          k_rad,
+    const float *__restrict__          disp_sx,
+    const float *__restrict__          disp_sy,
     float                              wf_to_opd,
     uint32_t                           nwf,
     uint32_t                           n_sub,
@@ -177,14 +181,17 @@ __global__ static void k_shwfs_build_patches(
         opd += ncpa_opd[p];
     }
 
-    cuFloatComplex sx_c = shift_1d[lx];
-    cuFloatComplex sy_c = shift_1d[ly];
-    float          sr   = sx_c.x * sy_c.x - sx_c.y * sy_c.y;
-    float          sm   = sx_c.x * sy_c.y + sx_c.y * sy_c.x;
+    float          p0_xy = 0.5f * (float) (nwf - 1u);
+    float          dx    = (float) px - p0_xy;
+    float          dy    = (float) py - p0_xy;
+    cuFloatComplex sx_c  = shift_1d[lx];
+    cuFloatComplex sy_c  = shift_1d[ly];
+    float          sr    = sx_c.x * sy_c.x - sx_c.y * sy_c.y;
+    float          sm    = sx_c.x * sy_c.y + sx_c.y * sy_c.x;
 
     for (int32_t c = 0; c < nlam; c++)
     {
-        float phi = opd * k_rad[c];
+        float phi = (opd + disp_sx[c] * dx + disp_sy[c] * dy) * k_rad[c];
         float si  = 0.0f;
         float co  = 1.0f;
         __sincosf(phi, &si, &co);
@@ -206,6 +213,8 @@ __global__ static void k_shwfs_build_patches_poly(
     const uint32_t *__restrict__       sub_len,
     const cuFloatComplex *__restrict__ shift_1d,
     const float *__restrict__          k_rad,
+    const float *__restrict__          disp_sx,
+    const float *__restrict__          disp_sy,
     shwfs_poly_map_t                   map,
     uint64_t                           chan_stride,
     uint32_t                           nwf,
@@ -213,6 +222,7 @@ __global__ static void k_shwfs_build_patches_poly(
     uint32_t                           nfft,
     uint32_t                           nbatch,
     int32_t                            nlam,
+    int32_t                            poly_mode,
     cuFloatComplex *__restrict__       patches)
 {
     uint64_t idx   = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -241,14 +251,17 @@ __global__ static void k_shwfs_build_patches_poly(
         return;
     }
 
-    uint32_t       px   = sub_off[sx] + lx;
-    uint32_t       py   = sub_off[sy] + ly;
-    uint64_t       p    = (uint64_t) py * nwf + px;
-    float          nc   = (ncpa_opd != NULL) ? ncpa_opd[p] : 0.0f;
-    cuFloatComplex sx_c = shift_1d[lx];
-    cuFloatComplex sy_c = shift_1d[ly];
-    float          sr   = sx_c.x * sy_c.x - sx_c.y * sy_c.y;
-    float          sm   = sx_c.x * sy_c.y + sx_c.y * sy_c.x;
+    uint32_t       px    = sub_off[sx] + lx;
+    uint32_t       py    = sub_off[sy] + ly;
+    uint64_t       p     = (uint64_t) py * nwf + px;
+    float          nc    = (ncpa_opd != NULL) ? ncpa_opd[p] : 0.0f;
+    float          p0_xy = 0.5f * (float) (nwf - 1u);
+    float          dx    = (float) px - p0_xy;
+    float          dy    = (float) py - p0_xy;
+    cuFloatComplex sx_c  = shift_1d[lx];
+    cuFloatComplex sy_c  = shift_1d[ly];
+    float          sr    = sx_c.x * sy_c.x - sx_c.y * sy_c.y;
+    float          sm    = sx_c.x * sy_c.y + sx_c.y * sy_c.x;
 
     for (int32_t c = 0; c < nlam; c++)
     {
@@ -262,27 +275,44 @@ __global__ static void k_shwfs_build_patches_poly(
         uint64_t off1 = (uint64_t) m1 * chan_stride + p;
         float    amp0 = (beam_amp != NULL) ? beam_amp[off0] : 1.0f;
         float    amp1 = (beam_amp != NULL) ? beam_amp[off1] : 1.0f;
-        if (amp0 <= 0.0f && amp1 <= 0.0f)
+        if (amp0 <= 0.0f && (m1 == m0 || amp1 <= 0.0f))
         {
             patches[((uint64_t) c * nbatch + b) * sfft2 + rem] = make_cuFloatComplex(0.0f, 0.0f);
             continue;
         }
 
-        float p0  = (((beam_opd != NULL) ? beam_opd[off0] : 0.0f) + nc) * kc;
-        float si0 = 0.0f;
-        float co0 = 1.0f;
-        __sincosf(p0, &si0, &co0);
-        float pr = w0 * amp0 * co0;
-        float pi = w0 * amp0 * si0;
-
-        if (m1 != m0 && w1 > 0.0f)
+        float nc_c = nc + disp_sx[c] * dx + disp_sy[c] * dy;
+        float pr   = 0.0f;
+        float pi   = 0.0f;
+        if (poly_mode == CACAOSIM_POLY_UNWRAPPED_OPD && m1 != m0 && w1 > 0.0f)
         {
-            float p1  = (((beam_opd != NULL) ? beam_opd[off1] : 0.0f) + nc) * kc;
-            float si1 = 0.0f;
-            float co1 = 1.0f;
-            __sincosf(p1, &si1, &co1);
-            pr += w1 * amp1 * co1;
-            pi += w1 * amp1 * si1;
+            float amp = w0 * amp0 + w1 * amp1;
+            float opd = w0 * ((beam_opd != NULL) ? beam_opd[off0] : 0.0f) +
+                        w1 * ((beam_opd != NULL) ? beam_opd[off1] : 0.0f) + nc_c;
+            float si  = 0.0f;
+            float co  = 1.0f;
+            __sincosf(opd * kc, &si, &co);
+            pr = amp * co;
+            pi = amp * si;
+        }
+        else
+        {
+            float p0  = (((beam_opd != NULL) ? beam_opd[off0] : 0.0f) + nc_c) * kc;
+            float si0 = 0.0f;
+            float co0 = 1.0f;
+            __sincosf(p0, &si0, &co0);
+            pr = w0 * amp0 * co0;
+            pi = w0 * amp0 * si0;
+
+            if (m1 != m0 && w1 > 0.0f)
+            {
+                float p1  = (((beam_opd != NULL) ? beam_opd[off1] : 0.0f) + nc_c) * kc;
+                float si1 = 0.0f;
+                float co1 = 1.0f;
+                __sincosf(p1, &si1, &co1);
+                pr += w1 * amp1 * co1;
+                pi += w1 * amp1 * si1;
+            }
         }
 
         patches[((uint64_t) c * nbatch + b) * sfft2 + rem] =
@@ -484,6 +514,8 @@ extern "C" int cacaosim_shwfs_cuda_init(
         cudaMalloc((void **) &cs->d_k_rad, lam_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_scale_c, lam_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_chan_w_jac, lam_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_disp_sx, lam_bytes) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_disp_sy, lam_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_poly_opd, poly_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_poly_amp, poly_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_sub_off, sub_bytes) != cudaSuccess ||
@@ -514,6 +546,8 @@ extern "C" int cacaosim_shwfs_cuda_init(
     cudaMemcpyAsync(cs->d_scale_c, ctx->scale_c, lam_bytes, cudaMemcpyHostToDevice, cs->stream);
     cudaMemcpyAsync(cs->d_chan_w_jac, ctx->chan_w_jac, lam_bytes, cudaMemcpyHostToDevice,
                     cs->stream);
+    cudaMemcpyAsync(cs->d_disp_sx, ctx->disp_sx, lam_bytes, cudaMemcpyHostToDevice, cs->stream);
+    cudaMemcpyAsync(cs->d_disp_sy, ctx->disp_sy, lam_bytes, cudaMemcpyHostToDevice, cs->stream);
     cudaMemcpyAsync(cs->d_sub_off, ctx->sub_off, sub_bytes, cudaMemcpyHostToDevice, cs->stream);
     cudaMemcpyAsync(cs->d_sub_len, ctx->sub_len, sub_bytes, cudaMemcpyHostToDevice, cs->stream);
     cudaMemcpyAsync(cs->d_shift_1d, ctx->shift_1d_cplx, sh_bytes, cudaMemcpyHostToDevice,
@@ -555,6 +589,8 @@ extern "C" void cacaosim_shwfs_cuda_free(cacaosim_shwfs_ctx_t *ctx)
     cudaFree(cs->d_k_rad);
     cudaFree(cs->d_scale_c);
     cudaFree(cs->d_chan_w_jac);
+    cudaFree(cs->d_disp_sx);
+    cudaFree(cs->d_disp_sy);
     cudaFree(cs->d_poly_opd);
     cudaFree(cs->d_poly_amp);
     cudaFree(cs->d_sub_off);
@@ -582,6 +618,18 @@ extern "C" void cacaosim_shwfs_cuda_upload_weights(cacaosim_shwfs_ctx_t *ctx)
     }
     cudaMemcpyAsync(cs->d_chan_w_jac, ctx->chan_w_jac, (size_t) ctx->eff_nlam * sizeof(float),
                     cudaMemcpyHostToDevice, cs->stream);
+}
+
+extern "C" void cacaosim_shwfs_cuda_upload_disp(cacaosim_shwfs_ctx_t *ctx)
+{
+    shwfs_cuda_state_t *cs = (shwfs_cuda_state_t *) ctx->cuda_priv;
+    if (cs == NULL || ctx->eff_nlam < 1)
+    {
+        return;
+    }
+    size_t lam_bytes = (size_t) ctx->eff_nlam * sizeof(float);
+    cudaMemcpyAsync(cs->d_disp_sx, ctx->disp_sx, lam_bytes, cudaMemcpyHostToDevice, cs->stream);
+    cudaMemcpyAsync(cs->d_disp_sy, ctx->disp_sy, lam_bytes, cudaMemcpyHostToDevice, cs->stream);
 }
 
 extern "C" void cacaosim_shwfs_cuda_accum(
@@ -650,8 +698,8 @@ extern "C" void cacaosim_shwfs_cuda_accum(
 
     k_shwfs_build_patches<<<bl_pat, 256, 0, cs->stream>>>(
         d_pup, d_amp, d_wf, d_dm, cs->d_ncpa_opd, cs->d_sub_off, cs->d_sub_len, cs->d_shift_1d,
-        cs->d_k_rad, wf_to_opd, ctx->cfg.nwf, ctx->cfg.n_sub, ctx->nfft_sub, ctx->nbatch, nlam,
-        cs->d_patches);
+        cs->d_k_rad, cs->d_disp_sx, cs->d_disp_sy, wf_to_opd, ctx->cfg.nwf, ctx->cfg.n_sub,
+        ctx->nfft_sub, ctx->nbatch, nlam, cs->d_patches);
 
     cufftExecC2C(cs->plan_batch, cs->d_patches, cs->d_patches, CUFFT_FORWARD);
 
@@ -692,13 +740,14 @@ extern "C" void cacaosim_shwfs_cuda_accum_poly(
     const float     *d_amp_use  = d_beam_amp;
     uint64_t         stride_use = chan_stride;
 
+    int32_t unwrapped = (ctx->in_poly_mode == CACAOSIM_POLY_UNWRAPPED_OPD) ? 1 : 0;
     for (int32_t c = 0; c < nlam; c++)
     {
         uint32_t m0 = 0u;
         uint32_t m1 = 0u;
         float    al = 0.0f;
-        cacaosim_poly_interp_bracket(ctx->lam_um[c], beam_lam_um, beam_nlam, def_l0, def_l1, &m0,
-                                     &m1, &al);
+        cacaosim_poly_interp_bracket_ex(ctx->lam_um[c], beam_lam_um, beam_nlam, def_l0, def_l1,
+                                        unwrapped, &m0, &m1, &al);
         if (d_beam_opd == NULL && beam_opd != NULL)
         {
             uint32_t s0 = (uint32_t) (2 * c);
@@ -750,8 +799,8 @@ extern "C" void cacaosim_shwfs_cuda_accum_poly(
 
     k_shwfs_build_patches_poly<<<bl_pat, 256, 0, cs->stream>>>(
         d_opd_use, d_amp_use, cs->d_ncpa_opd, cs->d_sub_off, cs->d_sub_len, cs->d_shift_1d,
-        cs->d_k_rad, map, stride_use, ctx->cfg.nwf, ctx->cfg.n_sub, ctx->nfft_sub, ctx->nbatch,
-        nlam, cs->d_patches);
+        cs->d_k_rad, cs->d_disp_sx, cs->d_disp_sy, map, stride_use, ctx->cfg.nwf, ctx->cfg.n_sub,
+        ctx->nfft_sub, ctx->nbatch, nlam, ctx->in_poly_mode, cs->d_patches);
 
     cufftExecC2C(cs->plan_batch, cs->d_patches, cs->d_patches, CUFFT_FORWARD);
 

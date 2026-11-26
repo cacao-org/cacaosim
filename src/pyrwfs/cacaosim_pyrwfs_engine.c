@@ -514,16 +514,21 @@ static void MILK_HOT pyrwfs_propagate_cpu(
     const uint32_t nfft    = ctx->nfft;
     const uint32_t pad_off = (nfft - nwf) / 2u;
     const int32_t  nlam    = (ctx->eff_nlam >= 1) ? ctx->eff_nlam : 1;
+    const float    p0_xy   = 0.5f * (float) (nwf - 1u);
 
     for (int32_t c = 0; c < nlam; c++)
     {
         const float opd_to_rad = ctx->k_rad[c];
+        const float sx_c       = ctx->disp_sx[c];
+        const float sy_c       = ctx->disp_sy[c];
+        const int   has_disp   = (sx_c != 0.0f || sy_c != 0.0f) ? 1 : 0;
         __builtin_memset(ctx->cpu_pup_cplx, 0, (size_t) ctx->npix_fft * 2u * sizeof(float));
 
         for (uint32_t jy = 0; jy < nwf; jy++)
         {
             float   *dst_row = &ctx->cpu_pup_cplx[((size_t) (jy + pad_off) * nfft + pad_off) * 2u];
             uint64_t pbase   = (uint64_t) jy * nwf;
+            float    dy      = has_disp ? (sy_c * ((float) jy - p0_xy)) : 0.0f;
             for (uint32_t ix = 0; ix < nwf; ix++)
             {
                 uint64_t p   = pbase + ix;
@@ -536,7 +541,7 @@ static void MILK_HOT pyrwfs_propagate_cpu(
                 {
                     amp *= atm_amp[p];
                 }
-                float opd = 0.0f;
+                float opd = has_disp ? (sx_c * ((float) ix - p0_xy) + dy) : 0.0f;
                 if (wf_in != NULL)
                 {
                     opd += wf_to_opd * wf_in[p];
@@ -571,30 +576,35 @@ static void MILK_HOT pyrwfs_propagate_poly_cpu(
     const float           *ncpa_opd,
     int32_t                slice_idx)
 {
-    const uint32_t nwf     = ctx->cfg.nwf;
-    const uint32_t nfft    = ctx->nfft;
-    const uint32_t pad_off = (nfft - nwf) / 2u;
-    const int32_t  nlam    = (ctx->eff_nlam >= 1) ? ctx->eff_nlam : 1;
-    const float    lam0    = (ctx->cfg.lambda_um > 0.05f) ? ctx->cfg.lambda_um : 0.75f;
-    const float    bw      = (ctx->cfg.bw_frac > 0.0f) ? ctx->cfg.bw_frac : 0.20f;
-    const float    def_l0  = lam0 * (1.0f - 0.5f * bw);
-    const float    def_l1  = lam0 * (1.0f + 0.5f * bw);
+    const uint32_t nwf       = ctx->cfg.nwf;
+    const uint32_t nfft      = ctx->nfft;
+    const uint32_t pad_off   = (nfft - nwf) / 2u;
+    const int32_t  nlam      = (ctx->eff_nlam >= 1) ? ctx->eff_nlam : 1;
+    const float    lam0      = (ctx->cfg.lambda_um > 0.05f) ? ctx->cfg.lambda_um : 0.75f;
+    const float    bw        = (ctx->cfg.bw_frac > 0.0f) ? ctx->cfg.bw_frac : 0.20f;
+    const float    def_l0    = lam0 * (1.0f - 0.5f * bw);
+    const float    def_l1    = lam0 * (1.0f + 0.5f * bw);
+    const float    p0_xy     = 0.5f * (float) (nwf - 1u);
+    const int32_t  unwrapped = (ctx->in_poly_mode == CACAOSIM_POLY_UNWRAPPED_OPD) ? 1 : 0;
 
     for (int32_t c = 0; c < nlam; c++)
     {
         uint32_t m0    = 0u;
         uint32_t m1    = 0u;
         float    alpha = 0.0f;
-        cacaosim_poly_interp_bracket(ctx->lam_um[c], beam_lam_um, beam_nlam, def_l0, def_l1, &m0,
-                                     &m1, &alpha);
+        cacaosim_poly_interp_bracket_ex(ctx->lam_um[c], beam_lam_um, beam_nlam, def_l0, def_l1,
+                                        unwrapped, &m0, &m1, &alpha);
 
-        const float *o0 = (beam_opd != NULL) ? (beam_opd + (uint64_t) m0 * chan_stride) : NULL;
-        const float *a0 = (beam_amp != NULL) ? (beam_amp + (uint64_t) m0 * chan_stride) : NULL;
-        const float *o1 = (beam_opd != NULL) ? (beam_opd + (uint64_t) m1 * chan_stride) : NULL;
-        const float *a1 = (beam_amp != NULL) ? (beam_amp + (uint64_t) m1 * chan_stride) : NULL;
-        const float  kc = ctx->k_rad[c];
-        const float  w0 = 1.0f - alpha;
-        const float  w1 = alpha;
+        const float *o0       = (beam_opd != NULL) ? (beam_opd + (uint64_t) m0 * chan_stride) : NULL;
+        const float *a0       = (beam_amp != NULL) ? (beam_amp + (uint64_t) m0 * chan_stride) : NULL;
+        const float *o1       = (beam_opd != NULL) ? (beam_opd + (uint64_t) m1 * chan_stride) : NULL;
+        const float *a1       = (beam_amp != NULL) ? (beam_amp + (uint64_t) m1 * chan_stride) : NULL;
+        const float  kc       = ctx->k_rad[c];
+        const float  w0       = 1.0f - alpha;
+        const float  w1       = alpha;
+        const float  sx_c     = ctx->disp_sx[c];
+        const float  sy_c     = ctx->disp_sy[c];
+        const int    has_disp = (sx_c != 0.0f || sy_c != 0.0f) ? 1 : 0;
 
         __builtin_memset(ctx->cpu_pup_cplx, 0, (size_t) ctx->npix_fft * 2u * sizeof(float));
 
@@ -602,6 +612,7 @@ static void MILK_HOT pyrwfs_propagate_poly_cpu(
         {
             float   *dst_row = &ctx->cpu_pup_cplx[((size_t) (jy + pad_off) * nfft + pad_off) * 2u];
             uint64_t pbase   = (uint64_t) jy * nwf;
+            float    dy      = has_disp ? (sy_c * ((float) jy - p0_xy)) : 0.0f;
             for (uint32_t ix = 0; ix < nwf; ix++)
             {
                 uint64_t p    = pbase + ix;
@@ -611,18 +622,31 @@ static void MILK_HOT pyrwfs_propagate_poly_cpu(
                 {
                     continue;
                 }
-                float nc = (ncpa_opd != NULL) ? ncpa_opd[p] : 0.0f;
-                float p0 = (((o0 != NULL) ? o0[p] : 0.0f) + nc) * kc;
-                float re = w0 * amp0 * cosf(p0);
-                float im = w0 * amp0 * sinf(p0);
-                if (m1 != m0 && w1 > 0.0f)
+                float disp_opd = has_disp ? (sx_c * ((float) ix - p0_xy) + dy) : 0.0f;
+                float nc       = ((ncpa_opd != NULL) ? ncpa_opd[p] : 0.0f) + disp_opd;
+                if (unwrapped && m1 != m0 && w1 > 0.0f)
                 {
-                    float p1 = (((o1 != NULL) ? o1[p] : 0.0f) + nc) * kc;
-                    re += w1 * amp1 * cosf(p1);
-                    im += w1 * amp1 * sinf(p1);
+                    float amp = w0 * amp0 + w1 * amp1;
+                    float opd = w0 * ((o0 != NULL) ? o0[p] : 0.0f) +
+                                w1 * ((o1 != NULL) ? o1[p] : 0.0f) + nc;
+                    float phi             = opd * kc;
+                    dst_row[2u * ix]      = amp * cosf(phi);
+                    dst_row[2u * ix + 1u] = amp * sinf(phi);
                 }
-                dst_row[2u * ix]      = re;
-                dst_row[2u * ix + 1u] = im;
+                else
+                {
+                    float p0 = (((o0 != NULL) ? o0[p] : 0.0f) + nc) * kc;
+                    float re = w0 * amp0 * cosf(p0);
+                    float im = w0 * amp0 * sinf(p0);
+                    if (m1 != m0 && w1 > 0.0f)
+                    {
+                        float p1 = (((o1 != NULL) ? o1[p] : 0.0f) + nc) * kc;
+                        re += w1 * amp1 * cosf(p1);
+                        im += w1 * amp1 * sinf(p1);
+                    }
+                    dst_row[2u * ix]      = re;
+                    dst_row[2u * ix + 1u] = im;
+                }
             }
         }
 
@@ -1111,6 +1135,50 @@ void cacaosim_pyrwfs_set_weights(
     if (changed && ctx->use_cuda)
     {
         cacaosim_pyrwfs_cuda_upload_weights(ctx);
+    }
+}
+
+void cacaosim_pyrwfs_set_disp(
+    cacaosim_pyrwfs_ctx_t *ctx,
+    const cacaosim_disp_t *disp,
+    float                  tel_diam_m,
+    int32_t                in_poly_mode)
+{
+    if (ctx == NULL || ctx->eff_nlam < 1)
+    {
+        return;
+    }
+    ctx->in_poly_mode = in_poly_mode;
+
+    if (disp == NULL || !disp->active)
+    {
+        if (ctx->disp_active)
+        {
+            memset(ctx->disp_sx, 0, sizeof(ctx->disp_sx));
+            memset(ctx->disp_sy, 0, sizeof(ctx->disp_sy));
+            ctx->disp_active = 0;
+            ctx->disp_gen    = 0ULL;
+            if (ctx->use_cuda)
+            {
+                cacaosim_pyrwfs_cuda_upload_disp(ctx);
+            }
+        }
+        return;
+    }
+
+    float diam = (tel_diam_m > 0.01f) ? tel_diam_m : 8.0f;
+    if (!ctx->disp_active || disp->gen != ctx->disp_gen ||
+        fabsf(diam - ctx->disp_tel_diam) > 1e-4f)
+    {
+        cacaosim_disp_eval_slopes(disp, ctx->lam_um, (uint32_t) ctx->eff_nlam, diam, ctx->cfg.nwf,
+                                  ctx->cfg.pup_diam, ctx->disp_sx, ctx->disp_sy);
+        ctx->disp_active   = 1;
+        ctx->disp_gen      = disp->gen;
+        ctx->disp_tel_diam = diam;
+        if (ctx->use_cuda)
+        {
+            cacaosim_pyrwfs_cuda_upload_disp(ctx);
+        }
     }
 }
 

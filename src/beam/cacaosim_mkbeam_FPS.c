@@ -39,6 +39,8 @@
 #include "COREMOD_memory/COREMOD_memory.h"
 #include "beam/cacaosim_mkbeam_FPS.h"
 #include "common/cacaosim_beam.h"
+#include "common/cacaosim_disp.h"
+#include "common/cacaosim_perturb.h"
 #include "common/cacaosim_time.h"
 #include "pupil/cacaosim_pupil.h"
 
@@ -66,6 +68,18 @@ static float    param_tel_tput                               = 0.75f;
 static int32_t  param_wf_unit                                = 1;
 static float    param_ref_lambda                             = 0.50f;
 static float    param_turb_gain                              = 1.0f;
+static int64_t  param_vib_enable                             = 0;
+static float    param_vib_rms_nm                             = 45.0f;
+static int64_t  param_petal_enable                           = 0;
+static float    param_petal_rms_nm                           = 1000.0f;
+static float    param_petal_tau_s                            = 3.0f;
+static int64_t  param_atm_disp_enable                        = 1;
+static float    param_zenith_deg                             = 0.0f;
+static float    param_disp_pa_deg                            = 0.0f;
+static float    param_atm_pressure_hpa                       = 615.0f;
+static float    param_atm_temp_c                             = 2.0f;
+static float    param_atm_rh_pct                             = 20.0f;
+static float    param_atm_disp_ref_um                        = 1.65f;
 static float    param_frame_rate                             = 0.0f;
 
 /**
@@ -142,6 +156,38 @@ static float    param_frame_rate                             = 0.0f;
     X(".turb_gain", &param_turb_gain, FPTYPE_FLOAT32, 0,                                \
       FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
       "Live atmospheric turbulence multiplier (0 = flat WF)")                           \
+    X(".vib_enable", &param_vib_enable, FPTYPE_ONOFF, 0,                                \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Enable stochastic telescope/bench vibrations (14.5..138 Hz)")                    \
+    X(".vib_rms_nm", &param_vib_rms_nm, FPTYPE_FLOAT32, 0,                              \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Total telescope/bench vibration OPD RMS [nm] (default: 45.0)")                   \
+    X(".petal_enable", &param_petal_enable, FPTYPE_ONOFF, 0,                            \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Enable thermally induced slow-varying pupil petaling (LWE)")                     \
+    X(".petal_rms_nm", &param_petal_rms_nm, FPTYPE_FLOAT32, 0,                          \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Total thermal petaling (LWE) OPD RMS [nm] (default: 1000.0)")                    \
+    X(".petal_tau_s", &param_petal_tau_s, FPTYPE_FLOAT32, 0,                            \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Thermal petaling correlation timescale [s] (default: 3.0)")                      \
+    X(".atm_disp_enable", &param_atm_disp_enable, FPTYPE_ONOFF, 0,                      \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Enable Maunakea atmospheric chromatic dispersion (0 = off, 1 = on)")             \
+    X(".zenith_deg", &param_zenith_deg, FPTYPE_FLOAT32, 0,                              \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Observing zenith angle [deg] for atmospheric dispersion (default: 0)")           \
+    X(".disp_pa_deg", &param_disp_pa_deg, FPTYPE_FLOAT32, 0,                            \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Azimuth of zenith dispersion vector on pupil [deg] (default: 0)")                \
+    X(".atm_pressure_hpa", &param_atm_pressure_hpa, FPTYPE_FLOAT32, 0,                  \
+      FPFLAG_DEFAULT_INPUT, "Ambient atmospheric pressure [hPa] (default: 615)")        \
+    X(".atm_temp_c", &param_atm_temp_c, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,        \
+      "Ambient air temperature [deg C] (default: 2.0)")                                 \
+    X(".atm_rh_pct", &param_atm_rh_pct, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,        \
+      "Ambient relative humidity [%] (default: 20.0)")                                  \
+    X(".atm_disp_ref_um", &param_atm_disp_ref_um, FPTYPE_FLOAT32, 0,                    \
+      FPFLAG_DEFAULT_INPUT, "Atmospheric dispersion zero-shift ref wavelength [um]")    \
     X(".frame_rate", &param_frame_rate, FPTYPE_FLOAT32, 0,                              \
       FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
       "Internal TIMER_ABSTIME pacing rate [Hz] (0 = use trigger)")
@@ -170,7 +216,10 @@ static MILK_COLD errno_t mkbeam_confcheck(void)
     if (dcfpsptr != NULL)
     {
         const char *live_keys[] = {
-            ".star_mag", ".star_teff", ".tel_tput", ".turb_gain", ".frame_rate"
+            ".star_mag",     ".star_teff",       ".tel_tput",      ".turb_gain",
+            ".frame_rate",   ".vib_enable",      ".vib_rms_nm",    ".petal_enable",
+            ".petal_rms_nm", ".petal_tau_s",     ".atm_disp_enable", ".zenith_deg",
+            ".disp_pa_deg"
         };
         for (size_t i = 0; i < sizeof(live_keys) / sizeof(live_keys[0]); i++)
         {
@@ -215,10 +264,44 @@ static MILK_HOT errno_t mkbeam_compute(const MILK_RUNNABLE *self)
     uint32_t nwf  = (param_nwf >= 8) ? param_nwf : 128;
     uint64_t npix = (uint64_t) nwf * nwf;
 
-    /* Create 3D [nwf x nwf x 2] beam cube (slice 0 = OPD [um], slice 1 = Amp) & init keywords */
-    IMGID img_beam = stream_connect_create_3Df32(param_out_beam, nwf, nwf, 2);
+    /* Probe optional upstream turbulence WF, scintillation amplitude, and static NCPA streams */
+    IMGID img_wf   = { 0 };
+    IMGID img_amp  = { 0 };
+    IMGID img_ncpa = { 0 };
+    img_wf.ID      = -1;
+    img_amp.ID     = -1;
+    img_ncpa.ID    = -1;
+
+    if (param_in_wf[0] != '\0')
+    {
+        img_wf = stream_connect(param_in_wf);
+    }
+    if (param_in_amp[0] != '\0')
+    {
+        img_amp = stream_connect(param_in_amp);
+    }
+    if (param_in_ncpa[0] != '\0')
+    {
+        img_ncpa = stream_connect(param_in_ncpa);
+    }
+
+    uint32_t chrom_nwl  = 1u;
+    int32_t  chrom_unit = 1;
+    float    chrom_wls[8];
+    memset(chrom_wls, 0, sizeof(chrom_wls));
+    if (img_wf.ID != -1)
+    {
+        (void) cacaosim_wf_shm_read_chrom(img_wf.im, &chrom_nwl, &chrom_unit, chrom_wls);
+    }
+    uint32_t beam_nz = (chrom_nwl >= 2u) ? (2u * chrom_nwl) : 2u;
+
+    /* Create 3D [nwf x nwf x 2*N_wl] beam cube (NBkw = 80 for spec + poly + dispersion) */
+    IMGID img_beam = cacaosim_beam_shm_create(param_out_beam, nwf, beam_nz);
     if (img_beam.ID == -1)
     {
+        if (img_ncpa.ID != -1) { imgid_free(&img_ncpa); }
+        if (img_amp.ID != -1) { imgid_free(&img_amp); }
+        if (img_wf.ID != -1) { imgid_free(&img_wf); }
         return RETURN_FAILURE;
     }
     cacaosim_beam_shm_init_kw(img_beam.im);
@@ -243,6 +326,9 @@ static MILK_HOT errno_t mkbeam_compute(const MILK_RUNNABLE *self)
         if (fallback_pup == NULL)
         {
             imgid_free(&img_beam);
+            if (img_ncpa.ID != -1) { imgid_free(&img_ncpa); }
+            if (img_amp.ID != -1) { imgid_free(&img_amp); }
+            if (img_wf.ID != -1) { imgid_free(&img_wf); }
             return RETURN_FAILURE;
         }
         cacaosim_pupil_cfg_t pcfg = {
@@ -258,26 +344,10 @@ static MILK_HOT errno_t mkbeam_compute(const MILK_RUNNABLE *self)
         pup_ptr = fallback_pup;
     }
 
-    /* Probe optional upstream turbulence WF, scintillation amplitude, and static NCPA streams */
-    IMGID img_wf   = { 0 };
-    IMGID img_amp  = { 0 };
-    IMGID img_ncpa = { 0 };
-    img_wf.ID      = -1;
-    img_amp.ID     = -1;
-    img_ncpa.ID    = -1;
-
-    if (param_in_wf[0] != '\0')
-    {
-        img_wf = stream_connect(param_in_wf);
-    }
-    if (param_in_amp[0] != '\0')
-    {
-        img_amp = stream_connect(param_in_amp);
-    }
-    if (param_in_ncpa[0] != '\0')
-    {
-        img_ncpa = stream_connect(param_in_ncpa);
-    }
+    cacaosim_perturb_cfg_t pcfg;
+    cacaosim_perturb_ctx_t pctx;
+    cacaosim_perturb_cfg_defaults(&pcfg);
+    (void) cacaosim_perturb_init(&pctx, nwf, param_pup_diam, pup_ptr, &pcfg, 0, NULL);
 
     struct timespec deadline;
     clock_gettime(CLOCK_MONOTONIC, &deadline);
@@ -325,17 +395,90 @@ static MILK_HOT errno_t mkbeam_compute(const MILK_RUNNABLE *self)
         float wf_to_opd =
             cacaosim_wf_to_opd_scale(param_wf_unit, param_ref_lambda, param_turb_gain);
 
-        /* Write slice 0 (OPD_um), slice 1 (Amp), and O(1) spectral keywords into SHM beam */
+        /* Write slice(s) [OPD_um, Amp], optional chromatic metadata, and O(1) spectral keywords */
         img_beam.md->write = 1;
-        cacaosim_beam_init_cpu(pup_ptr, amp_ptr, wf_ptr, ncpa_ptr, wf_to_opd, nwf,
-                               img_beam.im->array.F, img_beam.im->array.F + npix);
+        pcfg.vib_enable   = param_vib_enable ? 1 : 0;
+        pcfg.vib_rms_nm   = param_vib_rms_nm;
+        pcfg.petal_enable = param_petal_enable ? 1 : 0;
+        pcfg.petal_rms_nm = param_petal_rms_nm;
+        pcfg.petal_tau_s  = param_petal_tau_s;
+        double dt_s = (param_frame_rate > 0.1f) ? (1.0 / (double) param_frame_rate) : 0.0005;
+
+        uint32_t live_nwl  = 1u;
+        int32_t  live_unit = 1;
+        float    live_wls[8];
+        int      use_chrom =
+            (chrom_nwl >= 2u && wf_ptr != NULL &&
+             cacaosim_wf_shm_read_chrom(img_wf.im, &live_nwl, &live_unit, live_wls) &&
+             live_nwl == chrom_nwl && img_beam.md->size[2] >= 2u * chrom_nwl);
+
+        if (use_chrom)
+        {
+            const float inv_2pi = (float) (1.0 / (2.0 * M_PI));
+            int amp_is_3d = (amp_ptr != NULL && img_amp.md->naxis == 3 &&
+                             img_amp.md->size[2] >= chrom_nwl);
+            for (uint32_t m = 0u; m < chrom_nwl; m++)
+            {
+                float s_m = (live_unit == 0) ? param_turb_gain
+                                             : (live_wls[m] * inv_2pi * param_turb_gain);
+                const float *wf_m  = wf_ptr + (uint64_t) m * npix;
+                const float *amp_m = (amp_ptr != NULL)
+                                         ? (amp_is_3d ? (amp_ptr + (uint64_t) m * npix) : amp_ptr)
+                                         : NULL;
+                float       *out_o = img_beam.im->array.F + (uint64_t) (2u * m) * npix;
+                float       *out_a = out_o + npix;
+                cacaosim_beam_init_cpu(pup_ptr, amp_m, wf_m, ncpa_ptr, s_m, nwf, out_o, out_a);
+            }
+            if (pcfg.vib_enable || pcfg.petal_enable)
+            {
+                cacaosim_perturb_step_apply(&pctx, &pcfg, dt_s, param_turb_gain,
+                                            img_beam.im->array.F, NULL, NULL);
+                for (uint32_t m = 1u; m < chrom_nwl; m++)
+                {
+                    float *out_o = img_beam.im->array.F + (uint64_t) (2u * m) * npix;
+                    cacaosim_perturb_apply_current(&pctx, out_o, NULL, NULL);
+                }
+            }
+            cacaosim_beam_shm_write_poly_kw(img_beam.im, chrom_nwl, live_wls[0],
+                                            live_wls[chrom_nwl - 1u]);
+            cacaosim_beam_shm_write_poly_mode(img_beam.im,
+                                              (int32_t) CACAOSIM_POLY_UNWRAPPED_OPD);
+            cacaosim_beam_shm_write_poly_wls(img_beam.im, live_wls, chrom_nwl);
+        }
+        else
+        {
+            cacaosim_beam_init_cpu(pup_ptr, amp_ptr, wf_ptr, ncpa_ptr, wf_to_opd, nwf,
+                                   img_beam.im->array.F, img_beam.im->array.F + npix);
+            if (pcfg.vib_enable || pcfg.petal_enable)
+            {
+                cacaosim_perturb_step_apply(&pctx, &pcfg, dt_s, param_turb_gain,
+                                            img_beam.im->array.F, NULL, NULL);
+            }
+            cacaosim_beam_shm_write_poly_mode(img_beam.im, (int32_t) CACAOSIM_POLY_NONE);
+        }
         cacaosim_beam_shm_write_spec(img_beam.im, &spec);
+
+        cacaosim_atm_disp_cfg_t adcfg;
+        cacaosim_atm_disp_cfg_defaults(&adcfg);
+        adcfg.enable       = param_atm_disp_enable ? 1 : 0;
+        adcfg.zenith_deg   = param_zenith_deg;
+        adcfg.disp_pa_deg  = param_disp_pa_deg;
+        adcfg.pressure_hpa = param_atm_pressure_hpa;
+        adcfg.temp_c       = param_atm_temp_c;
+        adcfg.rh_pct       = param_atm_rh_pct;
+        adcfg.ref_lam_um   = param_atm_disp_ref_um;
+        cacaosim_disp_t atm_disp;
+        memset(&atm_disp, 0, sizeof(atm_disp));
+        cacaosim_disp_set_atm(&atm_disp, &adcfg);
+        cacaosim_beam_shm_write_disp(img_beam.im, &atm_disp);
+        cacaosim_beam_shm_write_diam(img_beam.im, param_tel_diam_m);
 
         IMAGE *trig_src = (img_wf.ID != -1) ? img_wf.im : NULL;
         processinfo_update_output_stream(processinfo, img_beam.im, trig_src);
     }
     MILK_PROCINFO_END(self)
 
+    cacaosim_perturb_free(&pctx);
     free(fallback_pup);
     if (img_ncpa.ID != -1)
     {

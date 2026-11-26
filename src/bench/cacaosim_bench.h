@@ -53,7 +53,10 @@
 
 #include "milk_runnable.h"
 #include "cacaosim_types.h"
+#include "adc/cacaosim_adc.h"
 #include "common/cacaosim_beam.h"
+#include "common/cacaosim_disp.h"
+#include "common/cacaosim_perturb.h"
 #include "coro/cacaosim_coro.h"
 #include "dm/cacaosim_dm.h"
 #include "fpcam/cacaosim_fpcam.h"
@@ -127,7 +130,8 @@ typedef enum
     CACAOSIM_NODE_SHWFS    = 4, /**< Diffractive Shack-Hartmann WFS + camera ([shwfs.<id>]) */
     CACAOSIM_NODE_ZWFS     = 5, /**< Babinet MFT Zernike WFS + camera ([zwfs.<id>]) */
     CACAOSIM_NODE_FPCAM    = 6, /**< Focal-plane science PSF camera ([fpcam.<id>]) */
-    CACAOSIM_NODE_WFE      = 7  /**< Static wavefront error map in OPD [m] ([wfe.<id>]) */
+    CACAOSIM_NODE_WFE      = 7, /**< Static wavefront error map in OPD [m] ([wfe.<id>]) */
+    CACAOSIM_NODE_ADC      = 8  /**< Atmospheric Dispersion Compensator ([adc.<id>]) */
 } cacaosim_node_kind_t;
 
 /**
@@ -199,6 +203,7 @@ typedef struct
     /* Optional SHM stream names and custom FITS/SHM mask specifiers */
     char                 in_cmd[CACAOSIM_BENCH_NAME_LEN];
     char                 out_opd[CACAOSIM_BENCH_NAME_LEN];
+    char                 out_state[CACAOSIM_BENCH_NAME_LEN];
     char                 in_flat[CACAOSIM_BENCH_NAME_LEN];
     char                 in_wfe[CACAOSIM_BENCH_NAME_LEN];
     char                 out_cam[CACAOSIM_BENCH_NAME_LEN];
@@ -246,6 +251,7 @@ typedef struct
     cacaosim_shwfs_cfg_t  shwfs;
     cacaosim_zwfs_cfg_t   zwfs;
     cacaosim_fpcam_cfg_t  fpcam;
+    cacaosim_adc_cfg_t    adc;
 } cacaosim_node_cfg_t;
 
 /**
@@ -303,9 +309,16 @@ typedef struct
     char                in_ncpa[CACAOSIM_BENCH_NAME_LEN];
     char                out_beam[CACAOSIM_BENCH_NAME_LEN];
     int32_t             wf_unit;
-    float               ref_lambda;
-    float               turb_gain;
-    int32_t             backend;
+    float                   ref_lambda;
+    float                   turb_gain;
+    cacaosim_perturb_cfg_t  perturb;
+    cacaosim_atm_disp_cfg_t atm_disp;
+    int32_t                 imr_mode;
+    float                   parallactic_rate_dps;
+    float                   site_alt_m;
+    int32_t                 chrom_turb;
+    char                    chrom_lambdas[CACAOSIM_BENCH_NAME_LEN];
+    int32_t                 backend;
 
     uint32_t            n_nodes;
     cacaosim_node_cfg_t nodes[CACAOSIM_BENCH_MAX_NODES];
@@ -336,6 +349,8 @@ typedef struct
 {
     char            name[CACAOSIM_BENCH_NAME_LEN];
     cacaosim_spec_t spec;
+    cacaosim_disp_t disp;
+    int32_t         poly_mode;
     uint32_t        nlam;
     float           lam_um[CACAOSIM_CORO_MAX_LAMBDA];
     float          *opd;
@@ -473,6 +488,7 @@ typedef struct
     /* Connected SHM stream handles when connect_shm == 1 */
     IMGID               img_cmd;
     IMGID               img_opd;
+    IMGID               img_state;
     IMGID               img_flat;
     IMGID               img_wfe;
     IMGID               img_cam;
@@ -488,6 +504,7 @@ typedef struct
 
     /* Active compute unit context */
     cacaosim_dm_ctx_t     dm_ctx;
+    cacaosim_adc_ctx_t    adc_ctx;
     cacaosim_coro_ctx_t   coro_ctx;
     cacaosim_pyrwfs_ctx_t pyrwfs_ctx;
     cacaosim_shwfs_ctx_t  shwfs_ctx;
@@ -561,6 +578,19 @@ typedef struct
     uint64_t              wf_prev_cnt0;
     uint32_t              wf_substep;
     int32_t               wf_interp_primed;
+    uint32_t              wf_chrom_nwl;
+    int32_t               wf_chrom_unit;
+    float                 wf_chrom_wls[8];
+    float                *d_wf_chrom_in;
+
+    /* Atmospheric dispersion state & IMR parallactic tracking */
+    double                  atm_disp_pa_curr_deg;
+    cacaosim_atm_disp_cfg_t cached_atm_cfg;
+    int32_t                 cached_atm_valid;
+    cacaosim_disp_t         cached_atm_disp;
+
+    /* Entrance-pupil vibration & thermal petaling engine */
+    cacaosim_perturb_ctx_t perturb;
 
     /* Entrance SHM streams (when connect_shm == 1) */
     IMGID                 img_pup;

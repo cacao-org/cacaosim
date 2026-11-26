@@ -177,72 +177,59 @@ static void MILK_HOT fpcam_build_epup_cpu(
     const float *__restrict ncpa_opd,
     float                   wf_to_opd,
     float                   opd_to_rad,
-    uint64_t                npix_wf,
+    uint32_t                nwf,
+    float                   disp_sx,
+    float                   disp_sy,
     float *__restrict       epup_cplx)
 {
-    const int nth = (npix_wf >= 16384ULL) ? omp_get_max_threads() : 1;
+    const uint64_t npix_wf  = (uint64_t) nwf * nwf;
+    const int      nth      = (npix_wf >= 16384ULL) ? omp_get_max_threads() : 1;
+    const float    p0_xy    = 0.5f * (float) (nwf - 1u);
+    const int      has_disp = (disp_sx != 0.0f || disp_sy != 0.0f) ? 1 : 0;
 
 #pragma omp parallel for num_threads(nth) if (nth > 1) schedule(static)
-    for (uint64_t p = 0; p < npix_wf; p++)
+    for (uint32_t iy = 0; iy < nwf; iy++)
     {
-        float amp = (pup_amp != NULL) ? pup_amp[p] : 1.0f;
-        if (atm_amp != NULL)
+        const float    dy    = has_disp ? (disp_sy * ((float) iy - p0_xy)) : 0.0f;
+        const uint64_t pbase = (uint64_t) iy * nwf;
+        for (uint32_t ix = 0; ix < nwf; ix++)
         {
-            amp *= atm_amp[p];
+            uint64_t p   = pbase + ix;
+            float    amp = (pup_amp != NULL) ? pup_amp[p] : 1.0f;
+            if (atm_amp != NULL)
+            {
+                amp *= atm_amp[p];
+            }
+            /* Short-circuit masked pixels outside pupil/Lyot support to skip transcendental math */
+            if (amp <= 0.0f)
+            {
+                epup_cplx[2u * p]      = 0.0f;
+                epup_cplx[2u * p + 1u] = 0.0f;
+                continue;
+            }
+            float opd = has_disp ? (disp_sx * ((float) ix - p0_xy) + dy) : 0.0f;
+            if (wf_in != NULL)
+            {
+                opd += wf_to_opd * wf_in[p];
+            }
+            if (dm_opd != NULL)
+            {
+                opd -= dm_opd[p];
+            }
+            if (ncpa_opd != NULL)
+            {
+                opd += ncpa_opd[p];
+            }
+            float phi = opd * opd_to_rad;
+            float s   = 0.0f;
+            float co  = 1.0f;
+            sincosf(phi, &s, &co);
+            epup_cplx[2u * p]      = amp * co;
+            epup_cplx[2u * p + 1u] = amp * s;
         }
-        /* Short-circuit masked pixels outside pupil/Lyot support to skip transcendental math */
-        if (amp <= 0.0f)
-        {
-            epup_cplx[2u * p]      = 0.0f;
-            epup_cplx[2u * p + 1u] = 0.0f;
-            continue;
-        }
-        float opd = 0.0f;
-        if (wf_in != NULL)
-        {
-            opd += wf_to_opd * wf_in[p];
-        }
-        if (dm_opd != NULL)
-        {
-            opd -= dm_opd[p];
-        }
-        if (ncpa_opd != NULL)
-        {
-            opd += ncpa_opd[p];
-        }
-        float phi = opd * opd_to_rad;
-        float s   = 0.0f;
-        float co  = 1.0f;
-        sincosf(phi, &s, &co);
-        epup_cplx[2u * p]      = amp * co;
-        epup_cplx[2u * p + 1u] = amp * s;
     }
 }
 
-/**
- * fpcam_accum_poly_cpu() - Propagate and incoherently sum polychromatic PSF channels on CPU
- * @ctx:         Initialized focal-plane camera context
- * @pup_amp:     Host pupil/beam amplitude slices (`[beam_nlam]` at `chan_stride`), or NULL
- * @atm_amp:     Optional achromatic atmospheric amplitude `[npix_wf]`, or NULL
- * @wf_in:       Optional wavefront/beam OPD slices (`[beam_nlam]` at `chan_stride`), or NULL
- * @beam_nlam:   Number of spectral slices in `pup_amp` / `wf_in` (`1` = achromatic)
- * @chan_stride: Float element stride between adjacent input spectral slices
- * @dm_opd:      Optional DM OPD `[npix_wf]` [um], or NULL
- * @ncpa_opd:    Optional static NCPA OPD `[npix_wf]` [um], or NULL
- * @wf_to_opd:   Scale factor mapping `wf_in` units to OPD [um]
- *
- * Role: Core hot-path CPU propagator that evaluates Fraunhofer diffraction across all `eff_nlam`
- * spectral channels for one optical subframe and accumulates `(1 / eff_nlam) * |Efoc_c|^2` into
- * `ctx->cpu_accum_int` in Strehl-normalized units.
- *
- * Rationale: Supports both monochrome/achromatic wavefront inputs (`beam_nlam == 1`) and
- * multi-wavelength post-coronagraphic `[OPD, Amp]` cubes (`beam_nlam >= 1`) via proportional
- * slice mapping `bc = (c * beam_nlam) / eff_nlam`. In `PROP_MFT` mode, two `cblas_cgemm` calls
- * compute `Efoc = U_c * Epup * V_c` directly onto the `[ncam x ncam]` grid. In `PROP_FFT` mode,
- * `Epup` is zero-padded into `[nfft x nfft]`, transformed via `fftwf_execute`, and cropped
- * modularly around index `(0, 0) -> (ncam / 2, ncam / 2)` without needing an `fftshift` phase
- * ramp because `|F(kx, ky)|^2` is invariant to pupil origin translation.
- */
 static void MILK_HOT fpcam_build_epup_poly_cpu(
     const float *__restrict beam_amp,
     const float *__restrict atm_amp,
@@ -255,50 +242,85 @@ static void MILK_HOT fpcam_build_epup_poly_cpu(
     const float *__restrict ncpa_opd,
     float                   wf_to_opd,
     float                   opd_to_rad,
-    uint64_t                npix_wf,
+    uint32_t                nwf,
+    float                   disp_sx,
+    float                   disp_sy,
+    int32_t                 poly_mode,
     float *__restrict       epup_cplx)
 {
     if (m1 == m0 || alpha <= 0.0f)
     {
         const float *pa = (beam_amp != NULL) ? (beam_amp + (uint64_t) m0 * chan_stride) : NULL;
         const float *po = (beam_opd != NULL) ? (beam_opd + (uint64_t) m0 * chan_stride) : NULL;
-        fpcam_build_epup_cpu(pa, atm_amp, po, dm_opd, ncpa_opd, wf_to_opd, opd_to_rad, npix_wf,
-                             epup_cplx);
+        fpcam_build_epup_cpu(pa, atm_amp, po, dm_opd, ncpa_opd, wf_to_opd, opd_to_rad, nwf,
+                             disp_sx, disp_sy, epup_cplx);
         return;
     }
 
-    const int    nth = (npix_wf >= 16384ULL) ? omp_get_max_threads() : 1;
-    const float  w1  = alpha;
-    const float  w0  = 1.0f - w1;
-    const float *a0  = (beam_amp != NULL) ? (beam_amp + (uint64_t) m0 * chan_stride) : NULL;
-    const float *a1  = (beam_amp != NULL) ? (beam_amp + (uint64_t) m1 * chan_stride) : NULL;
-    const float *o0  = (beam_opd != NULL) ? (beam_opd + (uint64_t) m0 * chan_stride) : NULL;
-    const float *o1  = (beam_opd != NULL) ? (beam_opd + (uint64_t) m1 * chan_stride) : NULL;
+    const uint64_t npix_wf   = (uint64_t) nwf * nwf;
+    const int      nth       = (npix_wf >= 16384ULL) ? omp_get_max_threads() : 1;
+    const float    w1        = alpha;
+    const float    w0        = 1.0f - w1;
+    const float    p0_xy     = 0.5f * (float) (nwf - 1u);
+    const int      has_disp  = (disp_sx != 0.0f || disp_sy != 0.0f) ? 1 : 0;
+    const int      unwrapped = (poly_mode == CACAOSIM_POLY_UNWRAPPED_OPD) ? 1 : 0;
+    const float   *a0        = (beam_amp != NULL) ? (beam_amp + (uint64_t) m0 * chan_stride) : NULL;
+    const float   *a1        = (beam_amp != NULL) ? (beam_amp + (uint64_t) m1 * chan_stride) : NULL;
+    const float   *o0        = (beam_opd != NULL) ? (beam_opd + (uint64_t) m0 * chan_stride) : NULL;
+    const float   *o1        = (beam_opd != NULL) ? (beam_opd + (uint64_t) m1 * chan_stride) : NULL;
 
 #pragma omp parallel for num_threads(nth) if (nth > 1) schedule(static)
-    for (uint64_t p = 0; p < npix_wf; p++)
+    for (uint32_t iy = 0; iy < nwf; iy++)
     {
-        float at   = (atm_amp != NULL) ? atm_amp[p] : 1.0f;
-        float amp0 = ((a0 != NULL) ? a0[p] : 1.0f) * at;
-        float amp1 = ((a1 != NULL) ? a1[p] : 1.0f) * at;
-        if (amp0 <= 0.0f && amp1 <= 0.0f)
+        const float    dy    = has_disp ? (disp_sy * ((float) iy - p0_xy)) : 0.0f;
+        const uint64_t pbase = (uint64_t) iy * nwf;
+        for (uint32_t ix = 0; ix < nwf; ix++)
         {
-            epup_cplx[2u * p]      = 0.0f;
-            epup_cplx[2u * p + 1u] = 0.0f;
-            continue;
+            uint64_t p    = pbase + ix;
+            float    at   = (atm_amp != NULL) ? atm_amp[p] : 1.0f;
+            float    amp0 = ((a0 != NULL) ? a0[p] : 1.0f) * at;
+            float    amp1 = ((a1 != NULL) ? a1[p] : 1.0f) * at;
+            if (amp0 <= 0.0f && amp1 <= 0.0f)
+            {
+                epup_cplx[2u * p]      = 0.0f;
+                epup_cplx[2u * p + 1u] = 0.0f;
+                continue;
+            }
+            float disp_opd = has_disp ? (disp_sx * ((float) ix - p0_xy) + dy) : 0.0f;
+            float common   = ((ncpa_opd != NULL) ? ncpa_opd[p] : 0.0f) -
+                             ((dm_opd != NULL) ? dm_opd[p] : 0.0f) + disp_opd;
+            if (unwrapped)
+            {
+                float amp = w0 * amp0 + w1 * amp1;
+                if (amp <= 0.0f)
+                {
+                    epup_cplx[2u * p]      = 0.0f;
+                    epup_cplx[2u * p + 1u] = 0.0f;
+                    continue;
+                }
+                float opd0 = (o0 != NULL) ? (wf_to_opd * o0[p]) : 0.0f;
+                float opd1 = (o1 != NULL) ? (wf_to_opd * o1[p]) : 0.0f;
+                float phi  = (w0 * opd0 + w1 * opd1 + common) * opd_to_rad;
+                float s    = 0.0f;
+                float co   = 1.0f;
+                sincosf(phi, &s, &co);
+                epup_cplx[2u * p]      = amp * co;
+                epup_cplx[2u * p + 1u] = amp * s;
+            }
+            else
+            {
+                float p0  = (((o0 != NULL) ? (wf_to_opd * o0[p]) : 0.0f) + common) * opd_to_rad;
+                float p1  = (((o1 != NULL) ? (wf_to_opd * o1[p]) : 0.0f) + common) * opd_to_rad;
+                float s0  = 0.0f;
+                float co0 = 1.0f;
+                float s1  = 0.0f;
+                float co1 = 1.0f;
+                sincosf(p0, &s0, &co0);
+                sincosf(p1, &s1, &co1);
+                epup_cplx[2u * p]      = w0 * amp0 * co0 + w1 * amp1 * co1;
+                epup_cplx[2u * p + 1u] = w0 * amp0 * s0 + w1 * amp1 * s1;
+            }
         }
-        float common = ((ncpa_opd != NULL) ? ncpa_opd[p] : 0.0f) -
-                       ((dm_opd != NULL) ? dm_opd[p] : 0.0f);
-        float p0  = (((o0 != NULL) ? (wf_to_opd * o0[p]) : 0.0f) + common) * opd_to_rad;
-        float p1  = (((o1 != NULL) ? (wf_to_opd * o1[p]) : 0.0f) + common) * opd_to_rad;
-        float s0  = 0.0f;
-        float co0 = 1.0f;
-        float s1  = 0.0f;
-        float co1 = 1.0f;
-        sincosf(p0, &s0, &co0);
-        sincosf(p1, &s1, &co1);
-        epup_cplx[2u * p]      = w0 * amp0 * co0 + w1 * amp1 * co1;
-        epup_cplx[2u * p + 1u] = w0 * amp0 * s0 + w1 * amp1 * s1;
     }
 }
 
@@ -326,12 +348,14 @@ static void fpcam_resolve_poly_bracket(
     {
         in_lam = ctx->lam_um;
     }
-    float lam0   = (ctx->cfg.lambda_um > 0.05f) ? ctx->cfg.lambda_um : 1.65f;
-    float bw     = (ctx->cfg.bw_frac > 0.0f) ? ctx->cfg.bw_frac : 0.20f;
-    float span   = 0.5f * bw * ((float) (beam_nlam - 1u) / (float) beam_nlam);
-    float def_l0 = lam0 * (1.0f - span);
-    float def_l1 = lam0 * (1.0f + span);
-    cacaosim_poly_interp_bracket(ctx->lam_um[c], in_lam, beam_nlam, def_l0, def_l1, m0, m1, alpha);
+    float   lam0   = (ctx->cfg.lambda_um > 0.05f) ? ctx->cfg.lambda_um : 1.65f;
+    float   bw     = (ctx->cfg.bw_frac > 0.0f) ? ctx->cfg.bw_frac : 0.20f;
+    float   span   = 0.5f * bw * ((float) (beam_nlam - 1u) / (float) beam_nlam);
+    float   def_l0 = lam0 * (1.0f - span);
+    float   def_l1 = lam0 * (1.0f + span);
+    int32_t inv2   = (ctx->in_poly_mode == CACAOSIM_POLY_UNWRAPPED_OPD) ? 1 : 0;
+    cacaosim_poly_interp_bracket_ex(ctx->lam_um[c], in_lam, beam_nlam, def_l0, def_l1, inv2, m0,
+                                    m1, alpha);
 }
 
 static void MILK_HOT fpcam_accum_poly_cpu(
@@ -363,8 +387,8 @@ static void MILK_HOT fpcam_accum_poly_cpu(
             fpcam_resolve_poly_bracket(ctx, c, beam_nlam, &m0, &m1, &al);
 
             fpcam_build_epup_poly_cpu(pup_amp, atm_amp, wf_in, m0, m1, al, chan_stride, dm_opd,
-                                      ncpa_opd, wf_to_opd, ctx->k_rad[c], ctx->npix_wf,
-                                      ctx->cpu_epup_cplx);
+                                      ncpa_opd, wf_to_opd, ctx->k_rad[c], nwf, ctx->disp_sx[c],
+                                      ctx->disp_sy[c], ctx->in_poly_mode, ctx->cpu_epup_cplx);
 
             const float *Uc = &ctx->mft_U_cplx[(size_t) c * ncam * nwf * 2u];
             const float *Vc = &ctx->mft_V_cplx[(size_t) c * nwf * ncam * 2u];
@@ -408,8 +432,8 @@ static void MILK_HOT fpcam_accum_poly_cpu(
             fpcam_resolve_poly_bracket(ctx, c, beam_nlam, &m0, &m1, &al);
 
             fpcam_build_epup_poly_cpu(pup_amp, atm_amp, wf_in, m0, m1, al, chan_stride, dm_opd,
-                                      ncpa_opd, wf_to_opd, ctx->k_rad[c], ctx->npix_wf,
-                                      ctx->cpu_epup_cplx);
+                                      ncpa_opd, wf_to_opd, ctx->k_rad[c], nwf, ctx->disp_sx[c],
+                                      ctx->disp_sy[c], ctx->in_poly_mode, ctx->cpu_epup_cplx);
 
             __builtin_memset(ctx->cpu_fft_in_cplx, 0, ctx->npix_fft * 2u * sizeof(float));
             for (uint32_t yp = 0; yp < nwf; yp++)
@@ -789,6 +813,72 @@ void cacaosim_fpcam_set_weights(
     {
         cacaosim_fpcam_cuda_upload_weights(ctx);
     }
+}
+
+void cacaosim_fpcam_set_disp(
+    cacaosim_fpcam_ctx_t  *ctx,
+    const cacaosim_disp_t *disp,
+    float                  tel_diam_m,
+    int32_t                in_poly_mode)
+{
+    if (ctx == NULL || ctx->eff_nlam < 1)
+    {
+        return;
+    }
+    ctx->in_poly_mode = in_poly_mode;
+
+    if (disp == NULL || !disp->active)
+    {
+        if (ctx->disp_active)
+        {
+            memset(ctx->disp_sx, 0, sizeof(ctx->disp_sx));
+            memset(ctx->disp_sy, 0, sizeof(ctx->disp_sy));
+            ctx->disp_active = 0;
+            ctx->disp_gen    = 0ULL;
+            if (ctx->use_cuda)
+            {
+                cacaosim_fpcam_cuda_upload_disp(ctx);
+            }
+        }
+        return;
+    }
+
+    float diam = (tel_diam_m > 0.01f) ? tel_diam_m : 8.0f;
+    if (!ctx->disp_active || disp->gen != ctx->disp_gen ||
+        fabsf(diam - ctx->disp_tel_diam) > 1e-4f)
+    {
+        cacaosim_disp_eval_slopes(disp, ctx->lam_um, (uint32_t) ctx->eff_nlam, diam, ctx->cfg.nwf,
+                                  ctx->cfg.pup_diam, ctx->disp_sx, ctx->disp_sy);
+        ctx->disp_active   = 1;
+        ctx->disp_gen      = disp->gen;
+        ctx->disp_tel_diam = diam;
+        if (ctx->use_cuda)
+        {
+            cacaosim_fpcam_cuda_upload_disp(ctx);
+        }
+    }
+}
+
+void cacaosim_fpcam_set_in_lambdas(
+    cacaosim_fpcam_ctx_t *ctx,
+    const float          *in_lam_um,
+    uint32_t              in_nlam)
+{
+    if (ctx == NULL)
+    {
+        return;
+    }
+    if (in_lam_um == NULL || in_nlam <= 1u)
+    {
+        ctx->cfg.has_in_lam = 0;
+        return;
+    }
+    uint32_t cnt = (in_nlam <= CACAOSIM_FPCAM_MAX_LAMBDA) ? in_nlam : CACAOSIM_FPCAM_MAX_LAMBDA;
+    for (uint32_t i = 0u; i < cnt; i++)
+    {
+        ctx->cfg.in_lam_um[i] = in_lam_um[i];
+    }
+    ctx->cfg.has_in_lam = 1;
 }
 
 /**

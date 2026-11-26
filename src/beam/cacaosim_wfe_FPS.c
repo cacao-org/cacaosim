@@ -41,6 +41,7 @@
 #include "COREMOD_memory/COREMOD_memory.h"
 #include "beam/cacaosim_wfe_FPS.h"
 #include "common/cacaosim_beam.h"
+#include "common/cacaosim_disp.h"
 #include "pupil/cacaosim_pupil.h"
 
 /*
@@ -299,7 +300,7 @@ static MILK_HOT errno_t wfe_compute(const MILK_RUNNABLE *self)
     {
         imgid_free(&img_in);
         uint32_t fb_nwf = (param_nwf >= 8u) ? param_nwf : 128u;
-        img_in          = stream_connect_create_3Df32(param_in_beam, fb_nwf, fb_nwf, 2u);
+        img_in          = cacaosim_beam_shm_create(param_in_beam, fb_nwf, 2u);
         if (img_in.ID == -1)
         {
             return RETURN_FAILURE;
@@ -332,8 +333,8 @@ static MILK_HOT errno_t wfe_compute(const MILK_RUNNABLE *self)
         wfe_populate_stream(&img_wfe, nwf);
     }
 
-    /* Match output beam Z depth (2 * nlam) to support both mono and polychromatic beams */
-    IMGID img_out = stream_connect_create_3Df32(param_out_beam, nwf, nwf, in_nz);
+    /* Match output beam Z depth (2 * nlam) with NBkw = 80 for dispersion metadata */
+    IMGID img_out = cacaosim_beam_shm_create(param_out_beam, nwf, in_nz);
     if (img_out.ID == -1)
     {
         imgid_free(&img_wfe);
@@ -396,14 +397,32 @@ static MILK_HOT errno_t wfe_compute(const MILK_RUNNABLE *self)
                                         out_o, out_a);
         }
 
-        /* Propagate 32-bin spectrum and optional multi-wavelength channel metadata to out_beam */
+        /* Propagate 32-bin spectrum, dispersion, and optional multi-wavelength metadata */
         cacaosim_beam_shm_write_spec(img_out.im, &out_spec);
+        cacaosim_disp_t in_disp, out_disp;
+        memset(&in_disp, 0, sizeof(in_disp));
+        memset(&out_disp, 0, sizeof(out_disp));
+        cacaosim_beam_shm_read_disp(img_in.im, &in_disp);
+        cacaosim_disp_apply_reg(&in_disp, &reg, &out_disp);
+        cacaosim_beam_shm_write_disp(img_out.im, &out_disp);
+        float in_diam = cacaosim_beam_shm_read_diam(img_in.im, 0.0f);
+        if (in_diam > 0.0f)
+        {
+            cacaosim_beam_shm_write_diam(img_out.im, in_diam);
+        }
         uint32_t nwl_kw = 1u;
         float    wl0_kw = 0.0f;
         float    wl1_kw = 0.0f;
         if (cacaosim_beam_shm_read_poly_kw(img_in.im, &nwl_kw, &wl0_kw, &wl1_kw))
         {
             cacaosim_beam_shm_write_poly_kw(img_out.im, nwl_kw, wl0_kw, wl1_kw);
+            cacaosim_beam_shm_write_poly_mode(
+                img_out.im, cacaosim_beam_shm_read_poly_mode(img_in.im, nwl_kw));
+            float wls_kw[8];
+            if (nwl_kw <= 8u && cacaosim_beam_shm_read_poly_wls(img_in.im, nwl_kw, wls_kw))
+            {
+                cacaosim_beam_shm_write_poly_wls(img_out.im, wls_kw, nwl_kw);
+            }
         }
         processinfo_update_output_stream(processinfo, img_out.im, img_in.im);
     }

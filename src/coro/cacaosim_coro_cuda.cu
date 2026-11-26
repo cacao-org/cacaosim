@@ -39,7 +39,15 @@
 #include <math.h>
 #include <stdlib.h>
 
+#include "common/cacaosim_beam.h"
 #include "coro/cacaosim_coro.h"
+
+typedef struct
+{
+    uint32_t m0[CACAOSIM_CORO_MAX_LAMBDA];
+    uint32_t m1[CACAOSIM_CORO_MAX_LAMBDA];
+    float    alpha[CACAOSIM_CORO_MAX_LAMBDA];
+} coro_poly_map_t;
 
 /**
  * struct coro_cuda_state_t - Private device buffers and library handles for `cacaosim.coro`
@@ -84,6 +92,8 @@ typedef struct
     int            has_fft;
 
     float         *d_lam_um;
+    float         *d_disp_sx;
+    float         *d_disp_sy;
     float         *d_lowfs_pup_mask;
     cuComplex     *d_pup_mask;
     cuComplex     *d_lyot_cplx;
@@ -146,12 +156,16 @@ typedef struct
 __global__ static void k_coro_build_epup_batch(
     const float *__restrict__     opd,
     const float *__restrict__     amp,
-    uint32_t                      in_nlam,
+    coro_poly_map_t               map,
     uint64_t                      in_stride,
     const cuComplex *__restrict__ pup_mask,
     const float *__restrict__     lam_um,
+    const float *__restrict__     disp_sx,
+    const float *__restrict__     disp_sy,
+    uint32_t                      nwf,
     uint64_t                      npix_wf,
     int32_t                       eff_nlam,
+    int32_t                       poly_mode,
     cuComplex *__restrict__       epup)
 {
     uint64_t p = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -161,24 +175,60 @@ __global__ static void k_coro_build_epup_batch(
         return;
     }
 
-    uint32_t ic      = (in_nlam > 1u)
-                           ? (((uint32_t) c < in_nlam) ? (uint32_t) c : (in_nlam - 1u))
-                           : 0u;
-    uint64_t in_idx  = (uint64_t) ic * in_stride + p;
+    uint32_t m0      = map.m0[c];
+    uint32_t m1      = map.m1[c];
+    float    w1      = map.alpha[c];
+    float    w0      = 1.0f - w1;
+    uint64_t in_idx0 = (uint64_t) m0 * in_stride + p;
+    uint64_t in_idx1 = (uint64_t) m1 * in_stride + p;
     uint64_t out_idx = (uint64_t) c * npix_wf + p;
-    float    a       = (amp != NULL) ? amp[in_idx] : 1.0f;
-    if (a <= 0.0f)
+    float    a0      = (amp != NULL) ? amp[in_idx0] : 1.0f;
+    float    a1      = (amp != NULL) ? amp[in_idx1] : 1.0f;
+    if (a0 <= 0.0f && (m1 == m0 || a1 <= 0.0f))
     {
         epup[out_idx] = make_cuComplex(0.0f, 0.0f);
         return;
     }
 
-    float phi = ((opd != NULL) ? opd[in_idx] : 0.0f) * (CACAOSIM_TWO_PI_F / lam_um[c]);
-    float s   = 0.0f;
-    float co  = 1.0f;
-    __sincosf(phi, &s, &co);
-    float pr = a * co;
-    float pi = a * s;
+    uint32_t ix       = (uint32_t) (p % nwf);
+    uint32_t iy       = (uint32_t) (p / nwf);
+    float    p0_xy    = 0.5f * (float) (nwf - 1u);
+    float    disp_opd = disp_sx[c] * ((float) ix - p0_xy) + disp_sy[c] * ((float) iy - p0_xy);
+    float    kc       = CACAOSIM_TWO_PI_F / lam_um[c];
+    float    pr       = 0.0f;
+    float    pi       = 0.0f;
+
+    if (m1 == m0 || w1 <= 0.0f)
+    {
+        float phi = (((opd != NULL) ? opd[in_idx0] : 0.0f) + disp_opd) * kc;
+        float s   = 0.0f;
+        float co  = 1.0f;
+        __sincosf(phi, &s, &co);
+        pr = a0 * co;
+        pi = a0 * s;
+    }
+    else if (poly_mode == CACAOSIM_POLY_UNWRAPPED_OPD)
+    {
+        float a     = w0 * a0 + w1 * a1;
+        float opd_c = w0 * ((opd != NULL) ? opd[in_idx0] : 0.0f) +
+                      w1 * ((opd != NULL) ? opd[in_idx1] : 0.0f) + disp_opd;
+        float s  = 0.0f;
+        float co = 1.0f;
+        __sincosf(opd_c * kc, &s, &co);
+        pr = a * co;
+        pi = a * s;
+    }
+    else
+    {
+        float phi0 = (((opd != NULL) ? opd[in_idx0] : 0.0f) + disp_opd) * kc;
+        float phi1 = (((opd != NULL) ? opd[in_idx1] : 0.0f) + disp_opd) * kc;
+        float s0 = 0.0f, co0 = 1.0f;
+        float s1 = 0.0f, co1 = 1.0f;
+        __sincosf(phi0, &s0, &co0);
+        __sincosf(phi1, &s1, &co1);
+        pr = w0 * a0 * co0 + w1 * a1 * co1;
+        pi = w0 * a0 * s0 + w1 * a1 * s1;
+    }
 
     if (pup_mask != NULL)
     {
@@ -800,13 +850,16 @@ extern "C" int cacaosim_coro_cuda_init(cacaosim_coro_ctx_t *ctx, void *ext_strea
     const size_t nlam     = (size_t) ctx->eff_nlam;
     const size_t wf_bytes = (size_t) ctx->npix_wf * sizeof(float);
     const size_t poly_f   = nlam * wf_bytes;
+    const size_t stg_f    = (size_t) (2u * nlam) * wf_bytes;
     const size_t poly_c   = nlam * (size_t) ctx->npix_wf * sizeof(cuComplex);
 
     if (cudaMalloc((void **) &cs->d_lam_um, nlam * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_disp_sx, nlam * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_disp_sy, nlam * sizeof(float)) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_lowfs_pup_mask, wf_bytes) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_lyot_cplx, poly_c) != cudaSuccess ||
-        cudaMalloc((void **) &cs->d_in_opd, poly_f) != cudaSuccess ||
-        cudaMalloc((void **) &cs->d_in_amp, poly_f) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_in_opd, stg_f) != cudaSuccess ||
+        cudaMalloc((void **) &cs->d_in_amp, stg_f) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_out_opd, poly_f) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_out_amp, poly_f) != cudaSuccess ||
         cudaMalloc((void **) &cs->d_lowfs_opd, poly_f) != cudaSuccess ||
@@ -826,6 +879,10 @@ extern "C" int cacaosim_coro_cuda_init(cacaosim_coro_ctx_t *ctx, void *ext_strea
     cudaMemsetAsync(cs->d_energy_stats, 0, 8u * sizeof(double), cs->stream);
 
     cudaMemcpyAsync(cs->d_lam_um, ctx->lam_um, nlam * sizeof(float), cudaMemcpyHostToDevice,
+                    cs->stream);
+    cudaMemcpyAsync(cs->d_disp_sx, ctx->disp_sx, nlam * sizeof(float), cudaMemcpyHostToDevice,
+                    cs->stream);
+    cudaMemcpyAsync(cs->d_disp_sy, ctx->disp_sy, nlam * sizeof(float), cudaMemcpyHostToDevice,
                     cs->stream);
     cudaMemcpyAsync(cs->d_lowfs_pup_mask, ctx->lowfs_pup_mask, wf_bytes, cudaMemcpyHostToDevice,
                     cs->stream);
@@ -945,6 +1002,8 @@ extern "C" void cacaosim_coro_cuda_free(cacaosim_coro_ctx_t *ctx)
         cufftDestroy(cs->fft_plan);
     }
     cudaFree(cs->d_lam_um);
+    cudaFree(cs->d_disp_sx);
+    cudaFree(cs->d_disp_sy);
     cudaFree(cs->d_lowfs_pup_mask);
     cudaFree(cs->d_pup_mask);
     cudaFree(cs->d_lyot_cplx);
@@ -981,6 +1040,18 @@ extern "C" void cacaosim_coro_cuda_free(cacaosim_coro_ctx_t *ctx)
     }
     free(cs);
     ctx->cuda_priv = NULL;
+}
+
+extern "C" void cacaosim_coro_cuda_upload_disp(cacaosim_coro_ctx_t *ctx)
+{
+    coro_cuda_state_t *cs = (ctx != NULL) ? (coro_cuda_state_t *) ctx->cuda_priv : NULL;
+    if (cs == NULL || ctx->eff_nlam < 1)
+    {
+        return;
+    }
+    size_t lam_bytes = (size_t) ctx->eff_nlam * sizeof(float);
+    cudaMemcpyAsync(cs->d_disp_sx, ctx->disp_sx, lam_bytes, cudaMemcpyHostToDevice, cs->stream);
+    cudaMemcpyAsync(cs->d_disp_sy, ctx->disp_sy, lam_bytes, cudaMemcpyHostToDevice, cs->stream);
 }
 
 /**
@@ -1036,54 +1107,147 @@ extern "C" void cacaosim_coro_cuda_step_poly(
     const size_t       wf_bytes = (size_t) npix_wf * sizeof(float);
     const int          dev_mode = (d_in_opd != NULL && d_out_opd != NULL) ? 1 : 0;
 
-    uint32_t copy_in_nlam = (in_nlam >= 1u)
-                                ? ((in_nlam <= (uint32_t) eff_nlam) ? in_nlam : (uint32_t) eff_nlam)
-                                : 1u;
+    coro_poly_map_t map       = { { 0 }, { 0 }, { 0.0f } };
+    int32_t         unwrapped = (ctx->in_poly_mode == CACAOSIM_POLY_UNWRAPPED_OPD) ? 1 : 0;
+    int             id_match  = (in_nlam == (uint32_t) eff_nlam) ? 1 : 0;
+    float           lam0      = (ctx->cfg.lambda_um > 0.05f) ? ctx->cfg.lambda_um : 1.65f;
+    float           bw        = (ctx->cfg.bw_frac > 0.0f) ? ctx->cfg.bw_frac : 0.20f;
+    for (int32_t c = 0; c < eff_nlam; c++)
+    {
+        if (in_nlam <= 1u)
+        {
+            map.m0[c]    = 0u;
+            map.m1[c]    = 0u;
+            map.alpha[c] = 0.0f;
+            id_match     = 0;
+        }
+        else if (ctx->has_in_lam || unwrapped)
+        {
+            cacaosim_poly_interp_bracket_ex(
+                ctx->lam_um[c], ctx->has_in_lam ? ctx->in_lam_um : NULL, in_nlam,
+                lam0 * (1.0f - 0.5f * bw), lam0 * (1.0f + 0.5f * bw), unwrapped, &map.m0[c],
+                &map.m1[c], &map.alpha[c]);
+            if (map.m0[c] != (uint32_t) c || map.m1[c] != (uint32_t) c || map.alpha[c] > 1e-6f)
+            {
+                id_match = 0;
+            }
+        }
+        else
+        {
+            uint32_t ic  = ((uint32_t) c < in_nlam) ? (uint32_t) c : (in_nlam - 1u);
+            map.m0[c]    = ic;
+            map.m1[c]    = ic;
+            map.alpha[c] = 0.0f;
+            if (ic != (uint32_t) c)
+            {
+                id_match = 0;
+            }
+        }
+    }
 
-    const float *din_opd       = d_in_opd;
-    const float *din_amp       = d_in_amp;
-    uint64_t     dev_in_stride = in_stride;
-    float       *dout_o        = (d_out_opd != NULL) ? d_out_opd : cs->d_out_opd;
-    float       *dout_a        = (d_out_amp != NULL) ? d_out_amp : cs->d_out_amp;
-    uint64_t     dev_out_str   = (d_out_opd != NULL) ? out_stride : npix_wf;
-    int          want_lo       = (d_lowfs_opd != NULL || h_lowfs_opd != NULL) ? 1 : 0;
-    float       *dlo_o = want_lo ? ((d_lowfs_opd != NULL) ? d_lowfs_opd : cs->d_lowfs_opd) : NULL;
-    float       *dlo_a = want_lo ? ((d_lowfs_amp != NULL) ? d_lowfs_amp : cs->d_lowfs_amp) : NULL;
-    uint64_t     dev_lo_str    = (d_lowfs_opd != NULL) ? out_stride : npix_wf;
+    const float    *din_opd       = d_in_opd;
+    const float    *din_amp       = d_in_amp;
+    uint64_t        dev_in_stride = in_stride;
+    coro_poly_map_t dev_map       = map;
+    float          *dout_o        = (d_out_opd != NULL) ? d_out_opd : cs->d_out_opd;
+    float          *dout_a        = (d_out_amp != NULL) ? d_out_amp : cs->d_out_amp;
+    uint64_t        dev_out_str   = (d_out_opd != NULL) ? out_stride : npix_wf;
+    int             want_lo       = (d_lowfs_opd != NULL || h_lowfs_opd != NULL) ? 1 : 0;
+    float          *dlo_o         = want_lo ? ((d_lowfs_opd != NULL) ? d_lowfs_opd : cs->d_lowfs_opd)
+                                            : NULL;
+    float          *dlo_a         = want_lo ? ((d_lowfs_amp != NULL) ? d_lowfs_amp : cs->d_lowfs_amp)
+                                            : NULL;
+    uint64_t        dev_lo_str    = (d_lowfs_opd != NULL) ? out_stride : npix_wf;
 
     /* Stage host SHM slices to contiguous GPU buffers when not running purely device-resident */
     if (!dev_mode)
     {
         dev_in_stride = npix_wf;
-        if (h_in_opd != NULL)
+        if (in_nlam <= 1u)
         {
-            if (copy_in_nlam == 1u || in_stride == npix_wf)
+            if (h_in_opd != NULL)
             {
-                cudaMemcpyAsync(cs->d_in_opd, h_in_opd, (size_t) copy_in_nlam * wf_bytes,
-                                cudaMemcpyHostToDevice, cs->stream);
+                cudaMemcpyAsync(cs->d_in_opd, h_in_opd, wf_bytes, cudaMemcpyHostToDevice,
+                                cs->stream);
+                din_opd = cs->d_in_opd;
             }
-            else
+            if (h_in_amp != NULL)
             {
-                cudaMemcpy2DAsync(cs->d_in_opd, wf_bytes, h_in_opd,
-                                  (size_t) in_stride * sizeof(float), wf_bytes, copy_in_nlam,
-                                  cudaMemcpyHostToDevice, cs->stream);
+                cudaMemcpyAsync(cs->d_in_amp, h_in_amp, wf_bytes, cudaMemcpyHostToDevice,
+                                cs->stream);
+                din_amp = cs->d_in_amp;
             }
-            din_opd = cs->d_in_opd;
         }
-        if (h_in_amp != NULL)
+        else if (id_match)
         {
-            if (copy_in_nlam == 1u || in_stride == npix_wf)
+            if (h_in_opd != NULL)
             {
-                cudaMemcpyAsync(cs->d_in_amp, h_in_amp, (size_t) copy_in_nlam * wf_bytes,
-                                cudaMemcpyHostToDevice, cs->stream);
+                if (in_stride == npix_wf)
+                {
+                    cudaMemcpyAsync(cs->d_in_opd, h_in_opd, (size_t) eff_nlam * wf_bytes,
+                                    cudaMemcpyHostToDevice, cs->stream);
+                }
+                else
+                {
+                    cudaMemcpy2DAsync(cs->d_in_opd, wf_bytes, h_in_opd,
+                                      (size_t) in_stride * sizeof(float), wf_bytes,
+                                      (size_t) eff_nlam, cudaMemcpyHostToDevice, cs->stream);
+                }
+                din_opd = cs->d_in_opd;
             }
-            else
+            if (h_in_amp != NULL)
             {
-                cudaMemcpy2DAsync(cs->d_in_amp, wf_bytes, h_in_amp,
-                                  (size_t) in_stride * sizeof(float), wf_bytes, copy_in_nlam,
-                                  cudaMemcpyHostToDevice, cs->stream);
+                if (in_stride == npix_wf)
+                {
+                    cudaMemcpyAsync(cs->d_in_amp, h_in_amp, (size_t) eff_nlam * wf_bytes,
+                                    cudaMemcpyHostToDevice, cs->stream);
+                }
+                else
+                {
+                    cudaMemcpy2DAsync(cs->d_in_amp, wf_bytes, h_in_amp,
+                                      (size_t) in_stride * sizeof(float), wf_bytes,
+                                      (size_t) eff_nlam, cudaMemcpyHostToDevice, cs->stream);
+                }
+                din_amp = cs->d_in_amp;
             }
-            din_amp = cs->d_in_amp;
+        }
+        else
+        {
+            for (int32_t c = 0; c < eff_nlam; c++)
+            {
+                uint32_t m0 = map.m0[c];
+                uint32_t m1 = map.m1[c];
+                uint32_t s0 = (uint32_t) (2 * c);
+                uint32_t s1 = (m1 == m0) ? s0 : (s0 + 1u);
+                if (h_in_opd != NULL)
+                {
+                    cudaMemcpyAsync(cs->d_in_opd + (uint64_t) s0 * npix_wf,
+                                    h_in_opd + (uint64_t) m0 * in_stride, wf_bytes,
+                                    cudaMemcpyHostToDevice, cs->stream);
+                    if (s1 != s0)
+                    {
+                        cudaMemcpyAsync(cs->d_in_opd + (uint64_t) s1 * npix_wf,
+                                        h_in_opd + (uint64_t) m1 * in_stride, wf_bytes,
+                                        cudaMemcpyHostToDevice, cs->stream);
+                    }
+                    din_opd = cs->d_in_opd;
+                }
+                if (h_in_amp != NULL)
+                {
+                    cudaMemcpyAsync(cs->d_in_amp + (uint64_t) s0 * npix_wf,
+                                    h_in_amp + (uint64_t) m0 * in_stride, wf_bytes,
+                                    cudaMemcpyHostToDevice, cs->stream);
+                    if (s1 != s0)
+                    {
+                        cudaMemcpyAsync(cs->d_in_amp + (uint64_t) s1 * npix_wf,
+                                        h_in_amp + (uint64_t) m1 * in_stride, wf_bytes,
+                                        cudaMemcpyHostToDevice, cs->stream);
+                    }
+                    din_amp = cs->d_in_amp;
+                }
+                dev_map.m0[c] = s0;
+                dev_map.m1[c] = s1;
+            }
         }
     }
 
@@ -1093,8 +1257,8 @@ extern "C" void cacaosim_coro_cuda_step_poly(
     dim3           grd_wf(bl_wf, (unsigned int) eff_nlam, 1);
 
     k_coro_build_epup_batch<<<grd_wf, 256, 0, cs->stream>>>(
-        din_opd, din_amp, copy_in_nlam, dev_in_stride, cs->d_pup_mask, cs->d_lam_um, npix_wf,
-        eff_nlam, cs->d_epup);
+        din_opd, din_amp, dev_map, dev_in_stride, cs->d_pup_mask, cs->d_lam_um, cs->d_disp_sx,
+        cs->d_disp_sy, ctx->cfg.nwf, npix_wf, eff_nlam, ctx->in_poly_mode, cs->d_epup);
 
     if (ctx->skip_fpm)
     {

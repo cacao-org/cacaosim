@@ -51,6 +51,7 @@
 
 #include "cacaosim_types.h"
 #include "common/cacaosim_detector.h"
+#include "common/cacaosim_disp.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -180,6 +181,14 @@ typedef struct
     float                scale_c[CACAOSIM_FPCAM_MAX_LAMBDA];
     float                k_rad[CACAOSIM_FPCAM_MAX_LAMBDA];
 
+    /* Chromatic angular dispersion OPD slopes [um/pixel] and input multi-band mode */
+    int32_t              disp_active;
+    uint64_t             disp_gen;
+    float                disp_tel_diam;
+    int32_t              in_poly_mode;
+    float                disp_sx[CACAOSIM_FPCAM_MAX_LAMBDA];
+    float                disp_sy[CACAOSIM_FPCAM_MAX_LAMBDA];
+
     /* Precomputed MFT basis matrices: U [eff_nlam * ncam * nwf], V [eff_nlam * nwf * ncam] */
     float               *mft_U_cplx;
     float               *mft_V_cplx;
@@ -264,6 +273,23 @@ void cacaosim_fpcam_reset_long(cacaosim_fpcam_ctx_t *ctx);
 void cacaosim_fpcam_set_weights(
     cacaosim_fpcam_ctx_t *ctx,
     const float          *weights);
+
+/**
+ * cacaosim_fpcam_set_disp() - Update chromatic angular dispersion OPD slopes & input poly mode
+ */
+void cacaosim_fpcam_set_disp(
+    cacaosim_fpcam_ctx_t  *ctx,
+    const cacaosim_disp_t *disp,
+    float                  tel_diam_m,
+    int32_t                in_poly_mode);
+
+/**
+ * cacaosim_fpcam_set_in_lambdas() - Register upstream beam slice wavelengths `[um]`
+ */
+void cacaosim_fpcam_set_in_lambdas(
+    cacaosim_fpcam_ctx_t *ctx,
+    const float          *in_lam_um,
+    uint32_t              in_nlam);
 
 /**
  * cacaosim_fpcam_accum_subframe() - Propagate one optical subframe into exposure accumulator
@@ -451,6 +477,7 @@ int  cacaosim_fpcam_cuda_init(cacaosim_fpcam_ctx_t *ctx,
  */
 void cacaosim_fpcam_cuda_free(cacaosim_fpcam_ctx_t *ctx);
 void cacaosim_fpcam_cuda_upload_weights(cacaosim_fpcam_ctx_t *ctx);
+void cacaosim_fpcam_cuda_upload_disp(cacaosim_fpcam_ctx_t *ctx);
 
 /**
  * cacaosim_fpcam_cuda_reset_accum() - Zero the GPU focal-plane subframe intensity accumulator

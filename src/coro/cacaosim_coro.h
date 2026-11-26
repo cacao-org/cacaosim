@@ -52,6 +52,7 @@
 #include <stdint.h>
 
 #include "cacaosim_types.h"
+#include "common/cacaosim_disp.h"
 #include "common/cacaosim_mask.h"
 
 #ifdef __cplusplus
@@ -270,6 +271,17 @@ typedef struct
     /* Per-channel wavelengths [eff_nlam] in microns */
     float               lam_um[CACAOSIM_CORO_MAX_LAMBDA];
 
+    /* Chromatic angular dispersion OPD slopes [um/pixel] and input multi-band mapping */
+    int32_t             disp_active;
+    uint64_t            disp_gen;
+    float               disp_tel_diam;
+    int32_t             in_poly_mode;
+    int32_t             has_in_lam;
+    uint32_t            in_nlam_cfg;
+    float               in_lam_um[CACAOSIM_CORO_MAX_LAMBDA];
+    float               disp_sx[CACAOSIM_CORO_MAX_LAMBDA];
+    float               disp_sy[CACAOSIM_CORO_MAX_LAMBDA];
+
     /* 2D slice-0 Lyot amplitude [npix_wf] + full complex pupil/Lyot cubes [eff_nlam * npix_wf] */
     float              *lyot_mask;
     float              *lowfs_pup_mask;
@@ -390,6 +402,23 @@ int cacaosim_coro_init(
  *   Provides idempotent cleanup for both normal shutdown and mid-initialization error rollback.
  */
 void cacaosim_coro_free(cacaosim_coro_ctx_t *ctx);
+
+/**
+ * cacaosim_coro_set_disp() - Update entrance-pupil chromatic dispersion slopes & input poly mode
+ */
+void cacaosim_coro_set_disp(
+    cacaosim_coro_ctx_t   *ctx,
+    const cacaosim_disp_t *disp,
+    float                  tel_diam_m,
+    int32_t                in_poly_mode);
+
+/**
+ * cacaosim_coro_set_in_lambdas() - Register upstream beam slice wavelengths `[um]`
+ */
+void cacaosim_coro_set_in_lambdas(
+    cacaosim_coro_ctx_t *ctx,
+    const float         *in_lam_um,
+    uint32_t             in_nlam);
 
 /**
  * cacaosim_coro_step_poly_cpu() - Propagate 1 or N_lambda channels through coronagraph on CPU
@@ -571,6 +600,7 @@ int  cacaosim_coro_cuda_init(cacaosim_coro_ctx_t *ctx, void *ext_stream);
  *   remain intact across individual optical element teardowns.
  */
 void cacaosim_coro_cuda_free(cacaosim_coro_ctx_t *ctx);
+void cacaosim_coro_cuda_upload_disp(cacaosim_coro_ctx_t *ctx);
 
 /**
  * cacaosim_coro_cuda_step_poly() - Execute polychromatic coronagraph propagation on CUDA GPU
