@@ -176,6 +176,18 @@ def analyze_bench_chromaticity(bench_path):
         "tput_tel": 0.75,
         "master_hz": 2000.0,
         "out_beam": "b_pup",
+        "atm_disp_enable": 0,
+        "zenith_deg": 0.0,
+        "disp_pa_deg": 0.0,
+        "imr_mode": "pupil_track",
+        "parallactic_rate_dps": 0.0,
+        "site_alt_m": 4205.0,
+        "atm_pressure_hpa": 615.0,
+        "atm_temp_c": 2.0,
+        "atm_rh_pct": 20.0,
+        "atm_disp_ref_um": 1.65,
+        "chrom_turb": 0,
+        "chrom_lambdas": "0.75,1.22,1.65",
     }
     raw_bench_keys = set()
     nodes = []
@@ -255,6 +267,7 @@ def analyze_bench_chromaticity(bench_path):
     beam_nlam = {bench.get("out_beam", "b_pup"): 1}
     sensors = []
     dms = []
+    adcs = []
     coros = []
     wfes = []
 
@@ -263,7 +276,58 @@ def analyze_bench_chromaticity(bench_path):
         in_b = nd.get("in", nd.get("in_beam", ""))
         sp_in = beams.get(in_b, root_spec)
         in_nl = beam_nlam.get(in_b, 1)
-        if kind in ("dm", "ttm", "wfe", "static_wfe"):
+        if kind == "adc":
+            adc_mode = str(nd.get("mode", "lut")).strip()
+            deployed = adc_mode.lower() not in ("retracted", "off", "bypass", "0")
+            tp_en = str(nd.get("tput_enable", "1")).strip().lower() not in ("0", "off", "false")
+            tp_base = float(nd.get("tput_base", 0.96))
+            out_b = nd.get("out", nd.get("out_beam", ""))
+            if out_b:
+                if deployed and tp_en:
+                    sp_out = []
+                    for b_i, lam in enumerate(lam_bins):
+                        t_b = tp_base
+                        if lam < 0.50:
+                            f_r = (0.50 - lam) / 0.10
+                            t_b *= 1.0 - 0.08 * f_r * f_r
+                        elif lam > 2.10:
+                            f_r = (lam - 2.10) / 0.30
+                            t_b *= 1.0 - 0.06 * f_r * f_r
+                        t_b = max(0.0, min(1.0, t_b))
+                        sp_out.append(sp_in[b_i] * t_b)
+                    beams[out_b] = sp_out
+                else:
+                    beams[out_b] = list(sp_in)
+                beam_nlam[out_b] = in_nl
+            adcs.append(
+                {
+                    "id": nd["id"],
+                    "in_beam": in_b,
+                    "out_beam": out_b,
+                    "preset": str(nd.get("preset", "ao188")).strip(),
+                    "mode": adc_mode,
+                    "opt_band": str(nd.get("opt_band", "whole")).strip(),
+                    "deployed": deployed,
+                    "ideal_mech": str(nd.get("ideal_mech", "1")).strip().lower()
+                    not in ("0", "off", "false"),
+                    "tput_enable": tp_en,
+                    "tput_base": tp_base,
+                    "lut_scale_err": float(nd.get("lut_scale_err", 0.0)),
+                    "lut_pa_err_deg": float(nd.get("lut_pa_err_deg", 0.0)),
+                    "lut_p_err_hpa": float(nd.get("lut_p_err_hpa", 0.0)),
+                    "lut_t_err_c": float(nd.get("lut_t_err_c", 0.0)),
+                    "lut_use_nominal": str(nd.get("lut_use_nominal", "0")).strip().lower()
+                    not in ("0", "off", "false"),
+                    "angle1_deg": float(nd.get("angle1_deg", -90.0)),
+                    "angle2_deg": float(nd.get("angle2_deg", 90.0)),
+                    "manual_use_psi": str(nd.get("manual_use_psi", "0")).strip().lower()
+                    not in ("0", "off", "false"),
+                    "manual_psi_deg": float(nd.get("manual_psi_deg", 0.0)),
+                    "in_cmd": str(nd.get("in_cmd", "")).strip(),
+                    "out_state": str(nd.get("out_state", "")).strip(),
+                }
+            )
+        elif kind in ("dm", "ttm", "wfe", "static_wfe"):
             tp = float(nd.get("tput", 0.98))
             out_b = nd.get("out", nd.get("out_beam", ""))
             if out_b:
@@ -478,6 +542,35 @@ def analyze_bench_chromaticity(bench_path):
         }
 
     pup_diam_pix = pup_diam_b * nwf_b
+    atm_disp_en = str(bench.get("atm_disp_enable", "0")).strip().lower() not in (
+        "0",
+        "off",
+        "false",
+    )
+    zen_deg = float(bench.get("zenith_deg", bench.get("zenith_angle_deg", 0.0)))
+    if "atm_disp_enable" not in raw_bench_keys and zen_deg > 1e-6:
+        atm_disp_en = True
+    chrom_turb_en = str(bench.get("chrom_turb", "0")).strip().lower() not in (
+        "0",
+        "off",
+        "false",
+    )
+    atm_info = {
+        "atm_disp_enable": atm_disp_en,
+        "zenith_deg": zen_deg,
+        "disp_pa_deg": float(
+            bench.get("disp_pa_deg", bench.get("parallactic_angle_deg", 0.0))
+        ),
+        "imr_mode": str(bench.get("imr_mode", "pupil_track")).strip(),
+        "parallactic_rate_dps": float(bench.get("parallactic_rate_dps", 0.0)),
+        "site_alt_m": float(bench.get("site_alt_m", 4205.0)),
+        "pressure_hpa": float(bench.get("atm_pressure_hpa", 615.0)),
+        "temp_c": float(bench.get("atm_temp_c", 2.0)),
+        "rh_pct": float(bench.get("atm_rh_pct", 20.0)),
+        "ref_lam_um": float(bench.get("atm_disp_ref_um", 1.65)),
+        "chrom_turb": chrom_turb_en,
+        "chrom_lambdas": str(bench.get("chrom_lambdas", "0.75,1.22,1.65")).strip(),
+    }
     return {
         "bench": {
             "name": str(bench.get("name", "")),
@@ -496,6 +589,8 @@ def analyze_bench_chromaticity(bench_path):
             "star_teff": teff,
             "pupil_scale_m_pix": diam / max(pup_diam_pix, 1.0),
         },
+        "atmosphere": atm_info,
+        "adcs": adcs,
         "coros": coros,
         "wfes": wfes,
         "lambda_bins_um": lam_bins,
@@ -512,6 +607,415 @@ def analyze_bench_chromaticity(bench_path):
         },
         "beams": beam_out,
         "sensors": sensors,
+    }
+
+
+def _air_n_minus_1_ciddor(lam_um, pressure_hpa=615.0, temp_c=2.0, rh_pct=20.0):
+    """Ciddor (1996, Appl. Opt. 35, 1566) moist-air refractivity matching cacaosim_disp.c."""
+    lam = max(0.20, float(lam_um))
+    if pressure_hpa <= 0.0:
+        return 0.0
+    sigma2 = 1.0 / (lam * lam)
+    t_k = max(150.0, float(temp_c) + 273.15)
+    p_pa = float(pressure_hpa) * 100.0
+    xc = 415.0
+    n_as_m1 = (5792105.0 / (238.0185 - sigma2) + 167917.0 / (57.362 - sigma2)) * 1.0e-8
+    n_ax_m1 = n_as_m1 * (1.0 + 0.534e-6 * (xc - 450.0))
+    n_ws_m1 = (
+        1.022
+        * (295.235 + sigma2 * (2.6422 + sigma2 * (-0.032380 + sigma2 * 0.004028)))
+        * 1.0e-8
+    )
+    rh = max(0.0, min(100.0, float(rh_pct)))
+    svp = math.exp(
+        1.2378847e-5 * t_k * t_k - 1.9121316e-2 * t_k + 33.93711047 - 6.3431645e3 / t_k
+    )
+    f_enh = 1.00062 + 3.14e-8 * p_pa + 5.6e-7 * temp_c * temp_c
+    p_v = min(p_pa, (rh * 0.01) * f_enh * svp)
+    x_w = p_v / p_pa
+    pt = p_pa / t_k
+    z_c = (
+        1.0
+        - pt
+        * (
+            1.58123e-6
+            - 2.9331e-8 * temp_c
+            + 1.1043e-10 * temp_c * temp_c
+            + (5.707e-6 - 2.051e-8 * temp_c) * x_w
+            + (1.9898e-4 - 2.376e-6 * temp_c) * x_w * x_w
+        )
+        + pt * pt * (1.83e-11 - 0.765e-8 * x_w * x_w)
+    )
+    r_gas = 8.314510
+    m_a = 1.0e-3 * (28.9635 + 12.011e-6 * (xc - 400.0))
+    m_w = 0.018015
+    rho_axs = (101325.0 * m_a) / (0.9995922115 * r_gas * 288.15)
+    rho_ws = (1333.0 * m_w) / (0.999621 * r_gas * 293.15)
+    rho_a = ((p_pa * m_a) / (z_c * r_gas * t_k)) * (1.0 - x_w)
+    rho_w = ((p_pa * m_w) / (z_c * r_gas * t_k)) * x_w
+    return (rho_a / rho_axs) * n_ax_m1 + (rho_w / rho_ws) * n_ws_m1
+
+
+def _atm_disp_mas(
+    lam_um, z_deg, pressure_hpa=615.0, temp_c=2.0, rh_pct=20.0, ref_lam_um=1.65
+):
+    """Maunakea spherical-atmosphere differential dispersion [mas] relative to ref_lam_um."""
+    if z_deg <= 1e-6:
+        return 0.0
+    tz = math.tan(math.radians(min(80.0, float(z_deg))))
+    fac = tz * (1.0 - 0.001254 * (1.0 + tz * tz))
+    dn = _air_n_minus_1_ciddor(lam_um, pressure_hpa, temp_c, rh_pct) - _air_n_minus_1_ciddor(
+        ref_lam_um, pressure_hpa, temp_c, rh_pct
+    )
+    return dn * fac * RAD2MAS
+
+
+def _egner_dmax_mas(lam_um, preset="ao188"):
+    """AO188 ADC max differential dispersion D_max(lam)-D_max(0.70) [mas] (Egner 2009)."""
+    lam = max(0.40, min(2.40, float(lam_um)))
+    if str(preset).lower() in ("ao188_nominal", "nominal"):
+        c = (336.8307, 13.2420, 2.9890, -2.1854)
+    else:
+        c = (317.5423, 15.9328, -2.6620, -1.8637)
+    l2 = lam * lam
+    l02 = 0.49
+    il2 = 1.0 / l2
+    il02 = 1.0 / l02
+    return (
+        c[0] * (il2 - il02)
+        + c[1] * (il2 * il2 - il02 * il02)
+        + c[2] * (l2 - l02)
+        + c[3] * (l2 * l2 - l02 * l02)
+    )
+
+
+def _solve_ao188_lut_angles(
+    z_deg,
+    pa_deg,
+    p_hpa,
+    t_c,
+    rh_pct,
+    ref_lam_um,
+    preset="ao188",
+    opt_band="whole",
+    lut_scale_err=0.0,
+    lut_pa_err_deg=0.0,
+    lut_p_err_hpa=0.0,
+    lut_t_err_c=0.0,
+    lut_use_nominal=False,
+):
+    """Solve optimal Egner (2009) 5-wavelength [1,1,2,1,1] RMS LUT angles (th1, th2, psi)."""
+    eff_pa = float(pa_deg) + float(lut_pa_err_deg)
+    if z_deg <= 1e-6:
+        return eff_pa - 90.0, eff_pa + 90.0, 0.0
+    w5 = (1.0 / 6.0, 1.0 / 6.0, 2.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0)
+    ob = str(opt_band).strip().lower()
+    if ob in ("whole", "broadband", "all"):
+        band_grids = [
+            (0.997, 1.015, 1.033, 1.051, 1.070),
+            (1.170, 1.210, 1.250, 1.290, 1.330),
+            (1.480, 1.555, 1.630, 1.705, 1.780),
+            (1.480, 1.685, 1.890, 2.095, 2.300),
+            (1.945, 2.033, 2.120, 2.208, 2.295),
+            (2.030, 2.115, 2.200, 2.285, 2.370),
+            (0.450, 0.563, 0.700, 0.813, 0.900),
+        ]
+    elif ob in ("vis", "apd", "apds"):
+        band_grids = [(0.450, 0.563, 0.700, 0.813, 0.900)]
+    else:
+        rng_map = {
+            "h": (1.500, 1.780),
+            "h-band": (1.500, 1.780),
+            "j": (1.175, 1.345),
+            "j-band": (1.175, 1.345),
+            "z": (0.970, 1.070),
+            "kp": (1.985, 2.295),
+            "k'": (1.985, 2.295),
+            "k": (2.030, 2.370),
+        }
+        l0, l1 = rng_map.get(ob, (1.500, 1.780))
+        band_grids = [tuple(l0 + (l1 - l0) * (i / 4.0) for i in range(5))]
+
+    lut_preset = "ao188_nominal" if (lut_use_nominal and preset == "ao188") else preset
+    num_cov = 0.0
+    den_var = 0.0
+    for grid in band_grids:
+        a_v = [
+            _atm_disp_mas(
+                l_u, z_deg, p_hpa + lut_p_err_hpa, t_c + lut_t_err_c, rh_pct, ref_lam_um
+            )
+            for l_u in grid
+        ]
+        d_v = [_egner_dmax_mas(l_u, lut_preset) for l_u in grid]
+        ma = sum(w * a for w, a in zip(w5, a_v))
+        md = sum(w * d for w, d in zip(w5, d_v))
+        for w, a, d in zip(w5, a_v, d_v):
+            num_cov += w * (a - ma) * (d - md)
+            den_var += w * (d - md) * (d - md)
+    s_opt = (num_cov / den_var) if den_var > 1e-30 else 0.0
+    s_opt = max(-1.0, min(1.0, s_opt * (1.0 + float(lut_scale_err))))
+    psi = math.degrees(math.asin(s_opt))
+    return eff_pa - 90.0 + psi, eff_pa + 90.0 - psi, psi
+
+
+def analyze_adc_and_dispersion(out_dir, chrom_info, tel_diam_m=TEL_DIAM_M):
+    """Compile Maunakea atmospheric dispersion, chromatic shear, and AO188 ADC telemetry."""
+    atm_c = (chrom_info or {}).get("atmosphere") or {}
+    adcs = (chrom_info or {}).get("adcs") or []
+    adc0 = adcs[0] if adcs else None
+
+    meta_p = os.path.join(out_dir, "adc_meta.json")
+    meta = None
+    if os.path.isfile(meta_p):
+        try:
+            with open(meta_p, "r", encoding="utf-8") as fh:
+                meta = json.load(fh)
+        except Exception:
+            meta = None
+
+    z_deg = float(
+        (meta or {}).get("zenith_deg", atm_c.get("zenith_deg", 0.0))
+    )
+    atm_en = bool(atm_c.get("atm_disp_enable", z_deg > 1e-6))
+    if meta is None and adc0 is None and (not atm_en or z_deg <= 1e-6):
+        return None
+
+    pa_deg = float((meta or {}).get("disp_pa_deg", atm_c.get("disp_pa_deg", 0.0)))
+    imr_mode = str((meta or {}).get("imr_mode", atm_c.get("imr_mode", "pupil_track")))
+    prate = float(
+        (meta or {}).get("parallactic_rate_dps", atm_c.get("parallactic_rate_dps", 0.0))
+    )
+    site_alt = float(atm_c.get("site_alt_m", 4205.0))
+    p_hpa = float(atm_c.get("pressure_hpa", 615.0))
+    t_c = float(atm_c.get("temp_c", 2.0))
+    rh_pct = float(atm_c.get("rh_pct", 20.0))
+    ref_lam = float(atm_c.get("ref_lam_um", 1.65))
+    chrom_turb = bool(
+        int((meta or {}).get("chrom_turb", 1 if atm_c.get("chrom_turb") else 0))
+    )
+    chrom_lams = str(
+        (meta or {}).get("chrom_lambdas", atm_c.get("chrom_lambdas", "0.75,1.22,1.65"))
+    )
+
+    adc_id = adc0["id"] if adc0 else "ao188"
+    preset = str((meta or {}).get("preset", (adc0 or {}).get("preset", "ao188")))
+    mode = str((meta or {}).get("mode", (adc0 or {}).get("mode", "retracted")))
+    opt_band = str((meta or {}).get("opt_band", (adc0 or {}).get("opt_band", "whole")))
+    mech = str(
+        (meta or {}).get(
+            "mech", "ideal" if (adc0 or {}).get("ideal_mech", True) else "realistic"
+        )
+    )
+    lut_sc_err = float(
+        (meta or {}).get("lut_scale_err", (adc0 or {}).get("lut_scale_err", 0.0))
+    )
+    lut_pa_err = float(
+        (meta or {}).get("lut_pa_err_deg", (adc0 or {}).get("lut_pa_err_deg", 0.0))
+    )
+    lut_p_err = float((adc0 or {}).get("lut_p_err_hpa", 0.0))
+    lut_t_err = float((adc0 or {}).get("lut_t_err_c", 0.0))
+    lut_nom = bool((adc0 or {}).get("lut_use_nominal", False))
+    tput_base = float((adc0 or {}).get("tput_base", 0.96))
+
+    st_raw = (meta or {}).get("state") if isinstance((meta or {}).get("state"), dict) else None
+    if st_raw is not None:
+        th1 = float(st_raw.get("theta1_deg", -90.0))
+        th2 = float(st_raw.get("theta2_deg", 90.0))
+        psi = float(st_raw.get("psi_deg", 0.0))
+        pa_live = float(st_raw.get("pa_deg", pa_deg))
+        z_live = float(st_raw.get("zenith_deg", z_deg))
+        deployed = bool(int(st_raw.get("deployed", 0)))
+    else:
+        deployed = (adc0 is not None) and (
+            mode.lower() not in ("retracted", "off", "bypass", "0")
+        )
+        pa_live = pa_deg
+        z_live = z_deg
+        if not deployed:
+            th1, th2, psi = pa_deg - 90.0, pa_deg + 90.0, 0.0
+        elif mode.lower() == "manual":
+            if (adc0 or {}).get("manual_use_psi", False):
+                psi = float((adc0 or {}).get("manual_psi_deg", 0.0))
+                th1 = pa_deg - 90.0 + psi
+                th2 = pa_deg + 90.0 - psi
+            else:
+                th1 = float((adc0 or {}).get("angle1_deg", -90.0))
+                th2 = float((adc0 or {}).get("angle2_deg", 90.0))
+                psi = 0.5 * (((th1 - th2 + 180.0) + 180.0) % 360.0 - 180.0)
+        else:
+            th1, th2, psi = _solve_ao188_lut_angles(
+                z_deg,
+                pa_deg,
+                p_hpa,
+                t_c,
+                rh_pct,
+                ref_lam,
+                preset=preset,
+                opt_band=opt_band,
+                lut_scale_err=lut_sc_err,
+                lut_pa_err_deg=lut_pa_err,
+                lut_p_err_hpa=lut_p_err,
+                lut_t_err_c=lut_t_err,
+                lut_use_nominal=lut_nom,
+            )
+
+    r_pa = math.radians(pa_live)
+    ex, ey = math.sin(r_pa), math.cos(r_pa)
+    px, py = math.cos(r_pa), -math.sin(r_pa)
+    r1, r2 = math.radians(th1), math.radians(th2)
+    vx = 0.5 * (math.sin(r1) + math.sin(r2))
+    vy = 0.5 * (math.cos(r1) + math.cos(r2))
+
+    def _eval_vec(lam_u):
+        a_m = _atm_disp_mas(lam_u, z_live, p_hpa, t_c, rh_pct, ref_lam) if atm_en else 0.0
+        ax, ay = a_m * ex, a_m * ey
+        if deployed:
+            dm = _egner_dmax_mas(lam_u, preset)
+            dx, dy = -dm * vx, -dm * vy
+        else:
+            dx, dy = 0.0, 0.0
+        return ax, ay, dx, dy
+
+    # Anchor ADC display curve at ref_lam_um so differential residual crosses 0 at ref_lam_um
+    _, _, dx0, dy0 = _eval_vec(ref_lam)
+    lam_grid = np.linspace(0.45, 2.40, 80)
+    c_atm, c_adc, c_res_par, c_res_perp = [], [], [], []
+    for l_u in lam_grid:
+        ax, ay, dx, dy = _eval_vec(float(l_u))
+        dx_r, dy_r = dx - dx0, dy - dy0
+        rx, ry = ax + dx_r, ay + dy_r
+        c_atm.append(round(ax * ex + ay * ey, 4))
+        c_adc.append(round(dx_r * ex + dy_r * ey, 4))
+        c_res_par.append(round(rx * ex + ry * ey, 4))
+        c_res_perp.append(round(rx * px + ry * py, 4))
+
+    def _span_2d(l0, l1, use_adc=True):
+        pts = []
+        for k in range(33):
+            lu = l0 + (l1 - l0) * (k / 32.0)
+            ax, ay, dx, dy = _eval_vec(lu)
+            pts.append((ax + (dx if use_adc else 0.0), ay + (dy if use_adc else 0.0)))
+        mx = 0.0
+        for i in range(len(pts)):
+            xi, yi = pts[i]
+            for j in range(i + 1, len(pts)):
+                d = math.hypot(xi - pts[j][0], yi - pts[j][1])
+                if d > mx:
+                    mx = d
+        return mx
+
+    def _shift_2d(l0, l1, use_adc=True):
+        ax0, ay0, dx0_, dy0_ = _eval_vec(l0)
+        ax1, ay1, dx1_, dy1_ = _eval_vec(l1)
+        x0 = ax0 + (dx0_ if use_adc else 0.0)
+        y0 = ay0 + (dy0_ if use_adc else 0.0)
+        x1 = ax1 + (dx1_ if use_adc else 0.0)
+        y1 = ay1 + (dy1_ if use_adc else 0.0)
+        return math.hypot(x0 - x1, y0 - y1)
+
+    band_specs = [
+        ("vis", "Visible I (0.675-0.825 um)", 0.675, 0.825, 0.75, False),
+        ("j", "NIR J (1.130-1.310 um)", 1.130, 1.310, 1.22, False),
+        ("h", "NIR H (1.500-1.780 um)", 1.500, 1.780, 1.65, False),
+        ("k", "NIR K (2.030-2.370 um)", 2.030, 2.370, 2.20, False),
+        ("broadband", "Broadband (0.500-2.200 um)", 0.500, 2.200, 1.22, False),
+        ("vis_to_h", "Vis-H Shift (0.75 vs 1.65 um)", 0.750, 1.650, 0.75, True),
+    ]
+    bands_out = {}
+    for bk, blab, l0, l1, lref, is_shift in band_specs:
+        atm_v = _shift_2d(l0, l1, False) if is_shift else _span_2d(l0, l1, False)
+        res_v = _shift_2d(l0, l1, True) if is_shift else _span_2d(l0, l1, True)
+        ld_mas = (lref * 1.0e-6 / max(tel_diam_m, 0.1)) * RAD2MAS
+        supp = (atm_v / res_v) if res_v > 1e-4 else (float("inf") if atm_v > 1e-4 else 1.0)
+        bands_out[bk] = {
+            "label": blab,
+            "lam_min_um": l0,
+            "lam_max_um": l1,
+            "ld_mas": round(ld_mas, 3),
+            "atm_mas": round(atm_v, 3),
+            "res_mas": round(res_v, 3),
+            "atm_ld": round(atm_v / ld_mas, 3),
+            "res_ld": round(res_v / ld_mas, 3),
+            "suppression_factor": round(min(supp, 9999.0), 2),
+        }
+
+    # Maunakea 7-layer chromatic atmospheric turbulence ray shear between 0.75 um and 1.65 um
+    dn_vh = abs(
+        _air_n_minus_1_ciddor(0.75, p_hpa, t_c, rh_pct)
+        - _air_n_minus_1_ciddor(1.65, p_hpa, t_c, rh_pct)
+    )
+    zr = math.radians(min(80.0, z_live))
+    geom_z = math.tan(zr) / max(math.cos(zr), 0.1)
+    mk_h_km = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 16.0]
+    mk_w = [0.52, 0.15, 0.08, 0.06, 0.08, 0.07, 0.04]
+    shear_cm = [round(h * 1.0e5 * dn_vh * geom_z, 3) for h in mk_h_km]
+    h_eff_cm = round(sum(w * s for w, s in zip(mk_w, shear_cm)), 3)
+
+    return {
+        "config": {
+            "atm_disp_enable": atm_en,
+            "zenith_deg": round(z_live, 3),
+            "disp_pa_deg": round(pa_live, 3),
+            "imr_mode": imr_mode,
+            "parallactic_rate_dps": round(prate, 5),
+            "site_alt_m": round(site_alt, 1),
+            "pressure_hpa": round(p_hpa, 2),
+            "temp_c": round(t_c, 2),
+            "rh_pct": round(rh_pct, 1),
+            "ref_lam_um": round(ref_lam, 3),
+            "chrom_turb": chrom_turb,
+            "chrom_lambdas": chrom_lams,
+            "adc_id": adc_id,
+            "preset": preset,
+            "mode": mode,
+            "opt_band": opt_band,
+            "mech": mech,
+            "lut_scale_err": round(lut_sc_err, 5),
+            "lut_pa_err_deg": round(lut_pa_err, 4),
+            "tput_base": round(tput_base, 4),
+            "deployed": deployed,
+        },
+        "state": {
+            "theta1_deg": round(th1, 3),
+            "theta2_deg": round(th2, 3),
+            "psi_deg": round(psi, 3),
+            "pa_deg": round(pa_live, 3),
+            "zenith_deg": round(z_live, 3),
+            "deployed": int(deployed),
+            "res_vis_mas": round(
+                float(st_raw["res_vis_mas"]) if st_raw else bands_out["vis"]["res_mas"], 3
+            ),
+            "res_j_mas": round(
+                float(st_raw["res_j_mas"]) if st_raw else bands_out["j"]["res_mas"], 3
+            ),
+            "res_h_mas": round(
+                float(st_raw["res_h_mas"]) if st_raw else bands_out["h"]["res_mas"], 3
+            ),
+            "res_vis_h_mas": round(
+                float(st_raw.get("res_vis_h_mas", st_raw.get("atm_vis_h_mas", 0.0)))
+                if st_raw
+                else bands_out["vis_to_h"]["res_mas"],
+                3,
+            ),
+        },
+        "bands": bands_out,
+        "chrom_shear": {
+            "enabled": chrom_turb,
+            "lambdas_um": chrom_lams,
+            "dn_075_165": round(dn_vh, 9),
+            "layers_km": mk_h_km,
+            "shear_075_165_cm": shear_cm,
+            "max_layer_shear_cm": max(shear_cm) if shear_cm else 0.0,
+            "cn2_weighted_shear_cm": h_eff_cm,
+        },
+        "curves": {
+            "lambda_um": [round(float(x), 4) for x in lam_grid],
+            "atm_mas": c_atm,
+            "adc_mas": c_adc,
+            "res_par_mas": c_res_par,
+            "res_perp_mas": c_res_perp,
+        },
+        "vis_pyrwfs_ttm": (meta or {}).get("vis_pyrwfs_ttm"),
     }
 
 
@@ -1758,6 +2262,30 @@ def load_loop_calib(
     raw_p = next((p for p in raw_cands if os.path.isfile(p)), None)
     def_wall_hz = {1: 40.0, 2: 80.0, 3: 20.0}.get(loop_num, 40.0)
     def_phys_hz = {1: 1000.0, 2: 2000.0, 3: 500.0}.get(loop_num, 1000.0)
+    if "wall_cal_hz" not in info and raw_p is not None:
+        # Standalone re-runs after WORK_ROOT cleanup lack rm_meta.env: recover the exact
+        # wall-clock calibration frame rate directly from consecutive frame timestamps [us]
+        # inside stg{N}_mlat_hardwlatency.dat (columns: frame_idx, t_us, response).
+        _dts_us = []
+        _prev_fi, _prev_tu = None, None
+        for _ln in open(raw_p, "r", encoding="utf-8"):
+            _s = _ln.strip()
+            if not _s or _s.startswith("#"):
+                _prev_fi, _prev_tu = None, None
+                continue
+            _tk = _s.split()
+            if len(_tk) >= 2:
+                try:
+                    _fi, _tu = int(_tk[0]), float(_tk[1])
+                    if _prev_fi is not None and _fi == _prev_fi + 1 and _tu > _prev_tu:
+                        _dts_us.append(_tu - _prev_tu)
+                    _prev_fi, _prev_tu = _fi, _tu
+                except ValueError:
+                    _prev_fi, _prev_tu = None, None
+        if len(_dts_us) >= 5:
+            _med_us = float(np.median(_dts_us))
+            if _med_us > 10.0:
+                info["wall_cal_hz"] = 1.0e6 / _med_us
     fps_cal = float(info.get("wall_cal_hz", def_wall_hz))
     phys_hz = float(phys_hz_override or def_phys_hz)
 
@@ -2260,7 +2788,7 @@ def load_pyrwfs_telemetry_metrics(out_dir, tmp_npys=None, chrom_info=None):
         "t_phys_s", "ftot", "bg_mean", "bg_std", "sat_hi_frac", "sat_dark_frac", "flux_ok",
         "f_pup", "f_diam", "f_bH", "f_bV", "f_out", "df_pup", "aniso", "nl_ratio",
         "qx", "qy", "qx_mean", "qy_mean", "qx_rms", "qy_rms", "qdiag",
-        "scint_idx", "curl_ratio", "lwe_metric",
+        "scint_idx", "scint_debias", "curl_ratio", "lwe_metric",
         "pup_dx", "pup_dy", "pup_ds", "pup_dast", "pup_rot", "pup_corr",
     ]
 
@@ -2349,6 +2877,8 @@ def load_pyrwfs_telemetry_metrics(out_dir, tmp_npys=None, chrom_info=None):
         qy_rms = _col("qy_rms")
         qdiag = _col("qdiag")
         scint = _col("scint_idx")
+        has_scint_debias = "scint_debias" in cmap
+        scint_deb = _col("scint_debias", float("nan"))
         curl = _col("curl_ratio")
         lwe = _col("lwe_metric")
         pup_dx = _col("pup_dx")
@@ -2399,11 +2929,13 @@ def load_pyrwfs_telemetry_metrics(out_dir, tmp_npys=None, chrom_info=None):
 
         # Save compact .npy arrays for matplotlib subprocess
         if tmp_npys is not None:
-            ts_mat = np.column_stack([_col(c) for c in plot_cols]).astype(np.float32)
+            ts_mat = np.column_stack(
+                [_col(c, float("nan") if c == "scint_debias" else 0.0) for c in plot_cols]
+            ).astype(np.float32)
             ts_npy = os.path.join(out_dir, f"pyrwfs_ts_stg{stg_i}.npy")
             np.save(ts_npy, ts_mat)
             tmp_npys.append(ts_npy)
-            for tag in ("ref", "zones", "isum", "scint", "lvar", "pupgeom"):
+            for tag in ("ref", "zones", "isum", "scint", "scint_debias", "lvar", "pupgeom"):
                 fp = os.path.join(out_dir, f"pyrwfs_{tag}_stg{stg_i}.fits")
                 if os.path.isfile(fp):
                     try:
@@ -2497,6 +3029,7 @@ def load_pyrwfs_telemetry_metrics(out_dir, tmp_npys=None, chrom_info=None):
         qyr_s = _stat(qy_rms)
         qd_s = _stat(qdiag)
         sc_s = _stat(scint)
+        scd_s = _stat(scint_deb) if has_scint_debias else None
         cu_s = _stat(curl)
         lw_s = _stat(lwe)
         dx_s = _stat(pup_dx)
@@ -2571,6 +3104,15 @@ def load_pyrwfs_telemetry_metrics(out_dir, tmp_npys=None, chrom_info=None):
             "wavefront": {
                 "scint_idx_mean": sc_s["mean"],
                 "scint_idx_p90": sc_s["p90"],
+                **(
+                    {
+                        "scint_debias_mean": scd_s["mean"],
+                        "scint_debias_p90": scd_s["p90"],
+                        "scint_noise_floor_mean": max(sc_s["mean"] - scd_s["mean"], 0.0),
+                    }
+                    if scd_s is not None
+                    else {}
+                ),
                 "curl_ratio_mean": cu_s["mean"],
                 "curl_ratio_p90": cu_s["p90"],
                 "lwe_metric_mean": lw_s["mean"],
@@ -2604,6 +3146,548 @@ def load_pyrwfs_telemetry_metrics(out_dir, tmp_npys=None, chrom_info=None):
         json.dump(result, fh, indent=2)
         fh.write("\n")
     return result
+
+
+# Exact 7-layer Maunakea von Karman atmospheric profile (atmturb_profile.c, site_alt = 4205 m ASL)
+_MK_ATM_LAYERS = (
+    {"index": 0, "alt_agl_m": 10.0,    "regime": "Boundary Layer", "cn2_raw": 5.32,  "speed_mps": 6.50,  "dir_rad": 1.47},
+    {"index": 1, "alt_agl_m": 25.0,    "regime": "Boundary Layer", "cn2_raw": 1.47,  "speed_mps": 6.55,  "dir_rad": 1.57},
+    {"index": 2, "alt_agl_m": 144.0,   "regime": "Boundary Layer", "cn2_raw": 1.08,  "speed_mps": 6.60,  "dir_rad": 1.67},
+    {"index": 3, "alt_agl_m": 802.0,   "regime": "Boundary Layer", "cn2_raw": 2.11,  "speed_mps": 6.70,  "dir_rad": 1.77},
+    {"index": 4, "alt_agl_m": 7795.0,  "regime": "Free Atm (Jet)", "cn2_raw": 1.83,  "speed_mps": 22.00, "dir_rad": 3.10},
+    {"index": 5, "alt_agl_m": 11995.0, "regime": "Free Atm",       "cn2_raw": 1.48,  "speed_mps": 9.50,  "dir_rad": 3.20},
+    {"index": 6, "alt_agl_m": 19496.0, "regime": "Free Atm",       "cn2_raw": 0.697, "speed_mps": 5.60,  "dir_rad": 3.30},
+)
+
+
+def _parse_wl_info_txt(info_path):
+    """Extract parameter and .res.* key-values from milk-fps-info wl-1 output."""
+    out = {}
+    if not os.path.isfile(info_path):
+        return out
+    ansi_re = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+    try:
+        with open(info_path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                s = ansi_re.sub("", line).strip()
+                if not s.startswith("---"):
+                    continue
+                toks = s.split()
+                if len(toks) >= 4:
+                    key = toks[1]
+                    typ = toks[2]
+                    val = toks[3]
+                    if typ in ("FLOAT64", "FLOAT32"):
+                        try:
+                            out[key] = float(val)
+                        except ValueError:
+                            pass
+                    elif typ in ("INT64", "INT32"):
+                        try:
+                            out[key] = int(val)
+                        except ValueError:
+                            pass
+                    elif typ == "ONOFF":
+                        out[key] = val.upper() in ("ON", "1", "TRUE")
+                    else:
+                        out[key] = val
+    except OSError:
+        pass
+    return out
+
+
+def load_windlayers_metrics(out_dir, tmp_npys=None, zenith_deg=30.0):
+    """Load Stage-1 mlt-windlayers FITS/info/report outputs & match against Maunakea truth."""
+    lay_fp = os.path.join(out_dir, "wl1_layers.fits")
+    rep_fp = os.path.join(out_dir, "wl1_report.txt")
+    info_fp = os.path.join(out_dir, "wl1_info.txt")
+    if not os.path.isfile(lay_fp):
+        return None
+
+    try:
+        tbl = np.asarray(fits.getdata(lay_fp), dtype=np.float64)
+    except Exception:
+        return None
+    if tbl.ndim != 2 or tbl.shape[1] < 16:
+        return None
+
+    # Read run_options.json for zenith_deg, disp_pa_deg & atmturb_fresnel if available
+    atmturb_fresnel = 0
+    disp_pa_deg = 0.0
+    wind_var = True
+    wind_burst = True
+    ro_fp = os.path.join(out_dir, "run_options.json")
+    if os.path.isfile(ro_fp):
+        try:
+            with open(ro_fp, "r", encoding="utf-8") as fh:
+                ro_raw = json.load(fh)
+            opts = ro_raw.get("options") if isinstance(ro_raw.get("options"), dict) else ro_raw
+            if isinstance(opts, dict):
+                if opts.get("zenith_deg") not in (None, ""):
+                    zenith_deg = float(opts["zenith_deg"])
+                if opts.get("disp_pa_deg") not in (None, ""):
+                    disp_pa_deg = float(opts["disp_pa_deg"])
+                if opts.get("atmturb_fresnel") not in (None, ""):
+                    atmturb_fresnel = int(float(opts["atmturb_fresnel"]))
+                if opts.get("wind_var") not in (None, ""):
+                    wind_var = str(opts["wind_var"]).strip().lower() not in ("0", "false", "off")
+                if opts.get("wind_burst") not in (None, ""):
+                    wind_burst = str(opts["wind_burst"]).strip().lower() not in ("0", "false", "off")
+        except Exception:
+            pass
+
+    fps_kv = _parse_wl_info_txt(info_fp)
+    cos_z = max(math.cos(math.radians(float(zenith_deg))), 0.1)
+    airmass = 1.0 / cos_z
+    pa_rad = math.radians(float(disp_pa_deg))
+    ez_x, ez_y = math.sin(pa_rad), math.cos(pa_rad)
+    ep_x, ep_y = ez_y, -ez_x
+
+    # Ground-truth 7-layer Maunakea profile mapped to WFS pupil pattern-motion frame
+    # including exact zenith foreshortening along ez (matches atmturb_geometry.c)
+    tot_cn2 = sum(l["cn2_raw"] for l in _MK_ATM_LAYERS)
+    gt_layers = []
+    for l in _MK_ATM_LAYERS:
+        spd_raw = float(l["speed_mps"])
+        dr = float(l["dir_rad"])
+        v_rx = spd_raw * math.cos(dr)
+        v_ry = spd_raw * math.sin(dr)
+        v_par = v_rx * ez_x + v_ry * ez_y
+        v_perp = v_rx * ep_x + v_ry * ep_y
+        # atmturb shifts screen lookup by +v_proj*t -> pattern drifts across pupil by -v_proj*t
+        vx_gt = -((v_par * cos_z) * ez_x + v_perp * ep_x)
+        vy_gt = -((v_par * cos_z) * ez_y + v_perp * ep_y)
+        spd = math.hypot(vx_gt, vy_gt)
+        dir_gt = (math.degrees(math.atan2(vy_gt, vx_gt)) + 360.0) % 360.0
+        z_los = float(l["alt_agl_m"]) * airmass
+        gt_layers.append(
+            {
+                "index": int(l["index"]),
+                "regime": str(l["regime"]),
+                "alt_agl_m": round(float(l["alt_agl_m"]), 1),
+                "z_los_m": round(z_los, 1),
+                "cn2_frac": round(float(l["cn2_raw"]) / tot_cn2, 4),
+                "speed_mps": round(spd, 2),
+                "dir_deg": round(dir_gt, 1),
+                "vx_mps": round(vx_gt, 3),
+                "vy_mps": round(vy_gt, 3),
+            }
+        )
+
+    def _safe_f(v, digits=3):
+        fv = float(v)
+        return round(fv, digits) if math.isfinite(fv) else None
+
+    layers = []
+    for row_i in range(tbl.shape[0]):
+        r = tbl[row_i]
+        if not (math.isfinite(r[15]) and r[15] >= 0.5):
+            continue
+        vx, vy, spd, ddeg = float(r[0]), float(r[1]), float(r[2]), float(r[3])
+        is_static = spd < 0.5
+        best_gt = None
+        best_dv = 1e9
+        if not is_static:
+            for g in gt_layers:
+                dv = math.hypot(vx - g["vx_mps"], vy - g["vy_mps"])
+                if dv < best_dv:
+                    best_dv = dv
+                    best_gt = g
+        if best_dv > 6.5:
+            best_gt = None
+        z_v = _safe_f(r[10], 1)
+        dz_v = round(z_v - best_gt["z_los_m"], 1) if (z_v is not None and best_gt is not None) else None
+        layers.append(
+            {
+                "index": len(layers),
+                "vx_mps": round(vx, 3),
+                "vy_mps": round(vy, 3),
+                "speed_mps": round(spd, 3),
+                "dir_deg": round(ddeg % 360.0, 2),
+                "snr": _safe_f(r[4], 2),
+                "pk_k": _safe_f(r[5], 4),
+                "pk_i": _safe_f(r[6], 4),
+                "pk_x": _safe_f(r[7], 4),
+                "frac_k": _safe_f(r[8], 4),
+                "frac_i": _safe_f(r[9], 4),
+                "z_m": z_v,
+                "zerr_m": _safe_f(r[11], 1),
+                "coh": _safe_f(r[12], 3),
+                "z_axis_m": _safe_f(r[13], 1),
+                "z_diag_m": _safe_f(r[14], 1),
+                "is_static": is_static,
+                "matched_gt_index": best_gt["index"] if best_gt is not None else None,
+                "matched_gt_regime": best_gt["regime"] if best_gt is not None else ("Static / LWE" if is_static else None),
+                "matched_gt_speed_mps": best_gt["speed_mps"] if best_gt is not None else None,
+                "matched_gt_dir_deg": best_gt["dir_deg"] if best_gt is not None else None,
+                "matched_gt_z_los_m": best_gt["z_los_m"] if best_gt is not None else None,
+                "dv_mps": round(best_dv, 2) if best_gt is not None else None,
+                "dz_m": dz_v,
+            }
+        )
+
+    # Save velocity maps as .npy for plotter and read VMAX / DV headers
+    vmax = float(fps_kv.get("vmax", 50.0) or 50.0)
+    dv_step = float(fps_kv.get("dv", 0.75) or 0.75)
+    has_vmaps = False
+    for tag in ("vmapk", "vmapi", "vmapx"):
+        fp = os.path.join(out_dir, f"wl1_{tag}.fits")
+        if os.path.isfile(fp):
+            try:
+                with fits.open(fp) as hdul:
+                    hdr = hdul[0].header
+                    if "VMAX" in hdr:
+                        vmax = float(hdr["VMAX"])
+                    if "DV" in hdr:
+                        dv_step = float(hdr["DV"])
+                    arr = np.asarray(hdul[0].data, dtype=np.float32)
+                if tmp_npys is not None and arr.ndim == 2:
+                    np_p = os.path.join(out_dir, f"wl1_{tag}.npy")
+                    np.save(np_p, arr)
+                    tmp_npys.append(np_p)
+                    has_vmaps = True
+            except Exception:
+                pass
+
+    pupgeom_rows = []
+    pg_fp = os.path.join(out_dir, "wl1_pupgeom.fits")
+    if os.path.isfile(pg_fp):
+        try:
+            pg = np.asarray(fits.getdata(pg_fp), dtype=np.float64)
+            if pg.ndim == 2 and pg.shape[0] >= 4 and pg.shape[1] >= 4:
+                q_names = ("BL (Q0)", "TL (Q1)", "BR (Q2)", "TR (Q3)")
+                for qi in range(4):
+                    pupgeom_rows.append(
+                        {
+                            "quadrant": q_names[qi],
+                            "xc_pix": round(float(pg[qi, 0]), 3),
+                            "yc_pix": round(float(pg[qi, 1]), 3),
+                            "rout_pix": round(float(pg[qi, 2]), 3),
+                            "corr": round(float(pg[qi, 3]), 4),
+                        }
+                    )
+        except Exception:
+            pupgeom_rows = []
+
+    report_text = ""
+    if os.path.isfile(rep_fp):
+        try:
+            with open(rep_fp, "r", encoding="utf-8", errors="replace") as fh:
+                report_text = fh.read().strip()
+        except OSError:
+            report_text = ""
+
+    moving_layers = [l for l in layers if not l["is_static"]]
+    matched_layers = [l for l in moving_layers if l["matched_gt_index"] is not None]
+    fresnel_labels = {0: "Geometric (fresnel=0)", 1: "Split-Step Fresnel (fresnel=1)", 2: "Fourier Rytov (fresnel=2)"}
+
+    wl_res = {
+        "schema_version": 1,
+        "enabled": True,
+        "stage": 1,
+        "wfs_stream": str(fps_kv.get("wfs", "csim_wfs_nir")),
+        "pha_stream": str(fps_kv.get("pha", "aol1_dmC")),
+        "in_pupgeom": str(fps_kv.get("in_pupgeom", "")),
+        "autocal_pup": bool(fps_kv.get("autocal_pup", True)),
+        "atmturb_fresnel": atmturb_fresnel,
+        "atmturb_fresnel_label": fresnel_labels.get(atmturb_fresnel, f"fresnel={atmturb_fresnel}"),
+        "zenith_deg": round(float(zenith_deg), 2),
+        "airmass": round(airmass, 4),
+        "wind_var": wind_var,
+        "wind_burst": wind_burst,
+        "nframes": int(fps_kv.get("res.nframes", 0) or 0),
+        "nblocks": int(fps_kv.get("res.nblocks", 0) or 0),
+        "tint_s": round(float(fps_kv.get("res.tint", 0.0) or 0.0), 3),
+        "nlayers": len(layers),
+        "n_moving_layers": len(moving_layers),
+        "n_matched_gt": len(matched_layers),
+        "ksign": int(fps_kv.get("res.ksign", 1) or 1),
+        "zvalid": bool(int(fps_kv.get("res.zvalid", 1) or 0)),
+        "npix": int(fps_kv.get("res.npix", 0) or 0),
+        "dx_m": round(float(fps_kv.get("res.dx", 0.0) or 0.0), 5),
+        "diampix": round(float(fps_kv.get("res.diampix", 0.0) or 0.0), 2),
+        "bg_adu": round(float(fps_kv.get("res.bg", 0.0) or 0.0), 2),
+        "corefrac": round(float(fps_kv.get("res.corefrac", 1.0) or 1.0), 3),
+        "fluxin": round(float(fps_kv.get("res.fluxin", 1.0) or 1.0), 4),
+        "lambda_um": round(float(fps_kv.get("lambda", 1.22) or 1.22), 3),
+        "modrad_ld": round(float(fps_kv.get("modrad", 3.0) or 3.0), 2),
+        "dm_plate_k2": round(float(fps_kv.get("dm_plate_k2", 0.0) or 0.0), 4),
+        "dm_plate_k4": round(float(fps_kv.get("dm_plate_k4", 0.0) or 0.0), 4),
+        "vmax_mps": round(vmax, 2),
+        "dv_mps": round(dv_step, 3),
+        "has_vmaps": has_vmaps,
+        "pupgeom": pupgeom_rows,
+        "layers": layers,
+        "ground_truth_layers": gt_layers,
+        "report_text": report_text,
+    }
+
+    wl_sum_p = os.path.join(out_dir, "windlayers_summary.json")
+    with open(wl_sum_p, "w", encoding="utf-8") as fh:
+        json.dump(wl_res, fh, indent=2)
+        fh.write("\n")
+    return wl_res
+
+
+def load_petal_ctrl_metrics(out_dir, tmp_npys):
+    """Load Stage-1 passive petal-unwrap controller stats, measurements, applied corrections & residual island OPD."""
+    import glob as _glob
+    from collections import deque as _deque
+
+    stats_p = os.path.join(out_dir, "petal_stats.json")
+    if not os.path.isfile(stats_p):
+        return None
+    try:
+        with open(stats_p, "r", encoding="utf-8") as fh:
+            stats = json.load(fh)
+    except Exception:
+        return None
+    if not isinstance(stats, dict) or not stats.get("enabled"):
+        return None
+
+    res = dict(stats)
+    meta_p = os.path.join(out_dir, "petal_ctrl", "petal_ctrl_meta.json")
+    cmeta = {}
+    if os.path.isfile(meta_p):
+        try:
+            with open(meta_p, "r", encoding="utf-8") as fh:
+                cmeta = json.load(fh)
+                res["calib_meta"] = cmeta
+        except Exception:
+            pass
+    dm_step_um = float(cmeta.get("dm_step_surface_um", 0.60268))
+    peq_nm = float(cmeta.get("p_eq_um", 1.20536)) * 1000.0
+
+    dm06_p = os.path.join(out_dir, "dm01disp06.fits")
+    if os.path.isfile(dm06_p):
+        try:
+            dm06 = np.asarray(fits.getdata(dm06_p), dtype=np.float32)
+            if dm06.ndim == 2:
+                dm06_npy = os.path.join(out_dir, "petal_dm06.npy")
+                np.save(dm06_npy, dm06)
+                tmp_npys.append(dm06_npy)
+                nz = dm06[np.abs(dm06) > 1e-6]
+                res["dm06_rms_um"] = float(np.sqrt(np.mean(dm06.astype(np.float64) ** 2)))
+                res["dm06_ptv_um"] = float(np.max(dm06) - np.min(dm06))
+                res["dm06_active_act"] = int(nz.size)
+        except Exception:
+            pass
+
+    tlm_dir = os.environ.get("CACAOSIM_TELEMETRY_DIR", "").strip()
+    if not tlm_dir or not os.path.isdir(tlm_dir):
+        tlm_dir = os.path.join(out_dir, "telemetry")
+
+    def _cat_fits(pattern):
+        files = sorted(_glob.glob(os.path.join(tlm_dir, pattern)))
+        chunks = []
+        for fp in files:
+            try:
+                arr = np.asarray(fits.getdata(fp), dtype=np.float32)
+                if arr.ndim >= 2 and arr.shape[0] > 0:
+                    chunks.append(arr)
+            except Exception:
+                continue
+        return np.concatenate(chunks, axis=0) if chunks else None
+
+    ema_raw = _cat_fits("aol1_petal_ema_*.fits")
+    n_ema = 0
+    j_idx = []
+    if ema_raw is not None:
+        ema_ts = ema_raw.reshape(-1, 7) if ema_raw.shape[-1] == 7 else None
+        if ema_ts is not None and ema_ts.shape[0] > 0:
+            ema_npy = os.path.join(out_dir, "petal_ema_ts.npy")
+            np.save(ema_npy, ema_ts)
+            tmp_npys.append(ema_npy)
+            n_ema = int(ema_ts.shape[0])
+            is_zero = np.all(np.abs(ema_ts) < 1e-7, axis=1)
+            j_idx = [
+                int(i)
+                for i in range(5, n_ema)
+                if is_zero[i] and not is_zero[i - 1]
+            ]
+            res["ema_n_frames"] = n_ema
+            res["jump_frames_in_science"] = j_idx
+            res["ev_sn_max_abs"] = float(np.max(np.abs(ema_ts[:, 0])))
+            res["ev_ew_max_abs"] = float(np.max(np.abs(ema_ts[:, 1])))
+            res["ev_adj_max_abs"] = float(np.max(np.abs(ema_ts[:, 2])))
+            tail = ema_ts[max(0, n_ema // 2) :]
+            if tail.shape[0] > 10:
+                res["steady_ev_rms"] = float(
+                    np.sqrt(np.mean(tail[:, :3].astype(np.float64) ** 2))
+                )
+
+    # Load 1 kHz applied correction command trace w[E, N, W, S](t) in waves:
+    # Priority 1: native aol1_petal_cmd_*.fits (8 floats: w_e..w_s, n_jumps, n_aborts, n_rollbacks, trial_p)
+    # Priority 2: reconstruct from dm01disp - aol1_dmC projected onto petal_dm_modes.fits
+    cmd_waves = None
+    cmd_raw = _cat_fits("aol1_petal_cmd_*.fits")
+    if cmd_raw is not None and cmd_raw.shape[-1] == 8:
+        cmd_all = cmd_raw.reshape(-1, 8)
+        cmd_waves = cmd_all[:, :4].astype(np.float32)
+        res["cmd_source"] = "aol1_petal_cmd"
+    elif n_ema > 0 and int(res.get("n_jumps", 0)) == 0 and float(res.get("dm06_ptv_um", 0.0)) < 1e-5:
+        cmd_waves = np.zeros((n_ema, 4), dtype=np.float32)
+        res["cmd_source"] = "zero_verified"
+    else:
+        dm_modes_p = os.path.join(out_dir, "petal_ctrl", "petal_dm_modes.fits")
+        dm_c = _cat_fits("aol1_dmC_*.fits")
+        dm_d = _cat_fits("dm01disp_*.fits")
+        if (
+            os.path.isfile(dm_modes_p)
+            and dm_c is not None
+            and dm_d is not None
+            and dm_c.ndim == 3
+            and dm_d.ndim == 3
+        ):
+            try:
+                dmm = np.asarray(fits.getdata(dm_modes_p), dtype=np.float64)
+                n_dm = min(dm_c.shape[0], dm_d.shape[0])
+                yy, xx = np.indices(dmm.shape[1:], dtype=np.float64)
+                rr = np.hypot(xx - 0.5 * (dmm.shape[2] - 1.0), yy - 0.5 * (dmm.shape[1] - 1.0))
+                pup_dm = (rr >= 10.5) & (rr <= 28.5)
+                imasks_dm = [(dmm[p] > 0.2 * dm_step_um) & pup_dm for p in range(4)]
+                if all(int(m.sum()) > 10 for m in imasks_dm):
+                    diff_dm = (dm_d[:n_dm] - dm_c[:n_dm]).astype(np.float64)
+                    # Zero-mean island projection in waves
+                    u = np.column_stack([diff_dm[:, m].mean(axis=1) for m in imasks_dm]) / max(dm_step_um, 1e-6)
+                    u -= u.mean(axis=1, keepdims=True)
+                    # Piecewise-constant integer reconstruction anchored on jump segments
+                    w_rec = np.zeros((n_dm, 4), dtype=np.float32)
+                    cuts = sorted({0, *[min(max(j, 0), n_dm) for j in j_idx], n_dm})
+                    w_fin = np.asarray(res.get("waves_enws") or [0, 0, 0, 0], dtype=np.float64)
+                    # Work segment by segment: each plateau has exact integer differences modulo common mode
+                    seg_u = []
+                    for s0, s1 in zip(cuts[:-1], cuts[1:]):
+                        if s1 > s0:
+                            pad = min(25, (s1 - s0) // 4)
+                            seg_u.append((s0, s1, np.median(u[s0 + pad : max(s0 + pad + 1, s1 - pad)], axis=0)))
+                    if seg_u:
+                        # Anchor final segment to w_final and propagate integer jumps backward
+                        w_segs = [None] * len(seg_u)
+                        w_segs[-1] = np.round(w_fin).astype(int)
+                        for k in range(len(seg_u) - 2, -1, -1):
+                            du = seg_u[k + 1][2] - seg_u[k][2]
+                            # Find integer jump dw matching du modulo common mode
+                            # (single-petal jump has 3 entries ~ -dw/4 and 1 entry ~ +3*dw/4)
+                            du_shift = du - np.median(du)
+                            dw = np.round(du_shift).astype(int)
+                            w_segs[k] = w_segs[k + 1] - dw
+                        for (s0, s1, _), wv in zip(seg_u, w_segs):
+                            w_rec[s0:s1] = wv.astype(np.float32)
+                    cmd_waves = w_rec
+                    res["cmd_source"] = "reconstructed_dm01disp_minus_dmC"
+            except Exception:
+                cmd_waves = None
+
+    jump_events = []
+    if cmd_waves is not None and cmd_waves.shape[0] > 1:
+        cmd_npy = os.path.join(out_dir, "petal_cmd_waves.npy")
+        np.save(cmd_npy, cmd_waves)
+        tmp_npys.append(cmd_npy)
+        p_names = ("E", "N", "W", "S")
+        dw_arr = np.diff(cmd_waves, axis=0)
+        chg = np.where(np.any(np.abs(dw_arr) > 0.5, axis=1))[0] + 1
+        for ci in chg:
+            dw = np.round(dw_arr[ci - 1]).astype(int)
+            parts = [f"{p_names[p]}{int(dw[p]):+d}λ" for p in range(4) if dw[p] != 0]
+            jump_events.append(
+                {
+                    "frame": int(ci),
+                    "n_frames": int(cmd_waves.shape[0]),
+                    "delta_enws": [int(x) for x in dw],
+                    "waves_after": [int(round(x)) for x in cmd_waves[ci]],
+                    "label": ", ".join(parts) if parts else "step",
+                }
+            )
+    res["jump_events"] = jump_events
+
+    # Compute ground-truth Post-AO3k differential residual island OPD [nm] from wf_full_final.fits
+    pup_p = os.path.join(out_dir, "wf_pupil_mask.fits")
+    wff_p = os.path.join(tlm_dir, "wf_full_final.fits")
+    if os.path.isfile(pup_p) and os.path.isfile(wff_p):
+        try:
+            pup = np.asarray(fits.getdata(pup_p), dtype=np.float64)
+            pm = pup > 0.5
+            ny, nx = pup.shape
+            # Pure-NumPy 4-connected component labeling to isolate the 4 Subaru islands
+            visited = np.zeros((ny, nx), dtype=bool)
+            comps = []
+            cy0, cx0 = 0.5 * (ny - 1.0), 0.5 * (nx - 1.0)
+            ys_all, xs_all = np.nonzero(pm)
+            for y0, x0 in zip(ys_all.tolist(), xs_all.tolist()):
+                if visited[y0, x0]:
+                    continue
+                q = _deque([(y0, x0)])
+                visited[y0, x0] = True
+                pts = []
+                while q:
+                    cy, cx = q.popleft()
+                    pts.append((cy, cx))
+                    for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                        ny_i, nx_i = cy + dy, cx + dx
+                        if 0 <= ny_i < ny and 0 <= nx_i < nx and pm[ny_i, nx_i] and not visited[ny_i, nx_i]:
+                            visited[ny_i, nx_i] = True
+                            q.append((ny_i, nx_i))
+                if len(pts) >= 200:
+                    m = np.zeros((ny, nx), dtype=bool)
+                    py_a = np.fromiter((p[0] for p in pts), dtype=np.intp)
+                    px_a = np.fromiter((p[1] for p in pts), dtype=np.intp)
+                    m[py_a, px_a] = True
+                    comps.append((float(px_a.mean() - cx0), float(py_a.mean() - cy0), m))
+            if len(comps) >= 4:
+                imasks_wf = [
+                    max(comps, key=lambda c: c[0])[2],  # E (+x)
+                    max(comps, key=lambda c: c[1])[2],  # N (+y)
+                    min(comps, key=lambda c: c[0])[2],  # W (-x)
+                    min(comps, key=lambda c: c[1])[2],  # S (-y)
+                ]
+                yy, xx = np.indices((ny, nx), dtype=np.float64)
+                ux = (xx - cx0) / (0.5 * nx)
+                uy = (yy - cy0) / (0.5 * ny)
+                Z = np.column_stack([np.ones(int(pm.sum())), ux[pm], uy[pm]])
+                pinvZ = np.linalg.pinv(Z)
+                wf_cube = np.asarray(fits.getdata(wff_p), dtype=np.float64)
+                if wf_cube.ndim == 3 and wf_cube.shape[0] > 4 and wf_cube.shape[1:] == (ny, nx):
+                    mid_rms = float(np.sqrt(np.mean(wf_cube[wf_cube.shape[0] // 2, pm] ** 2)))
+                    scale_nm = 1000.0 if mid_rms < 20.0 else 1.0
+                    n_wf = wf_cube.shape[0]
+                    res_p = np.zeros((n_wf, 4), dtype=np.float64)
+                    for fi in range(n_wf):
+                        w = wf_cube[fi] * scale_nm
+                        c = pinvZ @ w[pm]
+                        w_ptt = w - (c[0] + c[1] * ux + c[2] * uy)
+                        res_p[fi] = [float(w_ptt[m].mean()) for m in imasks_wf]
+                    res_p -= res_p.mean(axis=1, keepdims=True)
+                    res_npy = os.path.join(out_dir, "petal_res_opd_ts.npy")
+                    np.save(res_npy, res_p.astype(np.float32))
+                    tmp_npys.append(res_npy)
+                    res["residual_island_opd_nm"] = {
+                        "n_frames": int(n_wf),
+                        "mean_enws": [round(float(res_p[:, p].mean()), 2) for p in range(4)],
+                        "std_enws": [round(float(res_p[:, p].std()), 2) for p in range(4)],
+                        "max_abs_enws": [round(float(np.max(np.abs(res_p[:, p]))), 2) for p in range(4)],
+                        "rms_total_nm": round(float(np.sqrt(np.mean(res_p ** 2))), 2),
+                        "max_abs_any_nm": round(float(np.max(np.abs(res_p))), 2),
+                        "wrap_exceeded": bool(float(np.max(np.abs(res_p))) > 0.5 * peq_nm),
+                    }
+        except Exception:
+            pass
+    return res
+
+
+def load_modalwhite_metrics(out_dir):
+    """Load closed-loop modal whiteness audit metrics (modalwhite_stats.json)."""
+    mw_p = os.path.join(out_dir, "modalwhite_stats.json")
+    if not os.path.isfile(mw_p):
+        return None
+    try:
+        with open(mw_p, "r", encoding="utf-8") as fh:
+            mw = json.load(fh)
+        if isinstance(mw, dict) and mw.get("enabled") and mw.get("stages"):
+            return mw
+    except Exception:
+        pass
+    return None
 
 
 def render_plots_via_sys_python(out_dir, summary_path):
@@ -3315,6 +4399,8 @@ if wf_info and os.path.exists(os.path.join(out_dir, "wf_pupil_mask.npy")):
                 shrink=0.88,
                 pad=0.02,
             )
+            cb.locator = MaxNLocator(nbins=5)
+            cb.update_ticks()
             cb.set_label(cblab, fontsize=9.2)
         fig6.savefig(os.path.join(out_dir, "dm_samples_5x4.png"), dpi=175)
         plt.close(fig6)
@@ -3677,12 +4763,15 @@ if _want_plot(9) and lp1.get("mlat") and lp2.get("mlat"):
             f"RM poke shift : RMdelayfr={ml['rm_delay_fr']} fr "
             f"(+{ml['rm_subframe_wait_fr']:.2f} fr)"
         )
+        _box_on_left = lat_fr > 2.35
         ax.text(
-            0.47,
-            0.46,
+            0.03 if _box_on_left else 0.97,
+            0.57 if pk_y < 0.52 * max(ymax, 0.1) else 0.40,
             txt_m,
             transform=ax.transAxes,
-            fontsize=8.0,
+            ha="left" if _box_on_left else "right",
+            va="top",
+            fontsize=7.8,
             family="monospace",
             bbox=dict(
                 boxstyle="round,pad=0.32",
@@ -3722,8 +4811,9 @@ if _want_plot(10) and lp1.get("selfrm") and lp2.get("selfrm"):
         )
     nr_s = len(srm_rows)
     figs, axess = plt.subplots(
-        nr_s, 4, figsize=(17.6, 4.2 * nr_s + 0.5), constrained_layout=True
+        nr_s, 4, figsize=(18.4, 4.25 * nr_s + 0.55), constrained_layout=True
     )
+    figs.get_layout_engine().set(w_pad=0.14, h_pad=0.08, wspace=0.06)
     figs.suptitle(
         f"Subaru {tel_d:.2f} m AO3k + SCExAO — Modal Self-Response Matrix (selfRM): "
         f"Zero-Turbulence Calibration vs On-Sky Closed Loop ({seeing_top:.2f}\" @ 0.50 µm)\n"
@@ -3792,8 +4882,8 @@ if _want_plot(10) and lp1.get("selfrm") and lp2.get("selfrm"):
             family="monospace",
             bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#ccd2dc", alpha=0.90),
         )
-        cb = figs.colorbar(im1, ax=[ax0, ax1], fraction=0.032, pad=0.02)
-        cb.set_label("Modal WFS / DM Poke", fontsize=8.5)
+        cb = figs.colorbar(im1, ax=[ax0, ax1], fraction=0.030, pad=0.025)
+        cb.set_label("Modal WFS / DM Poke", fontsize=8.5, labelpad=6)
 
         ax2 = axess[r, 2]
         midx = np.arange(mcnt)
@@ -4227,12 +5317,12 @@ if _want_plot(11) and has_wf_ts and has_sr_ts:
             fontweight="bold",
         )
         ax_s.set_ylabel(f"{bkey.upper()} Strehl [%]")
-        top_sr = min(118.0, max_sr * 1.26)
+        top_sr = min(122.0, max(max_sr * 1.24, max_sr + 16.0))
         ax_s.set_ylim(0.0, top_sr)
         if top_sr > 100.0:
             ax_s.set_yticks([0, 20, 40, 60, 80, 100])
         ax_s.grid(True, alpha=0.28)
-        ax_s.legend(loc="upper right", fontsize=8.2, framealpha=0.92)
+        ax_s.legend(loc="upper right", fontsize=7.8, ncol=3, framealpha=0.92)
 
     xmax = max(
         float(np.nanmax(t_wf)) if t_wf.size else phys_t,
@@ -4285,9 +5375,11 @@ if _want_plot(20) and os.path.isfile(pert_npy_p):
             )
         ax00.set_title("Atmospheric Wind Speed Meandering & Gust Bursts", fontweight="bold")
         ax00.set_ylabel("Multiplier [x nominal]")
-        ax00.set_ylim(bottom=max(0.2, float(np.min(w_scl)) * 0.85))
+        _y00_lo = max(0.2, float(np.min(w_scl)) * 0.85)
+        _, _y00_hi = ax00.get_ylim()
+        ax00.set_ylim(_y00_lo, _y00_hi + 0.24 * max(_y00_hi - _y00_lo, 0.2))
         ax00.grid(True, alpha=0.28)
-        ax00.legend(loc="upper right", fontsize=8.5, framealpha=0.92)
+        ax00.legend(loc="upper right", fontsize=8.3, framealpha=0.92)
 
         # Panel (0,1): Wind heading drift
         ax01 = axp[0, 1]
@@ -4305,8 +5397,10 @@ if _want_plot(20) and os.path.isfile(pert_npy_p):
             )
         ax01.set_title("Atmospheric Wind Direction Changes", fontweight="bold")
         ax01.set_ylabel("Heading Offset [deg]")
+        _y01_lo, _y01_hi = ax01.get_ylim()
+        ax01.set_ylim(_y01_lo, _y01_hi + 0.22 * max(_y01_hi - _y01_lo, 5.0))
         ax01.grid(True, alpha=0.28)
-        ax01.legend(loc="upper right", fontsize=8.5, framealpha=0.92)
+        ax01.legend(loc="upper right", fontsize=8.3, framealpha=0.92)
 
         # Panel (1,0): Telescope & bench vibration PSD
         ax10 = axp[1, 0]
@@ -4380,6 +5474,8 @@ if _want_plot(20) and os.path.isfile(pert_npy_p):
         )
         ax11.set_xlabel("Physical Simulation Time t [s]")
         ax11.set_ylabel("Differential Petal OPD [nm]")
+        _y11_lo, _y11_hi = ax11.get_ylim()
+        ax11.set_ylim(_y11_lo, _y11_hi + 0.30 * max(_y11_hi - _y11_lo, 200.0))
         ax11.grid(True, alpha=0.28)
         ax11.legend(loc="upper right", fontsize=8.0, ncol=2, framealpha=0.92)
 
@@ -4395,8 +5491,14 @@ if _want_plot(12) and chrom and chrom.get("beams") and chrom.get("sensors"):
     lam_b = np.asarray(chrom["lambda_bins_um"], dtype=float)
     bmap = chrom["beams"]
     figc, axesc = plt.subplots(
-        2, 1, figsize=(13.8, 8.2), sharex=True, constrained_layout=True
+        2,
+        1,
+        figsize=(14.4, 9.4),
+        sharex=True,
+        gridspec_kw={"height_ratios": [1.0, 1.45]},
+        constrained_layout=True,
     )
+    figc.get_layout_engine().set(h_pad=0.10, hspace=0.06)
     figc.suptitle(
         f"Subaru {tel_d:.2f} m AO3k + SCExAO — Polychromatic Photon Budget & "
         "Sub-Band Optical Sampling\n"
@@ -4416,10 +5518,12 @@ if _want_plot(12) and chrom and chrom.get("beams") and chrom.get("sensors"):
         ("b_coro_sci", "Post-Lyot Coronagraph Arm (b_coro_sci)", "#7c3aed", ":", 2.1),
         ("b_lowfs_defoc", "Reflective-Lyot LLOWFS Arm (b_lowfs_defoc)", "#059669", "-.", 1.9),
     ]
+    _y_peak_sp = 1.0e8
     for bk, blab, col_b, ls_b, lw_b in beam_plot:
         if bk not in bmap:
             continue
         yv = np.maximum(np.asarray(bmap[bk]["ph_s_per_um"], dtype=float), 2.0e4)
+        _y_peak_sp = max(_y_peak_sp, float(np.nanmax(yv)))
         tot_s = bmap[bk]["total_ph_s"]
         ax_sp.semilogy(
             lam_b,
@@ -4429,11 +5533,14 @@ if _want_plot(12) and chrom and chrom.get("beams") and chrom.get("sensors"):
             lw=lw_b,
             label=f"{blab} ({tot_s:.2e} ph/s)",
         )
-    ax_sp.set_ylim(2.0e4, 8.0e11)
+    ax_sp.set_ylim(2.0e4, max(8.0e11, _y_peak_sp * 260.0))
     ax_sp.set_ylabel("Spectral Photon Rate [ph / s / µm]")
+    _c_bench = chrom.get("bench") or {}
+    _mv_sp = float(sa_top.get("star_mV", _c_bench.get("star_mag", 6.0)))
+    _teff_sp = float(sa_top.get("star_teff_K", _c_bench.get("star_teff", 9600.0)))
     ax_sp.set_title(
         f"Propagated 32-Bin Stellar & Dichroic Beam Spectra "
-        f"(mV = 6.0, Teff = 9600 K, D = {tel_d:.2f} m, Tput = {tput_pct:.0f}%)",
+        f"(mV = {_mv_sp:.1f}, Teff = {_teff_sp:.0f} K, D = {tel_d:.2f} m, Tput = {tput_pct:.0f}%)",
         fontsize=11,
         fontweight="bold",
     )
@@ -4454,6 +5561,7 @@ if _want_plot(12) and chrom and chrom.get("beams") and chrom.get("sensors"):
         "nir_coro": "#7c3aed",
         "wfs_lowfs": "#059669",
     }
+    xmin_sb, xmax_sb = 0.38, 2.42
     ylabels = []
     for idx_y, sn in enumerate(disp_sens):
         col_s = s_colors.get(sn["id"], "#3b82f6")
@@ -4465,7 +5573,7 @@ if _want_plot(12) and chrom and chrom.get("beams") and chrom.get("sensors"):
             idx_y,
             lmax - lmin,
             left=lmin,
-            height=0.46,
+            height=0.52,
             color=col_s,
             alpha=0.22,
             edgecolor=col_s,
@@ -4475,51 +5583,93 @@ if _want_plot(12) and chrom and chrom.get("beams") and chrom.get("sensors"):
             xe = lmin + k_edge * sub_dl
             ax_sb.plot(
                 [xe, xe],
-                [idx_y - 0.23, idx_y + 0.23],
+                [idx_y - 0.26, idx_y + 0.26],
                 color=col_s,
                 ls=":",
-                lw=1.2,
+                lw=1.1,
             )
         clams = sn["chan_lam_um"]
         cws = sn["chan_weight"]
         fscs = sn["focal_scale_lam0_over_lam"]
+        _ms_cap = 44.0 if nlam >= 5 else 90.0
         ax_sb.scatter(
             clams,
             [idx_y] * len(clams),
-            s=[160.0 * max(w, 0.15) for w in cws],
+            s=[min(150.0 * max(w, 0.14), _ms_cap) for w in cws],
             color=col_s,
             edgecolors="#111827",
-            linewidths=1.1,
+            linewidths=0.95,
             zorder=5,
         )
-        tag_pts = ", ".join(
-            f"{lc:.3f}µm ({w*100:.0f}%, {sc:.2f}×)"
+        hdr_s = f"N={nlam}ch | {sn['flux_ph_per_frame']:.2e} ph/fr"
+        items_s = [
+            f"{lc:.3f} ({w*100:.0f}%, {sc:.2f}×)"
             for lc, w, sc in zip(clams, cws, fscs)
-        )
-        place_left = lmin > 1.35
-        ax_sb.text(
-            (lmin - 0.025) if place_left else (lmax + 0.025),
+        ]
+        avail_left = lmin - xmin_sb
+        avail_right = xmax_sb - lmax
+        place_left = avail_left > avail_right
+        avail_um = max(0.25, (avail_left if place_left else avail_right) - 0.05)
+        max_ch = max(36, int(avail_um * 72.0))
+        one_line = f"{hdr_s} | {', '.join(items_s)}"
+        if len(one_line) <= max_ch:
+            annot_txt = one_line
+        else:
+            joined_all = ", ".join(items_s)
+            if len(joined_all) <= max_ch:
+                annot_txt = f"{hdr_s}\n{joined_all}"
+            else:
+                n_it = len(items_s)
+                half = (n_it + 1) // 2
+                l1 = ", ".join(items_s[:half])
+                l2 = ", ".join(items_s[half:])
+                if len(l1) <= max_ch and len(l2) <= max_ch:
+                    annot_txt = f"{hdr_s}\n{l1}\n{l2}"
+                else:
+                    lines_c = []
+                    cur = ""
+                    for it in items_s:
+                        cand = f"{cur}, {it}" if cur else it
+                        if len(cand) <= max_ch:
+                            cur = cand
+                        else:
+                            if cur:
+                                lines_c.append(cur)
+                            cur = it
+                    if cur:
+                        lines_c.append(cur)
+                    if len(lines_c) > 2:
+                        lines_c = [
+                            lines_c[0],
+                            f"{items_s[0]} .. {items_s[-1]} ({n_it} slices)",
+                        ]
+                    annot_txt = "\n".join([hdr_s] + lines_c)
+        txt_obj = ax_sb.text(
+            (lmin - 0.028) if place_left else (lmax + 0.028),
             idx_y,
-            f"N={nlam}ch | {sn['flux_ph_per_frame']:.2e} ph/fr | {tag_pts}",
+            annot_txt,
             va="center",
             ha="right" if place_left else "left",
-            fontsize=8.1,
+            fontsize=7.4,
             family="monospace",
+            linespacing=1.18,
             color="#111827",
+            clip_on=True,
         )
+        txt_obj.set_in_layout(False)
         ylabels.append(
             f"{sn['id']} ({sn['kind'].upper()})\n"
             f"λ₀={sn['lambda0_um']:.2f}µm, Δλ/λ₀={sn['bw_frac']*100:.0f}%"
         )
     ax_sb.set_yticks(range(len(disp_sens)))
     ax_sb.set_yticklabels(ylabels, fontsize=8.8, fontweight="bold")
-    ax_sb.set_ylim(-0.6, max(len(disp_sens) - 0.4, 0.6))
-    ax_sb.set_xlim(0.38, 2.42)
+    ax_sb.set_ylim(-0.62, max(len(disp_sens) - 0.38, 0.62))
+    ax_sb.set_xlim(xmin_sb, xmax_sb)
     ax_sb.set_xlabel("Wavelength λ [µm]", fontsize=10.5)
     ax_sb.set_title(
         "Sensor Passbands [λ_min..λ_max], Contiguous Sub-Bands & "
-        "Flux-Weighted Propagation Slices λ_c (w_c, λ₀/λ_c)",
-        fontsize=10.8,
+        "Flux-Weighted Propagation Slices λ_c [µm] (w_c, λ₀/λ_c)",
+        fontsize=10.6,
         fontweight="bold",
     )
     ax_sb.grid(True, axis="x", alpha=0.28)
@@ -5268,7 +6418,7 @@ if (
                 color="#7c3aed",
                 lw=1.0,
                 alpha=0.65,
-                label=f"Incident on Lyot Stop (⟨{float(np.mean(f_pre_inst)):.2f}%⟩)",
+                label=f"Incident on Lyot Stop (mean {float(np.mean(f_pre_inst)):.2f}%)",
             )
             ax_ts.plot(
                 t_v,
@@ -5276,7 +6426,7 @@ if (
                 color="#0284c7",
                 lw=1.05,
                 alpha=0.72,
-                label=f"Reflected into b_lowfs (⟨{float(np.mean(f_lo_inst)):.2f}%⟩)",
+                label=f"Reflected into b_lowfs (mean {float(np.mean(f_lo_inst)):.2f}%)",
             )
             ax_ts.plot(
                 t_v,
@@ -5284,7 +6434,7 @@ if (
                 color="#10b981",
                 lw=1.15,
                 alpha=0.78,
-                label=f"Reaching LOWFS FOV inst (⟨{float(np.mean(f_cam_inst)):.2f}%⟩)",
+                label=f"Reaching LOWFS FOV inst (mean {float(np.mean(f_cam_inst)):.2f}%)",
             )
             ax_ts.plot(
                 t_v,
@@ -5300,7 +6450,7 @@ if (
                 lw=1.4,
                 label=f"DL Floor LOWFS FOV ({dl_cam_pct:.2f}%, turb=0)",
             )
-            y_hi = max(22.0, float(np.percentile(f_pre_inst, 99.5)) * 1.25)
+            y_hi = max(22.0, float(np.percentile(f_pre_inst, 99.5)) * 1.45)
             ax_ts.set_xlim(float(t_v[0]), max(float(t_v[-1]), 0.05))
             ax_ts.set_ylim(0.0, y_hi)
             sec_y = ax_ts.secondary_yaxis(
@@ -5470,10 +6620,11 @@ if (
                 alpha=0.78,
                 label=f"{pr_lbl} ({st_pc.get('quad_pfres_rms', 0)*1e3:.1f} nm)",
             )
+        ax_r_bot = None
         if os.path.exists(mx_p):
             v_mx = np.load(mx_p)
-            ax_r = ax_bot.twinx()
-            ax_r.plot(
+            ax_r_bot = ax_bot.twinx()
+            ax_r_bot.plot(
                 modes[: len(v_mx)],
                 v_mx,
                 color="#475569",
@@ -5481,9 +6632,12 @@ if (
                 ls="--",
                 label="Applied PF Mix",
             )
-            ax_r.set_ylim(0.0, 1.05)
-            ax_r.set_ylabel("PF Mixing Weight", fontsize=8.8, color="#475569")
+            ax_r_bot.set_ylim(0.0, 1.32)
+            ax_r_bot.set_yticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+            ax_r_bot.set_ylabel("PF Mixing Weight", fontsize=8.8, color="#475569")
         ax_bot.set_xlim(0, max(1, n_m - 1))
+        _yb_lo, _yb_hi = ax_bot.get_ylim()
+        ax_bot.set_ylim(_yb_lo, _yb_hi * 3.4)
         ax_bot.set_title(
             f"{stg_lbl} — PSOL vs Closed-Loop Modal RMS Spectrum",
             fontsize=10.2,
@@ -5492,7 +6646,11 @@ if (
         ax_bot.set_xlabel("Modal Index")
         ax_bot.set_ylabel("Modal Amplitude RMS [nm]")
         ax_bot.grid(True, which="both", alpha=0.28)
-        ax_bot.legend(loc="upper right", fontsize=7.8, framealpha=0.9)
+        _hb, _lb = ax_bot.get_legend_handles_labels()
+        if ax_r_bot is not None:
+            _hr, _lr = ax_r_bot.get_legend_handles_labels()
+            _hb, _lb = _hb + _hr, _lb + _lr
+        ax_bot.legend(_hb, _lb, loc="upper right", fontsize=7.5, ncol=2, framealpha=0.92)
 
     figpc.savefig(os.path.join(out_dir, "predictive_control_summary_2x2.png"), dpi=180)
     plt.close(figpc)
@@ -5642,10 +6800,10 @@ if (
     ax10.set_ylabel(f"Output Mode Index (0..{kshow - 1})")
     geom_note = ""
     if "geom_col_cos_med" in c2d_plot:
-        geom_note = f" | DM2→DM1 Geom Cos = {float(c2d_plot['geom_col_cos_med']):.3f}"
+        geom_note = f"\nDM2→DM1 Geom Cos = {float(c2d_plot['geom_col_cos_med']):.3f}"
     ax10.set_title(
         f"Calibrated Response Matrices (Normalized |M|, top {kshow} modes){geom_note}",
-        fontsize=9.8,
+        fontsize=9.6,
         fontweight="bold",
     )
     fig2w.colorbar(im10, ax=ax10, fraction=0.032, pad=0.02, label="Relative |M|")
@@ -5682,7 +6840,7 @@ if (
     )
     ax11.axhline(0.0, color="#64748b", lw=0.8, ls=":")
     ax11.set_xlim(0, max(1, n_ov - 1))
-    ax11.set_ylim(-0.15, 1.05)
+    ax11.set_ylim(-0.15, 1.08)
     ax11.set_xlabel("Modal Index")
     ax11.set_ylabel("Held-Out Temporal CV R²")
     ax11.set_title(
@@ -5692,7 +6850,7 @@ if (
         fontweight="bold",
     )
     ax11.grid(True, alpha=0.28)
-    ax11.legend(loc="lower right", fontsize=7.8, framealpha=0.92)
+    ax11.legend(loc="upper right", fontsize=7.8, framealpha=0.92)
 
     fig2w.savefig(os.path.join(out_dir, "calib_2wfs1dm_summary_2x2.png"), dpi=180)
     plt.close(fig2w)
@@ -5753,13 +6911,13 @@ if (
             nrows_e,
             3,
             figure=fig3d,
-            width_ratios=[1.18, 1.02, 0.96],
+            width_ratios=[1.24, 1.02, 0.96],
             hspace=0.35,
-            wspace=0.28,
+            wspace=0.36,
             top=0.89,
             bottom=0.06,
-            left=0.04,
-            right=0.96,
+            left=0.03,
+            right=0.97,
         )
         fig3d.suptitle(
             f"Subaru {tel_d:.2f} m AO3k + SCExAO — 3D Modal Predictive Matrix "
@@ -5816,7 +6974,7 @@ if (
                 pan.set_edgecolor("#cbd5e1")
             ax3d.set_xlabel("Input Mode j", fontsize=8.5, labelpad=4)
             ax3d.set_ylabel("Output Mode i", fontsize=8.5, labelpad=4)
-            ax3d.set_zlabel("Lag k [fr]", fontsize=8.5, labelpad=4)
+            ax3d.set_zlabel("Lag k [fr]", fontsize=8.5, labelpad=6)
             ax3d.tick_params(labelsize=7.5)
             dt_ms = 1000.0 / rate_hz
             ax3d.set_title(
@@ -5829,7 +6987,7 @@ if (
             )
             sm3 = ScalarMappable(norm=norm3, cmap=cmap3)
             sm3.set_array([])
-            cb3 = fig3d.colorbar(sm3, ax=ax3d, fraction=0.036, pad=0.07, shrink=0.78)
+            cb3 = fig3d.colorbar(sm3, ax=ax3d, fraction=0.032, pad=0.13, shrink=0.72)
             cb3.ax.tick_params(labelsize=7.5)
             cb3.set_label("F[i, k, j]", fontsize=8.2)
 
@@ -5915,7 +7073,8 @@ if (
             ax_lag.bar(xk + 0.18, lo_pcts, width=0.35, color="#059669", label="Off-Diag % in Lag")
             ax_lag.set_xticks(xk)
             ax_lag.set_xlim(-0.6, max(0.6, len(xk) - 0.4))
-            ax_lag.set_ylim(0.0, 108.0)
+            ax_lag.set_ylim(0.0, 124.0)
+            ax_lag.set_yticks([0, 20, 40, 60, 80, 100])
             ax_lag.set_xlabel("Lookback Lag k [frames]", fontsize=8.0)
             ax_lag.set_ylabel("Share [%]", fontsize=8.0)
             ax_lag.tick_params(labelsize=7.5)
@@ -5940,7 +7099,7 @@ if (
         figsl, axessl = plt.subplots(
             n_rows_s,
             n_cols_s,
-            figsize=(max(9.0, 2.25 * n_cols_s + 1.2), 3.1 * n_rows_s + 0.9),
+            figsize=(max(9.0, 2.25 * n_cols_s + 1.2), 2.75 * n_rows_s + 0.85),
             squeeze=False,
             constrained_layout=True,
         )
@@ -6060,6 +7219,8 @@ if isinstance(pyrwfs_tlm, dict) and pyrwfs_tlm.get("stages") and (
         ax00.set_xticks(_zx)
         ax00.set_xticklabels(_zlabels, fontsize=8.4)
         ax00.set_ylabel("Fraction of Net Camera Flux [%]", fontsize=8.8)
+        _y00_lo, _y00_hi = ax00.get_ylim()
+        ax00.set_ylim(0.0, _y00_hi * 1.18)
         ax00.set_title("Packed-Zone Flux Budget: Flat-WF Ref vs. Closed-Loop", fontsize=9.8, fontweight="bold")
         ax00.grid(axis="y", alpha=0.25)
         ax00.legend(loc="upper right", fontsize=7.6, ncol=2, framealpha=0.9)
@@ -6086,9 +7247,13 @@ if isinstance(pyrwfs_tlm, dict) and pyrwfs_tlm.get("stages") and (
         ax01.set_xlabel("Physical Time [s]", fontsize=8.8)
         ax01.set_ylabel("Δf_pup = f_pup − f_pup0 [%]", fontsize=8.8)
         ax01_r.set_ylabel("True Residual WFE [nm RMS]", fontsize=8.6, color="#475569")
+        _yl01_lo, _yl01_hi = ax01.get_ylim()
+        ax01.set_ylim(_yl01_lo, _yl01_hi + 0.30 * max(_yl01_hi - _yl01_lo, 2.0))
+        _yr01_lo, _yr01_hi = ax01_r.get_ylim()
+        ax01_r.set_ylim(_yr01_lo, _yr01_hi + 0.30 * max(_yr01_hi - _yr01_lo, 50.0))
         ax01.set_title("Defocus-Invariant Flux Shift Δf_pup(t) vs. True WFE", fontsize=9.8, fontweight="bold")
         ax01.grid(alpha=0.25)
-        ax01.legend(_lns01, [l.get_label() for l in _lns01], loc="upper right", fontsize=7.3, framealpha=0.88)
+        ax01.legend(_lns01, [l.get_label() for l in _lns01], loc="upper right", fontsize=7.2, ncol=2, framealpha=0.92)
 
         # (1,0): Scatter df_pup vs 1 - S_Mar(lambda_WFS)
         ax10 = axp[1, 0]
@@ -6144,9 +7309,13 @@ if isinstance(pyrwfs_tlm, dict) and pyrwfs_tlm.get("stages") and (
         ax11.set_xlabel("Physical Time [s]", fontsize=8.8)
         ax11.set_ylabel("Bridge Anisotropy", fontsize=8.8)
         ax11_r.set_ylabel("Even-Mode Nonlinearity Ratio", fontsize=8.6, color="#475569")
+        _yl11_lo, _yl11_hi = ax11.get_ylim()
+        ax11.set_ylim(_yl11_lo, _yl11_hi + 0.30 * max(_yl11_hi - _yl11_lo, 0.1))
+        _yr11_lo, _yr11_hi = ax11_r.get_ylim()
+        ax11_r.set_ylim(_yr11_lo, _yr11_hi + 0.30 * max(_yr11_hi - _yr11_lo, 0.1))
         ax11.set_title("Diffraction Bridge Anisotropy & Even-Mode Nonlinearity", fontsize=9.8, fontweight="bold")
         ax11.grid(alpha=0.25)
-        ax11.legend(_lns11, [l.get_label() for l in _lns11], loc="upper right", fontsize=7.2, framealpha=0.88)
+        ax11.legend(_lns11, [l.get_label() for l in _lns11], loc="upper right", fontsize=7.1, ncol=2, framealpha=0.92)
 
         figp.savefig(os.path.join(out_dir, "pyrwfs_flux_strehl_2x2.png"), dpi=180)
         plt.close(figp)
@@ -6173,10 +7342,13 @@ if isinstance(pyrwfs_tlm, dict) and pyrwfs_tlm.get("stages") and (
         ax00.set_xlabel("Physical Time [s]", fontsize=8.8)
         ax00.set_ylabel("Pupil Shift [pix]", fontsize=8.8)
         ax00_r.set_ylabel("Min 4-Pupil Edge ZNCC", fontsize=8.4, color="#475569")
-        ax00_r.set_ylim(0.0, 1.08)
+        _yl00_lo, _yl00_hi = ax00.get_ylim()
+        ax00.set_ylim(_yl00_lo, _yl00_hi + 0.34 * max(_yl00_hi - _yl00_lo, 0.1))
+        ax00_r.set_ylim(0.0, 1.40)
+        ax00_r.set_yticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
         ax00.set_title("Edge-Based 6-DOF Pupil Registration Drift & Confidence", fontsize=9.8, fontweight="bold")
         ax00.grid(alpha=0.25)
-        ax00.legend(_lns00, [l.get_label() for l in _lns00], loc="lower left", fontsize=6.8, ncol=2, framealpha=0.88)
+        ax00.legend(_lns00, [l.get_label() for l in _lns00], loc="upper center", fontsize=6.8, ncol=4, framealpha=0.92)
 
         # (0,1): Quad-cell centering & TT jitter RMS
         ax01 = axa[0, 1]
@@ -6189,25 +7361,38 @@ if isinstance(pyrwfs_tlm, dict) and pyrwfs_tlm.get("stages") and (
         ax01.axhline(0.0, color="#64748b", ls=":", lw=0.8)
         ax01.set_xlabel("Physical Time [s]", fontsize=8.8)
         ax01.set_ylabel("Quad-Cell Signal (Normalized)", fontsize=8.8)
+        _yl01a_lo, _yl01a_hi = ax01.get_ylim()
+        ax01.set_ylim(_yl01a_lo, _yl01a_hi + 0.34 * max(_yl01a_hi - _yl01a_lo, 0.05))
         ax01.set_title("Quad-Cell Tip/Tilt Centering & High-Freq Jitter RMS", fontsize=9.8, fontweight="bold")
         ax01.grid(alpha=0.25)
-        ax01.legend(loc="upper right", fontsize=7.2, ncol=2, framealpha=0.88)
+        ax01.legend(loc="upper right", fontsize=7.2, ncol=2, framealpha=0.92)
 
-        # (1,0): Scintillation index & Slope Curl/Div ratio
+        # (1,0): Scintillation index (raw + noise-debiased) & Slope Curl/Div ratio
         ax10 = axa[1, 0]
         ax10_r = ax10.twinx()
         _lns10 = []
         for _si, _sk, _scol, _sd, _arr, _xc in _pstgs:
             _t = _arr[:, _pidx["t_phys_s"]]
-            _l1, = ax10.plot(_t, _arr[:, _pidx["scint_idx"]], color=_scol, lw=1.15, label=f"Stg{_si} Scint Index")
-            _l2, = ax10_r.plot(_t, _arr[:, _pidx["curl_ratio"]], color=_scol, lw=1.0, ls="--", alpha=0.72, label=f"Stg{_si} Curl/Div")
-            _lns10.extend([_l1, _l2])
+            _l1, = ax10.plot(_t, _arr[:, _pidx["scint_idx"]], color=_scol, lw=1.0, alpha=0.55, label=f"Stg{_si} Scint (raw)")
+            _lns10.append(_l1)
+            if "scint_debias" in _pidx:
+                _sdb = _arr[:, _pidx["scint_debias"]]
+                if np.any(np.isfinite(_sdb)):
+                    _l1d, = ax10.plot(_t, _sdb, color=_scol, lw=1.45, label=f"Stg{_si} Scint (debiased)")
+                    _lns10.append(_l1d)
+            _l2, = ax10_r.plot(_t, _arr[:, _pidx["curl_ratio"]], color=_scol, lw=0.95, ls="--", alpha=0.72, label=f"Stg{_si} Curl/Div")
+            _lns10.append(_l2)
+        ax10.axhline(0.0, color="#64748b", ls=":", lw=0.75, alpha=0.55)
         ax10.set_xlabel("Physical Time [s]", fontsize=8.8)
         ax10.set_ylabel("Pupil Scintillation Index σ²/Ī²", fontsize=8.8)
         ax10_r.set_ylabel("Slope Curl / Divergence RMS", fontsize=8.6, color="#475569")
-        ax10.set_title("Pupil-Plane Scintillation & Non-Conservative Slope Curl", fontsize=9.8, fontweight="bold")
+        _yl10_lo, _yl10_hi = ax10.get_ylim()
+        ax10.set_ylim(_yl10_lo, _yl10_hi + 0.34 * max(_yl10_hi - _yl10_lo, 0.01))
+        _yr10_lo, _yr10_hi = ax10_r.get_ylim()
+        ax10_r.set_ylim(_yr10_lo, _yr10_hi + 0.34 * max(_yr10_hi - _yr10_lo, 0.05))
+        ax10.set_title("Pupil Scintillation (Raw vs. Noise-Debiased) & Slope Curl", fontsize=9.8, fontweight="bold")
         ax10.grid(alpha=0.25)
-        ax10.legend(_lns10, [l.get_label() for l in _lns10], loc="upper right", fontsize=7.4, framealpha=0.88)
+        ax10.legend(_lns10, [l.get_label() for l in _lns10], loc="upper right", fontsize=6.9, ncol=2, framealpha=0.92)
 
         # (1,1): Spider LWE / Petaling Metric vs True Thermal Petaling
         ax11 = axa[1, 1]
@@ -6219,6 +7404,7 @@ if isinstance(pyrwfs_tlm, dict) and pyrwfs_tlm.get("stages") and (
             _r_s = f" (r={_r_lw:+.2f})" if _r_lw is not None else ""
             _l1, = ax11.plot(_t, _arr[:, _pidx["lwe_metric"]], color=_scol, lw=1.2, label=f"Stg{_si} Spider LWE{_r_s}")
             _lns11.append(_l1)
+        ax11_r = None
         if os.path.isfile(_pert_p):
             _pm = np.load(_pert_p)
             if _pm.ndim == 2 and _pm.shape[1] >= 12 and float(np.max(_pm[:, 10])) > 1e-2:
@@ -6228,9 +7414,14 @@ if isinstance(pyrwfs_tlm, dict) and pyrwfs_tlm.get("stages") and (
                 _lns11.append(_lp)
         ax11.set_xlabel("Physical Time [s]", fontsize=8.8)
         ax11.set_ylabel("Spider-Flanking LWE Metric", fontsize=8.8)
+        _yl11a_lo, _yl11a_hi = ax11.get_ylim()
+        ax11.set_ylim(_yl11a_lo, _yl11a_hi + 0.30 * max(_yl11a_hi - _yl11a_lo, 0.05))
+        if ax11_r is not None:
+            _yr11a_lo, _yr11a_hi = ax11_r.get_ylim()
+            ax11_r.set_ylim(_yr11a_lo, _yr11a_hi + 0.30 * max(_yr11a_hi - _yr11a_lo, 50.0))
         ax11.set_title("Spider-Flanking LWE / Petaling Telemetry vs. Ground Truth", fontsize=9.8, fontweight="bold")
         ax11.grid(alpha=0.25)
-        ax11.legend(_lns11, [l.get_label() for l in _lns11], loc="upper right", fontsize=7.4, framealpha=0.88)
+        ax11.legend(_lns11, [l.get_label() for l in _lns11], loc="upper right", fontsize=7.3, ncol=2 if len(_lns11) >= 3 else 1, framealpha=0.92)
 
         figa.savefig(os.path.join(out_dir, "pyrwfs_align_jitter_2x2.png"), dpi=180)
         plt.close(figa)
@@ -6303,23 +7494,33 @@ if isinstance(pyrwfs_tlm, dict) and pyrwfs_tlm.get("stages") and (
             ax1.set_xlabel("u [pix]", fontsize=7.8)
             ax1.tick_params(labelsize=7.0)
 
-            # Col 2: Scintillation Map (masked to illuminated pupil interior)
+            # Col 2: Scintillation Map (prefer noise-debiased map when available)
             ax2 = axesm[_ri, 2]
-            if os.path.isfile(_sci_p):
-                _sci = np.load(_sci_p).astype(np.float64)
+            _scid_p = os.path.join(out_dir, f"pyrwfs_map_scint_debias_stg{_si}.npy")
+            _wf_sd = _sd.get("wavefront") or {}
+            _has_deb_map = os.path.isfile(_scid_p)
+            _use_sci_p = _scid_p if _has_deb_map else _sci_p
+            if os.path.isfile(_use_sci_p):
+                _sci = np.load(_use_sci_p).astype(np.float64)
                 _sci_disp = np.where(_pup_mask, _sci, np.nan) if _pup_mask is not None else _sci
                 _fin2 = _sci_disp[np.isfinite(_sci_disp)]
-                _v2 = max(float(np.percentile(_fin2, 98.0)) if _fin2.size > 0 else 0.1, 1e-3)
+                _v2 = max(float(np.percentile(_fin2, 98.0)) if _fin2.size > 0 else 0.05, 1e-3)
                 _cm2 = plt.get_cmap("magma").copy()
                 _cm2.set_bad(color="#e2e8f0")
                 _im2 = ax2.imshow(np.clip(_sci_disp, 0.0, _v2), origin="lower", cmap=_cm2, vmin=0.0, vmax=_v2)
                 figm.colorbar(_im2, ax=ax2, fraction=0.046, pad=0.03)
             else:
                 ax2.text(0.5, 0.5, "No Scint FITS", ha="center", va="center", transform=ax2.transAxes)
-            ax2.set_title(
-                f"Scintillation σ²/Ī² (mean={float((_sd.get('wavefront') or {}).get('scint_idx_mean', 0.0)):.3f})",
-                fontsize=8.8, fontweight="bold",
-            )
+            if _wf_sd.get("scint_debias_mean") is not None:
+                ax2.set_title(
+                    f"Scintillation Debiased σ²/Ī²\ndeb={float(_wf_sd['scint_debias_mean']):.4f} (raw={float(_wf_sd.get('scint_idx_mean', 0.0)):.4f})",
+                    fontsize=8.5, fontweight="bold",
+                )
+            else:
+                ax2.set_title(
+                    f"Scintillation σ²/Ī² (mean={float(_wf_sd.get('scint_idx_mean', 0.0)):.3f})",
+                    fontsize=8.8, fontweight="bold",
+                )
             ax2.set_xlabel("u [pix]", fontsize=7.8)
             ax2.tick_params(labelsize=7.0)
 
@@ -6349,6 +7550,759 @@ if isinstance(pyrwfs_tlm, dict) and pyrwfs_tlm.get("stages") and (
 
         figm.savefig(os.path.join(out_dir, "pyrwfs_pupil_maps_2x4.png"), dpi=180)
         plt.close(figm)
+
+adc_d = data.get("adc_dispersion")
+if _want_plot(24) and isinstance(adc_d, dict) and adc_d.get("curves"):
+    _acfg = adc_d.get("config", {})
+    _ast = adc_d.get("state", {})
+    _abnd = adc_d.get("bands", {})
+    _acrv = adc_d.get("curves", {})
+    _ashr = adc_d.get("chrom_shear", {})
+    _lam = np.asarray(_acrv["lambda_um"], dtype=float)
+    _atm = np.asarray(_acrv["atm_mas"], dtype=float)
+    _adc = np.asarray(_acrv["adc_mas"], dtype=float)
+    _rpar = np.asarray(_acrv["res_par_mas"], dtype=float)
+    _rperp = np.asarray(_acrv["res_perp_mas"], dtype=float)
+    _rtot = np.hypot(_rpar, _rperp)
+
+    fig_a, axes_a = plt.subplots(1, 3, figsize=(16.8, 5.4), constrained_layout=True)
+    _dep_lbl = (
+        f"ADC {_acfg.get('mode', 'lut').upper()} ({_acfg.get('preset', 'ao188')}, "
+        f"opt={_acfg.get('opt_band', 'whole')}, ψ={_ast.get('psi_deg', 0.0):.1f}°)"
+        if _acfg.get("deployed")
+        else "ADC RETRACTED (Uncorrected Sky Dispersion)"
+    )
+    fig_a.suptitle(
+        f"Maunakea Atmospheric Dispersion & Subaru AO188 ADC — "
+        f"z = {_acfg.get('zenith_deg', 0.0):.1f}°, PA = {_acfg.get('disp_pa_deg', 0.0):.1f}° "
+        f"({_acfg.get('imr_mode', 'pupil_track')}) | {_dep_lbl}",
+        fontsize=11.8,
+        fontweight="bold",
+    )
+
+    _bshade = [
+        (0.675, 0.825, "#3b82f6", "Vis"),
+        (1.130, 1.310, "#d97706", "J"),
+        (1.500, 1.780, "#dc2626", "H"),
+        (2.030, 2.370, "#7c3aed", "K"),
+    ]
+
+    # Panel 1: Full broadband atmospheric vs ADC vs residual curve
+    ax0 = axes_a[0]
+    for _l0, _l1, _col, _lbl in _bshade:
+        ax0.axvspan(_l0, _l1, color=_col, alpha=0.10)
+    ax0.axhline(0.0, color="#94a3b8", lw=0.9, ls="--")
+    ax0.plot(_lam, _atm, color="#dc2626", lw=2.2, label="Atmosphere (Pre-ADC)")
+    if _acfg.get("deployed"):
+        ax0.plot(_lam, -_adc, color="#2563eb", lw=1.9, ls="--", label="−AO188 ADC Curve")
+    ax0.plot(_lam, _rpar, color="#059669", lw=2.3, label="Post-ADC Residual (∥)")
+    if float(np.max(np.abs(_rperp))) > 0.2:
+        ax0.plot(_lam, _rperp, color="#9333ea", lw=1.6, ls=":", label="Post-ADC Residual (⊥ PA err)")
+    ax0.set_xlim(0.45, 2.40)
+    ax0.set_xlabel("Wavelength λ [µm]", fontsize=9.8)
+    ax0.set_ylabel(
+        f"Differential Sky Dispersion [mas] (ref {_acfg.get('ref_lam_um', 1.65):.2f} µm)",
+        fontsize=9.6,
+    )
+    ax0.set_title("Broadband Dispersion Balance (0.45–2.40 µm)", fontsize=10.4, fontweight="bold")
+    ax0.grid(True, alpha=0.28)
+    ax0.legend(loc="upper right", fontsize=8.1, framealpha=0.92)
+
+    # Panel 2: Zoomed Post-ADC residual vs diffraction scales
+    ax1 = axes_a[1]
+    _m_z = (_lam >= 0.60) & (_lam <= 2.38)
+    for _l0, _l1, _col, _lbl in _bshade:
+        ax1.axvspan(_l0, _l1, color=_col, alpha=0.10)
+        ax1.text(
+            0.5 * (_l0 + _l1),
+            0.96,
+            _lbl,
+            transform=ax1.get_xaxis_transform(),
+            ha="center",
+            va="top",
+            fontsize=8.3,
+            fontweight="bold",
+            color=_col,
+        )
+    ax1.axhline(0.0, color="#64748b", lw=0.9, ls="--")
+    ax1.plot(_lam[_m_z], _rpar[_m_z], color="#059669", lw=2.2, label="Residual ∥ [mas]")
+    if float(np.max(np.abs(_rperp[_m_z]))) > 0.15:
+        ax1.plot(_lam[_m_z], _rperp[_m_z], color="#9333ea", lw=1.7, ls=":", label="Residual ⊥ [mas]")
+        ax1.plot(_lam[_m_z], _rtot[_m_z], color="#0f172a", lw=1.4, ls="-.", label="|Residual| [mas]")
+    _ld_vis = float((_abnd.get("vis") or {}).get("ld_mas", 19.5))
+    _ld_h = float((_abnd.get("h") or {}).get("ld_mas", 42.8))
+    ax1.axhspan(-0.5 * _ld_vis, 0.5 * _ld_vis, color="#0ea5e9", alpha=0.07, label=f"±0.5 λ/D @ Vis (±{0.5*_ld_vis:.1f} mas)")
+    ax1.set_xlim(0.60, 2.38)
+    _ymax_z = max(float(np.max(np.abs(_rpar[_m_z]))), float(np.max(np.abs(_rperp[_m_z]))), 5.0)
+    ax1.set_ylim(-1.18 * _ymax_z, 1.18 * _ymax_z)
+    ax1.set_xlabel("Wavelength λ [µm]", fontsize=9.8)
+    ax1.set_ylabel("Post-ADC Residual Dispersion [mas]", fontsize=9.6)
+    ax1.set_title("Residual Chromatic Shift vs Diffraction Scale", fontsize=10.4, fontweight="bold")
+    ax1.grid(True, alpha=0.28)
+    ax1.legend(loc="lower right", fontsize=7.9, framealpha=0.92)
+
+    # Panel 3: Band dispersion spans (Pre-ADC vs Post-ADC) + telemetry summary box
+    ax2 = axes_a[2]
+    _bkeys = [("vis", "Vis\n0.75µm"), ("j", "J\n1.22µm"), ("h", "H\n1.65µm"), ("vis_to_h", "Vis–H\nShift")]
+    _x = np.arange(len(_bkeys))
+    _w = 0.36
+    _v_atm = [float((_abnd.get(k) or {}).get("atm_mas", 0.0)) for k, _ in _bkeys]
+    _v_res = [float((_abnd.get(k) or {}).get("res_mas", 0.0)) for k, _ in _bkeys]
+    _b1 = ax2.bar(_x - 0.5 * _w, _v_atm, width=_w, color="#ef4444", alpha=0.82, label="Pre-ADC (Sky)")
+    _b2 = ax2.bar(_x + 0.5 * _w, _v_res, width=_w, color="#10b981", alpha=0.88, label="Post-ADC")
+    ax2.set_yscale("log")
+    _y_top = max(max(_v_atm + _v_res + [1.0]) * 40.0, 200.0)
+    ax2.set_ylim(0.1, _y_top)
+    for _bars in (_b1, _b2):
+        for _bar in _bars:
+            _h = _bar.get_height()
+            if _h >= 0.05:
+                ax2.text(
+                    _bar.get_x() + 0.5 * _bar.get_width(),
+                    _h * 1.15,
+                    f"{_h:.1f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7.6,
+                    fontweight="bold",
+                )
+    ax2.set_xticks(_x)
+    ax2.set_xticklabels([lbl for _, lbl in _bkeys], fontsize=8.8)
+    ax2.set_ylabel("Dispersion Span / Shift [mas] (log)", fontsize=9.6)
+    ax2.set_title("Band-Integrated Dispersion & AO188 Telemetry", fontsize=10.4, fontweight="bold")
+    ax2.grid(True, axis="y", which="both", alpha=0.25)
+    ax2.legend(loc="upper left", fontsize=8.1, framealpha=0.92)
+    _vtt = adc_d.get("vis_pyrwfs_ttm") if isinstance(adc_d.get("vis_pyrwfs_ttm"), dict) else None
+    _vtt_line = (
+        f"\nVis-TTM ({_vtt.get('mode', 'closed')}): "
+        f"({float(_vtt.get('cmd_x_mas', 0.0)):+.1f}, {float(_vtt.get('cmd_y_mas', 0.0)):+.1f}) mas"
+        if _vtt is not None
+        else ""
+    )
+    _tlm_txt = (
+        f"θ₁={_ast.get('theta1_deg', 0.0):+.2f}°  θ₂={_ast.get('theta2_deg', 0.0):+.2f}°  ψ={_ast.get('psi_deg', 0.0):.2f}°\n"
+        f"P={_acfg.get('pressure_hpa', 615.0):.0f} hPa  T={_acfg.get('temp_c', 2.0):.1f}°C  RH={_acfg.get('rh_pct', 20.0):.0f}%\n"
+        f"LUT err: sc={_acfg.get('lut_scale_err', 0.0)*100:+.1f}%, PA={_acfg.get('lut_pa_err_deg', 0.0):+.1f}° | {_acfg.get('mech', 'ideal')}\n"
+        f"ChromTurb: {'ON' if _ashr.get('enabled') else 'OFF'} (Δr_16km={_ashr.get('max_layer_shear_cm', 0.0):.1f} cm)"
+        f"{_vtt_line}"
+    )
+    ax2.text(
+        0.97,
+        0.97,
+        _tlm_txt,
+        transform=ax2.transAxes,
+        fontsize=7.0,
+        family="monospace",
+        va="top",
+        ha="right",
+        bbox=dict(boxstyle="round,pad=0.30", facecolor="#f8fafc", edgecolor="#94a3b8", alpha=0.92),
+    )
+
+    fig_a.savefig(os.path.join(out_dir, "adc_dispersion_summary.png"), dpi=180)
+    plt.close(fig_a)
+
+petal_d = data.get("petal_ctrl")
+if _want_plot(25) and isinstance(petal_d, dict) and petal_d.get("enabled"):
+    _ema_p = os.path.join(out_dir, "petal_ema_ts.npy")
+    _cmd_p = os.path.join(out_dir, "petal_cmd_waves.npy")
+    _res_p = os.path.join(out_dir, "petal_res_opd_ts.npy")
+    _dm6_p = os.path.join(out_dir, "petal_dm06.npy")
+    _pert_p = os.path.join(out_dir, "ts_perturb_plot.npy")
+    _wf_p = os.path.join(out_dir, "ts_wf_plot.npy")
+    _cmeta = petal_d.get("calib_meta") or {}
+    _peq_um = float(_cmeta.get("p_eq_um", 1.2054))
+    _peq_nm = _peq_um * 1000.0
+    _csep = float(_cmeta.get("chrom_sep", 0.0))
+    _wcorr = float(_cmeta.get("wfsref_corr", 0.0))
+    _th_ev = float(petal_d.get("th_even", 0.58))
+    _th_sg = float(petal_d.get("th_sign", 0.35))
+    _th_adj = float(petal_d.get("th_adj", 0.85))
+    _waves = petal_d.get("waves_enws") or [0, 0, 0, 0]
+    _n_jmp = int(petal_d.get("n_jumps", 0))
+    _n_abt = int(petal_d.get("n_aborts", 0))
+    _n_rbk = int(petal_d.get("n_rollbacks", 0))
+    _use_sg = int(petal_d.get("use_sign", 1))
+    _mode_lbl = (
+        f"Fused-Silica Chromatic Sign (chrom_sep={_csep:+.3f})"
+        if _use_sg
+        else "Even-Only Trial-and-Verify"
+    )
+    _status_lbl = (
+        "0 CORRECTIONS TRIGGERED (Phased Lock)"
+        if _n_jmp == 0
+        else f"{_n_jmp} CORRECTION{'S' if _n_jmp != 1 else ''} APPLIED (aborts={_n_abt}, rollbacks={_n_rbk})"
+    )
+    _p_cols = ("#2563eb", "#16a34a", "#dc2626", "#9333ea")
+    _p_names = ("East (E)", "North (N)", "West (W)", "South (S)")
+    _t_max = max(phys_t_top, 0.1)
+
+    fig_pc, ax_pc = plt.subplots(3, 2, figsize=(14.6, 11.4), constrained_layout=True)
+    fig_pc.suptitle(
+        f"Subaru {tel_d:.2f} m AO3k — Stage-1 Passive Petal-Unwrap Control: Measurements & Corrections (petal-1 → dm01disp06)\n"
+        f"{_mode_lbl} | p_eq={_peq_um:.3f} µm | {_status_lbl} | "
+        f"Waves(E,N,W,S)=({int(_waves[0]):+d},{int(_waves[1]):+d},{int(_waves[2]):+d},{int(_waves[3]):+d})",
+        fontsize=10.6,
+        fontweight="bold",
+    )
+
+    _jump_ts = []
+    _jevts = petal_d.get("jump_events") or []
+    if _jevts:
+        _jump_ts = [
+            _t_max * float(ev["frame"]) / max(float(ev.get("n_frames", 10000) - 1), 1.0)
+            for ev in _jevts
+        ]
+    elif os.path.isfile(_ema_p):
+        _ema_tmp = np.load(_ema_p)
+        _n_tmp = max(_ema_tmp.shape[0] - 1, 1)
+        _jump_ts = [_t_max * float(j) / float(_n_tmp) for j in (petal_d.get("jump_frames_in_science") or [])]
+
+    _inj_spec = str(petal_d.get("test_inject") or "").strip()
+    _inj_t = None
+    _inj_lbl = ""
+    if _inj_spec and ":" in _inj_spec:
+        try:
+            _ipw = _inj_spec.split("@")[0]
+            _it_s = _inj_spec.split("@")[1] if "@" in _inj_spec else "0.0"
+            _ip_i = int(_ipw.split(":")[0])
+            _iw_f = float(_ipw.split(":")[1])
+            _inj_t = float(_it_s)
+            _p_short = ("E", "N", "W", "S")[_ip_i] if 0 <= _ip_i < 4 else f"P{_ip_i}"
+            _inj_lbl = f"Injected {_p_short} {_iw_f:+g}λ @ {_inj_t:.1f}s"
+        except Exception:
+            _inj_t = None
+
+    # --- ROW 1: PASSIVE PYWFS1 MEASUREMENTS ---
+    if os.path.isfile(_ema_p):
+        _ema = np.load(_ema_p)
+        _t_ema = np.linspace(0.0, _t_max, _ema.shape[0])
+
+        ax00 = ax_pc[0, 0]
+        ax00.axhspan(-_th_ev, _th_ev, color="#10b981", alpha=0.09, label=f"No-trigger deadband (±{_th_ev:.2f} λ)")
+        ax00.axhline(_th_ev, color="#dc2626", lw=0.95, ls="--", alpha=0.80, label=f"±th_even (±{_th_ev:.2f} λ)")
+        ax00.axhline(-_th_ev, color="#dc2626", lw=0.95, ls="--", alpha=0.80)
+        ax00.axhline(_th_adj, color="#7c3aed", lw=0.85, ls=":", alpha=0.75, label=f"±th_adj (±{_th_adj:.2f} λ)")
+        ax00.axhline(-_th_adj, color="#7c3aed", lw=0.85, ls=":", alpha=0.75)
+        ax00.axhline(0.0, color="#64748b", lw=0.7, alpha=0.45)
+        ax00.plot(_t_ema, _ema[:, 0], color="#2563eb", lw=1.45, label="ev_sn (S−N)")
+        ax00.plot(_t_ema, _ema[:, 1], color="#d97706", lw=1.35, label="ev_ew (E−W)")
+        ax00.plot(_t_ema, _ema[:, 2], color="#7c3aed", lw=1.25, alpha=0.90, label="ev_adj (Adj)")
+        if _inj_t is not None:
+            ax00.axvline(_inj_t, color="#dc2626", lw=1.35, ls="--", alpha=0.88, label=_inj_lbl)
+        for _ji, _jt in enumerate(_jump_ts):
+            ax00.axvline(_jt, color="#111827", lw=1.15, ls="-.", alpha=0.80, label="Correction Trigger" if _ji == 0 else None)
+        ax00.set_title("1. Measurement: Passive PyWFS1 Even Phase-Wrap Signal (EMA)", fontsize=10.1, fontweight="bold")
+        ax00.set_xlabel("Physical Time t [s]")
+        ax00.set_ylabel("Even Wrap Signal [λ_J waves]")
+        ax00.set_xlim(0.0, _t_max)
+        _y00 = max(float(np.max(np.abs(_ema[:, :3]))), _th_adj) * 1.18
+        ax00.set_ylim(-_y00, _y00 * 1.50)
+        ax00.grid(True, alpha=0.26)
+        ax00.legend(loc="upper right", fontsize=7.4, ncol=2, framealpha=0.92)
+
+        ax01 = ax_pc[0, 1]
+        ax01.axhspan(-_th_sg, _th_sg, color="#94a3b8", alpha=0.10)
+        ax01.axhline(_th_sg, color="#475569", lw=0.9, ls="--", alpha=0.78, label=f"±th_sign (±{_th_sg:.2f} λ)")
+        ax01.axhline(-_th_sg, color="#475569", lw=0.9, ls="--", alpha=0.78)
+        ax01.axhline(0.0, color="#64748b", lw=0.7, alpha=0.45)
+        for _pi in range(4):
+            ax01.plot(_t_ema, _ema[:, 3 + _pi], color=_p_cols[_pi], lw=1.35, label=f"sg_{_p_names[_pi][0].lower()} ({_p_names[_pi]})")
+        if _inj_t is not None:
+            ax01.axvline(_inj_t, color="#dc2626", lw=1.35, ls="--", alpha=0.88)
+        for _jt in _jump_ts:
+            ax01.axvline(_jt, color="#111827", lw=1.15, ls="-.", alpha=0.80)
+        ax01.set_title("2. Measurement: Fused-Silica Chromatic Odd Sign Signal (EMA)", fontsize=10.1, fontweight="bold")
+        ax01.set_xlabel("Physical Time t [s]")
+        ax01.set_ylabel("Chromatic Odd Sign [λ_J waves]")
+        ax01.set_xlim(0.0, _t_max)
+        _y01p_lo, _y01p_hi = ax01.get_ylim()
+        ax01.set_ylim(_y01p_lo, _y01p_hi + 0.28 * max(_y01p_hi - _y01p_lo, 0.5))
+        ax01.grid(True, alpha=0.26)
+        ax01.legend(loc="upper right", fontsize=7.6, ncol=2, framealpha=0.92)
+    else:
+        for _ax_m, _t_m in (
+            (ax_pc[0, 0], "1. Measurement: Even Phase-Wrap Signal"),
+            (ax_pc[0, 1], "2. Measurement: Chromatic Odd Sign Signal"),
+        ):
+            _ax_m.text(0.5, 0.5, "No aol1_petal_ema telemetry cube saved", ha="center", va="center", transform=_ax_m.transAxes)
+            _ax_m.set_title(_t_m, fontsize=10.1, fontweight="bold")
+
+    # --- ROW 2: CONTROLLER CORRECTIONS (TIME SERIES + FINAL DM1 MAP) ---
+    ax10 = ax_pc[1, 0]
+    if os.path.isfile(_cmd_p):
+        _cmd = np.load(_cmd_p)
+        _t_cmd = np.linspace(0.0, _t_max, _cmd.shape[0])
+    else:
+        _t_cmd = np.linspace(0.0, _t_max, 200)
+        _cmd = np.zeros((200, 4), dtype=np.float32)
+        for _pi in range(4):
+            _cmd[:, _pi] = float(_waves[_pi])
+
+    ax10.axhline(0.0, color="#64748b", lw=0.8, ls="-", alpha=0.45)
+    for _pi in range(4):
+        # Tiny vertical stagger only when overlapping at 0 so all 4 traces remain visually distinct
+        _off = (_pi - 1.5) * 0.015 if _n_jmp == 0 else 0.0
+        ax10.step(
+            _t_cmd,
+            _cmd[:, _pi] + _off,
+            where="post",
+            color=_p_cols[_pi],
+            lw=2.1,
+            alpha=0.92,
+            label=f"w_{_p_names[_pi][0]} ({_p_names[_pi]}: final {int(_waves[_pi]):+d}λ)",
+        )
+    _w_abs_max = max(float(np.max(np.abs(_cmd))), 1.0)
+    _yl_w = max(1.45, _w_abs_max + 0.55)
+    ax10.set_ylim(-_yl_w, _yl_w)
+    ax10.yaxis.set_major_locator(MaxNLocator(integer=True))
+    ax10_r = ax10.twinx()
+    ax10_r.set_ylim(-_yl_w * _peq_nm, _yl_w * _peq_nm)
+    ax10_r.set_ylabel("Applied Island Step OPD [nm]", color="#334155")
+    ax10.set_xlim(0.0, _t_max)
+    ax10.set_xlabel("Physical Time t [s]")
+    ax10.set_ylabel("Applied Unwrap Command [λ_J waves]")
+    ax10.set_title("3. Correction: Applied Petal-Unwrap Commands on dm01disp06 vs. Time", fontsize=10.1, fontweight="bold")
+    ax10.grid(True, alpha=0.28)
+    _leg10_loc = (
+        "lower right"
+        if (_n_jmp > 0 and float(np.max(_cmd)) >= abs(float(np.min(_cmd))))
+        else "upper right"
+    )
+    ax10.legend(loc=_leg10_loc, fontsize=7.6, ncol=2, framealpha=0.92)
+
+    if _inj_t is not None:
+        ax10.axvline(_inj_t, color="#dc2626", lw=1.35, ls="--", alpha=0.88)
+        _inj_y = _yl_w * 0.72 if _leg10_loc == "lower right" else -_yl_w * 0.78
+        ax10.text(
+            min(_inj_t + 0.14, _t_max * 0.68),
+            _inj_y,
+            _inj_lbl,
+            fontsize=7.6,
+            fontweight="bold",
+            color="#991b1b",
+            va="center",
+            zorder=7,
+            bbox=dict(boxstyle="round,pad=0.22", facecolor="#fee2e2", edgecolor="#dc2626", alpha=0.92),
+        )
+    if _n_jmp == 0:
+        _ri = petal_d.get("residual_island_opd_nm") or {}
+        _ri_txt = (
+            f"\nLinear AO3k kept all 4 islands phased (res RMS={_ri['rms_total_nm']:.1f} nm, max={_ri['max_abs_any_nm']:.0f} nm)"
+            if _ri
+            else "\nAll 4 islands remained phased within ±0.5 λ_J"
+        )
+        ax10.text(
+            0.50,
+            0.22,
+            f"NO CORRECTIONS TRIGGERED (0 jumps, dm01disp06 ≡ 0 nm){_ri_txt}",
+            transform=ax10.transAxes,
+            ha="center",
+            va="center",
+            fontsize=7.9,
+            fontweight="bold",
+            color="#065f46",
+            bbox=dict(boxstyle="round,pad=0.38", facecolor="#ecfdf5", edgecolor="#10b981", lw=1.3, alpha=0.95),
+        )
+    else:
+        for _ji, _ev in enumerate(_jevts):
+            _jt = _t_max * float(_ev["frame"]) / max(float(_ev.get("n_frames", 10000) - 1), 1.0)
+            ax10.axvline(_jt, color="#111827", lw=1.15, ls="-.", alpha=0.78)
+            _dw_v = _ev.get("delta_enws") or [0, 0, 0, 0]
+            _wa_v = _ev.get("waves_after") or [0, 0, 0, 0]
+            _main_p = int(np.argmax(np.abs(_dw_v)))
+            _y_pt = float(_wa_v[_main_p])
+            ax10.scatter([_jt], [_y_pt], color="#111827", s=44, zorder=6)
+            if _y_pt >= 0.5:
+                _dy_txt = -0.45
+            elif _y_pt <= -0.5:
+                _dy_txt = 0.45
+            else:
+                _dy_txt = 0.35 if (_ji % 2 == 0) else -0.40
+            _xt = min(_jt + 0.50, _t_max * 0.80) if _jt < _t_max * 0.72 else max(_jt - 1.85, 0.25)
+            ax10.annotate(
+                f"J{_ji+1} @ {_jt:.2f}s\n{_ev.get('label', '')}",
+                xy=(_jt, _y_pt),
+                xytext=(_xt, max(-_yl_w + 0.30, min(_yl_w - 0.30, _y_pt + _dy_txt))),
+                fontsize=7.7,
+                fontweight="bold",
+                color="#0f172a",
+                va="center",
+                zorder=8,
+                arrowprops=dict(arrowstyle="->", color="#111827", lw=1.0),
+                bbox=dict(boxstyle="round,pad=0.24", facecolor="#fef3c7", edgecolor="#d97706", alpha=0.96),
+            )
+
+    # Panel (1,1): Final DM1 petal channel dm01disp06 (64x64)
+    ax11 = ax_pc[1, 1]
+    if os.path.isfile(_dm6_p):
+        _dm6 = np.load(_dm6_p)
+        _dm6_max = float(np.max(np.abs(_dm6)))
+        _vmax = max(_dm6_max, 0.10)
+        _im11 = ax11.imshow(_dm6, origin="lower", cmap="RdBu_r", vmin=-_vmax, vmax=_vmax)
+        _cb11 = fig_pc.colorbar(_im11, ax=ax11, fraction=0.046, pad=0.03)
+        _cb11.set_label("DM1 Surface Offset [µm]")
+        _ny6, _nx6 = _dm6.shape
+        for _ix, _iy, _ilbl in (
+            (0.84 * _nx6, 0.50 * _ny6, f"E\n{int(_waves[0]):+d}λ"),
+            (0.50 * _nx6, 0.80 * _ny6, f"N\n{int(_waves[1]):+d}λ"),
+            (0.16 * _nx6, 0.50 * _ny6, f"W\n{int(_waves[2]):+d}λ"),
+            (0.50 * _nx6, 0.24 * _ny6, f"S\n{int(_waves[3]):+d}λ"),
+        ):
+            ax11.text(
+                _ix,
+                _iy,
+                _ilbl,
+                ha="center",
+                va="center",
+                fontsize=8.2,
+                fontweight="bold",
+                color="#0f172a",
+                bbox=dict(boxstyle="round,pad=0.22", facecolor="#ffffff", edgecolor="#64748b", alpha=0.88),
+            )
+        if _dm6_max < 1e-5:
+            ax11.text(
+                0.50,
+                0.50,
+                "dm01disp06 ≡ 0\n(No Steps Applied)",
+                transform=ax11.transAxes,
+                ha="center",
+                va="center",
+                fontsize=7.7,
+                fontweight="bold",
+                color="#065f46",
+                bbox=dict(boxstyle="round,pad=0.30", facecolor="#ecfdf5", edgecolor="#10b981", lw=1.2, alpha=0.92),
+            )
+    else:
+        ax11.text(0.5, 0.5, "dm01disp06.fits not present", ha="center", va="center", transform=ax11.transAxes)
+    ax11.set_title("4. Correction: Final DM1 Petal Channel Map (dm01disp06, 64×64)", fontsize=10.1, fontweight="bold")
+    ax11.set_xlabel("DM1 Actuator X")
+    ax11.set_ylabel("DM1 Actuator Y")
+    _pc_box = (
+        f"alpha={float(petal_d.get('alpha', 0.0008)):.4g}  warmup={int(petal_d.get('min_warmup', 1500))}fr  at={petal_d.get('enable_at', 'warmup')}\n"
+        f"wfsref_corr={_wcorr:.5f}  step={float(_cmeta.get('dm_step_surface_um', 0.6027)):.4f} µm surf\n"
+        f"DM06 RMS={float(petal_d.get('dm06_rms_um', 0.0)):.3f} µm  PTV={float(petal_d.get('dm06_ptv_um', 0.0)):.3f} µm"
+    )
+    ax11.text(
+        0.02,
+        0.02,
+        _pc_box,
+        transform=ax11.transAxes,
+        fontsize=7.3,
+        family="monospace",
+        va="bottom",
+        ha="left",
+        bbox=dict(boxstyle="round,pad=0.28", facecolor="#f8fafc", edgecolor="#94a3b8", alpha=0.92),
+    )
+
+    # --- ROW 3: GROUND-TRUTH INCOMING PERTURBATION VS. POST-AO3K RESIDUAL ISLAND OPD ---
+    ax20 = ax_pc[2, 0]
+    _has_res = os.path.isfile(_res_p)
+    _res_arr = np.load(_res_p) if _has_res else None
+    _t_res = np.linspace(0.0, _t_max, _res_arr.shape[0]) if _has_res else None
+
+    if os.path.isfile(_pert_p):
+        _pm = np.load(_pert_p)
+        if _pm.ndim == 2 and _pm.shape[0] > 4 and _pm.shape[1] >= 16:
+            _tp = _pm[:, 1]
+            for _pi in range(4):
+                ax20.plot(
+                    _tp,
+                    _pm[:, 12 + _pi],
+                    color=_p_cols[_pi],
+                    lw=1.15,
+                    ls="--",
+                    alpha=0.58,
+                )
+            ax20.plot([], [], color="#475569", lw=1.2, ls="--", label="Incoming LWE (dashed)")
+    if _has_res:
+        for _pi in range(4):
+            ax20.plot(
+                _t_res,
+                _res_arr[:, _pi],
+                color=_p_cols[_pi],
+                lw=1.95,
+                alpha=0.95,
+                label=f"Res {_p_names[_pi]}",
+            )
+    ax20.axhline(_peq_nm, color="#991b1b", lw=0.9, ls=":", alpha=0.75, label=f"±1 λ_J (±{_peq_nm:.0f} nm)")
+    ax20.axhline(-_peq_nm, color="#991b1b", lw=0.9, ls=":", alpha=0.75)
+    ax20.axhline(0.5 * _peq_nm, color="#b45309", lw=0.75, ls=":", alpha=0.55, label=f"±0.5 λ_J (±{0.5*_peq_nm:.0f} nm)")
+    ax20.axhline(-0.5 * _peq_nm, color="#b45309", lw=0.75, ls=":", alpha=0.55)
+    ax20.axhline(0.0, color="#64748b", lw=0.7, alpha=0.45)
+    if _inj_t is not None:
+        ax20.axvline(_inj_t, color="#dc2626", lw=1.35, ls="--", alpha=0.88, label=_inj_lbl)
+    for _jt in _jump_ts:
+        ax20.axvline(_jt, color="#111827", lw=1.15, ls="-.", alpha=0.78)
+    ax20.set_title("5. Impact: Incoming Petaling (dashed) vs. Post-AO3k Residual (solid)", fontsize=9.8, fontweight="bold")
+    ax20.set_xlabel("Physical Time t [s]")
+    ax20.set_ylabel("Differential Island OPD [nm]")
+    ax20.set_xlim(0.0, _t_max)
+    _y20_lo, _y20_hi = ax20.get_ylim()
+    ax20.set_ylim(_y20_lo, _y20_hi + 0.24 * max(_y20_hi - _y20_lo, 200.0))
+    ax20.grid(True, alpha=0.26)
+    ax20.legend(loc="upper right", fontsize=7.2, ncol=3, framealpha=0.92)
+
+    # Panel (2,1): Zoomed Post-AO3k Residual Island OPD + Total Pupil WFE RMS
+    ax21 = ax_pc[2, 1]
+    _lns21 = []
+    if _has_res:
+        for _pi in range(4):
+            _ln, = ax21.plot(
+                _t_res,
+                _res_arr[:, _pi],
+                color=_p_cols[_pi],
+                lw=1.45,
+                alpha=0.92,
+                label=f"Res {_p_names[_pi][0]} (σ={float(np.std(_res_arr[:, _pi])):.0f} nm)",
+            )
+            _lns21.append(_ln)
+        _rlim = max(float(np.max(np.abs(_res_arr))) * 1.25, 80.0)
+        ax21.set_ylim(-_rlim, _rlim * 1.38)
+        ax21.axhline(0.0, color="#64748b", lw=0.75, alpha=0.5)
+    if os.path.isfile(_wf_p):
+        _wfa = np.load(_wf_p)
+        if _wfa.ndim == 2 and _wfa.shape[0] > 4 and _wfa.shape[1] >= 4:
+            ax21_r = ax21.twinx()
+            _twf = _wfa[:, 1]
+            _w1 = _wfa[:, 3]
+            _ln_w, = ax21_r.plot(_twf, _w1, color="#0f172a", lw=1.15, alpha=0.55, label=f"Total WFE RMS (mean={float(np.mean(_w1)):.0f} nm)")
+            ax21_r.set_ylabel("Post-AO3k Total Pupil WFE RMS [nm]", color="#0f172a")
+            ax21_r.set_ylim(0.0, max(float(np.nanpercentile(_w1, 99.5)) * 1.62, 220.0))
+            _lns21.append(_ln_w)
+    if _inj_t is not None:
+        ax21.axvline(_inj_t, color="#dc2626", lw=1.35, ls="--", alpha=0.88)
+    for _jt in _jump_ts:
+        ax21.axvline(_jt, color="#111827", lw=1.15, ls="-.", alpha=0.78)
+    ax21.set_title("6. Residual Zoom: Post-AO3k Island Piston OPD & Total Pupil WFE RMS", fontsize=10.0, fontweight="bold")
+    ax21.set_xlabel("Physical Time t [s]")
+    ax21.set_ylabel("Residual Island Piston OPD [nm]")
+    ax21.set_xlim(0.0, _t_max)
+    ax21.grid(True, alpha=0.26)
+    if _lns21:
+        ax21.legend(_lns21, [l.get_label() for l in _lns21], loc="upper right", fontsize=7.4, ncol=2, framealpha=0.92)
+
+    fig_pc.savefig(os.path.join(out_dir, "petal_ctrl_summary_3x2.png"), dpi=180)
+    plt.close(fig_pc)
+
+wl_d = data.get("windlayers")
+if _want_plot(26) and isinstance(wl_d, dict) and wl_d.get("enabled"):
+    _vk_p = os.path.join(out_dir, "wl1_vmapk.npy")
+    _vi_p = os.path.join(out_dir, "wl1_vmapi.npy")
+    _vx_p = os.path.join(out_dir, "wl1_vmapx.npy")
+    _vmax = float(wl_d.get("vmax_mps", 50.0) or 50.0)
+    _ksign = int(wl_d.get("ksign", 1) or 1)
+    _lays = wl_d.get("layers") or []
+    _gt_lays = wl_d.get("ground_truth_layers") or []
+    _mov_lays = [l for l in _lays if not l.get("is_static")]
+    _max_spd = max(
+        [24.0]
+        + [float(l.get("speed_mps", 0.0)) for l in _mov_lays]
+        + [float(g.get("speed_mps", 0.0)) for g in _gt_lays]
+    )
+    _vlim = min(_vmax, max(28.0, 1.30 * _max_spd))
+
+    fig_wl, ax_wl = plt.subplots(2, 2, figsize=(13.8, 10.2), constrained_layout=True)
+    _fres_lbl = wl_d.get("atmturb_fresnel_label", "fresnel=0")
+    fig_wl.suptitle(
+        f"Stage-1 Pyramid WFS Atmospheric Wind Layers Reconstruction (mlt-windlayers)\n"
+        f"{wl_d.get('wfs_stream', 'csim_wfs_nir')} + {wl_d.get('pha_stream', 'aol1_dmC')} | "
+        f"{_fres_lbl} | N={int(wl_d.get('nframes', 0))} fr (t={float(wl_d.get('tint_s', 0.0)):.1f} s) | "
+        f"D_pix={float(wl_d.get('diampix', 0.0)):.1f}, bg={float(wl_d.get('bg_adu', 0.0)):.1f} ADU, "
+        f"dx={float(wl_d.get('dx_m', 0.0)):.4f} m | {int(wl_d.get('n_moving_layers', 0))} moving layers detected",
+        fontsize=10.5,
+        fontweight="bold",
+    )
+
+    def _draw_vmap(ax, npy_path, title, cmap_name="inferno", symmetric=False, sign=1.0):
+        if os.path.isfile(npy_path):
+            vm = np.load(npy_path).astype(np.float64) * sign
+            ext = [-_vmax, _vmax, -_vmax, _vmax]
+            if symmetric:
+                lim = max(float(np.percentile(np.abs(vm), 99.6)), 1e-6)
+                im = ax.imshow(vm, origin="lower", extent=ext, cmap=cmap_name, vmin=-lim, vmax=lim, aspect="equal")
+            else:
+                vhi = max(float(np.percentile(vm, 99.7)), 1e-6)
+                vlo = max(float(np.percentile(vm, 10.0)), 0.0)
+                if vlo >= vhi * 0.8:
+                    vlo = 0.0
+                im = ax.imshow(vm, origin="lower", extent=ext, cmap=cmap_name, vmin=vlo, vmax=vhi, aspect="equal")
+            fig_wl.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+        else:
+            ax.text(0.5, 0.5, "Velocity map FITS not present", ha="center", va="center", transform=ax.transAxes)
+        # Speed rings
+        for rad in (10.0, 20.0, 30.0):
+            if rad <= _vlim * 1.15:
+                ax.add_patch(Circle((0.0, 0.0), rad, fill=False, edgecolor="#94a3b8", ls=":", lw=0.75, alpha=0.65))
+        ax.axhline(0.0, color="#94a3b8", lw=0.6, alpha=0.5)
+        ax.axvline(0.0, color="#94a3b8", lw=0.6, alpha=0.5)
+        # Ground-truth Maunakea layers (white diamonds)
+        for gi, g in enumerate(_gt_lays):
+            sz = 28.0 + 180.0 * float(g.get("cn2_frac", 0.1))
+            ax.scatter(
+                float(g["vx_mps"]),
+                float(g["vy_mps"]),
+                s=sz,
+                marker="D",
+                facecolors="none",
+                edgecolors="#facc15" if symmetric else "#ffffff",
+                linewidths=1.35,
+                zorder=5,
+                label="Maunakea Truth" if gi == 0 else None,
+            )
+        # Reconstructed moving layers (cyan open circles + label)
+        for li, l in enumerate(_mov_lays):
+            ax.scatter(
+                float(l["vx_mps"]),
+                float(l["vy_mps"]),
+                s=115,
+                marker="o",
+                facecolors="none",
+                edgecolors="#22d3ee" if not symmetric else "#0f172a",
+                linewidths=1.8,
+                zorder=6,
+                label="Reconstructed Layer" if li == 0 else None,
+            )
+            ax.annotate(
+                f"L{l['index']}",
+                (float(l["vx_mps"]), float(l["vy_mps"])),
+                xytext=(5, 4),
+                textcoords="offset points",
+                fontsize=7.8,
+                fontweight="bold",
+                color="#22d3ee" if not symmetric else "#0f172a",
+                zorder=7,
+            )
+        ax.set_xlim(-_vlim, _vlim)
+        ax.set_ylim(-_vlim, _vlim)
+        ax.set_xlabel("vx [m/s]", fontsize=8.8)
+        ax.set_ylabel("vy [m/s]", fontsize=8.8)
+        ax.set_title(title, fontsize=9.6, fontweight="bold")
+        ax.legend(loc="upper right", fontsize=7.5, framealpha=0.88)
+
+    _draw_vmap(ax_wl[0, 0], _vk_p, "Curvature / Phase-Space Velocity Map (vmapk)", cmap_name="inferno", symmetric=False)
+    _draw_vmap(ax_wl[0, 1], _vi_p, "4-Pupil Sum Intensity / Scintillation Velocity Map (vmapi)", cmap_name="viridis", symmetric=False)
+    _draw_vmap(ax_wl[1, 0], _vx_p, "Phase–Scintillation Cross-Correlation Map (vmapx)", cmap_name="RdBu_r", symmetric=True, sign=-float(_ksign))
+
+    # (1,1): Reconstructed vs Ground-Truth Altitude z_LOS [km] vs Wind Speed [m/s]
+    ax_p = ax_wl[1, 1]
+    if _gt_lays:
+        _gx = [float(g["speed_mps"]) for g in _gt_lays]
+        _gy = [float(g["z_los_m"]) / 1000.0 for g in _gt_lays]
+        _gs = [55.0 + 360.0 * float(g["cn2_frac"]) for g in _gt_lays]
+        ax_p.scatter(
+            _gx,
+            _gy,
+            s=_gs,
+            marker="D",
+            color="#f59e0b",
+            edgecolors="#78350f",
+            linewidths=1.1,
+            alpha=0.85,
+            zorder=4,
+            label="Maunakea Truth (size ∝ Cn²)",
+        )
+        # Annotate key ground-truth layers (BL, Jet, Free Atm) on the left/above to avoid L-label clashes
+        for g in _gt_lays:
+            if g["index"] in (0, 3, 4, 5, 6):
+                _rshort = (
+                    "BL" if g["regime"] == "Boundary Layer"
+                    else ("Jet" if "Jet" in g["regime"] else "Free Atm")
+                )
+                _glbl = f"GT{g['index']} ({_rshort})"
+                if g["index"] == 0:
+                    _gxy = (-4, -13)
+                    _gha = "right"
+                elif g["index"] == 3:
+                    _gxy = (-6, 5)
+                    _gha = "right"
+                elif g["index"] == 4:
+                    _gxy = (-6, 7)
+                    _gha = "right"
+                else:
+                    _gxy = (-6, 6)
+                    _gha = "right"
+                ax_p.annotate(
+                    _glbl,
+                    (float(g["speed_mps"]), float(g["z_los_m"]) / 1000.0),
+                    xytext=_gxy,
+                    textcoords="offset points",
+                    ha=_gha,
+                    fontsize=7.2,
+                    color="#92400e",
+                )
+    _rec_pts = [l for l in _mov_lays if l.get("z_m") is not None]
+    if _rec_pts:
+        _rx = [float(l["speed_mps"]) for l in _rec_pts]
+        _ry = [float(l["z_m"]) / 1000.0 for l in _rec_pts]
+        _re = [float(l["zerr_m"]) / 1000.0 if l.get("zerr_m") is not None else 0.0 for l in _rec_pts]
+        _rs = [70.0 + 280.0 * max(float(l.get("frac_k") or 0.05), 0.02) for l in _rec_pts]
+        ax_p.errorbar(
+            _rx,
+            _ry,
+            yerr=_re,
+            fmt="none",
+            ecolor="#1d4ed8",
+            elinewidth=1.35,
+            capsize=3.5,
+            zorder=5,
+        )
+        ax_p.scatter(
+            _rx,
+            _ry,
+            s=_rs,
+            marker="o",
+            color="#2563eb",
+            edgecolors="#ffffff",
+            linewidths=1.2,
+            zorder=6,
+            label="Reconstructed Layers (±zerr)",
+        )
+        for _li_p, l in enumerate(_rec_pts):
+            _coh = l.get("coh")
+            _cstr = f", coh={float(_coh):.2f}" if _coh is not None else ""
+            _spd_l = float(l["speed_mps"])
+            _z_km = float(l["z_m"]) / 1000.0
+            _ha = "right" if _spd_l > 18.0 else "left"
+            _dx_off = -8 if _ha == "right" else 8
+            _dy_off = -3 if (_z_km < 0.5 or _spd_l > 18.0) else 4
+            ax_p.annotate(
+                f"L{l['index']} ({float(l['dir_deg']):.0f}°{_cstr})",
+                (_spd_l, _z_km),
+                xytext=(_dx_off, _dy_off),
+                textcoords="offset points",
+                ha=_ha,
+                fontsize=7.3,
+                fontweight="bold",
+                color="#1e3a8a",
+            )
+    ax_p.axhline(0.0, color="#64748b", ls=":", lw=0.8)
+    _ymax_z = max(
+        [24.5]
+        + [float(g["z_los_m"]) / 1000.0 + 2.0 for g in _gt_lays]
+        + [float(l["z_m"]) / 1000.0 + 2.0 for l in _rec_pts if float(l["z_m"]) < 40000.0]
+    )
+    ax_p.set_xlim(0.0, max(28.0, _max_spd * 1.22))
+    ax_p.set_ylim(-2.2, min(_ymax_z, 35.0))
+    ax_p.set_xlabel("Wind Speed [m/s]", fontsize=8.8)
+    ax_p.set_ylabel(f"Line-of-Sight Distance z_LOS [km] (zenith={float(wl_d.get('zenith_deg', 30.0)):.0f}°)", fontsize=8.8)
+    ax_p.set_title("Atmospheric Wind Speed & Line-of-Sight Altitude Profile", fontsize=9.6, fontweight="bold")
+    ax_p.grid(True, alpha=0.25)
+    ax_p.legend(loc="upper right", fontsize=7.6, framealpha=0.92)
+    if int(wl_d.get("atmturb_fresnel", 0)) == 0:
+        ax_p.text(
+            0.03,
+            0.95,
+            "Geometric atmturb (fresnel=0):\nno atmospheric scintillation (z ≈ 0 m).\nRun --atmturb-fresnel 2 for 3D altitude.",
+            transform=ax_p.transAxes,
+            ha="left",
+            va="top",
+            fontsize=7.5,
+            color="#92400e",
+            bbox=dict(boxstyle="round,pad=0.30", facecolor="#fffbeb", edgecolor="#f59e0b", alpha=0.92),
+        )
+
+    fig_wl.savefig(os.path.join(out_dir, "pyrwfs_windlayers_2x2.png"), dpi=180)
+    plt.close(fig_wl)
 
 if _my_shard != 0:
     os._exit(0)
@@ -6856,6 +8810,60 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
             )
         if p_parts:
             lines.append(f"- **Realistic Perturbations**: {'; '.join(p_parts)}")
+    adc_md = s.get("adc_dispersion")
+    if isinstance(adc_md, dict) and adc_md.get("config"):
+        _ac = adc_md["config"]
+        _as = adc_md.get("state", {})
+        _ab = adc_md.get("bands", {})
+        _ash = adc_md.get("chrom_shear", {})
+        _h_pre = float((_ab.get("h") or {}).get("atm_mas", 0.0))
+        _h_res = float((_ab.get("h") or {}).get("res_mas", 0.0))
+        _v_pre = float((_ab.get("vis") or {}).get("atm_mas", 0.0))
+        _v_res = float((_ab.get("vis") or {}).get("res_mas", 0.0))
+        _adc_st_s = (
+            f"AO188 `{_ac.get('mode', 'lut')}` (`{_ac.get('preset', 'ao188')}`, "
+            f"`opt={_ac.get('opt_band', 'whole')}`, `psi={_as.get('psi_deg', 0.0):.2f} deg`, "
+            f"mech `{_ac.get('mech', 'ideal')}`)"
+            if _ac.get("deployed")
+            else "AO188 **RETRACTED**"
+        )
+        _ct_s = (
+            f"3-wl chromatic shear ON (`{_ash.get('lambdas_um', '0.75,1.22,1.65')} um`, "
+            f"`dr_16km={_ash.get('max_layer_shear_cm', 0.0):.1f} cm`)"
+            if _ash.get("enabled")
+            else "chromatic shear OFF"
+        )
+        _vtt_md = adc_md.get("vis_pyrwfs_ttm") if isinstance(adc_md.get("vis_pyrwfs_ttm"), dict) else None
+        _vtt_s = (
+            f"; Vis PyWFS TTM (`{_vtt_md.get('mode', 'closed')}`): "
+            f"`({float(_vtt_md.get('cmd_x_mas', 0.0)):+.1f}, {float(_vtt_md.get('cmd_y_mas', 0.0)):+.1f}) mas`"
+            if _vtt_md is not None
+            else ""
+        )
+        lines.append(
+            f"- **Atmospheric Dispersion & AO188 ADC**: Maunakea `z = {_ac.get('zenith_deg', 0.0):.1f} deg`, "
+            f"`PA = {_ac.get('disp_pa_deg', 0.0):.1f} deg` (`{_ac.get('imr_mode', 'pupil_track')}`), "
+            f"{_adc_st_s} -> H-band `{_h_pre:.1f} -> {_h_res:.2f} mas`, "
+            f"Vis `{_v_pre:.1f} -> {_v_res:.1f} mas`; {_ct_s}{_vtt_s}"
+        )
+    pet_md = s.get("petal_ctrl")
+    if isinstance(pet_md, dict) and pet_md.get("enabled"):
+        _pw = pet_md.get("waves_enws") or [0, 0, 0, 0]
+        _pcm = pet_md.get("calib_meta") or {}
+        lines.append(
+            f"- **Stage-1 Passive Petal-Unwrap Control**: JIT `petal-1` (`aol1_imWFS2` -> `dm01disp06`, "
+            f"`use_sign={int(pet_md.get('use_sign', 1))}`, `alpha={float(pet_md.get('alpha', 0.0008)):.4g}`, "
+            f"`p_eq={float(_pcm.get('p_eq_um', 1.2054)):.4f} um` OPD) -> "
+            f"**`{int(pet_md.get('n_jumps', 0))}` jumps** "
+            f"(`{int(pet_md.get('n_aborts', 0))}` aborts, `{int(pet_md.get('n_rollbacks', 0))}` rollbacks), "
+            f"final waves `(E,N,W,S)=({int(_pw[0]):+d},{int(_pw[1]):+d},{int(_pw[2]):+d},{int(_pw[3]):+d})`"
+        )
+    _sens_by_id = {sn["id"]: sn for sn in (chrom or {}).get("sensors", [])}
+    _nch_nir_wfs = int((_sens_by_id.get("wfs_nir") or {}).get("eff_nlam", 5))
+    _nch_vis_wfs = int((_sens_by_id.get("wfs_vis") or {}).get("eff_nlam", 5))
+    _nch_vis_cam = int((_sens_by_id.get("vis_final") or {}).get("eff_nlam", 7))
+    _nch_nir_cam = int((_sens_by_id.get("nir_final") or {}).get("eff_nlam", 5))
+    _nch_lowfs = int((_sens_by_id.get("wfs_lowfs") or {}).get("eff_nlam", 5))
     lines.extend([
         f"- **Internal Optical-Bench Clock**: **`{int_khz:.1f} kHz` "
         f"(`dt = {int_dt_ms:.3f} ms = {int_dt_us:.0f} us`), i.e., "
@@ -6866,11 +8874,11 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
         f"`{sa.get('wall_elapsed_s', 0):.2f} s` wall-clock)",
         f"- **Stage 1 (AO3k)**: `{l1.get('dm_grid', '64x64')}` DM (D="
         f"{l1.get('dm_pupil_diam_act', 60)}), `{l1.get('wfs_detector', '160x160')}` "
-        f"polychromatic J-band PyWFS (`1.22 um, 20% BW, N=2ch, /{2*ov_k} sub-ticks`), "
+        f"polychromatic J-band PyWFS (`1.22 um, 20% BW, N={_nch_nir_wfs}ch, /{2*ov_k} sub-ticks`), "
         f"`{l1.get('n_cm_modes', 0)}` CM modes",
         f"- **Stage 2 (SCExAO)**: `{l2.get('dm_grid', '50x50')}` DM (D="
         f"{l2.get('dm_pupil_diam_act', 46)}), `{l2.get('wfs_detector', '120x120')}` "
-        f"polychromatic Vis PyWFS (`0.75 um, 20% BW, N=2ch, /{ov_k} sub-ticks`), "
+        f"polychromatic Vis PyWFS (`0.75 um, 20% BW, N={_nch_vis_wfs}ch, /{ov_k} sub-ticks`), "
         f"`{l2.get('n_cm_modes', 0)}` CM modes",
     ])
     if l3:
@@ -6942,6 +8950,22 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
                 f"{' | '.join(p_parts)} — see dedicated [Pyramid WFS](pyrwfs.html) sub-page "
                 f"and [pyrwfs_tlm_summary.json](pyrwfs_tlm_summary.json)"
             )
+    wl_md = s.get("windlayers")
+    if isinstance(wl_md, dict) and wl_md.get("enabled"):
+        _wmov = [l for l in (wl_md.get("layers") or []) if not l.get("is_static")]
+        _wtop = ", ".join(
+            f"{float(l['speed_mps']):.1f} m/s @ {float(l['dir_deg']):.0f} deg"
+            + (f" (z={float(l['z_m'])/1000.0:.1f} km)" if l.get("z_m") is not None else "")
+            for l in _wmov[:4]
+        )
+        lines.append(
+            f"- **Atmospheric Wind Layers Reconstruction (`milk-fpsexec-mlt-windlayers`)**: "
+            f"`{int(wl_md.get('n_moving_layers', len(_wmov)))}` moving layers detected "
+            f"(`{wl_md.get('atmturb_fresnel_label', '')}`, `D_pix={float(wl_md.get('diampix', 0.0)):.1f}`, "
+            f"`bg={float(wl_md.get('bg_adu', 0.0)):.1f} ADU`): {_wtop or 'none'} — "
+            f"see [Wind Layers Reconstruction](pyrwfs.html#wind-layers-reconstruction) "
+            f"and [windlayers_summary.json](windlayers_summary.json)"
+        )
     coro_cam_note = (
         ", plus post-Lyot H-band coronagraphic dark-hole camera (`nir_coro`, `3.0 l/D` spot)"
         if coro_m
@@ -6950,7 +8974,8 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
     lines.extend(
         [
             "- **Science Cameras**: Polychromatic Soummer-MFT PSFs in Visible I-band "
-            "(`0.75 um, 15% BW, N=3ch`) & Near-IR H-band (`1.65 um, 18% BW, N=3ch`) with "
+            f"(`0.75 um, 15% BW, N={_nch_vis_cam}ch`) & Near-IR H-band "
+            f"(`1.65 um, 18% BW, N={_nch_nir_cam}ch`) with "
             f"focal `lambda/D` scaling{coro_cam_note}",
             "",
             "> Companion systems & optimization report: [COMPUTE_REPORT.md](COMPUTE_REPORT.md) "
@@ -6989,12 +9014,24 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
             if coro_m
             else "`1.65 um` H-band camera"
         )
+        _adc_relay = ""
+        if chrom and chrom.get("adcs"):
+            _a0 = chrom["adcs"][0]
+            _adc_relay = (
+                f" -> AO188 ADC (`{_a0['id']}`, `{_a0['mode']}`/`{_a0['opt_band']}` -> "
+                f"`{_a0['out_beam']}`)"
+            )
+        _has_vis_ttm = any(
+            d.get("kind") == "ttm" and "vis" in str(d.get("id", "")).lower()
+            for d in ((chrom or {}).get("timing") or {}).get("dms", [])
+        )
+        _vis_ttm_relay = "Vis PyWFS TTM (`dm_vis_pyrwfs_tt`) -> " if _has_vis_ttm else ""
         lines.append(
-            f"- **Optical Relay**: Entrance pupil (`b_pup`) -> Stage-1 AO3k "
+            f"- **Optical Relay**: Entrance pupil (`b_pup`){_adc_relay} -> Stage-1 AO3k "
             f"`{l1.get('dm_grid', '64x64')}` DM (`dm01disp`) -> `1.22 um` J-band dichroic "
             f"(`R` -> `{l1.get('wfs_detector', '160x160')}` NIR PyWFS @ `1 kHz`; `T` -> Stage-2) "
             f"-> Stage-2 SCExAO `{l2.get('dm_grid', '50x50')}` DM (`dm02disp`) -> `1.00 um` LP "
-            f"dichroic (`T` -> {h_arm_desc}; `R` -> `90/10` Vis splitter -> "
+            f"dichroic (`T` -> {h_arm_desc}; `R` -> `90/10` Vis splitter -> {_vis_ttm_relay}"
             f"`{l2.get('wfs_detector', '120x120')}` Vis PyWFS @ `2 kHz` + `0.75 um` Vis camera)"
         )
         if has_extra_gui:
@@ -7060,23 +9097,23 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
             f"every sub-tick | Servo & FIFO stepped at `{int_khz:.1f} kHz`: {dm2_note} |",
             f"| **Stage-2 Vis PyWFS (`wfs_vis`)** | `2.0 kHz` (`0.50 ms`) | "
             f"`2000 (/{ov_k})` | Propagated every sub-tick (`stride = 1`): `{ov_k}` sub-samples "
-            "`x 2ch x 16` pts |",
+            f"`x {_nch_vis_wfs}ch x 16` pts |",
             f"| **Stage-1 NIR PyWFS (`wfs_nir`)** | `1.0 kHz` (`1.00 ms`) | "
             f"`1000 (/{2*ov_k})` | Propagated every sub-tick (`stride = 1`): "
-            f"`{2*ov_k}` sub-samples `x 2ch x 16` pts |",
+            f"`{2*ov_k}` sub-samples `x {_nch_nir_wfs}ch x 16` pts |",
         ]
     )
     if coro_m:
         lines.append(
             f"| **Stage-3 Lyot LLOWFS (`wfs_lowfs`)** | `500 Hz` (`2.00 ms`) | "
             f"`500 (/{4*ov_k})` | Defocused (`200 nm` Z4) Lyot-stop reflection camera: "
-            f"`{4*ov_k}` sub-samples `x 3ch` |"
+            f"`{4*ov_k}` sub-samples `x {_nch_lowfs}ch` |"
         )
     lines.extend(
         [
             f"| **Science Cameras (`fpcam.*`, {n_sci_cams}x)** | `100 Hz` (`10.0 ms`) | "
             f"`100 (/{20*ov_k})` | `stride = {ov_k}` (staggered `0..{ov_k-1}`): `20` evals "
-            f"(`{outer_khz:.1f} kHz`) `x 3ch` / frame |",
+            f"(`{outer_khz:.1f} kHz`) `x {_nch_nir_cam}/{_nch_vis_cam}ch` / frame |",
             f"| **Wavefront OPD Stats (`wfstat`)** | "
             f"`{outer_khz:.1f} kHz` (`{outer_dt_ms:.2f} ms`) | every `{ov_k}` sub-ticks | "
             f"Sampled once per `{outer_dt_ms:.2f} ms` outer tick "
@@ -7122,6 +9159,82 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
                     "",
                     "![Optical Bench 32-Bin Spectra & Polychromatic Sensor Sub-Band "
                     "Sampling (2x1)](chromatic_passbands_2x1.png)",
+                ]
+            )
+
+    if isinstance(adc_md, dict) and adc_md.get("config"):
+        _ac = adc_md["config"]
+        _as = adc_md.get("state", {})
+        _ab = adc_md.get("bands", {})
+        _ash = adc_md.get("chrom_shear", {})
+        lines.extend(
+            [
+                "",
+                "## Atmospheric Dispersion, Chromatic Turbulence & AO188 ADC",
+                "",
+                "> Calibrated against Subaru AO188 ADC Specification Document (S. Egner, 17 April 2009) "
+                "using Ciddor (1996) Maunakea moist-air refractivity and spherical-atmosphere refraction.",
+                "",
+                "| Parameter | Value | Notes |",
+                "| :--- | :--- | :--- |",
+                f"| **Zenith Angle / Dispersion PA** | `z = {_ac.get('zenith_deg', 0.0):.2f} deg`, "
+                f"`PA = {_ac.get('disp_pa_deg', 0.0):.2f} deg` | IMR `{_ac.get('imr_mode', 'pupil_track')}`, "
+                f"drift `{_ac.get('parallactic_rate_dps', 0.0):+.4f} deg/s` |",
+                f"| **Maunakea Atmosphere** | `P = {_ac.get('pressure_hpa', 615.0):.1f} hPa`, "
+                f"`T = {_ac.get('temp_c', 2.0):.1f} C`, `RH = {_ac.get('rh_pct', 20.0):.0f}%` | "
+                f"Altitude `{_ac.get('site_alt_m', 4205.0):.0f} m`, ref `{_ac.get('ref_lam_um', 1.65):.2f} um` |",
+                f"| **AO188 ADC Preset / Mode** | `{_ac.get('preset', 'ao188')}` / "
+                f"`{_ac.get('mode', 'lut')}` (opt `{_ac.get('opt_band', 'whole')}`) | "
+                f"{'Deployed' if _ac.get('deployed') else 'RETRACTED'} "
+                f"(Tput `{_ac.get('tput_base', 0.96)*100:.0f}%`, mech `{_ac.get('mech', 'ideal')}`) |",
+                f"| **Prism Angles (`th1`, `th2`, `psi`)** | "
+                f"`{_as.get('theta1_deg', 0.0):+.2f} deg`, `{_as.get('theta2_deg', 0.0):+.2f} deg`, "
+                f"`psi = {_as.get('psi_deg', 0.0):.2f} deg` | "
+                f"LUT err: scale `{_ac.get('lut_scale_err', 0.0)*100:+.1f}%`, "
+                f"PA `{_ac.get('lut_pa_err_deg', 0.0):+.2f} deg` |",
+                f"| **Chromatic Turbulence Shear** | "
+                f"`{'ON' if _ash.get('enabled') else 'OFF'}` (`{_ash.get('lambdas_um', '0.75,1.22,1.65')} um`) | "
+                f"0.75 vs 1.65 um ray shear: `Cn2`-weighted `{_ash.get('cn2_weighted_shear_cm', 0.0):.2f} cm`, "
+                f"16 km layer `{_ash.get('max_layer_shear_cm', 0.0):.2f} cm` |",
+            ]
+        )
+        _vtt_tbl = adc_md.get("vis_pyrwfs_ttm") if isinstance(adc_md.get("vis_pyrwfs_ttm"), dict) else None
+        if _vtt_tbl is not None:
+            lines.append(
+                f"| **Vis PyWFS Tip-Tilt Mount** | `{_vtt_tbl.get('mode', 'closed')}` "
+                f"(`g = {float(_vtt_tbl.get('gain', 0.0)):.3f}`) | "
+                f"TTM `({float(_vtt_tbl.get('cmd_x_mas', 0.0)):+.2f}, {float(_vtt_tbl.get('cmd_y_mas', 0.0)):+.2f}) mas` "
+                f"(`|cmd| = {float(_vtt_tbl.get('cmd_tot_mas', 0.0)):.2f} mas`), "
+                f"res `dm02disp04` TT `({float(_vtt_tbl.get('res_dm02_tt_x_mas', 0.0)):+.2f}, "
+                f"{float(_vtt_tbl.get('res_dm02_tt_y_mas', 0.0)):+.2f}) mas` |"
+            )
+        lines.extend(
+            [
+                "",
+                "| Band / Metric | Pre-ADC Sky [mas] (`l/D`) | Post-ADC Residual [mas] (`l/D`) | Suppression |",
+                "| :--- | ---: | ---: | ---: |",
+            ]
+        )
+        for _bk in ("vis", "j", "h", "k", "broadband", "vis_to_h"):
+            _br = _ab.get(_bk)
+            if not _br:
+                continue
+            _sup_s = (
+                f"`{_br['suppression_factor']:.1f}x`"
+                if _br["suppression_factor"] < 9000.0
+                else "`>1000x`"
+            )
+            lines.append(
+                f"| {_br['label']} | `{_br['atm_mas']:.2f}` (`{_br['atm_ld']:.2f}`) | "
+                f"`{_br['res_mas']:.2f}` (`{_br['res_ld']:.2f}`) | {_sup_s} |"
+            )
+        adc_png = os.path.join(out_dir, "adc_dispersion_summary.png")
+        if os.path.isfile(adc_png):
+            lines.extend(
+                [
+                    "",
+                    "![Atmospheric Dispersion, Chromatic Shear & AO188 ADC Residual Summary (1x3)]"
+                    "(adc_dispersion_summary.png)",
                 ]
             )
 
@@ -7492,6 +9605,102 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
                     ]
                 )
 
+    mw_sec = s.get("modalwhite")
+    if isinstance(mw_sec, dict) and mw_sec.get("stages"):
+        lines.extend(
+            [
+                "",
+                "### Closed-Loop Modal Whiteness Audit (`cacao-fpsexec-modalwhite`)",
+                "",
+                "| Loop Stage | `N` | `d_ceil` | `Q_vw_b0` | `Q_xmode_b0` | `rho_d_b0` | `Q_wu_lo20` | OOS Recov WFE [nm] (`% var`) | Alerts |",
+                "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | :---: | ---: |",
+            ]
+        )
+        for _mlbl, _mk in (("Stage 1 (`AO3k`)", "stage1"), ("Stage 2 (`SCExAO`)", "stage2")):
+            _ms = mw_sec["stages"].get(_mk)
+            if not isinstance(_ms, dict):
+                continue
+            lines.append(
+                f"| {_mlbl} | `{int(_ms.get('n_samples', 0))}` | `{int(_ms.get('d_ceil', 0))}` | "
+                f"`{float(_ms.get('Q_vw_b0', 0.0)):.2f}` | `{float(_ms.get('Q_xmode_b0', 0.0)):.2f}` | "
+                f"`{float(_ms.get('rho_d_b0', 0.0)):+.4f}` | `{float(_ms.get('Q_wu_lo20', 0.0)):.2f}` | "
+                f"`{float(_ms.get('recov_wfe_nm', 0.0)):.1f} nm` (`{float(_ms.get('recov_var_pct', 0.0)):.1f}%`) | "
+                f"`{int(_ms.get('alert_flags', 0))}` |"
+            )
+
+    pet_sec = s.get("petal_ctrl")
+    if isinstance(pet_sec, dict) and pet_sec.get("enabled"):
+        _pw = pet_sec.get("waves_enws") or [0, 0, 0, 0]
+        _pe = pet_sec.get("final_ema") or {}
+        _pcm = pet_sec.get("calib_meta") or {}
+        _pmode_txt = (
+            f"Fused-Silica Chromatic Sign (`chrom_sep = {float(_pcm.get('chrom_sep', 0.0)):+.3f}`)"
+            if int(pet_sec.get("use_sign", 1))
+            else "Even-Only Trial-and-Verify"
+        )
+        _nj_md = int(pet_sec.get("n_jumps", 0))
+        _jev_md = pet_sec.get("jump_events") or []
+        _phys_t_md = float(sa.get("physical_time_s", 10.0))
+        if _nj_md == 0:
+            _action_md = "**0 corrections triggered** (phased lock maintained; `dm01disp06 = 0`)"
+        elif _jev_md:
+            _ev_strs = [
+                f"`t={_phys_t_md * float(e['frame']) / max(float(e.get('n_frames', 10000) - 1), 1.0):.2f}s` ({e.get('label', 'step')})"
+                for e in _jev_md[:6]
+            ]
+            _action_md = f"**{_nj_md} correction(s) applied**: " + ", ".join(_ev_strs)
+        else:
+            _action_md = f"**{_nj_md} correction(s) applied** (`aborts={int(pet_sec.get('n_aborts', 0))}`, `rollbacks={int(pet_sec.get('n_rollbacks', 0))}`)"
+        _ri_md = pet_sec.get("residual_island_opd_nm")
+        lines.extend(
+            [
+                "",
+                "## Stage-1 Passive Petal-Unwrap Control (`petal-1` -> `dm01disp06`)",
+                "",
+                f"- **Controller Architecture**: Real-time `milk-fpsexec-milk-calc` JIT unit (`petal-1`, "
+                f"triggered on 1 kHz `aol1_imWFS2`) projects each ref-subtracted J-band PyWFS frame onto "
+                f"a 7-row nuisance-orthogonalized filter (`3` Even phase-wrap rows `ev_sn, ev_ew, ev_adj` + "
+                f"`4` fused-silica chromatic Odd sign rows `sg_e, sg_n, sg_w, sg_s`), applies an unbiased "
+                f"causal EMA (`alpha = {float(pet_sec.get('alpha', 0.0008)):.4g}`, warmup "
+                f"`{int(pet_sec.get('min_warmup', 1500))}` fr), and injects integer `±1 lambda_J` Voronoi "
+                f"island steps (`p_eq = {float(_pcm.get('p_eq_um', 1.2054)):.4f} um` OPD = "
+                f"`{float(_pcm.get('dm_step_surface_um', 0.6027)):.4f} um` DM1 surface) into free DM1 channel "
+                f"`dm01disp06` with a 2-stage post-jump verifier (400 ms abort snap + 800 ms rollback guard).",
+                "",
+                "| Metric | Value | Notes |",
+                "| :--- | :---: | :--- |",
+                f"| Controller Action Status | {_action_md} | Aborts `{int(pet_sec.get('n_aborts', 0))}`, rollbacks `{int(pet_sec.get('n_rollbacks', 0))}`, runtime err `'{pet_sec.get('unit_error', '')}'` |",
+                f"| Sign / Detection Mode | **{_pmode_txt}** | `th_even={float(pet_sec.get('th_even', 0.58)):.2f}`, `th_sign={float(pet_sec.get('th_sign', 0.35)):.2f}`, `enable_at={pet_sec.get('enable_at', 'warmup')}` |",
+                f"| Calibration Fidelity (`calib_petal_ctrl.py`) | `wfsref_corr = {float(_pcm.get('wfsref_corr', 0.0)):.6f}` | `p_eq = {float(_pcm.get('p_eq_um', 1.2054)):.4f} um` OPD (`N={int(_pcm.get('nlambda', 5))}ch`, `mod={float(_pcm.get('mod_rad_ld', 0.0)):g} l/D`) |",
+                f"| Final Unwrapped Waves `(E, N, W, S)` | **`({int(_pw[0]):+d}, {int(_pw[1]):+d}, {int(_pw[2]):+d}, {int(_pw[3]):+d}) lambda_J`** | `dm01disp06` RMS `{float(pet_sec.get('dm06_rms_um', 0.0)):.3f} um`, PTV `{float(pet_sec.get('dm06_ptv_um', 0.0)):.3f} um` |",
+                f"| Final Even EMA `(ev_sn, ev_ew, ev_adj)` | `({float(_pe.get('ev_sn', 0.0)):+.3f}, {float(_pe.get('ev_ew', 0.0)):+.3f}, {float(_pe.get('ev_adj', 0.0)):+.3f}) lambda_J` | Steady-state Even RMS `{float(pet_sec.get('steady_ev_rms', 0.0)):.3f} lambda_J` |",
+                f"| Final Odd Sign EMA `(sg_e, sg_n, sg_w, sg_s)` | `({float(_pe.get('sg_e', 0.0)):+.3f}, {float(_pe.get('sg_n', 0.0)):+.3f}, {float(_pe.get('sg_w', 0.0)):+.3f}, {float(_pe.get('sg_s', 0.0)):+.3f}) lambda_J` | Chromatic direction discriminator |",
+            ]
+        )
+        if isinstance(_ri_md, dict) and _ri_md.get("std_enws"):
+            _st = _ri_md["std_enws"]
+            _mx = _ri_md["max_abs_enws"]
+            lines.append(
+                f"| Post-AO3k Residual Island OPD (E, N, W, S) | **RMS `{_ri_md['rms_total_nm']:.1f} nm`** (max `{_ri_md['max_abs_any_nm']:.0f} nm`) | "
+                f"Std `({_st[0]:.1f}, {_st[1]:.1f}, {_st[2]:.1f}, {_st[3]:.1f}) nm`, "
+                f"Max `({_mx[0]:.0f}, {_mx[1]:.0f}, {_mx[2]:.0f}, {_mx[3]:.0f}) nm` |"
+            )
+        _tinj_md = str(pet_sec.get("test_inject") or "").strip()
+        if _tinj_md:
+            lines.append(
+                f"| Sudden Petal Step Test Injection | **`{_tinj_md}`** (entrance-pupil LWE input) | "
+                f"Deterministic `±lambda_J` step (`petal:waves@t_sec`) added directly onto the thermal LWE input (`petal_off0..3_nm`) |"
+            )
+        pet_png = os.path.join(out_dir, "petal_ctrl_summary_3x2.png")
+        if os.path.isfile(pet_png):
+            lines.extend(
+                [
+                    "",
+                    "![Stage-1 Passive Petal-Unwrap Control: PyWFS1 Measurements, Applied Corrections & Residual Island OPD (3x2)]"
+                    "(petal_ctrl_summary_3x2.png)",
+                ]
+            )
+
     c2d_sec = s.get("calib_2wfs1dm")
     if isinstance(c2d_sec, dict) and c2d_sec.get("enabled"):
         w_ord_s = int(c2d_sec.get("whiten_order", 4))
@@ -7721,11 +9930,17 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
                 else f" (Post-AO3k at `{vp_s1:.0f} Hz`)"
             )
             wf_in_src = str(vid_meta.get("wf_in_source", ""))
+            psol_src = str(vid_meta.get("psol_source", ""))
             dm1_src = str(vid_meta.get("dm1_source", ""))
             has_wfdm = bool(vid_meta.get("has_wf_dm_row", False))
             has_psol = bool(vid_meta.get("has_psol_wf", False))
             has_diff = bool(vid_meta.get("has_wf_psol_diff", False))
             has_res_wf = bool(vid_meta.get("has_residual_wf", False))
+            psol_tag = (
+                "aol1_modevalOL + petal"
+                if psol_src == "aol1_modevalOL+petal"
+                else "aol1_modevalOL"
+            )
             wfdm_desc = ""
             if has_wfdm:
                 if has_diff:
@@ -7736,7 +9951,7 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
                     )
                     wf_lbl = (
                         f"Incoming Pupil WF (`{wf_src_tag}`) + "
-                        "PSOL Recon. WF (`aol1_modevalOL`) + "
+                        f"PSOL Recon. WF (`{psol_tag}`) + "
                         f"Diff (`{wf_src_tag} - PSOL`)"
                     )
                 elif wf_in_src in ("wf_clip", "wf_full", "b_pup"):
@@ -7744,7 +9959,7 @@ def write_ao_report_md(out_dir, s, bench_filename=None):
                 elif wf_in_src == "outarraypha":
                     wf_lbl = "Incoming Atm WF (`outarraypha`)"
                 elif has_psol or wf_in_src == "psol":
-                    wf_lbl = "PSOL Recon. WF (`aol1_modevalOL`)"
+                    wf_lbl = f"PSOL Recon. WF (`{psol_tag}`)"
                 else:
                     wf_lbl = "Incoming Pupil WF"
                 dm_lbl = (
@@ -8642,6 +10857,9 @@ def main():
             if pyr_upd is None:
                 raise FileNotFoundError(f"Missing pyrwfs_tlm_stg*.csv in {out_dir}")
             summary["pyrwfs_telemetry"] = pyr_upd
+            wl_upd = load_windlayers_metrics(out_dir, tmp_npys=tmp_npys)
+            if wl_upd is not None:
+                summary["windlayers"] = wl_upd
             if os.path.isfile(os.path.join(out_dir, "perturb_timeseries.csv")):
                 try:
                     pmat = np.loadtxt(
@@ -8661,7 +10879,7 @@ def main():
                 json.dump(summary, fh, indent=2)
                 fh.write("\n")
             prev_slot = os.environ.get("CACAOSIM_PLOT_SLOT")
-            os.environ["CACAOSIM_PLOT_SLOT"] = "21,22,23"
+            os.environ["CACAOSIM_PLOT_SLOT"] = "21,22,23,26"
             try:
                 render_plots_via_sys_python(out_dir, summary_path)
             finally:
@@ -8925,6 +11143,11 @@ def main():
     pyrwfs_info = load_pyrwfs_telemetry_metrics(
         out_dir, tmp_npys=tmp_npys, chrom_info=chrom_info
     )
+    windlayers_info = load_windlayers_metrics(
+        out_dir, tmp_npys=tmp_npys, zenith_deg=float(bcfg_parsed.get("zenith_deg", 30.0))
+    )
+    petal_ctrl_info = load_petal_ctrl_metrics(out_dir, tmp_npys)
+    modalwhite_info = load_modalwhite_metrics(out_dir)
     coro_metrics = analyze_coronagraph_and_lowfs(
         out_dir,
         chrom_info,
@@ -8934,6 +11157,7 @@ def main():
         tel_diam_m,
         tmp_npys,
     )
+    adc_disp_info = analyze_adc_and_dispersion(out_dir, chrom_info, tel_diam_m=tel_diam_m)
 
     nwf_tel = int(bcfg_parsed.get("nwf", 256))
     pup_dpix = float(bcfg_parsed.get("pup_diam_pix", 240.0))
@@ -9072,6 +11296,14 @@ def main():
         summary["calib_2wfs1dm"] = calib_2wfs_info
     if pyrwfs_info is not None:
         summary["pyrwfs_telemetry"] = pyrwfs_info
+    if windlayers_info is not None:
+        summary["windlayers"] = windlayers_info
+    if adc_disp_info is not None:
+        summary["adc_dispersion"] = adc_disp_info
+    if petal_ctrl_info is not None:
+        summary["petal_ctrl"] = petal_ctrl_info
+    if modalwhite_info is not None:
+        summary["modalwhite"] = modalwhite_info
 
     if chrom_info is not None:
         summary["chromaticity"] = chrom_info
@@ -9121,6 +11353,34 @@ def main():
             f"{t_prt['oversample']} sub-samples per {t_prt['outer_dt_ms']:.2f} ms "
             f"({t_prt['outer_master_hz']/1000:.1f} kHz) outer tick"
         )
+    if adc_disp_info is not None:
+        _ac = adc_disp_info["config"]
+        _as = adc_disp_info["state"]
+        _ab = adc_disp_info["bands"]
+        _ash = adc_disp_info["chrom_shear"]
+        print("\n[Atmospheric Dispersion & AO188 ADC]")
+        print(
+            f"  Geometry / ADC : z={_ac['zenith_deg']:.1f} deg, PA={_ac['disp_pa_deg']:.1f} deg "
+            f"({_ac['imr_mode']}), preset={_ac['preset']}, mode={_ac['mode']}, "
+            f"opt={_ac['opt_band']}, psi={_as['psi_deg']:.2f} deg, "
+            f"chrom_turb={'ON' if _ash['enabled'] else 'OFF'} "
+            f"(dr_16km={_ash['max_layer_shear_cm']:.1f} cm)"
+        )
+        print(
+            f"  Dispersion Span: Vis {_ab['vis']['atm_mas']:.1f} -> {_ab['vis']['res_mas']:.2f} mas | "
+            f"J {_ab['j']['atm_mas']:.1f} -> {_ab['j']['res_mas']:.2f} mas | "
+            f"H {_ab['h']['atm_mas']:.1f} -> {_ab['h']['res_mas']:.2f} mas | "
+            f"Vis-H {_ab['vis_to_h']['atm_mas']:.1f} -> {_ab['vis_to_h']['res_mas']:.2f} mas"
+        )
+        _vtt_p = adc_disp_info.get("vis_pyrwfs_ttm")
+        if isinstance(_vtt_p, dict):
+            print(
+                f"  Vis PyWFS TTM  : mode={_vtt_p.get('mode', 'closed')} (g={float(_vtt_p.get('gain', 0.0)):.3f}), "
+                f"cmd=({float(_vtt_p.get('cmd_x_mas', 0.0)):+.2f}, {float(_vtt_p.get('cmd_y_mas', 0.0)):+.2f}) mas "
+                f"({float(_vtt_p.get('cmd_x_um', 0.0)):+.4f}, {float(_vtt_p.get('cmd_y_um', 0.0)):+.4f} um), "
+                f"res_dm02_TT=({float(_vtt_p.get('res_dm02_tt_x_mas', 0.0)):+.2f}, "
+                f"{float(_vtt_p.get('res_dm02_tt_y_mas', 0.0)):+.2f}) mas"
+            )
     for bkey, bcfg in BANDS.items():
         print(f"\n[{bcfg['label']}]")
         for skey, slabel in STAGES:
@@ -9248,15 +11508,73 @@ def main():
                 xc = sd.get("crosscheck") or {}
                 r_s = xc.get("corr_dfpup_vs_1mS")
                 r_txt = f", r(df,1-S)={r_s:+.2f}" if r_s is not None else ""
+                _sc_deb = wf.get("scint_debias_mean")
+                _sc_txt = (
+                    f"scint={wf.get('scint_idx_mean', 0):.4f}(deb={_sc_deb:.4f})"
+                    if _sc_deb is not None
+                    else f"scint={wf.get('scint_idx_mean', 0):.3f}"
+                )
                 print(
                     f"  {tag:<20s}: N={sd.get('n_frames', 0):4d} | "
                     f"f_pup={fl.get('f_pup_mean', 0)*100:5.1f}% "
                     f"(f0={sd.get('f_pup0', 0)*100:5.1f}%, df={fl.get('df_pup_mean', 0)*100:+5.2f}%{r_txt}) | "
                     f"TT_rms={jt.get('q_tt_rms_quad', 0):.4f} | "
-                    f"scint={wf.get('scint_idx_mean', 0):.3f} | "
+                    f"{_sc_txt} | "
                     f"curl={wf.get('curl_ratio_mean', 0):.3f} | "
                     f"LWE={wf.get('lwe_metric_mean', 0):.3f} | "
                     f"dx/dy={al.get('pup_dx_mean', 0):+.2f}/{al.get('pup_dy_mean', 0):+.2f} pix"
+                )
+
+    if windlayers_info is not None and windlayers_info.get("enabled"):
+        print(
+            f"\n[Atmospheric Wind Layers Reconstruction (mlt-windlayers, {windlayers_info.get('atmturb_fresnel_label', '')})]"
+        )
+        print(
+            f"  N={windlayers_info.get('nframes', 0)} fr (t={windlayers_info.get('tint_s', 0.0):.2f} s) | "
+            f"D_pix={windlayers_info.get('diampix', 0.0):.1f}, bg={windlayers_info.get('bg_adu', 0.0):.1f} ADU, "
+            f"dx={windlayers_info.get('dx_m', 0.0):.4f} m | "
+            f"moving={windlayers_info.get('n_moving_layers', 0)}/{windlayers_info.get('nlayers', 0)}"
+        )
+        for _wl in windlayers_info.get("layers") or []:
+            _z_s = f"{float(_wl['z_m']):7.0f}+/-{float(_wl.get('zerr_m') or 0.0):.0f} m" if _wl.get("z_m") is not None else "    n/a"
+            _gt_s = (
+                f" -> GT{_wl['matched_gt_index']} ({_wl['matched_gt_regime']}, "
+                f"{_wl['matched_gt_speed_mps']:.1f} m/s @ {_wl['matched_gt_dir_deg']:.0f} deg, "
+                f"z_los={_wl['matched_gt_z_los_m']:.0f} m)"
+                if _wl.get("matched_gt_index") is not None
+                else (" [static/LWE]" if _wl.get("is_static") else "")
+            )
+            print(
+                f"  L{_wl['index']}: v={_wl['speed_mps']:5.2f} m/s @ {_wl['dir_deg']:5.1f} deg "
+                f"(vx={_wl['vx_mps']:+6.2f}, vy={_wl['vy_mps']:+6.2f}) | "
+                f"SNR={float(_wl.get('snr') or 0.0):5.1f} | z={_z_s} | coh={float(_wl.get('coh') or 0.0):.2f}{_gt_s}"
+            )
+
+    if petal_ctrl_info is not None:
+        _pw = petal_ctrl_info.get("waves_enws") or [0, 0, 0, 0]
+        _pe = petal_ctrl_info.get("final_ema") or {}
+        print("\n[Stage-1 Passive Petal-Unwrap Control (petal-1 -> dm01disp06)]")
+        print(
+            f"  Jumps={int(petal_ctrl_info.get('n_jumps', 0))} "
+            f"(aborts={int(petal_ctrl_info.get('n_aborts', 0))}, "
+            f"rollbacks={int(petal_ctrl_info.get('n_rollbacks', 0))}) | "
+            f"Waves(E,N,W,S)=({int(_pw[0]):+d},{int(_pw[1]):+d},{int(_pw[2]):+d},{int(_pw[3]):+d}) | "
+            f"DM06 RMS={float(petal_ctrl_info.get('dm06_rms_um', 0.0)):.3f} um | "
+            f"Final evSN={float(_pe.get('ev_sn', 0.0)):+.3f}, sgS={float(_pe.get('sg_s', 0.0)):+.3f}"
+        )
+
+    if modalwhite_info is not None and modalwhite_info.get("stages"):
+        print("\n[Closed-Loop Modal Whiteness Audit (modalwhite)]")
+        for _sk, _tag in (("stage1", "Stage 1 (AO3k)"), ("stage2", "Stage 2 (SCExAO)")):
+            _ms = modalwhite_info["stages"].get(_sk)
+            if isinstance(_ms, dict):
+                print(
+                    f"  {_tag:<18s}: N={int(_ms.get('n_samples', 0)):4d} (d={int(_ms.get('d_ceil', 0))}) | "
+                    f"Q_vw_b0={float(_ms.get('Q_vw_b0', 0.0)):6.2f}, "
+                    f"Q_xmode_b0={float(_ms.get('Q_xmode_b0', 0.0)):6.2f}, "
+                    f"rho_d={float(_ms.get('rho_d_b0', 0.0)):+.4f}, "
+                    f"recov={float(_ms.get('recov_wfe_nm', 0.0)):5.1f} nm ({float(_ms.get('recov_var_pct', 0.0)):4.1f}%), "
+                    f"alerts={int(_ms.get('alert_flags', 0))}"
                 )
 
 
