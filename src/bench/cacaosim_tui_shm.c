@@ -541,6 +541,11 @@ void cs_shm_scan(cs_shm_mon_t *mon, const cacaosim_bench_cfg_t *cfg, int force)
             {
                 register_stream(mon, nd->in_wfe, "wfe_opd_m", nd->id, 1);
             }
+            else if (nd->kind == CACAOSIM_NODE_ADC)
+            {
+                register_stream(mon, nd->in_cmd, "adc_cmd", nd->id, 1);
+                register_stream(mon, nd->out_state, "adc_state", nd->id, 1);
+            }
         }
     }
 

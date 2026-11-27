@@ -392,7 +392,7 @@ typedef struct
     double      max_v;         /**< Inclusive maximum bound for numeric/enum types */
     double      step_v;        /**< Fine increment step (`Left`/`Right`; `5x` when `coarse != 0`) */
     int         n_enum;        /**< Number of valid entries in `enum_names[]` (`CS_PTYPE_ENUM`) */
-    const char *enum_names[6]; /**< Canonical option strings for `CS_PTYPE_ENUM` (`<= 6` choices) */
+    const char *enum_names[8]; /**< Canonical option strings for `CS_PTYPE_ENUM` (`<= 8` choices) */
 } cs_param_desc_t;
 
 /* ── Undo/Redo Ring & Modals ──────────────────────────────────────────────── */

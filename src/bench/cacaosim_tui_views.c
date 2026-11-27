@@ -476,7 +476,7 @@ void cs_render_view_tables(cs_tui_app_t *app, int x, int y, int w, int h)
     if (ry + 2 < bot)
     {
         cs_printf_at(&app->scr, x + 2, ry++, w - 4, pal->fg_proc, pal->bg_panel, CS_ATTR_BOLD, 1,
-                     "BEAMSPLITTERS, CORONAGRAPHS & STATIC WFE");
+                     "ADC, BEAMSPLITTERS, CORONAGRAPHS & STATIC WFE");
         cs_printf_at(&app->scr, x + 2, ry++, w - 4, pal->fg_dim, pal->bg_panel, 0u, 1,
                      "%-12s %-10s %-24s %-16s %s", "ID", "KIND", "MODE / SPEC", "IN BEAM",
                      "OUTPUT ARMS / SHM");
@@ -486,7 +486,7 @@ void cs_render_view_tables(cs_tui_app_t *app, int x, int y, int w, int h)
     {
         const cacaosim_node_cfg_t *nd = &app->cfg.nodes[i];
         if (nd->kind != CACAOSIM_NODE_SPLITTER && nd->kind != CACAOSIM_NODE_CORO &&
-            nd->kind != CACAOSIM_NODE_WFE)
+            nd->kind != CACAOSIM_NODE_WFE && nd->kind != CACAOSIM_NODE_ADC)
         {
             continue;
         }
@@ -496,7 +496,9 @@ void cs_render_view_tables(cs_tui_app_t *app, int x, int y, int w, int h)
 
         const char *kstr = (nd->kind == CACAOSIM_NODE_SPLITTER)
                                ? "SPLITTER"
-                               : (nd->kind == CACAOSIM_NODE_CORO ? "CORO" : "WFE");
+                               : (nd->kind == CACAOSIM_NODE_CORO
+                                      ? "CORO"
+                                      : (nd->kind == CACAOSIM_NODE_ADC ? "ADC" : "WFE"));
         char mstr[36], arms[112];
         if (nd->kind == CACAOSIM_NODE_SPLITTER)
         {
@@ -561,6 +563,20 @@ void cs_render_view_tables(cs_tui_app_t *app, int x, int y, int w, int h)
             else
             {
                 snprintf(arms, sizeof(arms), "Sci:%s", nd->out_beam);
+            }
+        }
+        else if (nd->kind == CACAOSIM_NODE_ADC)
+        {
+            snprintf(mstr, sizeof(mstr), "%s %s(%s)", cacaosim_adc_preset_name(nd->adc.preset),
+                     cacaosim_adc_mode_name(nd->adc.mode),
+                     cacaosim_adc_opt_band_name(nd->adc.opt_band));
+            if (nd->out_state[0] != '\0')
+            {
+                snprintf(arms, sizeof(arms), "Out:%s  State:%s", nd->out_beam, nd->out_state);
+            }
+            else
+            {
+                snprintf(arms, sizeof(arms), "Out:%s", nd->out_beam);
             }
         }
         else

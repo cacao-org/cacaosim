@@ -141,6 +141,8 @@ static const char *node_badge(const cacaosim_node_cfg_t *nd)
         return "CAM";
     case CACAOSIM_NODE_WFE:
         return "WFE";
+    case CACAOSIM_NODE_ADC:
+        return "ADC";
     }
     return "NODE";
 }
@@ -174,6 +176,8 @@ static cs_tui_rgb_t node_color(const cacaosim_node_cfg_t *nd, const cs_tui_pal_t
     case CACAOSIM_NODE_CORO:
     case CACAOSIM_NODE_WFE:
         return pal->fg_warn;
+    case CACAOSIM_NODE_ADC:
+        return pal->fg_stream;
     case CACAOSIM_NODE_PYRWFS:
     case CACAOSIM_NODE_SHWFS:
     case CACAOSIM_NODE_ZWFS:
@@ -324,6 +328,11 @@ static void node_short_spec(
         {
             snprintf(out, cap, "%.0fnm [OPD m]", nd->wfe_rms_nm * fabsf(nd->wfe_gain));
         }
+        break;
+    case CACAOSIM_NODE_ADC:
+        snprintf(out, cap, "%s %s(%s)", cacaosim_adc_preset_name(nd->adc.preset),
+                 cacaosim_adc_mode_name(nd->adc.mode),
+                 cacaosim_adc_opt_band_name(nd->adc.opt_band));
         break;
     }
 }
@@ -615,6 +624,10 @@ static int node_primary_shm_live(const cs_tui_app_t *app, const cacaosim_node_cf
     else if (nd->kind == CACAOSIM_NODE_WFE)
     {
         s = nd->in_wfe;
+    }
+    else if (nd->kind == CACAOSIM_NODE_ADC)
+    {
+        s = (nd->out_state[0] != '\0') ? nd->out_state : nd->in_cmd;
     }
     else if (nd->kind == CACAOSIM_NODE_PYRWFS || nd->kind == CACAOSIM_NODE_SHWFS ||
              nd->kind == CACAOSIM_NODE_ZWFS || nd->kind == CACAOSIM_NODE_FPCAM)
@@ -1020,7 +1033,8 @@ static void dc_trace_beam(dag_draw_t *d, const char *beam, int lx, int row_slot,
                                    node_color(nd, d->pal), tip);
         int nx = cur_x + bw;
 
-        if (nd->kind == CACAOSIM_NODE_DM || nd->kind == CACAOSIM_NODE_WFE)
+        if (nd->kind == CACAOSIM_NODE_DM || nd->kind == CACAOSIM_NODE_WFE ||
+            nd->kind == CACAOSIM_NODE_ADC)
         {
             dc_draw_harrow(d, nx, ly, nd->out_beam, d->pal->fg_conn);
             dc_trace_beam(d, nd->out_beam, nx + 6, use_row, depth + 1);
@@ -1576,6 +1590,10 @@ static void render_view_builder(cs_tui_app_t *app, int x, int y, int w, int h)
         {
             kname = "wfe";
         }
+        else if (nd->kind == CACAOSIM_NODE_ADC)
+        {
+            kname = "adc";
+        }
         snprintf(ititle, sizeof(ititle), "INSPECTOR: [%s.%s]", kname, nd->id);
     }
     cs_draw_box(&app->scr, rx, iy, rw, ih, f_pa, ititle, "Enter:Edit  <-/->:Step",
@@ -1943,7 +1961,7 @@ static void render_modal(cs_tui_app_t *app)
     /* 1. Add-Element & Splice Wizard (`a` / `+` or clicking `[+]` on a schematic beam) */
     if (app->modal == CS_MODAL_ADD)
     {
-        static const char *const names[9] = {
+        static const char *const names[10] = {
             "1. [dm]       Zonal Deformable Mirror",
             "2. [ttm]      2-Axis Tip-Tilt Mirror",
             "3. [splitter] Dichroic / Gray Beamsplitter",
@@ -1953,8 +1971,9 @@ static void render_modal(cs_tui_app_t *app)
             "7. [zwfs]     Zernike Phase-Contrast WFS",
             "8. [fpcam]    Focal-Plane Science Camera",
             "9. [wfe]      Static Wavefront Error [OPD m]",
+            "0. [adc]      Atmospheric Dispersion Compensator (AO188)",
         };
-        static const char *const descs[9] = {
+        static const char *const descs[10] = {
             "Actuator grid with ZOH servo dynamics, stroke clip & DAC bits",
             "Fast steering tip-tilt mirror (dm_mode=1) with servo latency",
             "Splits beam into out_refl + out_trans (gray, LP, SP, or BP)",
@@ -1964,12 +1983,13 @@ static void render_modal(cs_tui_app_t *app)
             "Babinet Matrix-DFT Zernike phase-contrast wavefront sensor",
             "Polychromatic MFT/FFT science PSF camera + Strehl telemetry",
             "Inline static wavefront error SHM stream in unit of OPD [meter]",
+            "Subaru AO188 counter-rotating prism ADC (LUT, manual, or SHM)",
         };
 
         char     beams[CACAOSIM_BENCH_MAX_BEAMS][CACAOSIM_BENCH_NAME_LEN];
         uint32_t nb = cacaosim_bench_list_beams(&app->cfg, beams, CACAOSIM_BENCH_MAX_BEAMS);
         int      mw = (W > 80) ? 76 : (W - 4);
-        int      mh = 16;
+        int      mh = 17;
         int      mx = (W - mw) / 2;
         int      my = (H - mh) / 2;
 
@@ -1985,21 +2005,21 @@ static void render_modal(cs_tui_app_t *app)
         cs_tui_add_hit(app, CS_HIT_MODAL_EXTRA, 0, mx + 2, my + 1, mw - 4, 1,
                        "Click or press Tab to cycle target input beam");
 
-        for (int i = 0; i < 9; i++)
+        for (int i = 0; i < 10; i++)
         {
             int          sel = (app->modal_sel == i);
             cs_tui_rgb_t bg  = sel ? pal->bg_selected : pal->bg_popup;
             cs_fill_rect(&app->scr, mx + 1, my + 3 + i, mw - 2, 1, pal->fg_text, bg);
             cs_printf_at(&app->scr, mx + 2, my + 3 + i, mw - 4,
                          sel ? pal->fg_bright : pal->fg_text, bg, sel ? CS_ATTR_BOLD : 0u, 1,
-                         "%-44s", names[i]);
+                         "%-58s", names[i]);
             cs_tui_add_hit(app, CS_HIT_MODAL_ROW, i, mx + 1, my + 3 + i, mw - 2, 1, descs[i]);
         }
-        cs_printf_at(&app->scr, mx + 2, my + 13, mw - 4, pal->fg_muted, pal->bg_popup, 0u, 1, "%s",
-                     descs[(app->modal_sel >= 0 && app->modal_sel < 9) ? app->modal_sel : 0]);
-        draw_btn(app, mx + mw - 22, my + 14, "[Enter:Insert]", CS_HIT_MODAL_OK, 0, pal->fg_active,
+        cs_printf_at(&app->scr, mx + 2, my + 14, mw - 4, pal->fg_muted, pal->bg_popup, 0u, 1, "%s",
+                     descs[(app->modal_sel >= 0 && app->modal_sel < 10) ? app->modal_sel : 0]);
+        draw_btn(app, mx + mw - 22, my + 15, "[Enter:Insert]", CS_HIT_MODAL_OK, 0, pal->fg_active,
                  pal->bg_panel_alt, "Insert selected optical element");
-        draw_btn(app, mx + mw - 7, my + 14, "[Esc]", CS_HIT_MODAL_CANCEL, 0, pal->fg_error,
+        draw_btn(app, mx + mw - 7, my + 15, "[Esc]", CS_HIT_MODAL_CANCEL, 0, pal->fg_error,
                  pal->bg_panel_alt, "Cancel");
         return;
     }

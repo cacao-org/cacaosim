@@ -78,6 +78,18 @@ enum
     PID_B_PETAL_RMS,
     PID_B_PETAL_TAU,
     PID_B_PETAL_SEED,
+    PID_B_ATM_DISP_EN,
+    PID_B_ZENITH_DEG,
+    PID_B_DISP_PA_DEG,
+    PID_B_IMR_MODE,
+    PID_B_PAR_RATE,
+    PID_B_SITE_ALT,
+    PID_B_ATM_PRES,
+    PID_B_ATM_TEMP,
+    PID_B_ATM_RH,
+    PID_B_ATM_REF_UM,
+    PID_B_CHROM_TURB,
+    PID_B_CHROM_LAMS,
     PID_B_BACKEND,
     PID_B_OUT_BEAM,
     PID_B_IN_WF,
@@ -100,6 +112,7 @@ enum
     PID_N_IN_NCPA,
     PID_N_IN_LYOT,
     PID_N_IN_WFE,
+    PID_N_OUT_STATE,
     PID_N_TPUT,
     PID_N_SHIFT_X,
     PID_N_SHIFT_Y,
@@ -233,7 +246,23 @@ enum
     PID_WFE_DEFOCUS_NM,
     PID_WFE_ALPHA,
     PID_WFE_GAIN,
-    PID_WFE_SEED
+    PID_WFE_SEED,
+
+    /* Atmospheric Dispersion Compensator ([adc.<id>]) parameters */
+    PID_ADC_PRESET = 700,
+    PID_ADC_MODE,
+    PID_ADC_OPT_BAND,
+    PID_ADC_OPT_LAM1,
+    PID_ADC_OPT_LAM2,
+    PID_ADC_ANG1,
+    PID_ADC_ANG2,
+    PID_ADC_MAN_USE_PSI,
+    PID_ADC_MAN_PSI,
+    PID_ADC_LUT_SC_ERR,
+    PID_ADC_LUT_PA_ERR,
+    PID_ADC_IDEAL_MECH,
+    PID_ADC_TPUT_EN,
+    PID_ADC_TPUT_BASE
 };
 
 /**
@@ -397,6 +426,39 @@ static void add_enum6_pd(
     }
 }
 
+static void add_enum_list_pd(
+    cs_param_desc_t  *arr,
+    int              *n,
+    int               max_n,
+    int               id,
+    const char       *key,
+    const char       *label,
+    int               n_enum,
+    const char *const names[],
+    const char       *tip)
+{
+    if (*n >= max_n || n_enum <= 0 || n_enum > 8)
+    {
+        return;
+    }
+    cs_param_desc_t *p = &arr[(*n)++];
+    memset(p, 0, sizeof(*p));
+    p->id     = id;
+    p->key    = key;
+    p->label  = label;
+    p->unit   = "";
+    p->tip    = (tip != NULL) ? tip : "";
+    p->type   = CS_PTYPE_ENUM;
+    p->min_v  = 0.0;
+    p->max_v  = (double) (n_enum - 1);
+    p->step_v = 1.0;
+    p->n_enum = n_enum;
+    for (int i = 0; i < n_enum; i++)
+    {
+        p->enum_names[i] = names[i];
+    }
+}
+
 /**
  * cs_params_build() - Construct active Inspector parameter descriptors for `(sel_item, subtab)`
  * @cfg:      Source `.bench` configuration (must not be NULL)
@@ -480,8 +542,37 @@ int cs_params_build(
                    CS_PTYPE_FLOAT, 0.01, 1.0, 0.05, "Entrance telescope + relay transmission");
             add_pd(out, &n, max_out, PID_B_TURB_GAIN, "turb_gain", "Turbulence Gain", "x",
                    CS_PTYPE_FLOAT, 0.0, 10.0, 0.1, "Atmospheric phase amplitude multiplier");
+            add_pd(out, &n, max_out, PID_B_ATM_DISP_EN, "atm_disp_enable", "Atm Dispersion", "",
+                   CS_PTYPE_BOOL, 0, 1, 1, "Enable refractive atmospheric dispersion");
+            add_pd(out, &n, max_out, PID_B_ZENITH_DEG, "zenith_deg", "Zenith Angle", "deg",
+                   CS_PTYPE_FLOAT, 0.0, 75.0, 5.0, "Target telescope zenith distance [deg]");
+            add_pd(out, &n, max_out, PID_B_DISP_PA_DEG, "disp_pa_deg", "Dispersion PA", "deg",
+                   CS_PTYPE_FLOAT, -180.0, 180.0, 5.0, "Zenith dispersion azimuth on pupil [deg]");
             if (show_advanced)
             {
+                add_enum_pd(out, &n, max_out, PID_B_IMR_MODE, "imr_mode", "IMR Mode", 2,
+                            "pupil_track", "field_track", NULL, NULL,
+                            "Image rotator mode: pupil_track (ADI) or field_track");
+                add_pd(out, &n, max_out, PID_B_PAR_RATE, "parallactic_rate_dps", "PA Rate",
+                       "deg/s", CS_PTYPE_FLOAT, -1.0, 1.0, 0.01,
+                       "Parallactic angle slew rate in field_track IMR mode");
+                add_pd(out, &n, max_out, PID_B_SITE_ALT, "site_alt_m", "Site Altitude", "m",
+                       CS_PTYPE_FLOAT, 0.0, 6000.0, 100.0,
+                       "Observatory elevation [m] (Maunakea = 4205)");
+                add_pd(out, &n, max_out, PID_B_ATM_PRES, "atm_pressure_hpa", "Air Pressure", "hPa",
+                       CS_PTYPE_FLOAT, 300.0, 1100.0, 5.0, "Ambient pressure [hPa] (Maunakea=615)");
+                add_pd(out, &n, max_out, PID_B_ATM_TEMP, "atm_temp_c", "Air Temp", "C",
+                       CS_PTYPE_FLOAT, -30.0, 40.0, 1.0, "Ambient temperature [C] (Maunakea=2)");
+                add_pd(out, &n, max_out, PID_B_ATM_RH, "atm_rh_pct", "Rel Humidity", "%",
+                       CS_PTYPE_FLOAT, 0.0, 100.0, 5.0, "Ambient relative humidity [%]");
+                add_pd(out, &n, max_out, PID_B_ATM_REF_UM, "atm_disp_ref_um", "Disp Ref Lam", "um",
+                       CS_PTYPE_FLOAT, 0.38, 2.50, 0.05,
+                       "Zero-shift reference wavelength for atmospheric dispersion");
+                add_pd(out, &n, max_out, PID_B_CHROM_TURB, "chrom_turb", "Chrom Turb Shear", "",
+                       CS_PTYPE_BOOL, 0, 1, 1,
+                       "Enable multi-wavelength chromatic turbulence shear (Bouguer ray shift)");
+                add_pd(out, &n, max_out, PID_B_CHROM_LAMS, "chrom_lambdas", "Chrom Lambdas", "um",
+                       CS_PTYPE_STR, 0, 0, 0, "CSV anchor wavelengths [um] for chromatic cube");
                 add_pd(out, &n, max_out, PID_B_VIB_ENABLE, "vib_enable", "Vibrations", "",
                        CS_PTYPE_BOOL, 0, 1, 1, "Enable stochastic telescope/bench vibrations");
                 add_pd(out, &n, max_out, PID_B_VIB_RMS, "vib_rms_nm", "Vib OPD RMS", "nm",
@@ -609,6 +700,15 @@ int cs_params_build(
                    0, 0, "Downstream optical beam with static WFE applied");
             add_pd(out, &n, max_out, PID_N_IN_WFE, "in_wfe", "Static WFE SHM", "m", CS_PTYPE_STR, 0,
                    0, 0, "Input 2D static wavefront error OPD stream [meter]");
+        }
+        else if (nd->kind == CACAOSIM_NODE_ADC)
+        {
+            add_pd(out, &n, max_out, PID_N_OUT_BEAM, "out", "Output Beam", "beam", CS_PTYPE_STR, 0,
+                   0, 0, "Downstream optical beam with ADC dispersion applied");
+            add_pd(out, &n, max_out, PID_N_IN_CMD, "in_cmd", "ADC Cmd SHM", "shm", CS_PTYPE_STR, 0,
+                   0, 0, "Optional [2x1] float32 SHM prism command/trim stream");
+            add_pd(out, &n, max_out, PID_N_OUT_STATE, "out_state", "ADC State SHM", "shm",
+                   CS_PTYPE_STR, 0, 0, 0, "Optional [10x1] float32 SHM live ADC telemetry stream");
         }
         else
         {
@@ -875,6 +975,56 @@ int cs_params_build(
                    CS_PTYPE_FLOAT, -180.0, 180.0, 1.0, "In-plane pupil clocking angle [degrees]");
             add_pd(out, &n, max_out, PID_N_MAG_SCALE, "mag_scale", "Magnification", "x",
                    CS_PTYPE_FLOAT, 0.50, 1.50, 0.01, "Radial pupil magnification factor");
+        }
+        return n;
+    }
+
+    if (nd->kind == CACAOSIM_NODE_ADC)
+    {
+        if (subtab == 0)
+        {
+            static const char *const presets[3] = { "ao188", "ao188_nominal", "snell_doublet" };
+            static const char *const modes[5]   = { "retracted", "manual", "lut", "shm",
+                                                    "lut_plus_shm" };
+            static const char *const bands[8]   = { "whole", "H", "J", "z",
+                                                    "K'",    "K", "vis", "custom" };
+            add_enum_list_pd(out, &n, max_out, PID_ADC_PRESET, "preset", "ADC Preset", 3, presets,
+                             "ao188 (Egner Table 11), ao188_nominal (Table 10), or snell_doublet");
+            add_enum_list_pd(out, &n, max_out, PID_ADC_MODE, "mode", "Control Mode", 5, modes,
+                             "retracted, manual, lut, shm, or lut_plus_shm");
+            add_enum_list_pd(out, &n, max_out, PID_ADC_OPT_BAND, "opt_band", "LUT Band", 8, bands,
+                             "LUT optimization passband (Egner Table 11)");
+            if (nd->adc.opt_band == CACAOSIM_ADC_OPT_CUSTOM)
+            {
+                add_pd(out, &n, max_out, PID_ADC_OPT_LAM1, "opt_lam1_um", "Band Lam Min", "um",
+                       CS_PTYPE_FLOAT, 0.40, 2.40, 0.05, "Custom LUT lower wavelength [um]");
+                add_pd(out, &n, max_out, PID_ADC_OPT_LAM2, "opt_lam2_um", "Band Lam Max", "um",
+                       CS_PTYPE_FLOAT, 0.40, 2.50, 0.05, "Custom LUT upper wavelength [um]");
+            }
+            add_pd(out, &n, max_out, PID_ADC_ANG1, "angle1_deg", "Manual Angle 1", "deg",
+                   CS_PTYPE_FLOAT, -360.0, 360.0, 2.0, "Manual prism #1 angle [deg]");
+            add_pd(out, &n, max_out, PID_ADC_ANG2, "angle2_deg", "Manual Angle 2", "deg",
+                   CS_PTYPE_FLOAT, -360.0, 360.0, 2.0, "Manual prism #2 angle [deg]");
+            if (show_advanced)
+            {
+                add_pd(out, &n, max_out, PID_ADC_MAN_USE_PSI, "manual_use_psi", "Manual Use Psi",
+                       "", CS_PTYPE_BOOL, 0, 1, 1, "Command Egner psi instead of angle1/2");
+                add_pd(out, &n, max_out, PID_ADC_MAN_PSI, "manual_psi_deg", "Manual Psi", "deg",
+                       CS_PTYPE_FLOAT, -90.0, 90.0, 1.0, "Manual Egner dispersion angle psi [deg]");
+            }
+        }
+        else
+        {
+            add_pd(out, &n, max_out, PID_ADC_LUT_SC_ERR, "lut_scale_err", "LUT Scale Err", "",
+                   CS_PTYPE_FLOAT, -0.50, 0.50, 0.02, "Fractional LUT dispersion gain error");
+            add_pd(out, &n, max_out, PID_ADC_LUT_PA_ERR, "lut_pa_err_deg", "LUT PA Error", "deg",
+                   CS_PTYPE_FLOAT, -90.0, 90.0, 1.0, "Static LUT PA alignment error [deg]");
+            add_pd(out, &n, max_out, PID_ADC_IDEAL_MECH, "ideal_mech", "Ideal Stages", "",
+                   CS_PTYPE_BOOL, 0, 1, 1, "1=ideal; 0=Table 29 step/slew/backlash");
+            add_pd(out, &n, max_out, PID_ADC_TPUT_EN, "tput_enable", "Apply Tput", "",
+                   CS_PTYPE_BOOL, 0, 1, 1, "Apply AR-coated prism spectral throughput");
+            add_pd(out, &n, max_out, PID_ADC_TPUT_BASE, "tput_base", "Mid-Band Tput", "",
+                   CS_PTYPE_FLOAT, 0.05, 1.0, 0.01, "Mid-band optical transmission when deployed");
         }
         return n;
     }
@@ -1224,6 +1374,42 @@ void cs_param_format_val(
         case PID_B_PETAL_SEED:
             snprintf(buf, cap, "%llu", (unsigned long long) cfg->perturb.petal_seed);
             break;
+        case PID_B_ATM_DISP_EN:
+            snprintf(buf, cap, "%s", cfg->atm_disp.enable ? "ON" : "OFF");
+            break;
+        case PID_B_ZENITH_DEG:
+            snprintf(buf, cap, "%.1f", cfg->atm_disp.zenith_deg);
+            break;
+        case PID_B_DISP_PA_DEG:
+            snprintf(buf, cap, "%.1f", cfg->atm_disp.disp_pa_deg);
+            break;
+        case PID_B_IMR_MODE:
+            snprintf(buf, cap, "%s", (cfg->imr_mode == 1) ? "field_track" : "pupil_track");
+            break;
+        case PID_B_PAR_RATE:
+            snprintf(buf, cap, "%.4f", cfg->parallactic_rate_dps);
+            break;
+        case PID_B_SITE_ALT:
+            snprintf(buf, cap, "%.1f", cfg->site_alt_m);
+            break;
+        case PID_B_ATM_PRES:
+            snprintf(buf, cap, "%.1f", cfg->atm_disp.pressure_hpa);
+            break;
+        case PID_B_ATM_TEMP:
+            snprintf(buf, cap, "%.1f", cfg->atm_disp.temp_c);
+            break;
+        case PID_B_ATM_RH:
+            snprintf(buf, cap, "%.1f", cfg->atm_disp.rh_pct);
+            break;
+        case PID_B_ATM_REF_UM:
+            snprintf(buf, cap, "%.3f", cfg->atm_disp.ref_lam_um);
+            break;
+        case PID_B_CHROM_TURB:
+            snprintf(buf, cap, "%s", cfg->chrom_turb ? "ON" : "OFF");
+            break;
+        case PID_B_CHROM_LAMS:
+            snprintf(buf, cap, "%s", cfg->chrom_lambdas);
+            break;
         case PID_B_BACKEND:
             snprintf(buf, cap, "%s",
                      (cfg->backend == 1) ? "cpu" : (cfg->backend == 2 ? "cuda" : "auto"));
@@ -1295,6 +1481,9 @@ void cs_param_format_val(
         break;
     case PID_N_IN_WFE:
         snprintf(buf, cap, "%s", nd->in_wfe);
+        break;
+    case PID_N_OUT_STATE:
+        snprintf(buf, cap, "%s", nd->out_state);
         break;
     case PID_N_TPUT:
         snprintf(buf, cap, "%.3f", nd->tput);
@@ -1710,6 +1899,48 @@ void cs_param_format_val(
     case PID_WFE_SEED:
         snprintf(buf, cap, "%llu", (unsigned long long) nd->wfe_seed);
         break;
+    case PID_ADC_PRESET:
+        snprintf(buf, cap, "%s", cacaosim_adc_preset_name(nd->adc.preset));
+        break;
+    case PID_ADC_MODE:
+        snprintf(buf, cap, "%s", cacaosim_adc_mode_name(nd->adc.mode));
+        break;
+    case PID_ADC_OPT_BAND:
+        snprintf(buf, cap, "%s", cacaosim_adc_opt_band_name(nd->adc.opt_band));
+        break;
+    case PID_ADC_OPT_LAM1:
+        snprintf(buf, cap, "%.3f", nd->adc.opt_lam1_um);
+        break;
+    case PID_ADC_OPT_LAM2:
+        snprintf(buf, cap, "%.3f", nd->adc.opt_lam2_um);
+        break;
+    case PID_ADC_ANG1:
+        snprintf(buf, cap, "%.2f", nd->adc.angle1_deg);
+        break;
+    case PID_ADC_ANG2:
+        snprintf(buf, cap, "%.2f", nd->adc.angle2_deg);
+        break;
+    case PID_ADC_MAN_USE_PSI:
+        snprintf(buf, cap, "%s", nd->adc.manual_use_psi ? "ON" : "OFF");
+        break;
+    case PID_ADC_MAN_PSI:
+        snprintf(buf, cap, "%.2f", nd->adc.manual_psi_deg);
+        break;
+    case PID_ADC_LUT_SC_ERR:
+        snprintf(buf, cap, "%.3f", nd->adc.lut_scale_err);
+        break;
+    case PID_ADC_LUT_PA_ERR:
+        snprintf(buf, cap, "%.2f", nd->adc.lut_pa_err_deg);
+        break;
+    case PID_ADC_IDEAL_MECH:
+        snprintf(buf, cap, "%s", nd->adc.ideal_mech ? "ON" : "OFF");
+        break;
+    case PID_ADC_TPUT_EN:
+        snprintf(buf, cap, "%s", nd->adc.tput_enable ? "ON" : "OFF");
+        break;
+    case PID_ADC_TPUT_BASE:
+        snprintf(buf, cap, "%.3f", nd->adc.tput_base);
+        break;
     default:
         break;
     }
@@ -1938,6 +2169,43 @@ int cs_param_set_str(
         case PID_B_PETAL_SEED:
             cfg->perturb.petal_seed = (iv > 0) ? (uint64_t) iv : 202ULL;
             break;
+        case PID_B_ATM_DISP_EN:
+            cfg->atm_disp.enable = iv ? 1 : 0;
+            break;
+        case PID_B_ZENITH_DEG:
+            cfg->atm_disp.zenith_deg = (float) dv;
+            break;
+        case PID_B_DISP_PA_DEG:
+            cfg->atm_disp.disp_pa_deg = (float) dv;
+            break;
+        case PID_B_IMR_MODE:
+            cfg->imr_mode = (iv == 1) ? 1 : 0;
+            break;
+        case PID_B_PAR_RATE:
+            cfg->parallactic_rate_dps = (float) dv;
+            break;
+        case PID_B_SITE_ALT:
+            cfg->site_alt_m          = (float) dv;
+            cfg->atm_disp.site_alt_m = (float) dv;
+            break;
+        case PID_B_ATM_PRES:
+            cfg->atm_disp.pressure_hpa = (float) dv;
+            break;
+        case PID_B_ATM_TEMP:
+            cfg->atm_disp.temp_c = (float) dv;
+            break;
+        case PID_B_ATM_RH:
+            cfg->atm_disp.rh_pct = (float) dv;
+            break;
+        case PID_B_ATM_REF_UM:
+            cfg->atm_disp.ref_lam_um = (float) dv;
+            break;
+        case PID_B_CHROM_TURB:
+            cfg->chrom_turb = iv ? 1 : 0;
+            break;
+        case PID_B_CHROM_LAMS:
+            snprintf(cfg->chrom_lambdas, sizeof(cfg->chrom_lambdas), "%s", val_str);
+            break;
         case PID_B_BACKEND:
             cfg->backend = iv;
             break;
@@ -2033,6 +2301,9 @@ int cs_param_set_str(
         break;
     case PID_N_IN_WFE:
         snprintf(nd->in_wfe, sizeof(nd->in_wfe), "%s", val_str);
+        break;
+    case PID_N_OUT_STATE:
+        snprintf(nd->out_state, sizeof(nd->out_state), "%s", val_str);
         break;
     case PID_N_TPUT:
         nd->tput = (float) dv;
@@ -2510,6 +2781,48 @@ int cs_param_set_str(
         break;
     case PID_WFE_SEED:
         nd->wfe_seed = (uint64_t) llround(dv);
+        break;
+    case PID_ADC_PRESET:
+        nd->adc.preset = iv;
+        break;
+    case PID_ADC_MODE:
+        nd->adc.mode = iv;
+        break;
+    case PID_ADC_OPT_BAND:
+        nd->adc.opt_band = iv;
+        break;
+    case PID_ADC_OPT_LAM1:
+        nd->adc.opt_lam1_um = (float) dv;
+        break;
+    case PID_ADC_OPT_LAM2:
+        nd->adc.opt_lam2_um = (float) dv;
+        break;
+    case PID_ADC_ANG1:
+        nd->adc.angle1_deg = (float) dv;
+        break;
+    case PID_ADC_ANG2:
+        nd->adc.angle2_deg = (float) dv;
+        break;
+    case PID_ADC_MAN_USE_PSI:
+        nd->adc.manual_use_psi = iv ? 1 : 0;
+        break;
+    case PID_ADC_MAN_PSI:
+        nd->adc.manual_psi_deg = (float) dv;
+        break;
+    case PID_ADC_LUT_SC_ERR:
+        nd->adc.lut_scale_err = (float) dv;
+        break;
+    case PID_ADC_LUT_PA_ERR:
+        nd->adc.lut_pa_err_deg = (float) dv;
+        break;
+    case PID_ADC_IDEAL_MECH:
+        nd->adc.ideal_mech = iv ? 1 : 0;
+        break;
+    case PID_ADC_TPUT_EN:
+        nd->adc.tput_enable = iv ? 1 : 0;
+        break;
+    case PID_ADC_TPUT_BASE:
+        nd->adc.tput_base = (float) dv;
         break;
     default:
         break;

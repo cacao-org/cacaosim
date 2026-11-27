@@ -1889,6 +1889,44 @@ static void render_beam_subtree(
         return;
     }
 
+    /* If a beam feeds >=1 leaf monitor sensors plus exactly ONE downstream relay/splitter/ADC/
+     * coro node, render the leaf sensors as side taps and let the primary optical trunk continue
+     * vertically into Cases 1..3 without losing depth or collapsing downstream branches! */
+    if (n_cons > 1)
+    {
+        int n_non_leaf = 0;
+        int main_cons  = -1;
+        for (int c = 0; c < n_cons; c++)
+        {
+            cacaosim_node_kind_t k = ctx->nodes[consumers[c]].cfg.kind;
+            if (k < CACAOSIM_NODE_PYRWFS || k > CACAOSIM_NODE_FPCAM)
+            {
+                n_non_leaf++;
+                main_cons = consumers[c];
+            }
+        }
+        if (n_non_leaf == 1 && main_cons >= 0)
+        {
+            for (int c = 0; c < n_cons; c++)
+            {
+                if (consumers[c] == main_cons)
+                {
+                    continue;
+                }
+                const cacaosim_bench_node_t *nd = &ctx->nodes[consumers[c]];
+                sbuf_t                       line;
+                sb_init(&line);
+                sb_fg(&line, ev->lvl, ev->pal->fg_conn);
+                sb_puts(&line, prefix);
+                sb_puts(&line, ev->ascii ? "|--> " : "├──▶ ");
+                render_sensor_inline(&line, ev, ctx, nd);
+                panel_row(ev, ev->pal->fg_conn, line.data);
+            }
+            consumers[0] = main_cons;
+            n_cons       = 1;
+        }
+    }
+
     /* Case 1: Single inline DM or TTM -> keep vertical optical axis unindented so serial
      * TTM + Woofer + Tweeter chains flow straight down the same column */
     if (n_cons == 1 && ctx->nodes[consumers[0]].cfg.kind == CACAOSIM_NODE_DM)
@@ -2091,20 +2129,20 @@ static void render_beam_subtree(
         sb_rst(&line, ev->lvl);
 
         sb_fg(&line, ev->lvl, ev->pal->fg_text);
-        sb_printf(&line, " %s (%s/%s)", cacaosim_adc_preset_str(nd->cfg.adc.preset),
-                  cacaosim_adc_mode_str(nd->cfg.adc.mode),
-                  cacaosim_adc_opt_band_str(nd->cfg.adc.opt_band));
+        sb_printf(&line, " %s (%s/%s)", cacaosim_adc_preset_name(nd->cfg.adc.preset),
+                  cacaosim_adc_mode_name(nd->cfg.adc.mode),
+                  cacaosim_adc_opt_band_name(nd->cfg.adc.opt_band));
         sb_fg(&line, ev->lvl, ev->pal->fg_dim);
         sb_puts(&line, sep);
         sb_fg(&line, ev->lvl, ev->pal->fg_muted);
-        sb_printf(&line, "z=%.1fdeg psi=%.1fdeg res(H)=%.1fmas",
-                  ctx->cfg.atm_disp.zenith_deg, nd->adc_ctx.last_state[2],
-                  nd->adc_ctx.last_state[8]);
+        sb_printf(&line, "z=%.1fdeg psi=%.1fdeg res(H)=%.2fmas",
+                  ctx->cfg.atm_disp.zenith_deg, nd->adc_ctx.state_vec[CACAOSIM_ADC_ST_PSI],
+                  nd->adc_ctx.state_vec[CACAOSIM_ADC_ST_RES_H]);
         if (nd->cfg.out_state[0] != '\0')
         {
             sb_puts(&line, "  ");
             sb_fg(&line, ev->lvl, ev->pal->fg_conn);
-            sb_puts(&line, rarr);
+            sb_puts(&line, ev->ascii ? "--> " : "──▶ ");
             sb_stream_tag(&line, ev, nd->cfg.out_state);
         }
         panel_row(ev, ev->pal->fg_conn, line.data);
@@ -3312,16 +3350,16 @@ void cacaosim_bench_render(
                     sb_fg(&rline, ev.lvl, ev.pal->fg_stream);
                     sb_pad_col(&rline, "ADC", 9);
                     snprintf(mspec, sizeof(mspec), "%s %s(%s)",
-                             cacaosim_adc_preset_str(nd->cfg.adc.preset),
-                             cacaosim_adc_mode_str(nd->cfg.adc.mode),
-                             cacaosim_adc_opt_band_str(nd->cfg.adc.opt_band));
+                             cacaosim_adc_preset_name(nd->cfg.adc.preset),
+                             cacaosim_adc_mode_name(nd->cfg.adc.mode),
+                             cacaosim_adc_opt_band_name(nd->cfg.adc.opt_band));
                     sb_fg(&rline, ev.lvl, ev.pal->fg_text);
                     sb_pad_col(&rline, mspec, 26);
                     sb_fg(&rline, ev.lvl, ev.pal->fg_accent);
                     sb_pad_col(&rline, nd->cfg.in_beam, 13);
                     sb_fg(&rline, ev.lvl, ev.pal->fg_muted);
-                    sb_printf(&rline, "Out:%s  res(H)=%.1fmas", nd->cfg.out_beam,
-                              nd->adc_ctx.last_state[8]);
+                    sb_printf(&rline, "Out:%s  res(H)=%.2fmas", nd->cfg.out_beam,
+                              nd->adc_ctx.state_vec[CACAOSIM_ADC_ST_RES_H]);
                     if (nd->cfg.out_state[0] != '\0')
                     {
                         sb_puts(&rline, "  SHM:");

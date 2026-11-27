@@ -549,12 +549,13 @@ static void action_open_add_modal(cs_tui_app_t *app)
  */
 static void action_commit_add(cs_tui_app_t *app, int choice)
 {
-    static const cacaosim_node_kind_t kinds[9] = {
+    static const cacaosim_node_kind_t kinds[10] = {
         CACAOSIM_NODE_DM,     CACAOSIM_NODE_DM,     CACAOSIM_NODE_SPLITTER,
         CACAOSIM_NODE_CORO,   CACAOSIM_NODE_PYRWFS, CACAOSIM_NODE_SHWFS,
         CACAOSIM_NODE_ZWFS,   CACAOSIM_NODE_FPCAM,  CACAOSIM_NODE_WFE,
+        CACAOSIM_NODE_ADC,
     };
-    if (choice < 0 || choice >= 9)
+    if (choice < 0 || choice >= 10)
     {
         return;
     }
@@ -1000,7 +1001,7 @@ static void handle_modal_event(cs_tui_app_t *app, const cs_input_ev_t *ev)
     int max_items = 1;
     if (app->modal == CS_MODAL_ADD)
     {
-        max_items = 9;
+        max_items = 10;
     }
     else if (app->modal == CS_MODAL_PRESET)
     {
