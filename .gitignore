@@ -12,3 +12,6 @@ fps.*.datadir/
 proc.*.shm
 *.im.shm
 milkscriptcmd.log
+__pycache__/
+*.py[cod]
+
