@@ -922,11 +922,11 @@ static int apply_bench_kv(cacaosim_bench_cfg_t *cfg, const char *k, const char *
     {
         cfg->perturb.petal_seed = (uint64_t) strtoull(v, NULL, 10);
     }
-    else if (strcmp(k, "zenith_deg") == 0)
+    else if (strcmp(k, "zenith_deg") == 0 || strcmp(k, "zenith_angle_deg") == 0)
     {
         cfg->atm_disp.zenith_deg = strtof(v, NULL);
     }
-    else if (strcmp(k, "disp_pa_deg") == 0)
+    else if (strcmp(k, "disp_pa_deg") == 0 || strcmp(k, "parallactic_angle_deg") == 0)
     {
         cfg->atm_disp.disp_pa_deg = strtof(v, NULL);
     }

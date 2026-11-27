@@ -140,6 +140,17 @@ static float    param_vib_rms_nm                               = 45.0f;
 static int64_t  param_petal_enable                             = 0;
 static float    param_petal_rms_nm                             = 1000.0f;
 static float    param_petal_tau_s                              = 3.0f;
+static float    param_petal_off0_nm                            = 0.0f;
+static float    param_petal_off1_nm                            = 0.0f;
+static float    param_petal_off2_nm                            = 0.0f;
+static float    param_petal_off3_nm                            = 0.0f;
+static int64_t  param_atm_disp_enable                          = 1;
+static float    param_zenith_deg                               = 0.0f;
+static float    param_disp_pa_deg                              = 0.0f;
+static int32_t  param_adc_mode                                 = -1;
+static int32_t  param_adc_opt_band                             = -1;
+static float    param_adc_lut_scale_err                        = 0.0f;
+static float    param_adc_lut_pa_err_deg                       = 0.0f;
 static float    param_frame_rate                               = 2000.0f;
 static uint64_t param_rng_seed                                 = 98765;
 static int32_t  param_backend                                  = 0;
@@ -326,6 +337,39 @@ static float    param_strehl_ave                               = 0.0f;
     X(".petal_tau_s", &param_petal_tau_s, FPTYPE_FLOAT32, 0,                            \
       FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
       "Thermal petaling correlation timescale [s] (default: 3.0)")                      \
+    X(".petal_off0_nm", &param_petal_off0_nm, FPTYPE_FLOAT32, 0,                        \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Live additive LWE piston step offset on island 0 / East [nm OPD]")               \
+    X(".petal_off1_nm", &param_petal_off1_nm, FPTYPE_FLOAT32, 0,                        \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Live additive LWE piston step offset on island 1 / North [nm OPD]")              \
+    X(".petal_off2_nm", &param_petal_off2_nm, FPTYPE_FLOAT32, 0,                        \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Live additive LWE piston step offset on island 2 / West [nm OPD]")               \
+    X(".petal_off3_nm", &param_petal_off3_nm, FPTYPE_FLOAT32, 0,                        \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Live additive LWE piston step offset on island 3 / South [nm OPD]")              \
+    X(".atm_disp_enable", &param_atm_disp_enable, FPTYPE_ONOFF, 0,                      \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Live gate for atmospheric dispersion (ON/OFF)")                                  \
+    X(".zenith_deg", &param_zenith_deg, FPTYPE_FLOAT32, 0,                              \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Live telescope zenith angle [deg] for atmospheric dispersion & ADC LUT")         \
+    X(".disp_pa_deg", &param_disp_pa_deg, FPTYPE_FLOAT32, 0,                            \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Live zenith dispersion azimuth on pupil [deg]")                                  \
+    X(".adc_mode", &param_adc_mode, FPTYPE_INT32, 0,                                    \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Live ADC mode override (-1=bench default, 0=retract, 1=man, 2=lut, 3=shm, 4=l+s)") \
+    X(".adc_opt_band", &param_adc_opt_band, FPTYPE_INT32, 0,                            \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Live ADC LUT opt_band override (-1=bench default, 0=whole, 1=H, 2=J, ..., 7=cust)") \
+    X(".adc_lut_scale_err", &param_adc_lut_scale_err, FPTYPE_FLOAT32, 0,                \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Live additive LUT dispersion gain error applied to ADC nodes")                   \
+    X(".adc_lut_pa_err_deg", &param_adc_lut_pa_err_deg, FPTYPE_FLOAT32, 0,              \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Live additive LUT PA error [deg] applied to ADC nodes")                          \
     X(".frame_rate", &param_frame_rate, FPTYPE_FLOAT32, 0,                              \
       FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
       "Wall-clock pacing [Hz] (0 = procinfo trigger; .bench master_hz sets physics)")    \
@@ -370,7 +414,10 @@ static MILK_COLD errno_t htsim_confcheck(void)
             ".wfstat_clip_len", ".wfstat_full_fps", ".calib_fast",
             ".calib_temporal", ".calib_poke_offset",
             ".calib_trig",    ".calib_wfs",     ".vib_enable",     ".vib_rms_nm",
-            ".petal_enable",  ".petal_rms_nm",  ".petal_tau_s"
+            ".petal_enable",  ".petal_rms_nm",  ".petal_tau_s",
+            ".petal_off0_nm", ".petal_off1_nm", ".petal_off2_nm", ".petal_off3_nm",
+            ".atm_disp_enable", ".zenith_deg",  ".disp_pa_deg",    ".adc_mode",
+            ".adc_opt_band",  ".adc_lut_scale_err", ".adc_lut_pa_err_deg"
         };
         for (size_t i = 0; i < sizeof(live_keys) / sizeof(live_keys[0]); i++)
         {
@@ -701,6 +748,16 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
         bcfg.perturb.petal_enable = param_petal_enable ? 1 : 0;
         bcfg.perturb.petal_rms_nm = param_petal_rms_nm;
         bcfg.perturb.petal_tau_s  = param_petal_tau_s;
+        bcfg.perturb.petal_offset_nm[0] = param_petal_off0_nm;
+        bcfg.perturb.petal_offset_nm[1] = param_petal_off1_nm;
+        bcfg.perturb.petal_offset_nm[2] = param_petal_off2_nm;
+        bcfg.perturb.petal_offset_nm[3] = param_petal_off3_nm;
+        bcfg.atm_disp.enable      = param_atm_disp_enable ? 1 : 0;
+        if (param_zenith_deg >= 0.0f)
+        {
+            bcfg.atm_disp.zenith_deg = param_zenith_deg;
+        }
+        bcfg.atm_disp.disp_pa_deg = param_disp_pa_deg;
     }
     else
     {
@@ -716,6 +773,9 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
         {
             param_turb_gain = bcfg.turb_gain;
         }
+        param_atm_disp_enable = bcfg.atm_disp.enable ? 1 : 0;
+        param_zenith_deg      = bcfg.atm_disp.zenith_deg;
+        param_disp_pa_deg     = bcfg.atm_disp.disp_pa_deg;
     }
 
     /* Compile topological DAG, allocate CPU/CUDA beam slots, and bind SHM (`connect_shm = 1`) */
@@ -723,6 +783,19 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
     {
         fprintf(stderr, "[cacaosim.htsim] .bench init error: %s\n", err_buf);
         return RETURN_FAILURE;
+    }
+
+    /* Record base ADC settings per topologically-sorted node so live overrides remain lossless */
+    int32_t base_adc_mode[CACAOSIM_BENCH_MAX_NODES];
+    int32_t base_adc_band[CACAOSIM_BENCH_MAX_NODES];
+    float   base_adc_sc_err[CACAOSIM_BENCH_MAX_NODES];
+    float   base_adc_pa_err[CACAOSIM_BENCH_MAX_NODES];
+    for (uint32_t i = 0; i < bctx.n_nodes; i++)
+    {
+        base_adc_mode[i]   = bctx.nodes[i].cfg.adc.mode;
+        base_adc_band[i]   = bctx.nodes[i].cfg.adc.opt_band;
+        base_adc_sc_err[i] = bctx.nodes[i].cfg.adc.lut_scale_err;
+        base_adc_pa_err[i] = bctx.nodes[i].cfg.adc.lut_pa_err_deg;
     }
     if (dcfpsptr == NULL && param_frame_rate == 2000.0f)
     {
@@ -1023,6 +1096,42 @@ static MILK_HOT errno_t htsim_run_bench(const MILK_RUNNABLE *self)
                     bctx.cfg.perturb.petal_enable = param_petal_enable ? 1 : 0;
                     bctx.cfg.perturb.petal_rms_nm = param_petal_rms_nm;
                     bctx.cfg.perturb.petal_tau_s  = param_petal_tau_s;
+                    bctx.cfg.perturb.petal_offset_nm[0] = param_petal_off0_nm;
+                    bctx.cfg.perturb.petal_offset_nm[1] = param_petal_off1_nm;
+                    bctx.cfg.perturb.petal_offset_nm[2] = param_petal_off2_nm;
+                    bctx.cfg.perturb.petal_offset_nm[3] = param_petal_off3_nm;
+                    bctx.cfg.atm_disp.enable      = param_atm_disp_enable ? 1 : 0;
+                    if (param_zenith_deg >= 0.0f)
+                    {
+                        bctx.cfg.atm_disp.zenith_deg = param_zenith_deg;
+                    }
+                    bctx.cfg.atm_disp.disp_pa_deg = param_disp_pa_deg;
+                    for (uint32_t i = 0; i < bctx.n_nodes; i++)
+                    {
+                        cacaosim_bench_node_t *nd = &bctx.nodes[i];
+                        if (nd->cfg.kind != CACAOSIM_NODE_ADC)
+                        {
+                            continue;
+                        }
+                        int32_t emode = (param_adc_mode >= 0 && param_adc_mode <= 4)
+                                            ? param_adc_mode
+                                            : base_adc_mode[i];
+                        int32_t eband = (param_adc_opt_band >= 0 && param_adc_opt_band <= 7)
+                                            ? param_adc_opt_band
+                                            : base_adc_band[i];
+                        float esc = base_adc_sc_err[i] + param_adc_lut_scale_err;
+                        float epa = base_adc_pa_err[i] + param_adc_lut_pa_err_deg;
+                        if (nd->adc_ctx.cfg.mode != emode || nd->adc_ctx.cfg.opt_band != eband ||
+                            fabsf(nd->adc_ctx.cfg.lut_scale_err - esc) > 1e-7f ||
+                            fabsf(nd->adc_ctx.cfg.lut_pa_err_deg - epa) > 1e-7f)
+                        {
+                            nd->adc_ctx.cfg.mode           = emode;
+                            nd->adc_ctx.cfg.opt_band       = eband;
+                            nd->adc_ctx.cfg.lut_scale_err  = esc;
+                            nd->adc_ctx.cfg.lut_pa_err_deg = epa;
+                            nd->adc_ctx.cache_valid        = 0;
+                        }
+                    }
                 }
                 bctx.export_beams_active =
                     (param_export_beams[0] != '\0' && param_export_enable != 0) ? 1 : 0;

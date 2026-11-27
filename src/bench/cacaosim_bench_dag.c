@@ -1632,6 +1632,7 @@ int cacaosim_bench_init(
                 cacaosim_bench_free(ctx);
                 return -1;
             }
+            ctx->beams[nd->out_idx].poly_mode = bin_wfe->poly_mode;
         }
         else
         {
@@ -1690,13 +1691,18 @@ int cacaosim_bench_init(
                 cfg_nlam = nd->cfg.fpcam.nlambda;
             }
 
-            float dt_exp_s = (float) nd->eff_navg * ctx->dt_master_s;
-            nd->eff_nlam   = cacaosim_resolve_nlambda(cfg_nlam, in_nlam, nd->cfg.bw_frac);
+            uint32_t res_in_nlam = (bin_sens->poly_mode == CACAOSIM_POLY_UNWRAPPED_OPD)
+                                       ? 1u
+                                       : in_nlam;
+            float    dt_exp_s    = (float) nd->eff_navg * ctx->dt_master_s;
+            nd->eff_nlam         = cacaosim_resolve_nlambda(cfg_nlam, res_in_nlam,
+                                                            nd->cfg.bw_frac);
             (void) cacaosim_spec_sample_band(
                 nd->cfg.use_beam_flux ? &bin_sens->spec : NULL, sens_lam, nd->cfg.bw_frac,
                 nd->eff_nlam, dt_exp_s, nd->cfg.qe, nd->chan_lam_um, nd->chan_weight, NULL);
 
-            if (in_nlam > 1u && cfg_nlam <= 0 && (int32_t) in_nlam == nd->eff_nlam)
+            if (in_nlam > 1u && bin_sens->poly_mode != CACAOSIM_POLY_UNWRAPPED_OPD &&
+                cfg_nlam <= 0 && (int32_t) in_nlam == nd->eff_nlam)
             {
                 float mid_in = 0.5f * (bin_sens->lam_um[0] + bin_sens->lam_um[in_nlam - 1u]);
                 if (fabsf(sens_lam - mid_in) <= 0.05f * sens_lam)
@@ -1862,6 +1868,24 @@ int cacaosim_bench_init(
     for (uint32_t i = 0; i < ctx->n_nodes; i++)
     {
         cacaosim_bench_node_t *nd = &ctx->nodes[i];
+        if (nd->cfg.kind == CACAOSIM_NODE_ADC && nd->out_idx >= 0)
+        {
+            const cacaosim_beam_slot_t *bin_adc = &ctx->beams[nd->in_idx];
+            cacaosim_beam_slot_t       *bout    = &ctx->beams[nd->out_idx];
+            if (bout->owns_buf)
+            {
+                free(bout->opd);
+                free(bout->amp);
+                cacaosim_cuda_free_f32(bout->d_opd);
+                cacaosim_cuda_free_f32(bout->d_amp);
+                bout->owns_buf = 0;
+            }
+            bout->opd   = bin_adc->opd;
+            bout->amp   = bin_adc->amp;
+            bout->d_opd = bin_adc->d_opd;
+            bout->d_amp = bin_adc->d_amp;
+            continue;
+        }
         if (nd->cfg.kind != CACAOSIM_NODE_SPLITTER)
         {
             continue;
@@ -1909,6 +1933,7 @@ int cacaosim_bench_init(
     {
         cacaosim_cuda_stream_sync(ctx->cuda_stream);
     }
+    bench_warn_chromatic_sampling(ctx);
     return 0;
 }
 
@@ -1981,6 +2006,7 @@ void cacaosim_bench_free(cacaosim_bench_ctx_t *ctx)
         free_imgid_if_valid(&nd->img_opd);
         free_imgid_if_valid(&nd->img_flat);
         free_imgid_if_valid(&nd->img_wfe);
+        free_imgid_if_valid(&nd->img_state);
         free_imgid_if_valid(&nd->img_cam);
         free_imgid_if_valid(&nd->img_long);
         free_imgid_if_valid(&nd->img_ncpa);
@@ -2011,6 +2037,7 @@ void cacaosim_bench_free(cacaosim_bench_ctx_t *ctx)
     cacaosim_cuda_free_f32(ctx->d_wf_in);
     cacaosim_cuda_free_f32(ctx->d_wf_prev);
     cacaosim_cuda_free_f32(ctx->d_wf_curr);
+    cacaosim_cuda_free_f32(ctx->d_wf_chrom_in);
     cacaosim_cuda_free_f32(ctx->d_atm_amp);
     cacaosim_cuda_stream_destroy(ctx->cuda_stream);
 
@@ -2057,6 +2084,8 @@ static const char *node_kind_str(cacaosim_node_kind_t k, int dm_mode)
         return "FPCAM";
     case CACAOSIM_NODE_WFE:
         return "WFE";
+    case CACAOSIM_NODE_ADC:
+        return "ADC";
     default:
         return "UNKNOWN";
     }
@@ -2099,6 +2128,15 @@ void cacaosim_bench_print_summary(const cacaosim_bench_ctx_t *ctx, FILE *fp)
     }
     fprintf(fp, "  Entrance beam '%s': %.3e ph/s (0.40..2.40 um)\n", ctx->beams[0].name,
             cacaosim_spec_total(&ctx->beams[0].spec));
+    if ((ctx->cfg.atm_disp.enable && ctx->cfg.atm_disp.zenith_deg > 1e-4f) || ctx->cfg.chrom_turb)
+    {
+        fprintf(fp,
+                "  Atmosphere: z=%.1f deg, PA=%.1f deg (IMR=%s), chrom_turb=%s (%u wl)\n",
+                ctx->cfg.atm_disp.zenith_deg, ctx->cfg.atm_disp.disp_pa_deg,
+                (ctx->cfg.imr_mode == 1) ? "field_track" : "pupil_track",
+                ctx->cfg.chrom_turb ? "ON" : "OFF",
+                (ctx->wf_chrom_nwl >= 1u) ? ctx->wf_chrom_nwl : 1u);
+    }
 
     for (uint32_t i = 0; i < ctx->n_nodes; i++)
     {
@@ -2109,6 +2147,19 @@ void cacaosim_bench_print_summary(const cacaosim_bench_ctx_t *ctx, FILE *fp)
             fprintf(fp, "  [%u] %-8s %-12s : %s -> %s (%ux%u, cmd=%s)\n", i, ks, nd->cfg.id,
                     nd->cfg.in_beam, nd->cfg.out_beam, nd->cfg.dm.nact_x, nd->cfg.dm.nact_y,
                     nd->cfg.in_cmd);
+        }
+        else if (nd->cfg.kind == CACAOSIM_NODE_ADC)
+        {
+            fprintf(fp,
+                    "  [%u] %-8s %-12s : %s -> %s (%s, %s/%s, psi=%.1fdeg, res Vis/J/H=%.1f/%.1f/%.1fmas)\n",
+                    i, ks, nd->cfg.id, nd->cfg.in_beam, nd->cfg.out_beam,
+                    cacaosim_adc_preset_name(nd->cfg.adc.preset),
+                    cacaosim_adc_mode_name(nd->cfg.adc.mode),
+                    cacaosim_adc_opt_band_name(nd->cfg.adc.opt_band),
+                    nd->adc_ctx.state_vec[CACAOSIM_ADC_ST_PSI],
+                    nd->adc_ctx.state_vec[CACAOSIM_ADC_ST_RES_VIS],
+                    nd->adc_ctx.state_vec[CACAOSIM_ADC_ST_RES_J],
+                    nd->adc_ctx.state_vec[CACAOSIM_ADC_ST_RES_H]);
         }
         else if (nd->cfg.kind == CACAOSIM_NODE_WFE)
         {
@@ -2359,7 +2410,8 @@ MILK_HOT void cacaosim_bench_step(
     {
         const cacaosim_bench_node_t *nd = &ctx->nodes[idx];
         uint8_t live                    = 0u;
-        if (nd->cfg.kind == CACAOSIM_NODE_DM || nd->cfg.kind == CACAOSIM_NODE_WFE)
+        if (nd->cfg.kind == CACAOSIM_NODE_DM || nd->cfg.kind == CACAOSIM_NODE_WFE ||
+            nd->cfg.kind == CACAOSIM_NODE_ADC)
         {
             live = beam_needed[nd->out_idx];
         }
@@ -2420,16 +2472,85 @@ MILK_HOT void cacaosim_bench_step(
                          : turb_gain;
 
     /*
-     * 1. Synthesize entrance beam [OPD_um, Amplitude] in slot 0.
-     *    When `atm_interp && eff_oversample > 1` on a live SHM `in_wf` stream, upload each new
-     *    base-rate `outarraypha` screen once upon `md->cnt0` increment and linearly blend
-     *    `(1 - alpha) * wf_prev + alpha * wf_curr` across the `K` sub-ticks.
+     * 1. Synthesize entrance beam [OPD_um, Amplitude] in slot 0 and update Maunakea atmospheric
+     *    dispersion descriptor. When `wf_chrom_nwl >= 2` (multi-wavelength chromatic turbulence),
+     *    slot 0 carries `cnwl` unwrapped `[OPD_um, Amp]` anchor slices interpolated in `1/lam^2`.
      */
-    cacaosim_beam_slot_t *b0      = &ctx->beams[0];
-    int                   do_lerp = (ext_wf == NULL && wf_ptr != NULL && ctx->cfg.atm_interp &&
-                                     eff_ov > 1u && fabsf(wf_scale) > 0.0f &&
-                                     ((ctx->use_cuda && ctx->d_wf_curr != NULL) ||
-                                      (!ctx->use_cuda && ctx->h_wf_curr != NULL)));
+    cacaosim_beam_slot_t *b0   = &ctx->beams[0];
+    uint32_t              cnwl = (ctx->wf_chrom_nwl >= 2u && b0->nlam >= ctx->wf_chrom_nwl)
+                                     ? ctx->wf_chrom_nwl
+                                     : 1u;
+    int                   wf_is_3d = 0;
+    float                 slice_scale[8];
+    for (uint32_t m = 0; m < cnwl && m < 8u; m++)
+    {
+        slice_scale[m] = wf_scale;
+    }
+    if (cnwl >= 2u && ext_wf == NULL && wf_ptr != NULL && ctx->connect_shm &&
+        ctx->img_wf.ID != -1 && ctx->img_wf.md->naxis >= 3 && ctx->img_wf.md->size[2] >= cnwl)
+    {
+        uint32_t shm_nwl  = 1u;
+        int32_t  shm_unit = ctx->wf_chrom_unit;
+        float    shm_wls[8];
+        if (cacaosim_wf_shm_read_chrom(ctx->img_wf.im, &shm_nwl, &shm_unit, shm_wls) &&
+            shm_nwl >= cnwl)
+        {
+            wf_is_3d = 1;
+            for (uint32_t m = 0; m < cnwl; m++)
+            {
+                b0->lam_um[m]  = shm_wls[m];
+                slice_scale[m] = (shm_unit == 1)
+                                     ? (turb_gain * shm_wls[m] / (2.0f * CACAOSIM_PI_F))
+                                     : turb_gain;
+            }
+        }
+    }
+    else if (cnwl >= 2u && ext_wf != NULL && ctx->cfg.chrom_turb)
+    {
+        /* Caller explicitly enabled chrom_turb and supplied a contiguous [cnwl * npix_wf] cube */
+        wf_is_3d = 1;
+        for (uint32_t m = 0; m < cnwl; m++)
+        {
+            b0->lam_um[m]  = ctx->wf_chrom_wls[m];
+            slice_scale[m] = (ctx->cfg.wf_unit == 1)
+                                 ? (turb_gain * ctx->wf_chrom_wls[m] / (2.0f * CACAOSIM_PI_F))
+                                 : turb_gain;
+        }
+    }
+
+    if (ctx->calib_fast)
+    {
+        memset(&b0->disp, 0, sizeof(b0->disp));
+    }
+    else
+    {
+        if (ctx->cfg.imr_mode == 1 && fabsf(ctx->cfg.parallactic_rate_dps) > 1e-7f)
+        {
+            if (ctx->tick_cnt == 0ULL)
+            {
+                ctx->atm_disp_pa_curr_deg = (double) ctx->cfg.atm_disp.disp_pa_deg;
+            }
+            else
+            {
+                ctx->atm_disp_pa_curr_deg +=
+                    (double) ctx->cfg.parallactic_rate_dps * (double) ctx->dt_master_s;
+            }
+        }
+        else
+        {
+            ctx->atm_disp_pa_curr_deg = (double) ctx->cfg.atm_disp.disp_pa_deg;
+        }
+        bench_update_atm_disp(ctx);
+        b0->disp = ctx->cached_atm_disp;
+    }
+    b0->poly_mode = (cnwl >= 2u) ? (int32_t) CACAOSIM_POLY_UNWRAPPED_OPD
+                                 : (int32_t) CACAOSIM_POLY_NONE;
+
+    size_t wf_copy_pix = (wf_is_3d ? (size_t) cnwl : 1u) * ctx->npix_wf;
+    int    do_lerp     = (ext_wf == NULL && wf_ptr != NULL && ctx->cfg.atm_interp &&
+                          eff_ov > 1u && fabsf(turb_gain) > 0.0f &&
+                          ((ctx->use_cuda && ctx->d_wf_curr != NULL) ||
+                           (!ctx->use_cuda && ctx->h_wf_curr != NULL)));
 
     if (do_lerp)
     {
@@ -2438,11 +2559,11 @@ MILK_HOT void cacaosim_bench_step(
         {
             if (ctx->use_cuda)
             {
-                cacaosim_cuda_h2d_f32(ctx->d_wf_curr, wf_ptr, ctx->npix_wf, ctx->cuda_stream);
+                cacaosim_cuda_h2d_f32(ctx->d_wf_curr, wf_ptr, wf_copy_pix, ctx->cuda_stream);
             }
             else
             {
-                memcpy(ctx->h_wf_curr, wf_ptr, ctx->npix_wf * sizeof(float));
+                memcpy(ctx->h_wf_curr, wf_ptr, wf_copy_pix * sizeof(float));
             }
             ctx->wf_prev_cnt0     = cur_cnt0;
             ctx->wf_substep       = 0u;
@@ -2455,14 +2576,14 @@ MILK_HOT void cacaosim_bench_step(
                 float *tmp     = ctx->d_wf_prev;
                 ctx->d_wf_prev = ctx->d_wf_curr;
                 ctx->d_wf_curr = tmp;
-                cacaosim_cuda_h2d_f32(ctx->d_wf_curr, wf_ptr, ctx->npix_wf, ctx->cuda_stream);
+                cacaosim_cuda_h2d_f32(ctx->d_wf_curr, wf_ptr, wf_copy_pix, ctx->cuda_stream);
             }
             else
             {
                 float *tmp     = ctx->h_wf_prev;
                 ctx->h_wf_prev = ctx->h_wf_curr;
                 ctx->h_wf_curr = tmp;
-                memcpy(ctx->h_wf_curr, wf_ptr, ctx->npix_wf * sizeof(float));
+                memcpy(ctx->h_wf_curr, wf_ptr, wf_copy_pix * sizeof(float));
             }
             ctx->wf_prev_cnt0     = cur_cnt0;
             ctx->wf_substep       = 0u;
@@ -2491,16 +2612,33 @@ MILK_HOT void cacaosim_bench_step(
                     cacaosim_cuda_h2d_f32(ctx->d_atm_amp, amp_ptr, ctx->npix_wf, ctx->cuda_stream);
                     d_amp = ctx->d_atm_amp;
                 }
-                cacaosim_cuda_beam_init_lerp(
-                    ctx->d_pup_amp, d_amp, (ctx->wf_interp_primed >= 2) ? ctx->d_wf_prev : NULL,
-                    ctx->d_wf_curr, alpha, ctx->d_ncpa_opd, wf_scale, ctx->nwf, b0->d_opd,
-                    b0->d_amp, ctx->cuda_stream);
+                for (uint32_t m = 0; m < cnwl; m++)
+                {
+                    size_t       src_off = wf_is_3d ? ((size_t) m * ctx->npix_wf) : 0u;
+                    size_t       dst_off = (size_t) m * ctx->npix_wf;
+                    const float *d_prev  = (ctx->wf_interp_primed >= 2)
+                                               ? (ctx->d_wf_prev + src_off)
+                                               : NULL;
+                    cacaosim_cuda_beam_init_lerp(
+                        ctx->d_pup_amp, d_amp, d_prev, ctx->d_wf_curr + src_off, alpha,
+                        ctx->d_ncpa_opd, slice_scale[m], ctx->nwf, b0->d_opd + dst_off,
+                        b0->d_amp + dst_off, ctx->cuda_stream);
+                }
             }
             else
             {
-                cacaosim_beam_init_lerp_cpu(
-                    ctx->pup_ptr, amp_ptr, (ctx->wf_interp_primed >= 2) ? ctx->h_wf_prev : NULL,
-                    ctx->h_wf_curr, alpha, ctx->ncpa_ptr, wf_scale, ctx->nwf, b0->opd, b0->amp);
+                for (uint32_t m = 0; m < cnwl; m++)
+                {
+                    size_t       src_off = wf_is_3d ? ((size_t) m * ctx->npix_wf) : 0u;
+                    size_t       dst_off = (size_t) m * ctx->npix_wf;
+                    const float *h_prev  = (ctx->wf_interp_primed >= 2)
+                                               ? (ctx->h_wf_prev + src_off)
+                                               : NULL;
+                    cacaosim_beam_init_lerp_cpu(
+                        ctx->pup_ptr, amp_ptr, h_prev, ctx->h_wf_curr + src_off, alpha,
+                        ctx->ncpa_ptr, slice_scale[m], ctx->nwf, b0->opd + dst_off,
+                        b0->amp + dst_off);
+                }
             }
         }
     }
@@ -2510,9 +2648,9 @@ MILK_HOT void cacaosim_bench_step(
         {
             const float *d_wf  = NULL;
             const float *d_amp = NULL;
-            if (wf_ptr != NULL && fabsf(wf_scale) > 0.0f)
+            if (wf_ptr != NULL && fabsf(turb_gain) > 0.0f)
             {
-                cacaosim_cuda_h2d_f32(ctx->d_wf_in, wf_ptr, ctx->npix_wf, ctx->cuda_stream);
+                cacaosim_cuda_h2d_f32(ctx->d_wf_in, wf_ptr, wf_copy_pix, ctx->cuda_stream);
                 d_wf = ctx->d_wf_in;
             }
             if (amp_ptr != NULL)
@@ -2520,22 +2658,41 @@ MILK_HOT void cacaosim_bench_step(
                 cacaosim_cuda_h2d_f32(ctx->d_atm_amp, amp_ptr, ctx->npix_wf, ctx->cuda_stream);
                 d_amp = ctx->d_atm_amp;
             }
-            cacaosim_cuda_beam_init(ctx->d_pup_amp, d_amp, d_wf, ctx->d_ncpa_opd, wf_scale,
-                                    ctx->nwf, b0->d_opd, b0->d_amp, ctx->cuda_stream);
+            for (uint32_t m = 0; m < cnwl; m++)
+            {
+                size_t       src_off = wf_is_3d ? ((size_t) m * ctx->npix_wf) : 0u;
+                size_t       dst_off = (size_t) m * ctx->npix_wf;
+                const float *d_wfm   = (d_wf != NULL) ? (d_wf + src_off) : NULL;
+                cacaosim_cuda_beam_init(ctx->d_pup_amp, d_amp, d_wfm, ctx->d_ncpa_opd,
+                                        slice_scale[m], ctx->nwf, b0->d_opd + dst_off,
+                                        b0->d_amp + dst_off, ctx->cuda_stream);
+            }
         }
         else
         {
-            cacaosim_beam_init_cpu(ctx->pup_ptr, amp_ptr, wf_ptr, ctx->ncpa_ptr, wf_scale,
-                                   ctx->nwf, b0->opd, b0->amp);
+            for (uint32_t m = 0; m < cnwl; m++)
+            {
+                size_t       src_off = wf_is_3d ? ((size_t) m * ctx->npix_wf) : 0u;
+                size_t       dst_off = (size_t) m * ctx->npix_wf;
+                const float *h_wfm   = (wf_ptr != NULL) ? (wf_ptr + src_off) : NULL;
+                cacaosim_beam_init_cpu(ctx->pup_ptr, amp_ptr, h_wfm, ctx->ncpa_ptr, slice_scale[m],
+                                       ctx->nwf, b0->opd + dst_off, b0->amp + dst_off);
+            }
         }
     }
 
-    if (beam_needed[0] && !ctx->calib_fast &&
-        (ctx->cfg.perturb.vib_enable || ctx->cfg.perturb.petal_enable))
+    if (beam_needed[0] && !ctx->calib_fast && cacaosim_perturb_any_active(&ctx->cfg.perturb))
     {
         cacaosim_perturb_step_apply(
             &ctx->perturb, &ctx->cfg.perturb, (double) ctx->dt_master_s, turb_gain, b0->opd,
             ctx->use_cuda ? b0->d_opd : NULL, ctx->cuda_stream);
+        for (uint32_t m = 1u; m < cnwl; m++)
+        {
+            size_t dst_off = (size_t) m * ctx->npix_wf;
+            cacaosim_perturb_apply_current(&ctx->perturb, b0->opd + dst_off,
+                                           ctx->use_cuda ? (b0->d_opd + dst_off) : NULL,
+                                           ctx->cuda_stream);
+        }
     }
 
     /* Use primary DM command stream as lineage trigger reference for sensor SHM updates */
@@ -2682,6 +2839,49 @@ MILK_HOT void cacaosim_bench_step(
                                                    ctx->nwf, bout->opd + off, bout->amp + off);
                     }
                 }
+                bench_prop_disp(&bin->disp, &nd->cfg.reg, &bout->disp);
+                bout->poly_mode = bin->poly_mode;
+            }
+        }
+        else if (nd->cfg.kind == CACAOSIM_NODE_ADC)
+        {
+            /*
+             * Inline Atmospheric Dispersion Compensator: pixel buffers are zero-copy aliased onto
+             * `bin`, so only the 12-mode Chebyshev dispersion descriptor and mechanical stages
+             * advance. During internal-source calibration (`calib_fast`), dispersion is zeroed.
+             */
+            cacaosim_beam_slot_t *bout = &ctx->beams[nd->out_idx];
+            if (ctx->calib_fast)
+            {
+                memset(&bout->disp, 0, sizeof(bout->disp));
+            }
+            else
+            {
+                cacaosim_atm_disp_cfg_t atm_now = ctx->cfg.atm_disp;
+                atm_now.disp_pa_deg             = (float) ctx->atm_disp_pa_curr_deg;
+                if (!atm_now.enable)
+                {
+                    atm_now.zenith_deg = 0.0f;
+                }
+                const float *cmd_in =
+                    (ctx->connect_shm && nd->img_cmd.ID != -1 && nd->img_cmd.im != NULL)
+                        ? nd->img_cmd.im->array.F
+                        : NULL;
+                cacaosim_adc_step(&nd->adc_ctx, (double) ctx->dt_master_s, &atm_now, cmd_in,
+                                  &bin->disp, NULL, &bout->disp, NULL);
+                if (ctx->connect_shm && nd->img_state.ID != -1 && nd->img_state.im != NULL &&
+                    ((ctx->tick_cnt % tel_st) == 0ULL))
+                {
+                    nd->img_state.md->write = 1;
+                    memcpy(nd->img_state.im->array.F, nd->adc_ctx.state_vec,
+                           sizeof(nd->adc_ctx.state_vec));
+                    processinfo_update_output_stream(pinfo, nd->img_state.im, trig_im);
+                }
+            }
+            bout->poly_mode = bin->poly_mode;
+            if (bin->nlam > 1u && bout->nlam == bin->nlam)
+            {
+                memcpy(bout->lam_um, bin->lam_um, (size_t) bin->nlam * sizeof(float));
             }
         }
         else if (nd->cfg.kind == CACAOSIM_NODE_SPLITTER)
@@ -2691,45 +2891,65 @@ MILK_HOT void cacaosim_bench_step(
                 continue;
             }
             uint32_t nl = (bin->nlam >= 1u) ? bin->nlam : 1u;
-            if (nd->refl_idx >= 0 && !nd->alias_refl && beam_needed[nd->refl_idx])
+            if (nd->refl_idx >= 0 && beam_needed[nd->refl_idx])
             {
                 cacaosim_beam_slot_t *br = &ctx->beams[nd->refl_idx];
-                for (uint32_t c = 0; c < nl; c++)
+                bench_prop_disp(&bin->disp, &nd->cfg.reg_refl, &br->disp);
+                br->poly_mode = bin->poly_mode;
+                if (bin->nlam > 1u && br->nlam == bin->nlam)
                 {
-                    size_t off = (size_t) c * ctx->npix_wf;
-                    if (ctx->use_cuda)
+                    memcpy(br->lam_um, bin->lam_um, (size_t) bin->nlam * sizeof(float));
+                }
+                if (!nd->alias_refl)
+                {
+                    for (uint32_t c = 0; c < nl; c++)
                     {
-                        cacaosim_cuda_beam_relay(bin->d_opd + off, bin->d_amp + off,
-                                                 nd->d_ncpa_refl, nd->d_pup_refl,
-                                                 &nd->cfg.reg_refl, ctx->nwf, br->d_opd + off,
-                                                 br->d_amp + off, ctx->cuda_stream);
-                    }
-                    else
-                    {
-                        cacaosim_beam_relay_cpu(bin->opd + off, bin->amp + off, nd->h_ncpa_refl,
-                                                nd->h_pup_refl, &nd->cfg.reg_refl, ctx->nwf,
-                                                br->opd + off, br->amp + off);
+                        size_t off = (size_t) c * ctx->npix_wf;
+                        if (ctx->use_cuda)
+                        {
+                            cacaosim_cuda_beam_relay(bin->d_opd + off, bin->d_amp + off,
+                                                     nd->d_ncpa_refl, nd->d_pup_refl,
+                                                     &nd->cfg.reg_refl, ctx->nwf, br->d_opd + off,
+                                                     br->d_amp + off, ctx->cuda_stream);
+                        }
+                        else
+                        {
+                            cacaosim_beam_relay_cpu(bin->opd + off, bin->amp + off,
+                                                    nd->h_ncpa_refl, nd->h_pup_refl,
+                                                    &nd->cfg.reg_refl, ctx->nwf, br->opd + off,
+                                                    br->amp + off);
+                        }
                     }
                 }
             }
-            if (nd->trans_idx >= 0 && !nd->alias_trans && beam_needed[nd->trans_idx])
+            if (nd->trans_idx >= 0 && beam_needed[nd->trans_idx])
             {
                 cacaosim_beam_slot_t *bt = &ctx->beams[nd->trans_idx];
-                for (uint32_t c = 0; c < nl; c++)
+                bench_prop_disp(&bin->disp, &nd->cfg.reg_trans, &bt->disp);
+                bt->poly_mode = bin->poly_mode;
+                if (bin->nlam > 1u && bt->nlam == bin->nlam)
                 {
-                    size_t off = (size_t) c * ctx->npix_wf;
-                    if (ctx->use_cuda)
+                    memcpy(bt->lam_um, bin->lam_um, (size_t) bin->nlam * sizeof(float));
+                }
+                if (!nd->alias_trans)
+                {
+                    for (uint32_t c = 0; c < nl; c++)
                     {
-                        cacaosim_cuda_beam_relay(bin->d_opd + off, bin->d_amp + off,
-                                                 nd->d_ncpa_trans, nd->d_pup_trans,
-                                                 &nd->cfg.reg_trans, ctx->nwf, bt->d_opd + off,
-                                                 bt->d_amp + off, ctx->cuda_stream);
-                    }
-                    else
-                    {
-                        cacaosim_beam_relay_cpu(bin->opd + off, bin->amp + off, nd->h_ncpa_trans,
-                                                nd->h_pup_trans, &nd->cfg.reg_trans, ctx->nwf,
-                                                bt->opd + off, bt->amp + off);
+                        size_t off = (size_t) c * ctx->npix_wf;
+                        if (ctx->use_cuda)
+                        {
+                            cacaosim_cuda_beam_relay(bin->d_opd + off, bin->d_amp + off,
+                                                     nd->d_ncpa_trans, nd->d_pup_trans,
+                                                     &nd->cfg.reg_trans, ctx->nwf, bt->d_opd + off,
+                                                     bt->d_amp + off, ctx->cuda_stream);
+                        }
+                        else
+                        {
+                            cacaosim_beam_relay_cpu(bin->opd + off, bin->amp + off,
+                                                    nd->h_ncpa_trans, nd->h_pup_trans,
+                                                    &nd->cfg.reg_trans, ctx->nwf, bt->opd + off,
+                                                    bt->amp + off);
+                        }
                     }
                 }
             }
@@ -2744,11 +2964,26 @@ MILK_HOT void cacaosim_bench_step(
             cacaosim_beam_slot_t *blow = (nd->lowfs_idx >= 0) ? &ctx->beams[nd->lowfs_idx] : NULL;
             uint32_t              nl   = (bin->nlam >= 1u) ? bin->nlam : 1u;
 
+            if (nl > 1u)
+            {
+                cacaosim_coro_set_in_lambdas(&nd->coro_ctx, bin->lam_um, nl);
+            }
+            cacaosim_coro_set_disp(&nd->coro_ctx, &bin->disp, ctx->cfg.tel_diam_m,
+                                   bin->poly_mode);
             cacaosim_coro_step_poly(&nd->coro_ctx, bin->opd, bin->amp, nl, ctx->npix_wf, bout->opd,
                                     bout->amp, ctx->npix_wf, blow ? blow->opd : NULL,
                                     blow ? blow->amp : NULL, bin->d_opd, bin->d_amp, bout->d_opd,
                                     bout->d_amp, blow ? blow->d_opd : NULL,
                                     blow ? blow->d_amp : NULL);
+            bout->disp.active = 0;
+            bout->poly_mode   = (bout->nlam > 1u) ? (int32_t) CACAOSIM_POLY_COMPLEX_FIELD
+                                                  : (int32_t) CACAOSIM_POLY_NONE;
+            if (blow != NULL)
+            {
+                blow->disp.active = 0;
+                blow->poly_mode   = (blow->nlam > 1u) ? (int32_t) CACAOSIM_POLY_COMPLEX_FIELD
+                                                      : (int32_t) CACAOSIM_POLY_NONE;
+            }
             if (!ctx->connect_shm)
             {
                 if (ctx->use_cuda)
@@ -2816,6 +3051,12 @@ MILK_HOT void cacaosim_bench_step(
                                                 bout->amp + off);
                 }
             }
+            bench_prop_disp(&bin->disp, &nd->cfg.reg, &bout->disp);
+            bout->poly_mode = bin->poly_mode;
+            if (bin->nlam > 1u && bout->nlam == bin->nlam)
+            {
+                memcpy(bout->lam_um, bin->lam_um, (size_t) bin->nlam * sizeof(float));
+            }
         }
         else
         {
@@ -2869,11 +3110,21 @@ MILK_HOT void cacaosim_bench_step(
             const float *s_ncpa =
                 (ctx->connect_shm && nd->img_ncpa.ID != -1) ? nd->img_ncpa.im->array.F : NULL;
 
+            cacaosim_disp_t        reg_disp;
+            const cacaosim_disp_t *eff_disp = &bin->disp;
+            if (nd->has_reg && bin->disp.active)
+            {
+                bench_prop_disp(&bin->disp, &nd->cfg.reg, &reg_disp);
+                eff_disp = &reg_disp;
+            }
+
             if (nd->cfg.kind == CACAOSIM_NODE_PYRWFS)
             {
                 nd->pyrwfs_ctx.force_full_mod = is_static_cal ? 1 : 0;
                 if (sens_accum[i])
                 {
+                    cacaosim_pyrwfs_set_disp(&nd->pyrwfs_ctx, eff_disp, ctx->cfg.tel_diam_m,
+                                             bin->poly_mode);
                     cacaosim_pyrwfs_accum_beam_poly(&nd->pyrwfs_ctx, h_opd, h_amp,
                                                     (nl > 1u) ? bin->lam_um : NULL, nl,
                                                     ctx->npix_wf, s_ncpa, d_opd, d_amp,
@@ -2896,6 +3147,8 @@ MILK_HOT void cacaosim_bench_step(
             {
                 if (sens_accum[i])
                 {
+                    cacaosim_shwfs_set_disp(&nd->shwfs_ctx, eff_disp, ctx->cfg.tel_diam_m,
+                                            bin->poly_mode);
                     cacaosim_shwfs_accum_beam_poly(&nd->shwfs_ctx, h_opd, h_amp,
                                                    (nl > 1u) ? bin->lam_um : NULL, nl,
                                                    ctx->npix_wf, s_ncpa, d_opd, d_amp);
@@ -2916,6 +3169,8 @@ MILK_HOT void cacaosim_bench_step(
             {
                 if (sens_accum[i])
                 {
+                    cacaosim_zwfs_set_disp(&nd->zwfs_ctx, eff_disp, ctx->cfg.tel_diam_m,
+                                           bin->poly_mode);
                     cacaosim_zwfs_accum_beam_poly(&nd->zwfs_ctx, h_opd, h_amp,
                                                   (nl > 1u) ? bin->lam_um : NULL, nl,
                                                   ctx->npix_wf, s_ncpa, d_opd, d_amp);
@@ -2936,6 +3191,17 @@ MILK_HOT void cacaosim_bench_step(
             {
                 if (sens_accum[i])
                 {
+                    if (nl > 1u)
+                    {
+                        uint32_t cap_in = (nl <= (uint32_t) CACAOSIM_FPCAM_MAX_LAMBDA)
+                                              ? nl
+                                              : (uint32_t) CACAOSIM_FPCAM_MAX_LAMBDA;
+                        nd->fpcam_ctx.cfg.has_in_lam = 1;
+                        memcpy(nd->fpcam_ctx.cfg.in_lam_um, bin->lam_um,
+                               (size_t) cap_in * sizeof(float));
+                    }
+                    cacaosim_fpcam_set_disp(&nd->fpcam_ctx, eff_disp, ctx->cfg.tel_diam_m,
+                                            bin->poly_mode);
                     cacaosim_fpcam_accum_beam_poly(&nd->fpcam_ctx, h_opd, h_amp, nl, ctx->npix_wf,
                                                    s_ncpa, d_opd, d_amp);
                 }
@@ -3106,6 +3372,13 @@ MILK_HOT void cacaosim_bench_step(
                 continue;
             }
             cacaosim_beam_shm_write_spec(bs->img_shm.im, &bs->spec);
+            cacaosim_beam_shm_write_disp(bs->img_shm.im, &bs->disp);
+            cacaosim_beam_shm_write_poly_mode(bs->img_shm.im, bs->poly_mode);
+            cacaosim_beam_shm_write_diam(bs->img_shm.im, ctx->cfg.tel_diam_m);
+            if (bs->nlam > 1u)
+            {
+                cacaosim_beam_shm_write_poly_wls(bs->img_shm.im, bs->lam_um, bs->nlam);
+            }
             processinfo_update_output_stream(pinfo, bs->img_shm.im, trig_im);
         }
     }
@@ -3370,7 +3643,7 @@ static int bind_single_export_beam(
         return 0;
     }
     uint32_t nl = (bs->nlam >= 1u) ? bs->nlam : 1u;
-    bs->img_shm = stream_connect_create_3Df32(bs->name, ctx->nwf, ctx->nwf, 2u * nl);
+    bs->img_shm = cacaosim_beam_shm_create(bs->name, ctx->nwf, 2u * nl);
     if (bs->img_shm.ID == -1)
     {
         dag_err(err_buf, err_cap, "Failed creating export SHM stream for beam '%s'", bs->name);
@@ -3392,9 +3665,13 @@ static int bind_single_export_beam(
     }
     cacaosim_beam_shm_init_kw(bs->img_shm.im);
     cacaosim_beam_shm_write_spec(bs->img_shm.im, &bs->spec);
+    cacaosim_beam_shm_write_disp(bs->img_shm.im, &bs->disp);
+    cacaosim_beam_shm_write_poly_mode(bs->img_shm.im, bs->poly_mode);
+    cacaosim_beam_shm_write_diam(bs->img_shm.im, ctx->cfg.tel_diam_m);
     if (nl > 1u)
     {
         cacaosim_beam_shm_write_poly_kw(bs->img_shm.im, nl, bs->lam_um[0], bs->lam_um[nl - 1u]);
+        cacaosim_beam_shm_write_poly_wls(bs->img_shm.im, bs->lam_um, nl);
     }
     bs->export_shm = 1;
     return 0;

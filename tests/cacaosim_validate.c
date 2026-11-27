@@ -6064,6 +6064,7 @@ static void test_options_schema_and_tui_coverage(void)
             j_has_ok  = (strstr(jb, "\"bench_options\"") != NULL &&
                          strstr(jb, "\"fps_units\"") != NULL &&
                          strstr(jb, "\"wfstat\"") != NULL &&
+                         strstr(jb, "\"adc\"") != NULL &&
                          strstr(jb, "\"clock_offset_us\"") != NULL);
             free(jb);
         }
@@ -6088,9 +6089,9 @@ static void test_options_schema_and_tui_coverage(void)
 
     snprintf(det, sizeof(det), "units=%zu, fps_params=%zu, json=%ldB, md=%ldB, tbl=%ldB", n_units,
              n_bindings, jsz, msz, tsz);
-    check_cond(n_units == 12u && n_bindings >= 350u && jrc == 0 && j_has_ok && mrc == 0 &&
+    check_cond(n_units == 13u && n_bindings >= 380u && jrc == 0 && j_has_ok && mrc == 0 &&
                    msz > 10000L && trc == 0 && tsz > 10000L,
-               "12 MILK_RUNNABLE FPS units introspected & JSON/MD/Table exported", det);
+               "13 MILK_RUNNABLE FPS units introspected & JSON/MD/Table exported", det);
 }
 
 static void test_entrance_perturbations(void)
@@ -6210,6 +6211,511 @@ static void test_entrance_perturbations(void)
     free(opd);
 }
 
+/**
+ * @brief Section 20: Maunakea atmospheric dispersion, AO188 ADC (Egner 2009), 3D Snell doublet,
+ *        5-engine CPU/CUDA chromatic parity, coronagraph no-double-count, and bench round-trip.
+ */
+static void test_atm_disp_and_ao188_adc(void)
+{
+    printf("\n=== 20. Atmospheric Dispersion, AO188 ADC (Egner 2009) & Chromatic Parity ===\n");
+    char det[220];
+    char err[256];
+
+    /* 20a. Maunakea Ciddor dispersion (z=30, 60 deg) + Chebyshev-12 fit accuracy */
+    cacaosim_atm_disp_cfg_t atm;
+    cacaosim_atm_disp_cfg_defaults(&atm);
+    atm.enable       = 1;
+    atm.zenith_deg   = 30.0f;
+    atm.disp_pa_deg  = 0.0f;
+    atm.pressure_hpa = 615.0f;
+    atm.temp_c       = 2.0f;
+    atm.rh_pct       = 20.0f;
+    atm.ref_lam_um   = 1.65f;
+    atm.sphere_corr  = 1;
+
+    cacaosim_disp_t d_atm30;
+    memset(&d_atm30, 0, sizeof(d_atm30));
+    cacaosim_disp_set_atm(&d_atm30, &atm);
+
+    double max_cheb_mas = 0.0;
+    for (int i = 0; i <= 40; i++)
+    {
+        double lam  = 0.42 + (2.38 - 0.42) * ((double) i / 40.0);
+        double ex_r = cacaosim_atm_disp_rad(lam, &atm);
+        double tx = 0.0, ty = 0.0;
+        cacaosim_disp_eval_rad(&d_atm30, lam, &tx, &ty);
+        double em = hypot(tx, ty - ex_r) * 206264806.24709636;
+        if (em > max_cheb_mas)
+        {
+            max_cheb_mas = em;
+        }
+    }
+    double span_h30   = cacaosim_disp_band_span_mas(&d_atm30, 1.500, 1.780);
+    double span_vis30 = cacaosim_disp_band_span_mas(&d_atm30, 0.675, 0.825);
+    double span_bb30  = cacaosim_disp_band_span_mas(&d_atm30, 0.500, 2.200);
+    snprintf(det, sizeof(det), "z=30: H=%.2f, Vis=%.1f, 0.5-2.2=%.1f mas, Cheb_err=%.2e mas",
+             span_h30, span_vis30, span_bb30, max_cheb_mas);
+    check_cond(span_h30 > 15.0 && span_h30 < 25.0 && span_vis30 > 80.0 && span_vis30 < 120.0 &&
+                   span_bb30 > 450.0 && span_bb30 < 620.0 && max_cheb_mas < 1e-3,
+               "Maunakea Ciddor dispersion & Chebyshev-12 fit", det);
+
+    /* 20b. AO188 Egner (2009) Table 11 measured & nominal LUT at z=60 deg */
+    cacaosim_atm_disp_cfg_t atm60 = atm;
+    atm60.zenith_deg              = 60.0f;
+    cacaosim_disp_t d_atm60;
+    memset(&d_atm60, 0, sizeof(d_atm60));
+    cacaosim_disp_set_atm(&d_atm60, &atm60);
+
+    cacaosim_adc_cfg_t adc_h;
+    cacaosim_adc_cfg_defaults(&adc_h);
+    adc_h.preset     = CACAOSIM_ADC_PRESET_AO188;
+    adc_h.mode       = CACAOSIM_ADC_MODE_LUT;
+    adc_h.opt_band   = CACAOSIM_ADC_OPT_H;
+    adc_h.ideal_mech = 1;
+
+    cacaosim_adc_ctx_t actx_h;
+    cacaosim_disp_t    d_out_h;
+    memset(&d_out_h, 0, sizeof(d_out_h));
+    cacaosim_adc_init(&actx_h, &adc_h, &atm60);
+    cacaosim_adc_step(&actx_h, 0.001, &atm60, NULL, &d_atm60, NULL, &d_out_h, NULL);
+    double res_h60 = cacaosim_disp_band_span_mas(&d_out_h, 1.500, 1.780);
+
+    cacaosim_adc_cfg_t adc_w = adc_h;
+    adc_w.opt_band           = CACAOSIM_ADC_OPT_WHOLE;
+    cacaosim_adc_ctx_t actx_w;
+    cacaosim_disp_t    d_out_w;
+    memset(&d_out_w, 0, sizeof(d_out_w));
+    cacaosim_adc_init(&actx_w, &adc_w, &atm60);
+    cacaosim_adc_step(&actx_w, 0.001, &atm60, NULL, &d_atm60, NULL, &d_out_w, NULL);
+    double res_bb60  = cacaosim_disp_band_span_mas(&d_out_w, 0.500, 2.200);
+    double res_h60_w = cacaosim_disp_band_span_mas(&d_out_w, 1.500, 1.780);
+    double res_v60_w = cacaosim_disp_band_span_mas(&d_out_w, 0.675, 0.825);
+
+    cacaosim_adc_cfg_t adc_nom_mis = adc_h;
+    adc_nom_mis.lut_use_nominal    = 1;
+    cacaosim_adc_ctx_t actx_nm;
+    cacaosim_disp_t    d_out_nm;
+    memset(&d_out_nm, 0, sizeof(d_out_nm));
+    cacaosim_adc_init(&actx_nm, &adc_nom_mis, &atm60);
+    cacaosim_adc_step(&actx_nm, 0.001, &atm60, NULL, &d_atm60, NULL, &d_out_nm, NULL);
+    double res_h60_nom = cacaosim_disp_band_span_mas(&d_out_nm, 1.500, 1.780);
+
+    snprintf(det, sizeof(det),
+             "z=60: opt(H) resH=%.2f, opt(whole) bb=%.1f H=%.2f Vis=%.1f, nom-err=%.2f mas",
+             res_h60, res_bb60, res_h60_w, res_v60_w, res_h60_nom);
+    check_cond(res_h60 < 1.5 && res_bb60 < 80.0 && res_h60_w < 6.0 && res_v60_w < 25.0 &&
+                   res_h60_nom > res_h60 + 0.4 &&
+                   fabsf(actx_h.state_vec[CACAOSIM_ADC_ST_RES_H] - (float) res_h60) < 1e-3f &&
+                   actx_h.state_vec[CACAOSIM_ADC_ST_DEPLOYED] > 0.5f,
+               "AO188 Egner Table 11 LUT & nominal mismatch", det);
+
+    /* 20c. Exact 3D vector Snell doublet: zero disp at psi=0 + Chebyshev fit accuracy */
+    cacaosim_adc_cfg_t adc_sn;
+    cacaosim_adc_cfg_defaults(&adc_sn);
+    adc_sn.preset     = CACAOSIM_ADC_PRESET_SNELL_DOUBLET;
+    adc_sn.mode       = CACAOSIM_ADC_MODE_MANUAL;
+    adc_sn.angle1_deg = -90.0f;
+    adc_sn.angle2_deg = 90.0f;
+    double sx0 = 0.0, sy0 = 0.0, sx1 = 0.0, sy1 = 0.0;
+    cacaosim_adc_eval_deflection_rad(&adc_sn, 0.70, -90.0, 90.0, &sx0, &sy0);
+    cacaosim_adc_eval_deflection_rad(&adc_sn, 1.65, -90.0, 90.0, &sx1, &sy1);
+    double zero_psi_mas = hypot(sx0 - sx1, sy0 - sy1) * 206264806.24709636;
+
+    adc_sn.angle1_deg = -60.0f; /* psi = 30 deg */
+    adc_sn.angle2_deg = 60.0f;
+    cacaosim_adc_ctx_t actx_sn;
+    cacaosim_disp_t    d_sn;
+    memset(&d_sn, 0, sizeof(d_sn));
+    cacaosim_adc_init(&actx_sn, &adc_sn, &atm);
+    cacaosim_adc_step(&actx_sn, 0.001, &atm, NULL, NULL, NULL, &d_sn, NULL);
+    double sn_span = cacaosim_disp_band_span_mas(&d_sn, 0.50, 2.20);
+    double sn_cheb = 0.0;
+    double ex0 = 0.0, ey0 = 0.0;
+    cacaosim_adc_eval_deflection_rad(&adc_sn, (double) atm.ref_lam_um, -60.0, 60.0, &ex0, &ey0);
+    for (int i = 0; i <= 20; i++)
+    {
+        double lam = 0.45 + (2.35 - 0.45) * ((double) i / 20.0);
+        double ex = 0.0, ey = 0.0, cx = 0.0, cy = 0.0;
+        cacaosim_adc_eval_deflection_rad(&adc_sn, lam, -60.0, 60.0, &ex, &ey);
+        cacaosim_disp_eval_rad(&d_sn, lam, &cx, &cy);
+        double em = hypot(cx - (ex - ex0), cy - (ey - ey0)) * 206264806.24709636;
+        if (em > sn_cheb)
+        {
+            sn_cheb = em;
+        }
+    }
+    snprintf(det, sizeof(det), "psi=0 span=%.2e mas, psi=30 span=%.1f mas, Cheb=%.2e mas",
+             zero_psi_mas, sn_span, sn_cheb);
+    check_cond(zero_psi_mas < 1e-8 && sn_span > 50.0 && sn_cheb < 0.25,
+               "3D vector Snell doublet zero-psi & Chebyshev fit", det);
+
+    /* 20d. Egner Table 29 mechanical realism: encoder quantization, slew rate, backlash */
+    cacaosim_adc_cfg_t adc_m;
+    cacaosim_adc_cfg_defaults(&adc_m);
+    adc_m.mode       = CACAOSIM_ADC_MODE_SHM;
+    adc_m.angle1_deg = 0.0f;
+    adc_m.angle2_deg = 0.0f;
+    adc_m.ideal_mech = 0;
+    cacaosim_adc_ctx_t actx_m;
+    cacaosim_adc_init(&actx_m, &adc_m, &atm);
+    float cmd_fwd[2] = { 10.0f, -10.0f };
+    cacaosim_adc_step(&actx_m, 0.1, &atm, cmd_fwd, NULL, NULL, NULL, NULL);
+    double step_slew = actx_m.cur_th1_deg; /* max_slew=3.75 deg/s * 0.1s = 0.375 deg */
+    float  cmd_rev[2] = { -10.0f, 10.0f };
+    cacaosim_adc_step(&actx_m, 0.1, &atm, cmd_rev, NULL, NULL, NULL, NULL);
+    double bl_seen = fabs(actx_m.bl_off1_deg);
+    snprintf(det, sizeof(det), "0.1s slew=%.4f deg (cap 0.375), rev backlash=%.3f deg", step_slew,
+             bl_seen);
+    check_cond(fabs(step_slew - 0.375) < 1e-4 && fabs(bl_seen - 0.100) < 1e-4,
+               "Egner Table 29 slew cap & backlash hysteresis", det);
+
+    /* 20e. 5-engine chromatic dispersion + 3-wl real-OPD CPU vs CUDA parity & no-double-count */
+    const uint32_t nwf  = 64u;
+    const uint64_t npix = (uint64_t) nwf * nwf;
+    const char    *bench_tmpl =
+        "[bench]\n"
+        "name = \"adc_val\"\n"
+        "nwf = 64\n"
+        "pup_diam = 0.875\n"
+        "tel_diam_m = 7.95\n"
+        "cobs = 0.30\n"
+        "wf_unit = 0\n"
+        "atm_disp_enable = 1\n"
+        "zenith_deg = 45.0\n"
+        "disp_pa_deg = 25.0\n"
+        "atm_pressure_hpa = 615.0\n"
+        "atm_temp_c = 2.0\n"
+        "atm_rh_pct = 20.0\n"
+        "atm_disp_ref_um = 1.65\n"
+        "chrom_turb = 1\n"
+        "chrom_lambdas = \"0.75,1.22,1.65\"\n"
+        "out_beam = \"b_pup\"\n"
+        "\n"
+        "[adc.ao188]\n"
+        "in = \"b_pup\"\n"
+        "out = \"b_adc\"\n"
+        "preset = \"ao188\"\n"
+        "mode = \"%s\"\n"
+        "opt_band = \"H\"\n"
+        "ideal_mech = 1\n"
+        "tput_enable = 0\n"
+        "\n"
+        "[fpcam.cam_vis]\n"
+        "in = \"b_pup\"\n"
+        "ncam = 64\n"
+        "lambda_um = 1.22\n"
+        "bw_frac = 0.02\n"
+        "nlambda = 3\n"
+        "pixscale_ld = 3.0\n"
+        "photon_noise = 0\n"
+        "ron_e = 0.0\n"
+        "bias_adu = 0.0\n"
+        "out_dtype = \"float32\"\n"
+        "use_beam_flux = 0\n"
+        "flux_ph = 100000\n"
+        "\n"
+        "[fpcam.cam_h]\n"
+        "in = \"b_adc\"\n"
+        "ncam = 64\n"
+        "lambda_um = 1.65\n"
+        "bw_frac = 0.18\n"
+        "nlambda = 5\n"
+        "pixscale_ld = 3.0\n"
+        "photon_noise = 0\n"
+        "ron_e = 0.0\n"
+        "bias_adu = 0.0\n"
+        "out_dtype = \"float32\"\n"
+        "use_beam_flux = 0\n"
+        "flux_ph = 100000\n"
+        "\n"
+        "[pyrwfs.pyr]\n"
+        "in = \"b_adc\"\n"
+        "ncam = 64\n"
+        "pad_factor = 2\n"
+        "lambda_um = 0.75\n"
+        "bw_frac = 0.16\n"
+        "nlambda = 3\n"
+        "mod_rad = 3.0\n"
+        "mod_npts = 8\n"
+        "photon_noise = 0\n"
+        "ron_e = 0.0\n"
+        "bias_adu = 0.0\n"
+        "out_dtype = \"float32\"\n"
+        "use_beam_flux = 0\n"
+        "flux_ph = 100000\n"
+        "\n"
+        "[shwfs.sh]\n"
+        "in = \"b_adc\"\n"
+        "n_sub = 4\n"
+        "pix_per_sub = 8\n"
+        "lambda_um = 1.22\n"
+        "bw_frac = 0.18\n"
+        "nlambda = 3\n"
+        "photon_noise = 0\n"
+        "ron_e = 0.0\n"
+        "bias_adu = 0.0\n"
+        "out_dtype = \"float32\"\n"
+        "use_beam_flux = 0\n"
+        "flux_ph = 100000\n"
+        "\n"
+        "[zwfs.zw]\n"
+        "in = \"b_adc\"\n"
+        "ncam = 64\n"
+        "lambda_um = 1.65\n"
+        "bw_frac = 0.18\n"
+        "nlambda = 3\n"
+        "photon_noise = 0\n"
+        "ron_e = 0.0\n"
+        "bias_adu = 0.0\n"
+        "out_dtype = \"float32\"\n"
+        "use_beam_flux = 0\n"
+        "flux_ph = 100000\n"
+        "\n"
+        "[coro.cor]\n"
+        "in = \"b_adc\"\n"
+        "out = \"b_cor\"\n"
+        "out_lowfs = \"b_lo\"\n"
+        "mode = \"lyot_spot\"\n"
+        "lambda_um = 1.65\n"
+        "bw_frac = 0.18\n"
+        "nlambda = 3\n"
+        "fpm_rad_ld = 1.5\n"
+        "lyot_outer = 0.85\n"
+        "lyot_obs = 0.36\n"
+        "lowfs_mode = \"lyot_refl\"\n"
+        "\n"
+        "[fpcam.cam_cor]\n"
+        "in = \"b_cor\"\n"
+        "ncam = 64\n"
+        "lambda_um = 1.65\n"
+        "bw_frac = 0.18\n"
+        "nlambda = 3\n"
+        "pixscale_ld = 3.0\n"
+        "photon_noise = 0\n"
+        "ron_e = 0.0\n"
+        "bias_adu = 0.0\n"
+        "out_dtype = \"float32\"\n"
+        "use_beam_flux = 0\n"
+        "flux_ph = 100000\n"
+        "\n"
+        "[zwfs.zw_lo]\n"
+        "in = \"b_lo\"\n"
+        "ncam = 64\n"
+        "lambda_um = 1.65\n"
+        "bw_frac = 0.18\n"
+        "nlambda = 3\n"
+        "photon_noise = 0\n"
+        "ron_e = 0.0\n"
+        "bias_adu = 0.0\n"
+        "out_dtype = \"float32\"\n"
+        "use_beam_flux = 0\n"
+        "flux_ph = 100000\n";
+
+    char bench_ret[4096];
+    char bench_lut[4096];
+    snprintf(bench_ret, sizeof(bench_ret), bench_tmpl, "retracted");
+    snprintf(bench_lut, sizeof(bench_lut), bench_tmpl, "lut");
+
+    cacaosim_bench_cfg_t cfg_ret, cfg_lut;
+    int p1 = cacaosim_bench_parse_str(bench_ret, &cfg_ret, err, sizeof(err));
+    int p2 = cacaosim_bench_parse_str(bench_lut, &cfg_lut, err, sizeof(err));
+    cfg_ret.backend = CACAOSIM_BACKEND_CPU;
+    cfg_lut.backend = CACAOSIM_BACKEND_CPU;
+
+    /* 3-slice distinct chromatic OPD cube [0.75, 1.22, 1.65] um */
+    float *wf3 = (float *) cacaosim_aligned_calloc(3u * npix, sizeof(float));
+    float *pup_tmp = (float *) cacaosim_aligned_calloc(npix, sizeof(float));
+    cacaosim_pupil_cfg_t pcfg = { .nwf = nwf, .pup_diam = 0.875f, .cobs = 0.30f };
+    cacaosim_make_pupil(&pcfg, pup_tmp);
+    cacaosim_make_ncpa(nwf, 0.875f, pup_tmp, 0.06f, 7701ULL, wf3);
+    cacaosim_make_ncpa(nwf, 0.875f, pup_tmp, 0.06f, 7702ULL, wf3 + npix);
+    cacaosim_make_ncpa(nwf, 0.875f, pup_tmp, 0.06f, 7703ULL, wf3 + 2u * npix);
+
+    /* Centroid test on pure flat WF at z=45, PA=25: cam_vis shifts vs ref 1.65 um */
+    float *wf_flat3 = (float *) cacaosim_aligned_calloc(3u * npix, sizeof(float));
+    cacaosim_bench_ctx_t ctx_ret_c, ctx_lut_c;
+    int i1 = (p1 == 0) ? cacaosim_bench_init(&ctx_ret_c, &cfg_ret, NULL, 0, err, sizeof(err)) : -1;
+    int i2 = (p2 == 0) ? cacaosim_bench_init(&ctx_lut_c, &cfg_lut, NULL, 0, err, sizeof(err)) : -1;
+
+    snprintf(det, sizeof(det), "p1=%d p2=%d i1=%d i2=%d err=%.100s", p1, p2, i1, i2,
+             (p1 || p2 || i1 || i2) ? err : "ok");
+    check_cond(p1 == 0 && p2 == 0 && i1 == 0 && i2 == 0,
+               "5-engine chrom+ADC bench parse & init", det);
+    if (i1 == 0 && i2 == 0)
+    {
+        /* Step with flat 3-slice WF to measure pure chromatic PSF shift and coronagraph leakage */
+        cacaosim_bench_step(&ctx_ret_c, wf_flat3, NULL, 1.0f, NULL);
+        cacaosim_bench_step(&ctx_lut_c, wf_flat3, NULL, 1.0f, NULL);
+
+        int          s_vis = cacaosim_bench_find_sensor(&ctx_ret_c, "cam_vis");
+        const float *im_v  = cacaosim_bench_sensor_f32(&ctx_ret_c, s_vis);
+        double       sum_i = 0.0, cx = 0.0, cy = 0.0;
+        for (uint32_t y = 0; y < 64u; y++)
+        {
+            for (uint32_t x = 0; x < 64u; x++)
+            {
+                double v = (double) im_v[(size_t) y * 64u + x];
+                sum_i += v;
+                cx += v * (double) x;
+                cy += v * (double) y;
+            }
+        }
+        cx /= sum_i;
+        cy /= sum_i;
+        /* Expected shift of J=1.22 um (ref 1.65 um) at z=45, PA=25, D=7.95, 3 px/(l/D) */
+        cacaosim_disp_t d_ref;
+        memset(&d_ref, 0, sizeof(d_ref));
+        cacaosim_disp_set_atm(&d_ref, &cfg_ret.atm_disp);
+        double tx = 0.0, ty = 0.0;
+        cacaosim_disp_eval_rad(&d_ref, 1.22, &tx, &ty);
+        double ld_rad = 1.22e-6 / 7.95;
+        double ex_dx  = (tx / ld_rad) * 3.0;
+        double ex_dy  = (ty / ld_rad) * 3.0;
+        double meas_r = hypot(cx - 32.0, cy - 32.0);
+        double exp_r  = hypot(ex_dx, ex_dy);
+        double r_err  = fabs(meas_r - exp_r);
+        snprintf(det, sizeof(det), "centroid=(%.2f,%.2f), |dr|=%.2f px vs analytic %.2f px (err=%.3f)",
+                 cx, cy, meas_r, exp_r, r_err);
+        check_cond(r_err < 0.15 && meas_r > 3.0,
+                   "FPCAM chromatic PSF shift matches Ciddor dispersion", det);
+
+        /* Coronagraph no-double-count: post-coro beams clear disp.active & ADC recovers contrast */
+        int    cor_b_idx = -1;
+        int    lo_b_idx  = -1;
+        for (uint32_t b = 0; b < ctx_ret_c.n_beams; b++)
+        {
+            if (strcmp(ctx_ret_c.beams[b].name, "b_cor") == 0)
+            {
+                cor_b_idx = (int) b;
+            }
+            if (strcmp(ctx_ret_c.beams[b].name, "b_lo") == 0)
+            {
+                lo_b_idx = (int) b;
+            }
+        }
+        int          s_h_r   = cacaosim_bench_find_sensor(&ctx_ret_c, "cam_h");
+        int          s_h_l   = cacaosim_bench_find_sensor(&ctx_lut_c, "cam_h");
+        const float *im_h_r  = cacaosim_bench_sensor_f32(&ctx_ret_c, s_h_r);
+        const float *im_h_l  = cacaosim_bench_sensor_f32(&ctx_lut_c, s_h_l);
+        float        pk_h_r  = 0.0f;
+        float        pk_h_l  = 0.0f;
+        for (size_t p = 0; p < 64u * 64u; p++)
+        {
+            if (im_h_r[p] > pk_h_r)
+            {
+                pk_h_r = im_h_r[p];
+            }
+            if (im_h_l[p] > pk_h_l)
+            {
+                pk_h_l = im_h_l[p];
+            }
+        }
+        int          s_cr_r  = cacaosim_bench_find_sensor(&ctx_ret_c, "cam_cor");
+        int          s_cr_l  = cacaosim_bench_find_sensor(&ctx_lut_c, "cam_cor");
+        const float *im_cr_r = cacaosim_bench_sensor_f32(&ctx_ret_c, s_cr_r);
+        const float *im_cr_l = cacaosim_bench_sensor_f32(&ctx_lut_c, s_cr_l);
+        double       sum_cr_r = 0.0, sum_cr_l = 0.0;
+        for (size_t p = 0; p < 64u * 64u; p++)
+        {
+            sum_cr_r += (double) im_cr_r[p];
+            sum_cr_l += (double) im_cr_l[p];
+        }
+        int disp_cleared = (cor_b_idx >= 0 && ctx_ret_c.beams[cor_b_idx].disp.active == 0 &&
+                            lo_b_idx >= 0 && ctx_ret_c.beams[lo_b_idx].disp.active == 0);
+        snprintf(det, sizeof(det), "disp_cleared=%d, H_peak LUT/Ret=%.3f, Coro_sum Ret/LUT=%.2fx",
+                 disp_cleared, (pk_h_r > 0.0f) ? (pk_h_l / pk_h_r) : 0.0f,
+                 (sum_cr_l > 0.0) ? (sum_cr_r / sum_cr_l) : 0.0);
+        check_cond(disp_cleared && pk_h_l > pk_h_r * 1.05f && sum_cr_r > sum_cr_l * 1.015,
+                   "Coro clears downstream disp & ADC restores H PSF", det);
+
+        /* Steady-state disp.gen invariance across consecutive ticks with static (z, PA) */
+        uint64_t gen_b0_1  = ctx_lut_c.beams[0].disp.gen;
+        uint64_t gen_adc_1 = ctx_lut_c.beams[1].disp.gen;
+        cacaosim_bench_step(&ctx_lut_c, wf3, NULL, 1.0f, NULL);
+        uint64_t gen_b0_2  = ctx_lut_c.beams[0].disp.gen;
+        uint64_t gen_adc_2 = ctx_lut_c.beams[1].disp.gen;
+        snprintf(det, sizeof(det), "b0 gen %llu->%llu, adc gen %llu->%llu",
+                 (unsigned long long) gen_b0_1, (unsigned long long) gen_b0_2,
+                 (unsigned long long) gen_adc_1, (unsigned long long) gen_adc_2);
+        check_cond(gen_b0_1 == gen_b0_2 && gen_adc_1 == gen_adc_2 && gen_b0_1 > 0ULL,
+                   "Steady-state disp.gen stays invariant in hot loop", det);
+
+        /* CPU vs CUDA parity across ALL 5 engines (fpcam, pyrwfs, shwfs, zwfs, coro+lowfs) */
+        if (cacaosim_cuda_available())
+        {
+            cacaosim_bench_cfg_t cfg_gpu = cfg_lut;
+            cfg_gpu.backend              = CACAOSIM_BACKEND_CUDA;
+            cacaosim_bench_ctx_t ctx_lut_g;
+            if (cacaosim_bench_init(&ctx_lut_g, &cfg_gpu, NULL, 0, err, sizeof(err)) == 0)
+            {
+                /* Sync both CPU and GPU to fresh tick with 3-slice chromatic wf3 */
+                cacaosim_bench_step(&ctx_lut_c, wf3, NULL, 1.0f, NULL);
+                cacaosim_bench_step(&ctx_lut_g, wf3, NULL, 1.0f, NULL);
+
+                const char *snames[6] = { "cam_vis", "cam_h", "pyr", "sh", "zw", "cam_cor" };
+                double      errs[6]   = { 0 };
+                double      max_e     = 0.0;
+                for (int k = 0; k < 6; k++)
+                {
+                    int    sc  = cacaosim_bench_find_sensor(&ctx_lut_c, snames[k]);
+                    int    sg  = cacaosim_bench_find_sensor(&ctx_lut_g, snames[k]);
+                    size_t npx = (strcmp(snames[k], "sh") == 0) ? (32u * 32u) : (64u * 64u);
+                    errs[k]    = rel_l2_f32(cacaosim_bench_sensor_f32(&ctx_lut_c, sc),
+                                            cacaosim_bench_sensor_f32(&ctx_lut_g, sg), npx);
+                    if (errs[k] > max_e)
+                    {
+                        max_e = errs[k];
+                    }
+                }
+                int    s_zl_c = cacaosim_bench_find_sensor(&ctx_lut_c, "zw_lo");
+                int    s_zl_g = cacaosim_bench_find_sensor(&ctx_lut_g, "zw_lo");
+                double e_zlo  = rel_l2_f32(cacaosim_bench_sensor_f32(&ctx_lut_c, s_zl_c),
+                                           cacaosim_bench_sensor_f32(&ctx_lut_g, s_zl_g),
+                                           64u * 64u);
+                if (e_zlo > max_e)
+                {
+                    max_e = e_zlo;
+                }
+                snprintf(det, sizeof(det),
+                         "vis=%.1e H=%.1e pyr=%.1e sh=%.1e zw=%.1e cor=%.1e lo=%.1e", errs[0],
+                         errs[1], errs[2], errs[3], errs[4], errs[5], e_zlo);
+                check_cond(max_e < 5e-5, "5-engine chrom+disp+3wl OPD CPU vs CUDA parity", det);
+                cacaosim_bench_free(&ctx_lut_g);
+            }
+        }
+    }
+    if (i1 == 0)
+    {
+        cacaosim_bench_free(&ctx_ret_c);
+    }
+    if (i2 == 0)
+    {
+        cacaosim_bench_free(&ctx_lut_c);
+    }
+
+    /* 20f. .bench format -> re-parse round-trip preserving atmospheric & ADC fields */
+    char                 rt_buf[8192];
+    int                  rt_len = cacaosim_bench_format_str(&cfg_lut, rt_buf, sizeof(rt_buf));
+    cacaosim_bench_cfg_t cfg_rt;
+    int rt_ok = (rt_len > 0 && cacaosim_bench_parse_str(rt_buf, &cfg_rt, err, sizeof(err)) == 0);
+    int fields_ok =
+        (rt_ok && fabsf(cfg_rt.atm_disp.zenith_deg - 45.0f) < 1e-4f &&
+         fabsf(cfg_rt.atm_disp.disp_pa_deg - 25.0f) < 1e-4f && cfg_rt.chrom_turb == 1 &&
+         cfg_rt.n_nodes == cfg_lut.n_nodes && cfg_rt.nodes[0].kind == CACAOSIM_NODE_ADC &&
+         cfg_rt.nodes[0].adc.preset == CACAOSIM_ADC_PRESET_AO188 &&
+         cfg_rt.nodes[0].adc.mode == CACAOSIM_ADC_MODE_LUT &&
+         cfg_rt.nodes[0].adc.opt_band == CACAOSIM_ADC_OPT_H);
+    snprintf(det, sizeof(det), "len=%d, z=%.1f, pa=%.1f, chrom=%d, adc_mode=%s", rt_len,
+             rt_ok ? cfg_rt.atm_disp.zenith_deg : -1.0f,
+             rt_ok ? cfg_rt.atm_disp.disp_pa_deg : -1.0f, rt_ok ? cfg_rt.chrom_turb : -1,
+             rt_ok ? cacaosim_adc_mode_name(cfg_rt.nodes[0].adc.mode) : "ERR");
+    check_cond(fields_ok, ".bench round-trip preserves atm_disp, chrom & ADC", det);
+
+    free(wf_flat3);
+    free(pup_tmp);
+    free(wf3);
+}
+
 int main(void)
 {
     printf("======================================================================\n");
@@ -6236,6 +6742,7 @@ int main(void)
     test_subaru_lyot_coro_and_llowfs();
     test_options_schema_and_tui_coverage();
     test_entrance_perturbations();
+    test_atm_disp_and_ao188_adc();
 
     printf("\n======================================================================\n");
     printf("  Summary: %d passed, %d failed\n", g_pass, g_fail);
