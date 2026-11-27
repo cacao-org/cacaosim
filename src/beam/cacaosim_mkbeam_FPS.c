@@ -73,6 +73,10 @@ static float    param_vib_rms_nm                             = 45.0f;
 static int64_t  param_petal_enable                           = 0;
 static float    param_petal_rms_nm                           = 1000.0f;
 static float    param_petal_tau_s                            = 3.0f;
+static float    param_petal_off0_nm                          = 0.0f;
+static float    param_petal_off1_nm                          = 0.0f;
+static float    param_petal_off2_nm                          = 0.0f;
+static float    param_petal_off3_nm                          = 0.0f;
 static int64_t  param_atm_disp_enable                        = 1;
 static float    param_zenith_deg                             = 0.0f;
 static float    param_disp_pa_deg                            = 0.0f;
@@ -171,6 +175,18 @@ static float    param_frame_rate                             = 0.0f;
     X(".petal_tau_s", &param_petal_tau_s, FPTYPE_FLOAT32, 0,                            \
       FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
       "Thermal petaling correlation timescale [s] (default: 3.0)")                      \
+    X(".petal_off0_nm", &param_petal_off0_nm, FPTYPE_FLOAT32, 0,                        \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Live additive LWE piston step offset on island 0 / East [nm OPD]")               \
+    X(".petal_off1_nm", &param_petal_off1_nm, FPTYPE_FLOAT32, 0,                        \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Live additive LWE piston step offset on island 1 / North [nm OPD]")              \
+    X(".petal_off2_nm", &param_petal_off2_nm, FPTYPE_FLOAT32, 0,                        \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Live additive LWE piston step offset on island 2 / West [nm OPD]")               \
+    X(".petal_off3_nm", &param_petal_off3_nm, FPTYPE_FLOAT32, 0,                        \
+      FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
+      "Live additive LWE piston step offset on island 3 / South [nm OPD]")              \
     X(".atm_disp_enable", &param_atm_disp_enable, FPTYPE_ONOFF, 0,                      \
       FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,                                           \
       "Enable Maunakea atmospheric chromatic dispersion (0 = off, 1 = on)")             \
@@ -218,7 +234,8 @@ static MILK_COLD errno_t mkbeam_confcheck(void)
         const char *live_keys[] = {
             ".star_mag",     ".star_teff",       ".tel_tput",      ".turb_gain",
             ".frame_rate",   ".vib_enable",      ".vib_rms_nm",    ".petal_enable",
-            ".petal_rms_nm", ".petal_tau_s",     ".atm_disp_enable", ".zenith_deg",
+            ".petal_rms_nm", ".petal_tau_s",     ".petal_off0_nm", ".petal_off1_nm",
+            ".petal_off2_nm", ".petal_off3_nm",  ".atm_disp_enable", ".zenith_deg",
             ".disp_pa_deg"
         };
         for (size_t i = 0; i < sizeof(live_keys) / sizeof(live_keys[0]); i++)
@@ -402,6 +419,10 @@ static MILK_HOT errno_t mkbeam_compute(const MILK_RUNNABLE *self)
         pcfg.petal_enable = param_petal_enable ? 1 : 0;
         pcfg.petal_rms_nm = param_petal_rms_nm;
         pcfg.petal_tau_s  = param_petal_tau_s;
+        pcfg.petal_offset_nm[0] = param_petal_off0_nm;
+        pcfg.petal_offset_nm[1] = param_petal_off1_nm;
+        pcfg.petal_offset_nm[2] = param_petal_off2_nm;
+        pcfg.petal_offset_nm[3] = param_petal_off3_nm;
         double dt_s = (param_frame_rate > 0.1f) ? (1.0 / (double) param_frame_rate) : 0.0005;
 
         uint32_t live_nwl  = 1u;
@@ -429,7 +450,7 @@ static MILK_HOT errno_t mkbeam_compute(const MILK_RUNNABLE *self)
                 float       *out_a = out_o + npix;
                 cacaosim_beam_init_cpu(pup_ptr, amp_m, wf_m, ncpa_ptr, s_m, nwf, out_o, out_a);
             }
-            if (pcfg.vib_enable || pcfg.petal_enable)
+            if (cacaosim_perturb_any_active(&pcfg))
             {
                 cacaosim_perturb_step_apply(&pctx, &pcfg, dt_s, param_turb_gain,
                                             img_beam.im->array.F, NULL, NULL);
@@ -449,7 +470,7 @@ static MILK_HOT errno_t mkbeam_compute(const MILK_RUNNABLE *self)
         {
             cacaosim_beam_init_cpu(pup_ptr, amp_ptr, wf_ptr, ncpa_ptr, wf_to_opd, nwf,
                                    img_beam.im->array.F, img_beam.im->array.F + npix);
-            if (pcfg.vib_enable || pcfg.petal_enable)
+            if (cacaosim_perturb_any_active(&pcfg))
             {
                 cacaosim_perturb_step_apply(&pctx, &pcfg, dt_s, param_turb_gain,
                                             img_beam.im->array.F, NULL, NULL);

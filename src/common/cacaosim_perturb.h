@@ -52,6 +52,7 @@ extern "C" {
  * @petal_rms_nm: Target total pupil-plane LWE OPD RMS [nm] (default: 1000.0).
  * @petal_tau_s:  Thermal LWE correlation timescale [s] (default: 3.0).
  * @petal_seed:   Deterministic PRNG seed for thermal petal evolution.
+ * @petal_offset_nm: Optional live additive piston step offset per island 0..3 [nm OPD].
  */
 typedef struct
 {
@@ -62,7 +63,33 @@ typedef struct
     float    petal_rms_nm;
     float    petal_tau_s;
     uint64_t petal_seed;
+    float    petal_offset_nm[4];
 } cacaosim_perturb_cfg_t;
+
+static inline int cacaosim_perturb_has_petal_offset(const cacaosim_perturb_cfg_t *cfg)
+{
+    if (cfg == NULL)
+    {
+        return 0;
+    }
+    for (int p = 0; p < 4; p++)
+    {
+        if (cfg->petal_offset_nm[p] > 1.0e-6f || cfg->petal_offset_nm[p] < -1.0e-6f)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static inline int cacaosim_perturb_any_active(const cacaosim_perturb_cfg_t *cfg)
+{
+    if (cfg == NULL)
+    {
+        return 0;
+    }
+    return (cfg->vib_enable || cfg->petal_enable || cacaosim_perturb_has_petal_offset(cfg)) ? 1 : 0;
+}
 
 /**
  * struct cacaosim_perturb_tlm_t - Instantaneous ground-truth perturbation telemetry snapshot

@@ -651,6 +651,9 @@ static void step_petaling(
     double                  dt_s,
     double                  rms_um,
     double                  tau_s,
+    int                     stoch_on,
+    const float            *offset_nm,
+    double                  scale,
     float                  *out_p_um)
 {
     int np = ctx->n_petals;
@@ -661,8 +664,8 @@ static void step_petaling(
 
     /* 75% variance in differential island pistons, 25% split equally in local tip & tilt */
     double np_d    = (double) np;
-    double sig_pis = rms_um * sqrt(0.75 * np_d / ((np > 1) ? (np_d - 1.0) : 1.0));
-    double sig_tt  = rms_um * sqrt(0.125);
+    double sig_pis = stoch_on ? (rms_um * sqrt(0.75 * np_d / ((np > 1) ? (np_d - 1.0) : 1.0))) : 0.0;
+    double sig_tt  = stoch_on ? (rms_um * sqrt(0.125)) : 0.0;
 
     double pis_raw[CACAOSIM_PERTURB_MAX_PETALS];
     double mean_p = 0.0;
@@ -671,10 +674,21 @@ static void step_petaling(
         int i0 = 3 * p + 0;
         int i1 = 3 * p + 1;
         int i2 = 3 * p + 2;
-        perturb_matern32_step(&ctx->petal_u[i0], &ctx->petal_v[i0], dt_s, tau_s, &ctx->petal_rng);
-        perturb_matern32_step(&ctx->petal_u[i1], &ctx->petal_v[i1], dt_s, tau_s, &ctx->petal_rng);
-        perturb_matern32_step(&ctx->petal_u[i2], &ctx->petal_v[i2], dt_s, tau_s, &ctx->petal_rng);
-        pis_raw[p] = sig_pis * ctx->petal_u[i0];
+        if (stoch_on)
+        {
+            perturb_matern32_step(&ctx->petal_u[i0], &ctx->petal_v[i0], dt_s, tau_s, &ctx->petal_rng);
+            perturb_matern32_step(&ctx->petal_u[i1], &ctx->petal_v[i1], dt_s, tau_s, &ctx->petal_rng);
+            perturb_matern32_step(&ctx->petal_u[i2], &ctx->petal_v[i2], dt_s, tau_s, &ctx->petal_rng);
+            pis_raw[p] = sig_pis * ctx->petal_u[i0];
+        }
+        else
+        {
+            pis_raw[p] = 0.0;
+        }
+        if (p < 4 && offset_nm != NULL)
+        {
+            pis_raw[p] += (double) offset_nm[p] * 1.0e-3 * scale;
+        }
         mean_p += ctx->petal_frac[p] * pis_raw[p];
     }
 
@@ -684,8 +698,8 @@ static void step_petaling(
     for (int p = 0; p < np; p++)
     {
         double dp = pis_raw[p] - mean_p;
-        double tx = sig_tt * ctx->petal_u[3 * p + 1];
-        double ty = sig_tt * ctx->petal_u[3 * p + 2];
+        double tx = stoch_on ? (sig_tt * ctx->petal_u[3 * p + 1]) : 0.0;
+        double ty = stoch_on ? (sig_tt * ctx->petal_u[3 * p + 2]) : 0.0;
 
         out_p_um[3 * p + 0] = (float) dp;
         out_p_um[3 * p + 1] = (float) tx;
@@ -767,7 +781,8 @@ void cacaosim_perturb_step_apply(
     memset(ctx->tlm.petal_p_nm, 0, sizeof(ctx->tlm.petal_p_nm));
 
     float asc = fabsf(scale);
-    if (asc <= 0.0f || (!cfg->vib_enable && !cfg->petal_enable))
+    int   has_poff = cacaosim_perturb_has_petal_offset(cfg);
+    if (asc <= 0.0f || (!cfg->vib_enable && !cfg->petal_enable && !has_poff))
     {
         return;
     }
@@ -779,10 +794,12 @@ void cacaosim_perturb_step_apply(
                         ctx->coeff_um);
         any = 1;
     }
-    if (cfg->petal_enable && cfg->petal_rms_nm > 0.0f)
+    int stoch_petal = (cfg->petal_enable && cfg->petal_rms_nm > 0.0f) ? 1 : 0;
+    if (stoch_petal || has_poff)
     {
         step_petaling(ctx, dt_s, (double) cfg->petal_rms_nm * 1.0e-3 * (double) scale,
-                      (double) cfg->petal_tau_s, ctx->coeff_um + CACAOSIM_PERTURB_NVIB_ZERN);
+                      (double) cfg->petal_tau_s, stoch_petal, cfg->petal_offset_nm, (double) scale,
+                      ctx->coeff_um + CACAOSIM_PERTURB_NVIB_ZERN);
         any = 1;
     }
     if (!any)
