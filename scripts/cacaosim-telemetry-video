@@ -1087,7 +1087,8 @@ def _load_wf_and_dm_panels(
                 wf_in_rate_hz = r_ph
                 wf_in_title = f"Incoming Atm WF\n(outarraypha, {_fmt_rate_hz(r_ph)}, {nwf}×{nwf})"
 
-    # 4. PSOL Reconstructed Pupil WF [nm] (aol1_modevalOL + Stage-1 CMmodesDM -> DM1 pupil OPD)
+    # 4. PSOL Reconstructed Pupil WF [nm] (aol1_modevalOL + Stage-1 CMmodesDM -> DM1 pupil OPD,
+    #    plus Stage-1 passive petal-unwrap dm01disp06 offset when aol1_petal_cmd is active)
     psol_disp = None
     psol_rms = None
     psol_ptv = None
@@ -1108,9 +1109,60 @@ def _load_wf_and_dm_panels(
             (idxs1, ws1), psolve1 = _get_dm_ops(1, dm1_cfg, (ny_c, nx_c))
             psol_surf = psolve1(psol_cmd) if psolve1 is not None else psol_cmd
             psol_opd = _apply_dm_stencil(psol_surf, idxs1, ws1, nwf) * 1000.0
-            psol_disp, psol_rms, psol_ptv = _finalize_opd_cube(psol_opd, pmask, weights)
             psol_src = "aol1_modevalOL"
             psol_title = f"PSOL Recon. WF\n(aol1_modevalOL, {_fmt_rate_hz(r_ol)})"
+
+            # Include atomic integer-wave petal-unwrapper offset (dm01disp06) when active:
+            # mfilt-1 computes aol1_modevalOL from dm01disp04 only, so total Stage-1 PSOL
+            # reconstruction of the incoming wavefront adds dm01disp06 = w_enws @ petalDM.
+            pdm_cands = [
+                os.path.join(report_dir, "petal_ctrl", "petal_dm_modes.fits"),
+                os.path.join(os.path.dirname(telem_dir), "petal_ctrl", "petal_dm_modes.fits"),
+                os.path.join(telem_dir, "calib_stg1", "petal_dm_modes.fits"),
+            ]
+            pdm_p = next((p for p in pdm_cands if os.path.isfile(p)), None)
+            if pdm_p is not None:
+                delay1_s = float(dm1_cfg.get("delay_us", 1000.0)) * 1.0e-6
+                t_pet_q = np.maximum(t_grid - delay1_s, 0.0)
+                res_pet = _slice_stream_at_times(
+                    telem_dir, "aol1_petal_cmd", phys_time_s, fs_stg1, t_pet_q
+                )
+                if res_pet is not None:
+                    pet_c, pet_midx, _ = res_pet
+                    pet_2d = pet_c.reshape(pet_c.shape[0], -1)
+                    if pet_2d.shape[1] >= 4 and bool(np.any(np.abs(pet_2d[:, :4]) > 1.0e-9)):
+                        pdm = np.asarray(fits.getdata(pdm_p), dtype=np.float32)
+                        if pdm.ndim == 3 and pdm.shape == (4, ny_c, nx_c):
+                            step_scale = 1.0
+                            for ps_p in (
+                                os.path.join(report_dir, "petal_stats.json"),
+                                os.path.join(os.path.dirname(telem_dir), "petal_stats.json"),
+                            ):
+                                if os.path.isfile(ps_p):
+                                    try:
+                                        with open(ps_p, "r", encoding="utf-8") as fh:
+                                            step_scale = float(json.load(fh).get("step_scale", 1.0))
+                                    except (OSError, ValueError, TypeError):
+                                        step_scale = 1.0
+                                    break
+                            pdm_surf = psolve1(pdm) if psolve1 is not None else pdm
+                            pdm_opd = (
+                                _apply_dm_stencil(pdm_surf, idxs1, ws1, nwf)
+                                * (1000.0 * step_scale)
+                            )
+                            pairs = np.stack([psol_midx, pet_midx], axis=1)
+                            uniq_pairs, inv_pairs = np.unique(pairs, axis=0, return_inverse=True)
+                            pet_opd_u = np.tensordot(
+                                pet_2d[uniq_pairs[:, 1], :4], pdm_opd, axes=(1, 0)
+                            )
+                            psol_opd = psol_opd[uniq_pairs[:, 0]] + pet_opd_u
+                            psol_midx = inv_pairs
+                            psol_src = "aol1_modevalOL+petal"
+                            psol_title = (
+                                f"PSOL Recon. WF\n(modevalOL + petal, {_fmt_rate_hz(r_ol)})"
+                            )
+
+            psol_disp, psol_rms, psol_ptv = _finalize_opd_cube(psol_opd, pmask, weights)
 
     # 5. Optional Exact Final Residual Pupil WF [nm] (b_post_stg2 / wf_clip_final)
     wf_res_disp = None
