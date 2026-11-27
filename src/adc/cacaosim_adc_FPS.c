@@ -30,7 +30,7 @@ static char     param_out_state[FUNCTION_PARAMETER_STRMAXLEN] = "";
 static uint32_t param_nwf                                     = 256;
 static char     param_preset[FUNCTION_PARAMETER_STRMAXLEN]    = "ao188";
 static char     param_mode[FUNCTION_PARAMETER_STRMAXLEN]      = "lut";
-static char     param_opt_band[FUNCTION_PARAMETER_STRMAXLEN]  = "H";
+static char     param_opt_band[FUNCTION_PARAMETER_STRMAXLEN]  = "whole";
 static float    param_opt_lam1                                = 1.50f;
 static float    param_opt_lam2                                = 1.78f;
 static float    param_angle1_deg                              = -90.0f;
@@ -83,7 +83,7 @@ static float    param_dt_sec                                  = 0.0005f;
     X(".mode", param_mode, FPTYPE_STRING, 0, FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,            \
       "ADC mode: retracted, manual, lut, shm, lut_plus_shm")                                    \
     X(".opt_band", param_opt_band, FPTYPE_STRING, 0, FPFLAG_DEFAULT_INPUT | FPFLAG_WRITERUN,    \
-      "LUT band: H, whole, J, z, K', K, vis, custom")                                           \
+      "LUT band: whole, H, J, z, K', K, vis, custom")                                           \
     X(".opt_lam1_um", &param_opt_lam1, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,                 \
       "Custom LUT band lower bound [um]")                                                       \
     X(".opt_lam2_um", &param_opt_lam2, FPTYPE_FLOAT32, 0, FPFLAG_DEFAULT_INPUT,                 \
@@ -157,7 +157,7 @@ static void sync_adc_cfg(cacaosim_adc_cfg_t *cfg)
 
     cfg->preset           = (pr >= 0) ? pr : CACAOSIM_ADC_PRESET_AO188;
     cfg->mode             = (md >= 0) ? md : CACAOSIM_ADC_MODE_LUT;
-    cfg->opt_band         = (ob >= 0) ? ob : CACAOSIM_ADC_OPT_H;
+    cfg->opt_band         = (ob >= 0) ? ob : CACAOSIM_ADC_OPT_WHOLE;
     cfg->opt_lam1_um      = param_opt_lam1;
     cfg->opt_lam2_um      = param_opt_lam2;
     cfg->angle1_deg       = param_angle1_deg;

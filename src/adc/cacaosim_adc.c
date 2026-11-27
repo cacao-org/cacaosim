@@ -101,7 +101,7 @@ void cacaosim_adc_cfg_defaults(cacaosim_adc_cfg_t *cfg)
     memset(cfg, 0, sizeof(*cfg));
     cfg->preset           = CACAOSIM_ADC_PRESET_AO188;
     cfg->mode             = CACAOSIM_ADC_MODE_LUT;
-    cfg->opt_band         = CACAOSIM_ADC_OPT_H;
+    cfg->opt_band         = CACAOSIM_ADC_OPT_WHOLE;
     cfg->opt_lam1_um      = 1.50f;
     cfg->opt_lam2_um      = 1.78f;
     cfg->angle1_deg       = -90.0f;
@@ -223,14 +223,14 @@ int32_t cacaosim_adc_parse_opt_band(const char *s)
     {
         return -1;
     }
-    if (str_eq_ci(s, "h") || str_eq_ci(s, "h-band") || str_eq_ci(s, "0"))
-    {
-        return CACAOSIM_ADC_OPT_H;
-    }
     if (str_eq_ci(s, "whole") || str_eq_ci(s, "broadband") || str_eq_ci(s, "all") ||
-        str_eq_ci(s, "1"))
+        str_eq_ci(s, "0"))
     {
         return CACAOSIM_ADC_OPT_WHOLE;
+    }
+    if (str_eq_ci(s, "h") || str_eq_ci(s, "h-band") || str_eq_ci(s, "1"))
+    {
+        return CACAOSIM_ADC_OPT_H;
     }
     if (str_eq_ci(s, "j") || str_eq_ci(s, "j-band") || str_eq_ci(s, "2"))
     {
@@ -280,7 +280,7 @@ const char *cacaosim_adc_opt_band_name(int32_t opt_band)
     case CACAOSIM_ADC_OPT_CUSTOM:
         return "custom";
     default:
-        return "H";
+        return "whole";
     }
 }
 
@@ -474,16 +474,14 @@ void cacaosim_adc_eval_deflection_rad(
         double ref_x = 0.0, ref_y = 0.0;
         trace_snell_doublet_pair(cfg, lam_um, t1, t2, &raw_x, &raw_y);
         trace_snell_doublet_pair(cfg, 0.70, t1, t2, &ref_x, &ref_y);
-        /* Note: keep relative chromatic dispersion anchored at 0.70 um + residual zero-dev */
-        (void) ref_x;
-        (void) ref_y;
+        /* Anchor differential chromatic dispersion to 0.70 um (zero-deviation optical axis) */
         if (tx_rad != NULL)
         {
-            *tx_rad = raw_x;
+            *tx_rad = raw_x - ref_x;
         }
         if (ty_rad != NULL)
         {
-            *ty_rad = raw_y;
+            *ty_rad = raw_y - ref_y;
         }
         return;
     }
@@ -761,6 +759,7 @@ typedef struct
     const cacaosim_adc_cfg_t *cfg;
     double                    th1_deg;
     double                    th2_deg;
+    double                    ref_lam_um;
 } adc_fit_ctx_t;
 
 static void adc_eval_cb(
@@ -769,8 +768,13 @@ static void adc_eval_cb(
     double *tx_rad,
     double *ty_rad)
 {
-    const adc_fit_ctx_t *c = (const adc_fit_ctx_t *) vctx;
+    const adc_fit_ctx_t *c  = (const adc_fit_ctx_t *) vctx;
+    double               rx = 0.0;
+    double               ry = 0.0;
     cacaosim_adc_eval_deflection_rad(c->cfg, lam_um, c->th1_deg, c->th2_deg, tx_rad, ty_rad);
+    cacaosim_adc_eval_deflection_rad(c->cfg, c->ref_lam_um, c->th1_deg, c->th2_deg, &rx, &ry);
+    *tx_rad -= rx;
+    *ty_rad -= ry;
 }
 
 void cacaosim_adc_init(
@@ -920,10 +924,12 @@ void cacaosim_adc_step(
                                 (double) ctx->cfg.max_slew_dps, (double) ctx->cfg.backlash_deg,
                                 &ctx->cur_th2_deg, &ctx->dir2, &ctx->bl_off2_deg);
 
-    /* Rebuild cached ADC Chebyshev dispersion only when deployment or prism angles change */
-    int need_refit = (!ctx->cache_valid || ctx->cache_deployed != deployed ||
-                      fabs(eff1 - ctx->cache_th1_deg) > 1e-7 ||
-                      fabs(eff2 - ctx->cache_th2_deg) > 1e-7);
+    /* Rebuild cached ADC Chebyshev dispersion only when deployment, angles, or ref_lam change */
+    double ref_lam_um = (atm != NULL && atm->ref_lam_um > 0.1f) ? (double) atm->ref_lam_um : 1.65;
+    int    need_refit = (!ctx->cache_valid || ctx->cache_deployed != deployed ||
+                         fabs(eff1 - ctx->cache_th1_deg) > 1e-7 ||
+                         fabs(eff2 - ctx->cache_th2_deg) > 1e-7 ||
+                         fabs(ref_lam_um - ctx->cache_ref_lam_um) > 1e-7);
     if (need_refit)
     {
         if (!deployed)
@@ -932,13 +938,19 @@ void cacaosim_adc_step(
         }
         else
         {
-            adc_fit_ctx_t fctx = { .cfg = &ctx->cfg, .th1_deg = eff1, .th2_deg = eff2 };
+            adc_fit_ctx_t fctx = {
+                .cfg        = &ctx->cfg,
+                .th1_deg    = eff1,
+                .th2_deg    = eff2,
+                .ref_lam_um = ref_lam_um,
+            };
             cacaosim_disp_fit_fn(&ctx->cached_adc_disp, adc_eval_cb, &fctx);
         }
-        ctx->cache_valid    = 1;
-        ctx->cache_deployed = deployed;
-        ctx->cache_th1_deg  = eff1;
-        ctx->cache_th2_deg  = eff2;
+        ctx->cache_valid      = 1;
+        ctx->cache_deployed   = deployed;
+        ctx->cache_th1_deg    = eff1;
+        ctx->cache_th2_deg    = eff2;
+        ctx->cache_ref_lam_um = ref_lam_um;
     }
 
     /* Compose output dispersion: out = in_disp + adc_disp (preserve gen when steady) */
@@ -978,14 +990,18 @@ void cacaosim_adc_step(
     double pa_deg  = (atm != NULL) ? (double) atm->disp_pa_deg : 0.0;
     double z_deg   = (atm != NULL) ? (double) atm->zenith_deg : 0.0;
 
-    ctx->state_vec[0] = (float) eff1;
-    ctx->state_vec[1] = (float) eff2;
-    ctx->state_vec[2] = (float) psi_deg;
-    ctx->state_vec[3] = (float) pa_deg;
-    ctx->state_vec[4] = (float) z_deg;
-    ctx->state_vec[5] = (float) cacaosim_disp_band_span_mas(dst_d, 0.675, 0.825); /* Vis [mas] */
-    ctx->state_vec[6] = (float) cacaosim_disp_band_span_mas(dst_d, 1.130, 1.310); /* J [mas] */
-    ctx->state_vec[7] = (float) cacaosim_disp_band_span_mas(dst_d, 1.500, 1.780); /* H [mas] */
-    ctx->state_vec[8] = (float) cacaosim_disp_shift_mas(dst_d, 0.750, 1.650);     /* Vis-H [mas] */
-    ctx->state_vec[9] = (float) deployed;
+    ctx->state_vec[CACAOSIM_ADC_ST_TH1]      = (float) eff1;
+    ctx->state_vec[CACAOSIM_ADC_ST_TH2]      = (float) eff2;
+    ctx->state_vec[CACAOSIM_ADC_ST_PSI]      = (float) psi_deg;
+    ctx->state_vec[CACAOSIM_ADC_ST_PA]       = (float) pa_deg;
+    ctx->state_vec[CACAOSIM_ADC_ST_ZENITH]   = (float) z_deg;
+    ctx->state_vec[CACAOSIM_ADC_ST_DEPLOYED] = (float) deployed;
+    ctx->state_vec[CACAOSIM_ADC_ST_RES_VIS] =
+        (float) cacaosim_disp_band_span_mas(dst_d, 0.675, 0.825);
+    ctx->state_vec[CACAOSIM_ADC_ST_RES_J] =
+        (float) cacaosim_disp_band_span_mas(dst_d, 1.130, 1.310);
+    ctx->state_vec[CACAOSIM_ADC_ST_RES_H] =
+        (float) cacaosim_disp_band_span_mas(dst_d, 1.500, 1.780);
+    ctx->state_vec[CACAOSIM_ADC_ST_RES_VIS_H] =
+        (float) cacaosim_disp_shift_mas(dst_d, 0.750, 1.650);
 }

@@ -35,6 +35,18 @@ extern "C" {
 /** Number of float32 telemetry elements written to `out_state` SHM stream */
 #define CACAOSIM_ADC_STATE_LEN 10
 
+/** Canonical element indices in `cacaosim_adc_ctx_t.state_vec` and `out_state` SHM `[10 x 1]` */
+#define CACAOSIM_ADC_ST_TH1       0 /**< Mechanical angle of prism #1 [deg] */
+#define CACAOSIM_ADC_ST_TH2       1 /**< Mechanical angle of prism #2 [deg] */
+#define CACAOSIM_ADC_ST_PSI       2 /**< Differential dispersion angle psi [deg] */
+#define CACAOSIM_ADC_ST_PA        3 /**< Atmospheric dispersion PA [deg] */
+#define CACAOSIM_ADC_ST_ZENITH    4 /**< Target zenith angle [deg] */
+#define CACAOSIM_ADC_ST_DEPLOYED  5 /**< Deployment flag (1.0 = in beam, 0.0 = retracted) */
+#define CACAOSIM_ADC_ST_RES_VIS   6 /**< Post-ADC Vis (0.675..0.825 um) span [mas] */
+#define CACAOSIM_ADC_ST_RES_J     7 /**< Post-ADC J (1.130..1.310 um) span [mas] */
+#define CACAOSIM_ADC_ST_RES_H     8 /**< Post-ADC H (1.500..1.780 um) span [mas] */
+#define CACAOSIM_ADC_ST_RES_VIS_H 9 /**< Post-ADC Vis(0.75)-H(1.65) shift [mas] */
+
 /** Optical prescription preset / model selector */
 typedef enum
 {
@@ -56,8 +68,8 @@ typedef enum
 /** LUT spectral optimization target band */
 typedef enum
 {
-    CACAOSIM_ADC_OPT_H      = 0, /**< H-band (1.500..1.780 um; Egner HiCIAO/coro default) */
-    CACAOSIM_ADC_OPT_WHOLE  = 1, /**< Simultaneous APDs + z/J/H/K' (Egner Table 10/11 whole) */
+    CACAOSIM_ADC_OPT_WHOLE  = 0, /**< Simultaneous APDs + z/J/H/K' (Egner Table 10/11 default) */
+    CACAOSIM_ADC_OPT_H      = 1, /**< H-band (1.500..1.780 um; Egner HiCIAO/coronagraph) */
     CACAOSIM_ADC_OPT_J      = 2, /**< J-band (1.175..1.345 um) */
     CACAOSIM_ADC_OPT_Z      = 3, /**< z-band (0.970..1.070 um) */
     CACAOSIM_ADC_OPT_KP     = 4, /**< K'-band (1.985..2.295 um) */
@@ -73,7 +85,7 @@ typedef struct
 {
     int32_t preset;          /**< cacaosim_adc_preset_t (default: CACAOSIM_ADC_PRESET_AO188) */
     int32_t mode;            /**< cacaosim_adc_mode_t (default: CACAOSIM_ADC_MODE_LUT) */
-    int32_t opt_band;        /**< cacaosim_adc_opt_band_t (default: CACAOSIM_ADC_OPT_H) */
+    int32_t opt_band;        /**< cacaosim_adc_opt_band_t (default: CACAOSIM_ADC_OPT_WHOLE) */
     float   opt_lam1_um;     /**< Custom LUT lower bound [um] when opt_band == CUSTOM */
     float   opt_lam2_um;     /**< Custom LUT upper bound [um] when opt_band == CUSTOM */
 
@@ -134,6 +146,7 @@ typedef struct
     int                cache_deployed;
     double             cache_th1_deg;
     double             cache_th2_deg;
+    double             cache_ref_lam_um;
     uint64_t           cache_in_gen;
     cacaosim_disp_t    cached_adc_disp;
     cacaosim_disp_t    cached_out_disp;
